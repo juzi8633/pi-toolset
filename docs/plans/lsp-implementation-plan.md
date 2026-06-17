@@ -244,7 +244,7 @@ cache clear.
 - [x] `pi.on("context", …)` — drain new diagnostics, strip previous injected blocks from
       `event.messages`, append the fresh block; return `{ messages }`.
 - [x] `pi.on("tool_result", …)` — when `toolName` is `edit`/`write`, extract the file path from
-      `event.details`, send `didChange` + `didSave`, and `diagnostics.clearForFile(uri)`.
+      `event.input.path`, send `didChange` + `didSave`, and `diagnostics.clearForFile(uri)`.
 - [x] Decide `LRUCache` source (small internal impl vs dependency) — keep it dependency-light.
       → Implemented a minimal `LruMap` in `diagnostics.ts` (no new runtime dep).
 
@@ -261,12 +261,14 @@ cache clear.
       _(`stripDiagnosticBlocks` filters `customType === "lsp-diagnostics"`)_
 - [x] `bunx tsc --noEmit` + `hk check` pass.
 
-### Open questions (spec §8)
+### Resolved decisions (spec §8)
 
-- `context` hook injection vs `before_agent_start` — test which is more stable in Pi (position in
-  context, interaction with compaction).
-- Stable extraction of the edited path from `tool_result` `details` (depends on the built-in
-  edit/write tool detail shape).
+- Use the `context` hook for passive diagnostic injection. It runs before every LLM call, supports
+  same-loop diagnostics after `edit`/`write`, and does not persist injected blocks to the session
+  transcript.
+- Extract edited paths from `tool_result.input.path`, not `details`. SDK evidence: `EditToolInput`
+  and `WriteToolInput` both carry `path`; `EditToolDetails` has only diff/patch metadata, and
+  `WriteToolResultEvent.details` is `undefined`.
 
 ---
 
