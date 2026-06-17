@@ -1,65 +1,29 @@
-# AGENTS.md
+# Instructions
 
-## Build & Test Commands
+## Goal
 
-- **Build**: `mise run build` or `bun build ./src/index.ts --outdir dist --target bun`
-- **Test**: `mise run test` or `bun test`
-- **Single Test**: `bun test BackgroundTask.test.ts` (use file glob pattern)
-- **Watch Mode**: `bun test --watch`
-- **Lint**: `mise run lint` (eslint)
-- **Fix Lint**: `mise run lint:fix` (eslint --fix)
-- **Format**: `mise run format` (prettier)
+Implement LSP support for Pi. Before acting, identify the deliverable, constraints, and allowed side effects. Choose the most efficient path that satisfies them.
 
-## Code Style Guidelines
+## Success Criteria
 
-### Imports & Module System
+- The requested change is complete and in the requested shape
+- Validation passes before reporting done
+- Missing information, permissions, or blockers are surfaced rather than hidden
 
-- Use ES6 `import`/`export` syntax (module: "ESNext", type: "module")
-- Group imports: external libraries first, then internal modules
-- Use explicit file extensions (`.ts`) for internal imports
+## Constraints
 
-### Formatting (Prettier)
+- Use `bun` as the package manager; prefer `bunx` for one-off tools
+- Keep comments to a minimum — let the code speak for itself
+- Match surrounding style and formatting
+- Make the smallest reasonable change that solves the task
+- Do not introduce mock modes or fake data paths
+- Reference `Claude Code` source at `@/home/julian/workspace/source/claude-code-2.1.88/package-src/src` when useful
 
-- **Single quotes** (`singleQuote: true`)
-- **Line width**: 100 characters
-- **Tab width**: 2 spaces
-- **Trailing commas**: ES5 (no trailing commas in function parameters)
-- **Semicolons**: enabled
+## Validation
 
-### TypeScript & Naming
+After a change, run the most relevant check: targeted tests for changed behavior, type checks, lint, or `hk`. If validation cannot run, state why and give the next best check.
 
-- **NeverNesters**: avoid deeply nested structures. Always exit early.
-- **Strict mode**: enforced (`"strict": true`)
-- **Classes**: PascalCase (e.g., `BackgroundTask`, `BackgroundTaskManager`)
-- **Methods/properties**: camelCase
-- **Status strings**: use union types (e.g., `'pending' | 'running' | 'completed' | 'failed' | 'cancelled'`)
-- **Explicit types**: prefer explicit type annotations over inference
-- **Return types**: optional (not required but recommended for public methods)
+## Stop Rules
 
-### Error Handling
-
-- Check error type before accessing error properties: `error instanceof Error ? error.toString() : String(error)`
-- Log errors with `[ERROR]` prefix for consistency
-- Always provide error context when recording output
-
-### Linting Rules
-
-- `@typescript-eslint/no-explicit-any`: warn (avoid `any` type)
-- `no-console`: error (minimize console logs)
-- `prettier/prettier`: error (formatting violations are errors)
-
-## Testing
-
-- Framework: **vitest** with `describe` & `it` blocks
-- Style: Descriptive nested test cases with clear expectations
-- Assertion library: `expect()` (vitest)
-
-## Memory
-
-- Store temporary data in `.memory/` directory (gitignored)
-
-## Project Context
-
-- **Type**: ES Module package for Bun modules
-- **Target**: Bun runtime, ES2021+
-- **Purpose**: General-purpose Bun module development
+- Ask before: replacing an entire implementation, destructive or irreversible actions, changing secrets, or acting outside the request scope
+- Stop and report when a change requires more context than available
