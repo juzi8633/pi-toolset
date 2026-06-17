@@ -37,6 +37,21 @@ export default tseslint.config(
       'prettier/prettier': 'error',
       '@typescript-eslint/explicit-function-return-type': 'off',
       '@typescript-eslint/no-explicit-any': 'warn',
+      // Use the TypeScript-aware unused-vars rule so type-signature parameter
+      // names and `_`-prefixed throwaway params are not falsely flagged.
+      'no-unused-vars': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrors: 'none',
+        },
+      ],
+      // TypeScript's compiler already reports undefined identifiers, and
+      // no-undef produces false positives for type-only references and runtime
+      // globals (setTimeout, NodeJS, …). Disable it as typescript-eslint advises.
+      'no-undef': 'off',
       'no-console': 'error',
     },
   }

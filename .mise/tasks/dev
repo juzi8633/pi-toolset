@@ -9,4 +9,7 @@ bun build ./src/index.ts \
   --sourcemap=inline \
   --splitting \
   --entry-naming='[dir]/[name].js' \
-  --chunk-naming='[name].js'
+  --chunk-naming='[name].js' \
+  --external @earendil-works/pi-ai \
+  --external @earendil-works/pi-coding-agent \
+  --external typebox

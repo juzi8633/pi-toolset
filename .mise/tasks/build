@@ -4,7 +4,11 @@
 #MISE sources=["src/**/*"]
 #MISE outputs=["dist/index.js"]
 
-bun build ./src/index.ts --outdir dist --target bun
+# Externalize the Pi SDK peer packages so the host provides them at runtime.
+# Bundling them would load a second SDK instance, breaking type/identity checks.
+bun build ./src/index.ts --outdir dist --target bun \
+  --external @earendil-works/pi-ai \
+  --external @earendil-works/pi-coding-agent \
+  --external typebox
 
-# If you need to exlude some packages from your bundle, you can use the --external flag. For example, to exclude the "lodash" package, you can run:
-# bun build ./src/index.ts --outdir dist --target bun --external lodash
+# If you need to exclude additional packages from your bundle, add more --external flags above.
