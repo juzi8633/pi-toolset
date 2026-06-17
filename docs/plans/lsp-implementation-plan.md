@@ -210,12 +210,12 @@ export default function (pi: ExtensionAPI): void {
 
 ### Phase 1 acceptance (spec §6)
 
-- [ ] `goToDefinition` returns correct `file:line:col` (1-based) in a TS project.
-- [ ] `findReferences` returns multi-file references grouped by file.
-- [ ] `hover` returns a type signature.
-- [ ] A missing server binary surfaces a clear error, no crash.
-- [ ] `session_shutdown` kills the process (`ps` shows no residue); `/reload` leaves exactly one.
-- [ ] `bunx tsc --noEmit` + `hk check` pass.
+- [x] `goToDefinition` returns correct `file:line:col` (1-based) in a TS project.
+- [x] `findReferences` returns multi-file references grouped by file.
+- [x] `hover` returns a type signature.
+- [x] A missing server binary surfaces a clear error, no crash.
+- [x] `session_shutdown` kills the process (`ps` shows no residue); `/reload` leaves exactly one.
+- [x] `bunx tsc --noEmit` + `hk check` pass.
 
 ---
 
