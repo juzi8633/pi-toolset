@@ -109,7 +109,7 @@ The extension is published as `pi-lsp`. When installed as a Pi package, it regis
 - `mise run lint:fix` — Fix linting issues
 - `mise run format` — Format code with Prettier
 - `mise run format:check` — Check formatting with Prettier
-- `mise run typercheck` - Run TypeScript type check
+- `mise run typecheck` - Run TypeScript type check
 
 ## Validation
 

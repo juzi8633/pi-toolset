@@ -374,7 +374,211 @@ initialization and/or by answering `workspace/configuration` requests from `conf
 
 ---
 
-## 7. Validation
+## 7. UX optimization — Zero-config LSP activation
+
+**Deliver:** PATH-based autodetection backed by a small built-in LSP server recipe registry. With no
+`lsp.servers` configuration, `pi-lsp` should enable matching installed language servers
+automatically; with user configuration, recipes should supplement only uncovered languages. When no
+matching server is available on PATH, the first LSP trigger should surface a clear
+install/configuration hint through Pi's standard extension UI notification API.
+
+**Inputs:** User request to minimize configuration: keep `settings.json` user configuration, let user
+entries override built-in recipes by server name and covered file extensions, use recipes to fill
+uncovered languages, and remind the user to install the corresponding LSP server when a file type has
+no available server.
+
+**Assumptions:**
+
+- User-owned `lsp.servers` entries in either `~/.pi/agent/settings.json` or
+  `<cwd>/.pi/settings.json` are authoritative for their server names and covered extensions. Built-in
+  recipes may still be added for other languages, but a recipe is skipped when its server name
+  collides with a user entry or any of its extensions are already covered by a user entry.
+- This optimization does not install binaries. It only detects existing executables on `PATH` and
+  shows human-readable install hints.
+- Notifications are session-deduplicated by extension/reason. Persistent "never show again" state is
+  left out of this iteration because the requested flow is guidance, not an interactive installer.
+
+**Architecture:** Add a focused recipe module that owns executable discovery, extension mapping, and
+install guidance. `config.ts` keeps the existing settings reader, normalizes user configuration
+first, then appends detected recipes only when they do not collide with user server names or covered
+extensions. `tools.ts` and the post-edit `tool_result` hook call a shared notifier when a file
+extension has no active server.
+
+**Pi UI guidance:** Pi's extension docs list `ctx.ui` as the common user-interaction surface
+(`select`, `confirm`, `input`, `notify`) and recommend guarding UI methods with `ctx.hasUI`. This
+optimization should use non-blocking `ctx.ui.notify(..., "warning")` for missing-server guidance.
+`ctx.ui.confirm()` or `ctx.ui.select()` should be reserved for a later feature that writes or changes
+user configuration.
+
+### File map
+
+- Create: `src/recipes.ts` — recipe registry, PATH executable discovery, extension-to-recipe lookup,
+  and install hint formatting.
+- Create: `src/notifications.ts` — session-scoped missing-server notification dedup and Pi UI helper.
+- Modify: `src/config.ts` — merge autodetected recipes after normalized user configuration; keep user
+  server names and extension coverage authoritative.
+- Modify: `src/manager.ts` — expose a cheap `hasServerForFile(filePath)` or reuse `getServerForFile`
+  at call sites to decide whether guidance is needed without starting a process.
+- Modify: `src/tools.ts` — pass `ExtensionContext` into `runLsp`, return install guidance in the text
+  result, and notify once when a requested file type has no active server.
+- Modify: `src/index.ts` — after agent edit/write events, notify once when the edited file extension
+  has no active server and the recipe registry has a known install hint.
+- Modify: `README.md` — document zero-config autodetection, supported built-in recipes, and the
+  rule that explicit user servers override recipes by server name and covered extensions.
+- Test: `src/recipes.test.ts` — temp-PATH executable discovery and extension matching without relying
+  on real system binaries.
+- Test: `src/config.test.ts` — no-user-config recipe fallback, user-config precedence, recipe
+  supplementation for uncovered languages, invalid user-config behavior, and TypeScript fallback
+  replacement.
+
+### Built-in recipe set for the first iteration
+
+| Recipe | Command | Args | Extensions | Install hint text |
+| ------ | ------- | ---- | ---------- | ----------------- |
+| TypeScript | `typescript-language-server` | `--stdio` | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts` | Install `typescript-language-server` and `typescript` (for example `npm install -g typescript typescript-language-server`) and ensure the command is on `PATH`. |
+| Python | `pyright-langserver` | `--stdio` | `.py`, `.pyw` | Install `pyright` (for example `npm install -g pyright`) and ensure `pyright-langserver` is on `PATH`. |
+| Rust | `rust-analyzer` | none | `.rs` | Install `rust-analyzer` (for example `rustup component add rust-analyzer` or an OS package) and ensure it is on `PATH`. |
+| Go | `gopls` | none | `.go` | Install `gopls` (for example `go install golang.org/x/tools/gopls@latest`) and ensure it is on `PATH`. |
+
+### Tasks
+
+#### Task 7.1: Add the recipe registry
+
+**Outcome:** The extension has a typed source of built-in LSP server recipes and can detect which
+recipes are available on the current `PATH`.
+
+**Files:**
+
+- Create: `src/recipes.ts`
+- Test: `src/recipes.test.ts`
+
+**Steps:**
+
+- [ ] Define `LspServerRecipe` with `name`, `command`, `args`, `extensionToLanguage`, and
+      `installHint`.
+- [ ] Add recipes for TypeScript, Python, Rust, and Go using the table above.
+- [ ] Implement `findExecutable(command, pathValue = process.env.PATH)` using real filesystem checks
+      against PATH entries; support executable files on POSIX and `.exe/.cmd/.bat` suffixes on
+      Windows.
+- [ ] Implement `getDetectedRecipeServers(pathValue?)` that returns
+      `Record<string, ScopedLspServerConfig>` for recipes whose command exists.
+- [ ] Implement `getRecipeHintForExtension(ext)` for missing-server guidance.
+- [ ] Test detection with temporary executable files placed in a temporary PATH directory.
+
+**Validation:**
+
+- Run: `bun test src/recipes.test.ts`
+- Expected: recipe detection passes without depending on host-installed LSP binaries.
+
+#### Task 7.2: Replace hardcoded fallback with autodetected recipes
+
+**Outcome:** The manager receives normalized user servers plus detected recipe servers for uncovered
+languages. User server names and user-covered extensions always win.
+
+**Files:**
+
+- Modify: `src/config.ts`
+- Test: `src/config.test.ts`
+- Modify: `README.md`
+
+**Steps:**
+
+- [ ] Normalize global/project user entries first, preserving the existing project-over-global server
+      name merge behavior.
+- [ ] Build a covered-extension set from normalized user entries.
+- [ ] Return `getDetectedRecipeServers()` instead of the current hardcoded TypeScript fallback when
+      no valid user entries exist.
+- [ ] When valid user entries exist, append each detected recipe only if its server name does not
+      collide with a user server name and none of its extensions are already in the user
+      covered-extension set.
+- [ ] Cover both conflict paths in tests: same server name with different extensions, and different
+      server name with overlapping extensions.
+- [ ] If a user block exists but all entries are invalid, fall back to detected recipes and keep the
+      validation errors in the debug/error log; invalid entries should not disable zero-config support
+      for unrelated languages.
+- [ ] Update README configuration docs to explain zero-config autodetection and user-config
+      precedence.
+
+**Validation:**
+
+- Run: `bun test src/config.test.ts`
+- Expected: no-config sessions use detected recipes; explicit config overrides conflicting recipes;
+  detected recipes still fill uncovered languages; invalid explicit entries do not suppress unrelated
+  recipes.
+
+#### Task 7.3: Add missing-server guidance on first trigger
+
+**Outcome:** The first LSP request or agent edit/write for an unsupported known extension surfaces a
+clear install/configuration hint without interrupting the agent loop.
+
+**Files:**
+
+- Create: `src/notifications.ts`
+- Modify: `src/tools.ts`
+- Modify: `src/index.ts`
+- Modify: `src/manager.ts` if a helper is needed for readability
+
+**Steps:**
+
+- [ ] Implement `maybeNotifyMissingServer(filePath, ctx, reason)` that checks `ctx.hasUI`, looks up
+      `getRecipeHintForExtension(path.extname(filePath))`, and calls `ctx.ui.notify(message,
+      "warning")` once per session for each extension/reason pair.
+- [ ] In `tools.ts`, pass `ctx` to `runLsp`; when `manager.sendRequest()` returns `undefined`, include
+      the same install hint in the returned text and call `maybeNotifyMissingServer(..., "tool")`.
+- [ ] In `index.ts` `tool_result`, after edit/write success and before or after `syncFileChange`, call
+      the notifier when `manager.getServerForFile(absolutePath)` is absent.
+- [ ] Keep notifications non-blocking; do not call `confirm`, do not write settings, and do not run
+      installation commands.
+
+**Validation:**
+
+- Run: a focused real-Pi smoke in a fixture without `.pi/settings.json` and without `pyright` on PATH,
+  then edit a `.py` file.
+- Expected: one warning notification explains how to install `pyright`; repeated edits in the same
+  session do not repeat the same warning.
+
+#### Task 7.4: Real-project smoke checks
+
+**Outcome:** Zero-config setup works for installed binaries and fails helpfully for missing ones.
+
+**Files:**
+
+- Modify: `README.md`
+- Modify: `fixtures/phase3-smoke/README.md` — add zero-config smoke steps alongside the existing
+  explicit-config checks.
+
+**Steps:**
+
+- [ ] Run a TypeScript fixture with `typescript-language-server` on PATH and no `.pi/settings.json`.
+- [ ] Run a Python fixture with `pyright-langserver` on PATH and no `.pi/settings.json`.
+- [ ] Run a known-extension fixture where the relevant binary is absent from PATH.
+- [ ] Run an explicit `.pi/settings.json` fixture and verify conflicting recipes are skipped while
+      unrelated detected recipes still supplement it.
+
+**Validation:**
+
+- Run: `mise run typecheck && mise run build && mise run test && hk check`
+- Expected: static checks pass; zero-config fixtures use detected servers; explicit config remains
+  authoritative for its server names/extensions; unrelated detected recipes supplement it; missing
+  binaries produce a clear warning and text result.
+
+### Acceptance
+
+- [ ] With no `lsp.servers` configuration and `typescript-language-server` on PATH, `.ts/.tsx/.js`
+      files route to the autodetected TypeScript server.
+- [ ] With no `lsp.servers` configuration and `pyright-langserver` on PATH, `.py` files route to the
+      autodetected Python server.
+- [ ] With no matching binary on PATH, the first LSP request or edit/write for a known extension shows
+      one non-blocking `ctx.ui.notify(..., "warning")` install hint and the tool result includes the
+      same actionable guidance.
+- [ ] With user `lsp.servers` entries present, autodetected recipes are skipped only when they collide
+      by server name or covered extension; unrelated recipes are still added.
+- [ ] `settings.json` remains supported exactly as documented, including project-over-global
+      override and `extensions` sugar.
+
+---
+
+## 8. Validation
 
 Per phase: `bunx tsc --noEmit` (strict typecheck) and `hk check` (eslint + prettier). Functional
 verification uses a **real** LSP server in a real TS/Python project — no mocks (per the repo
@@ -387,7 +591,7 @@ holds no shared identity with the host, unlike the Pi SDK.
 
 ---
 
-## 8. Risks
+## 9. Risks
 
 - **Build externalize (handled).** The one mandatory non-source change; without it the host loads a
   second SDK instance.
@@ -399,3 +603,7 @@ holds no shared identity with the host, unlike the Pi SDK.
   the Windows drive-letter branch in `formatUri` stays inert but is kept for portability.
 - **Concurrent multi-server startup (Phase 3).** May need a cap on simultaneously starting servers
   (spec §8 open question).
+- **Autodetect masking user intent.** Recipe fallback must not override user server names or user
+  covered extensions. The merge should add recipes only for uncovered languages.
+- **Notification fatigue.** Missing-server warnings are useful only when deduplicated. The first
+  implementation should keep session-scoped dedup by extension/reason and avoid blocking prompts.
