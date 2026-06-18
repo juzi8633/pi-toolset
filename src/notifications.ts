@@ -43,7 +43,7 @@ export function formatMissingServerMessage(filePath: string): string | undefined
  */
 export function formatFailedStartMessage(serverName: string, errorDetail?: string): string {
   const reason = errorDetail ? `: ${errorDetail}` : '';
-  return `LSP server '${serverName}' failed to start${reason}. Check that the configured command is installed and on PATH.`;
+  return `LSP server '${serverName}' failed to start${reason}.`;
 }
 
 /**
