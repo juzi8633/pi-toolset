@@ -88,6 +88,9 @@ export function createLSPServerInstance(
   // Counts crash recoveries across this instance lifetime; do not reset after
   // successful start, or restartOnCrash can loop forever.
   let crashRecoveryCount = 0;
+  // In-flight start() promise so concurrent callers await the same startup
+  // instead of racing a not-yet-healthy server.
+  let startingPromise: Promise<void> | undefined;
   // Propagate crash state so ensureServerStarted can restart on next use.
   // Without this, state stays 'running' after crash and the server is never
   // restarted (zombie state).
@@ -122,14 +125,25 @@ export function createLSPServerInstance(
   /**
    * Starts the LSP server and initializes it with workspace information.
    *
-   * If the server is already running or starting, this method returns immediately.
-   * On failure, sets state to 'error', logs for monitoring, and throws.
+   * If already running, returns immediately. If another caller is already
+   * starting it, awaits that in-flight start instead of returning a
+   * not-yet-healthy server. On failure, sets state to 'error', logs, and throws.
    */
   async function start(): Promise<void> {
-    if (state === 'running' || state === 'starting') {
+    if (state === 'running') return;
+    if (state === 'starting' && startingPromise) {
+      await startingPromise;
       return;
     }
+    startingPromise = doStart();
+    try {
+      await startingPromise;
+    } finally {
+      startingPromise = undefined;
+    }
+  }
 
+  async function doStart(): Promise<void> {
     // Cap crash-recovery attempts so a persistently crashing server doesn't
     // spawn unbounded child processes on every incoming request.
     const maxRestarts = config.maxRestarts ?? 3;

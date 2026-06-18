@@ -303,17 +303,45 @@ priming for cold-start workspaces.
 
 ### Acceptance (spec §6)
 
-- [ ] `.ts` and `.py` route to different servers in one session. _(manager routes by extension via
-      `extensionToLanguage`; config supports multiple servers)_
-- [ ] Adding/removing a server in `settings.json` takes effect after `/reload`. _(config is read
-      fresh in `initializeManager` on each `session_start`)_
-- [ ] callHierarchy two-step returns incoming/outgoing calls. _(prepareCallHierarchy →
-      callHierarchy/incomingCalls|outgoingCalls in `runLsp`)_
-- [ ] `.gitignore`d files are excluded from results. _(`filterGitIgnoredLocations` applied to
-      findReferences/goToDefinition/goToImplementation/workspaceSymbol)_
-- [ ] Optional: cold-start `findReferences` behavior for unopened files is documented; workspace
-      priming is not enabled (see limitation note below).
-- [ ] `bunx tsc --noEmit` + `hk check` pass.
+Real-Pi verification uses the `fixtures/phase3-smoke` fixture (`bun run pi` loads the built
+extension into a real `pi -p` session with local `typescript-language-server` + `pyright`).
+
+- [x] `.ts` and `.py` route to different servers in one session. _(config: temp `.pi/settings.json`
+      `direct-route ts_server typescript py_server python`. **Real Pi**: stderr shows
+      `loaded 2 LSP server(s): typescript, python`; `.ts` hover answered by the typescript server,
+      `.py` hover on `src/caller.py` line 5 (the `def target` line) returns
+      `(function) def target() -> Literal[1]` from the pyright server)_
+- [x] Adding/removing a server in `settings.json` takes effect after `/reload`. _(verified with
+      `initializeManager` → `shutdownManager` → `initializeManager`: `first-session py_server,ts_server`,
+      `second-session py_only`; config is read fresh on each `session_start`. **Interactive `/reload`
+      still needs a human** — run `bun run pi` in `fixtures/phase3-smoke`, edit `.pi/settings.json`,
+      `/reload`, re-test per the fixture README §A2.)_
+- [x] callHierarchy two-step returns incoming/outgoing calls. _(**Real Pi**: model drove the `lsp`
+      tool; stderr shows `prepareCallHierarchy` → `callHierarchy/outgoingCalls` then
+      `callHierarchy/incomingCalls`; result `incoming=caller`, `outgoing=callee`)_
+- [x] `.gitignore`d files are excluded from results. _(unit: `filterGitIgnoredLocations` returned
+      only `kept.ts`. **Real Pi + control**: with `.gitignore` present, `findReferences` on `secret`
+      (after `didOpen` of `src/ignored.ts`) returns only `src/main.ts`; with `.gitignore` removed
+      (control) it returns `src/main.ts` + `src/ignored.ts` — proving the filter removes the ignored
+      file in the live pipeline)_
+- [x] Optional: cold-start `findReferences` behavior for unopened files is documented; workspace
+      priming is not enabled. _(**Real Pi**: `src/ignored.ts` is absent from `findReferences` until it
+      is `didOpen`'d by a prior operation — the documented cold-start limitation, observed live; see
+      limitation note below and README Limitations)_
+- [x] `bunx tsc --noEmit` + `hk check` pass. _(also ran full `mise run lint`,
+      `mise run format_check`, and `mise run build`; `mise run test` is not applicable yet because no
+      test files exist)_
+
+#### Concurrency fix from real-Pi smoke (fixed)
+
+When two `lsp` calls race the first server startup, the second call's `didOpen` used to fire
+while the server was still `starting` and log `Cannot send notification to LSP server
+'typescript': server is starting`. Root cause: `ensureServerStarted` returned immediately when
+`state === 'starting'` instead of awaiting the in-flight `start()`. Fixed by sharing an in-flight
+`startingPromise` in `createLSPServerInstance` (concurrent `start()` callers await the same
+startup) and making `ensureServerStarted` await `start()` whenever `state !== 'running'`. **Real
+Pi re-run**: the A3 two-call case now logs `server is starting` 0 times (was 3) and both calls
+succeed first try.
 
 ### `findReferences` cold-start limitation
 

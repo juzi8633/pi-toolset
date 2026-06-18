@@ -207,7 +207,7 @@ export function createLSPServerManager(): LSPServerManager {
     const server = getServerForFile(filePath);
     if (!server) return undefined;
 
-    if (server.state === 'stopped' || server.state === 'error') {
+    if (server.state !== 'running') {
       try {
         await server.start();
       } catch (error) {
