@@ -1,0 +1,22 @@
+{
+  "servers": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "extensionToLanguage": {
+        ".ts": "typescript"
+      },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
+    },
+    "python": {
+      "command": "pyright-langserver",
+      "args": ["--stdio"],
+      "extensionToLanguage": {
+        ".py": "python"
+      },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
+    }
+  }
+}

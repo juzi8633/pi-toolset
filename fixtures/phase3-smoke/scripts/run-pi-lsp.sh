@@ -32,8 +32,8 @@ cd "${FIXTURE_DIR}"
 # Settings helpers
 # ---------------------------------------------------------------------------
 
-SETTINGS_FILE="${FIXTURE_DIR}/.pi/settings.json"
-SETTINGS_BACKUP="${FIXTURE_DIR}/.pi/settings.backup.json"
+SETTINGS_FILE="${FIXTURE_DIR}/.pi/@balaenis/pi-lsp/config.json"
+SETTINGS_BACKUP="${FIXTURE_DIR}/.pi/@balaenis/pi-lsp/config.backup.json"
 
 backup_settings() {
   if [[ -f "${SETTINGS_FILE}" ]]; then
@@ -56,26 +56,24 @@ write_settings() {
   mkdir -p "$(dirname "${SETTINGS_FILE}")"
   cat > "${SETTINGS_FILE}" <<'INNEREOF'
 {
-  "lsp": {
-    "servers": {
-      "typescript": {
-        "command": "typescript-language-server",
-        "args": ["--stdio"],
-        "extensionToLanguage": {
-          ".ts": "typescript"
-        },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
+  "servers": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "extensionToLanguage": {
+        ".ts": "typescript"
       },
-      "python": {
-        "command": "pyright-langserver",
-        "args": ["--stdio"],
-        "extensionToLanguage": {
-          ".py": "python"
-        },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
-      }
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
+    },
+    "python": {
+      "command": "pyright-langserver",
+      "args": ["--stdio"],
+      "extensionToLanguage": {
+        ".py": "python"
+      },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
     }
   }
 }
@@ -147,7 +145,7 @@ SMOKE_PATH=""
 
 case "${MODE}" in
   explicit)
-    # Use the existing .pi/settings.json as-is (or write default if missing).
+    # Use the existing .pi/@balaenis/pi-lsp/config.json as-is (or write default if missing).
     if [[ ! -f "${SETTINGS_FILE}" ]]; then
       write_settings
     fi
@@ -176,22 +174,20 @@ case "${MODE}" in
     backup_settings
     cat > "${SETTINGS_FILE}" <<'INNEREOF'
 {
-  "lsp": {
-    "servers": {
-      "typescript": {
-        "command": "typescript-language-server",
-        "args": ["--stdio"],
-        "extensionToLanguage": { ".ts": "typescript" },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
-      },
-      "python": {
-        "command": "pyright-langserver-typo",
-        "args": ["--stdio"],
-        "extensionToLanguage": { ".py": "python" },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
-      }
+  "servers": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "extensionToLanguage": { ".ts": "typescript" },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
+    },
+    "python": {
+      "command": "pyright-langserver-typo",
+      "args": ["--stdio"],
+      "extensionToLanguage": { ".py": "python" },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
     }
   }
 }
@@ -208,22 +204,20 @@ INNEREOF
     backup_settings
     cat > "${SETTINGS_FILE}" <<'INNEREOF'
 {
-  "lsp": {
-    "servers": {
-      "typescript": {
-        "command": "typescript-language-server",
-        "args": ["--stdio", "--my-flag"],
-        "extensionToLanguage": { ".ts": "typescript" },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
-      },
-      "python": {
-        "command": "pyright-langserver",
-        "args": ["--stdio"],
-        "extensionToLanguage": { ".py": "python" },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
-      }
+  "servers": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio", "--my-flag"],
+      "extensionToLanguage": { ".ts": "typescript" },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
+    },
+    "python": {
+      "command": "pyright-langserver",
+      "args": ["--stdio"],
+      "extensionToLanguage": { ".py": "python" },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
     }
   }
 }
@@ -239,14 +233,12 @@ INNEREOF
     backup_settings
     cat > "${SETTINGS_FILE}" <<'INNEREOF'
 {
-  "lsp": {
-    "servers": {
-      "broken-ts": {
-        "extensionToLanguage": { ".ts": "typescript" }
-      },
-      "broken-py": {
-        "extensionToLanguage": { ".py": "python" }
-      }
+  "servers": {
+    "broken-ts": {
+      "extensionToLanguage": { ".ts": "typescript" }
+    },
+    "broken-py": {
+      "extensionToLanguage": { ".py": "python" }
     }
   }
 }
@@ -260,13 +252,11 @@ INNEREOF
     backup_settings
     cat > "${SETTINGS_FILE}" <<'INNEREOF'
 {
-  "lsp": {
-    "servers": {
-      "my-ts": {
-        "command": "typescript-language-server",
-        "args": ["--stdio"],
-        "extensionToLanguage": { ".ts": "typescript" }
-      }
+  "servers": {
+    "my-ts": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "extensionToLanguage": { ".ts": "typescript" }
     }
   }
 }
@@ -282,15 +272,13 @@ INNEREOF
     backup_settings
     cat > "${SETTINGS_FILE}" <<'INNEREOF'
 {
-  "lsp": {
-    "servers": {
-      "typescript": {
-        "command": "typescript-language-server",
-        "args": ["--stdio"],
-        "extensionToLanguage": { ".ts": "typescript" },
-        "startupTimeout": 15000,
-        "shutdownTimeout": 5000
-      }
+  "servers": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "extensionToLanguage": { ".ts": "typescript" },
+      "startupTimeout": 15000,
+      "shutdownTimeout": 5000
     }
   }
 }
@@ -303,9 +291,9 @@ INNEREOF
     echo "Usage: $0 [explicit|zero|missing-pyright|broken-python|bad-args|all-invalid|user-ts-only|name-collision]" >&2
     echo "" >&2
     echo "Modes:" >&2
-    echo "  explicit         Default. Uses .pi/settings.json as-is (A1-A5 prompts)." >&2
-    echo "  zero             No settings.json; recipe autodetection (Z0/Z1)." >&2
-    echo "  missing-pyright  No settings.json; PATH without pyright-langserver (Z2)." >&2
+    echo "  explicit         Default. Uses .pi/@balaenis/pi-lsp/config.json as-is (A1-A5 prompts)." >&2
+    echo "  zero             No config.json; recipe autodetection (Z0/Z1)." >&2
+    echo "  missing-pyright  No config.json; PATH without pyright-langserver (Z2)." >&2
     echo "  broken-python    User config with wrong python command path (Z3/Z4/Z9)." >&2
     echo "  bad-args         User config with valid command but invalid args (Z10)." >&2
     echo "  all-invalid      Both user entries structurally invalid; recipe fallback (Z5)." >&2

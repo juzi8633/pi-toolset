@@ -1,5 +1,5 @@
 // ABOUTME: Built-in LSP server recipes, PATH executable discovery, and install-hint lookup.
-// ABOUTME: Drives zero-config activation when no user lsp.servers config exists or covers a given file.
+// ABOUTME: Drives zero-config activation when no user servers config exists or covers a given file.
 
 import { accessSync, constants, statSync } from 'node:fs';
 import * as path from 'node:path';

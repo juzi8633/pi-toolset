@@ -15,7 +15,7 @@
 - 9 种 LSP 操作作为 Agent 可调用工具
 - 被动诊断推送(去重、限流、编辑感知清理)
 - 多 server 路由(按文件扩展名)
-- 通过 `settings.json` 配置 server
+- 通过独立配置文件 `@balaenis/pi-lsp/config.json` 配置 server(与 Pi 共享 `settings.json` 隔离，避免 key 碰撞)
 
 ### 1.2 非目标(Out of Scope,初版)
 
@@ -54,7 +54,7 @@ pi-lsp/
     ├── tools.ts            # registerTool:9 种操作 + 输入 schema
     ├── formatters.ts       # LSP 响应 → 可读文本(照搬 CC formatters.ts)
     ├── symbol-context.ts   # 光标符号提取(照搬 CC symbolContext.ts)
-    ├── config.ts           # settings.json 读取 + 校验 + 环境变量替换
+    ├── config.ts           # config.json 读取 + 校验 + 环境变量替换
     └── types.ts            # 共享类型
 ```
 
@@ -64,7 +64,7 @@ pi-lsp/
 
 ## 4. 模块规格
 
-### 4.1 `client.ts` — JSON-RPC 通信层
+### 4.1 `client.ts` - JSON-RPC 通信层
 
 照搬 CC `services/lsp/LSPClient.ts`,工厂函数 `createLSPClient(config)`。保留 CC 已处理的边界:
 
@@ -90,7 +90,7 @@ interface LSPClient {
 
 `vscode-jsonrpc` 延迟 `require`,只在真正 start 时加载。
 
-### 4.2 `instance.ts` — 单 server 状态机
+### 4.2 `instance.ts` - 单 server 状态机
 
 照搬 CC `LSPServerInstance.ts`。状态机:`stopped → starting → running → stopping`,异常进 `error`。保留:
 
@@ -100,7 +100,7 @@ interface LSPClient {
 - 瞬态错误重试:`-32801`(ContentModified),指数退避 500/1000/2000ms,`MAX_RETRIES = 3`
 - `startFailed` / `checkStartFailed()` 前置检查
 
-### 4.3 `manager.ts` — 多 server 路由 + 全局单例
+### 4.3 `manager.ts` - 多 server 路由 + 全局单例
 
 合并 CC 的 `LSPServerManager.ts` + `manager.ts`。数据结构:
 
@@ -123,7 +123,7 @@ closeFile(path)           → didClose
 保留 generation counter 防 stale init。
 导出 `getManager()` / `isLspConnected()` 供工具 `execute` 内判断 LSP 是否就绪。
 
-### 4.4 `diagnostics.ts` — 被动诊断
+### 4.4 `diagnostics.ts` - 被动诊断
 
 照搬 CC `LSPDiagnosticRegistry` 纯逻辑:
 
@@ -142,7 +142,7 @@ interface DiagnosticRegistry {
 }
 ```
 
-### 4.5 `tools.ts` — 9 种操作
+### 4.5 `tools.ts` - 9 种操作
 
 采用**单工具 + discriminated union 输入**(贴近 CC `lspToolInputSchema`)。`operation` 用 `StringEnum`:
 
@@ -195,27 +195,25 @@ const parameters = Type.Object({
 
 照搬 CC 同名文件:`formatUri()`、`symbolKindToString()`(26 种)、`groupByFile()`;符号提取只读前 64KB。
 
-### 4.7 `config.ts` — 配置(必须重写)
+### 4.7 `config.ts` - 配置(必须重写)
 
-从 `settings.json` 读 `lsp` 段(全局 `~/.pi/agent/settings.json`,项目 `<cwd>/.pi/settings.json` 覆盖):
+从 `config.json` 读 `servers` 段(全局 `~/.pi/agent/@balaenis/pi-lsp/config.json`，项目 `<cwd>/.pi/@balaenis/pi-lsp/config.json` 覆盖):
 
 ```jsonc
 {
-  "lsp": {
-    "servers": {
-      "typescript": {
-        "command": "typescript-language-server",
-        "args": ["--stdio"],
-        "extensionToLanguage": {
-          ".ts": "typescript",
-          ".tsx": "typescriptreact",
-          ".js": "javascript",
-          ".jsx": "javascriptreact",
-        },
-        "env": {}, // 支持 ${VAR} 替换；也接受 `extensions` 作为 sugar
-        "startupTimeout": 10000,
-        "maxRestarts": 3,
+  "servers": {
+    "typescript": {
+      "command": "typescript-language-server",
+      "args": ["--stdio"],
+      "extensionToLanguage": {
+        ".ts": "typescript",
+        ".tsx": "typescriptreact",
+        ".js": "javascript",
+        ".jsx": "javascriptreact",
       },
+      "env": {}, // 支持 ${VAR} 替换；也接受 `extensions` 作为 sugar
+      "startupTimeout": 10000,
+      "maxRestarts": 3,
     },
   },
 }
@@ -223,7 +221,7 @@ const parameters = Type.Object({
 
 保留 CC 的校验逻辑(`command` 不含空格除非绝对路径)、`$VAR` / `${VAR}` 环境变量替换。删去 `${CLAUDE_PLUGIN_ROOT}` 等 plugin 专有项。初版可内置一份默认配置表作为兜底。
 
-### 4.8 `index.ts` — 扩展入口与生命周期
+### 4.8 `index.ts` - 扩展入口与生命周期
 
 ```ts
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
@@ -287,7 +285,7 @@ export default function (pi: ExtensionAPI): void {
 
 ## 6. 分阶段交付与验收标准
 
-### 阶段一 — MVP·核心链路
+### 阶段一 - MVP·核心链路
 
 **交付**:`client.ts` + `instance.ts` + 单 server(硬编码 typescript-language-server)+ `goToDefinition` / `findReferences` / `hover`。
 
@@ -300,7 +298,7 @@ export default function (pi: ExtensionAPI): void {
 - [ ] `session_shutdown` 后进程被 kill(`ps` 验证无残留)
 - [ ] `bunx tsc --noEmit` + `hk check` 通过
 
-### 阶段二 — 被动诊断
+### 阶段二 - 被动诊断
 
 **交付**:`diagnostics.ts` + `context` hook 注入 + `tool_result` 触发 `didChange` / 清理。
 
@@ -312,14 +310,14 @@ export default function (pi: ExtensionAPI): void {
 - [ ] 旧诊断块在新 LLM 调用前被剥离(不堆积)
 - [ ] `bunx tsc --noEmit` + `hk check` 通过
 
-### 阶段三 — 多 server + 配置 + 补全
+### 阶段三 - 多 server + 配置 + 补全
 
-**交付**:`manager.ts` 多语言路由 + `config.ts`(settings.json)+ callHierarchy / workspaceSymbol / documentSymbol / goToImplementation + gitignore 过滤。
+**交付**:`manager.ts` 多语言路由 + `config.ts`(config.json)+ callHierarchy / workspaceSymbol / documentSymbol / goToImplementation + gitignore 过滤。
 
 **验收**:
 
 - [ ] 同会话内 `.ts` 与 `.py` 路由到不同 server
-- [ ] `settings.json` 增删 server 后 `/reload` 生效
+- [ ] `config.json` 增删 server 后 `/reload` 生效
 - [ ] callHierarchy 两步调用返回 incoming/outgoing
 - [ ] `.gitignore` 中的文件不出现在结果里
 - [ ] `bunx tsc --noEmit` + `hk check` 通过

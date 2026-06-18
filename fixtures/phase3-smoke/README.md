@@ -13,7 +13,7 @@ multi-server routing, `/reload` config refresh, call hierarchy two-step, and
 ## Layout
 
 ```
-.pi/settings.json   # two servers: typescript + python (pyright)
+.pi/@balaenis/pi-lsp/config.json   # two servers: typescript + python (pyright)
 .gitignore          # ignores src/ignored.ts (used by the gitignore test)
 tsconfig.json
 src/main.ts         # callee / target / caller + revealSecret
@@ -59,7 +59,7 @@ The script (`scripts/run-pi-lsp.sh`):
 
 Run these inside the pi session. Each prompt is self-contained.
 
-- **A1–A5** validate the explicit `.pi/settings.json` mode that this fixture
+- **A1–A5** validate the explicit `.pi/@balaenis/pi-lsp/config.json` mode that this fixture
   ships with (multi-server routing, `/reload`, call hierarchy, gitignore
   filtering, cold-start limitation).
 - **Z0–Z10** validate the zero-config recipe mode added in Phase 7, covering:
@@ -72,9 +72,9 @@ Run these inside the pi session. Each prompt is self-contained.
 
 ### Z0 — zero-config setup and restore
 
-The fixture normally includes `.pi/settings.json` for explicit-config smoke
+The fixture normally includes `.pi/@balaenis/pi-lsp/config.json` for explicit-config smoke
 checks. To validate zero-config autodetection, use the `zero` mode which moves
-`.pi/settings.json` aside and launches pi with a minimal PATH containing only
+`.pi/@balaenis/pi-lsp/config.json` aside and launches pi with a minimal PATH containing only
 the fixture's binaries, the repo's `pi`, and the node runtime — **no system
 paths** so no host LSP install can interfere.
 
@@ -84,12 +84,12 @@ bun run pi-zero
 
 The script:
 
-- backs up `.pi/settings.json` to `.pi/settings.backup.json`;
-- removes `.pi/settings.json` so the extension must use recipe autodetection;
+- backs up `.pi/@balaenis/pi-lsp/config.json` to `.pi/@balaenis/pi-lsp/config.backup.json`;
+- removes `.pi/@balaenis/pi-lsp/config.json` so the extension must use recipe autodetection;
 - sets `PATH` to `<fixture>/node_modules/.bin:<repo>/node_modules/.bin:<node>`;
 - validates that both `typescript-language-server` and `pyright-langserver` are
   on this PATH before launching pi;
-- restores `.pi/settings.json` on exit (via `trap EXIT`).
+- restores `.pi/@balaenis/pi-lsp/config.json` on exit (via `trap EXIT`).
 
 Expected during startup/use:
 
@@ -102,18 +102,18 @@ After the zero-config smoke, the script restores settings automatically. If you
 need to restore manually (e.g. the script was killed):
 
 ```sh
-mv .pi/settings.backup.json .pi/settings.json
+mv .pi/@balaenis/pi-lsp/config.backup.json .pi/@balaenis/pi-lsp/config.json
 ```
 
 ### Z1 — zero-config TypeScript and Python routing
 
-With `.pi/settings.json` moved aside as described in Z0, run:
+With `.pi/@balaenis/pi-lsp/config.json` moved aside as described in Z0, run:
 
 ```text
 Use the lsp tool with operation "hover" on src/main.ts line 7 character 17
 (the `target` function). Then use lsp "hover" on src/caller.py line 5
 character 5 (the `target` function, on its `def` line). Report whether each
-answer came from zero-config autodetection rather than .pi/settings.json.
+answer came from zero-config autodetection rather than .pi/@balaenis/pi-lsp/config.json.
 ```
 
 Expected:
@@ -129,7 +129,7 @@ Expected:
 This check validates the missing-server UX when **no user config exists** and
 the recipe binary is absent. The `missing-pyright` mode creates a temp directory
 with only `typescript-language-server` (symlinked from the fixture), removes
-`.pi/settings.json`, and validates that `pyright-langserver` is **not** on the
+`.pi/@balaenis/pi-lsp/config.json`, and validates that `pyright-langserver` is **not** on the
 constructed PATH before launching pi.
 
 ```sh
@@ -138,7 +138,7 @@ bun run pi-missing-pyright
 
 The script:
 
-- backs up and removes `.pi/settings.json`;
+- backs up and removes `.pi/@balaenis/pi-lsp/config.json`;
 - creates a temp bin with only `typescript-language-server`;
 - sets `PATH` to `<tempbin>:<repo>/node_modules/.bin:<node>` — no fixture bin,
   no system paths;
@@ -169,7 +169,7 @@ Expected:
 ### Z3 — user-configured server with binary not on PATH (ENOENT)
 
 This validates the **wrong path** failure mode: the user has a server entry in
-`.pi/settings.json` but the configured command is not on PATH. The message
+`.pi/@balaenis/pi-lsp/config.json` but the configured command is not on PATH. The message
 must say **"failed to start"** with the actual error reason (e.g. `spawn
 pyright-langserver-typo ENOENT`), **not** "no server is configured".
 
@@ -182,7 +182,7 @@ bun run pi-broken-python
 
 The script:
 
-- backs up the original `.pi/settings.json`;
+- backs up the original `.pi/@balaenis/pi-lsp/config.json`;
 - writes a config with a working typescript server and a broken python server
   (`command: "pyright-langserver-typo"`);
 - sets `PATH` to `<fixture>/node_modules/.bin:<repo>/node_modules/.bin:<node>`;
@@ -248,7 +248,7 @@ bun run pi-all-invalid
 
 The script:
 
-- backs up the original `.pi/settings.json`;
+- backs up the original `.pi/@balaenis/pi-lsp/config.json`;
 - writes a config with two servers that both lack a `command` field;
 - validates that the real binaries are on PATH (for recipe fallback);
 - restores the original settings on exit.
@@ -283,7 +283,7 @@ bun run pi-user-ts-only
 
 The script:
 
-- backs up the original `.pi/settings.json`;
+- backs up the original `.pi/@balaenis/pi-lsp/config.json`;
 - writes a config with a single `my-ts` server covering `.ts`;
 - restores the original settings on exit.
 
@@ -316,7 +316,7 @@ bun run pi-name-collision
 
 The script:
 
-- backs up the original `.pi/settings.json`;
+- backs up the original `.pi/@balaenis/pi-lsp/config.json`;
 - writes a config with a `typescript` server covering only `.ts` (valid args,
   so the server actually starts);
 - restores the original settings on exit.
@@ -411,7 +411,7 @@ bun run pi-bad-args
 
 The script:
 
-- backs up the original `.pi/settings.json`;
+- backs up the original `.pi/@balaenis/pi-lsp/config.json`;
 - writes a config with `typescript` server using `args: ["--stdio", "--my-flag"]`;
 - the python server is configured normally so it can answer requests and prove
   the broken typescript server doesn't poison the manager;
@@ -461,7 +461,7 @@ Expected:
 
 ### A2 — adding/removing a server takes effect after `/reload`
 
-1. While pi is running, edit `.pi/settings.json` and delete the `python` server
+1. While pi is running, edit `.pi/@balaenis/pi-lsp/config.json` and delete the `python` server
    block (leave only `typescript`).
 2. In pi, run `/reload`.
 3. Re-run the python half of A1:
@@ -475,7 +475,7 @@ Expected:
 - The tool reports no server is available for `.py` (the python server is gone).
 - On stderr, `session_shutdown` tears the old manager down and `session_start`
   rebuilds it from the freshly-read config.
-- Restore `python` in `.pi/settings.json`, `/reload` again, and the `.py` hover
+- Restore `python` in `.pi/@balaenis/pi-lsp/config.json`, `/reload` again, and the `.py` hover
   works once more — proving config is read fresh on each `session_start`.
 
 ### A3 — callHierarchy two-step returns incoming/outgoing

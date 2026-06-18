@@ -1,5 +1,5 @@
-// ABOUTME: LSP server config source — reads settings.json and appends detected recipe servers.
-// ABOUTME: Validates lsp.servers, preserves user precedence, and applies env substitution.
+// ABOUTME: LSP server config source — reads the dedicated config.json and appends detected recipe servers.
+// ABOUTME: Validates servers, preserves user precedence, and applies env substitution.
 
 import { readFile } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -9,7 +9,7 @@ import { getDetectedRecipeServers } from './recipes.ts';
 import type { LspTransport, ScopedLspServerConfig } from './types.ts';
 
 /**
- * Raw server entry as it appears in settings.json `lsp.servers.<name>`.
+ * Raw server entry as it appears in config.json `servers.<name>`.
  * `extensions` is accepted as sugar and mapped to `extensionToLanguage` via
  * {@link guessLanguageId} when `extensionToLanguage` is absent.
  */
@@ -181,12 +181,12 @@ function normalizeServer(name: string, raw: RawServerConfig): ScopedLspServerCon
   };
 }
 
-/** Read and parse a settings.json file, returning undefined on any error. */
-async function readSettingsFile(filePath: string): Promise<Record<string, unknown> | undefined> {
+/** Read and parse a config.json file, returning undefined on any error. */
+async function readConfigFile(filePath: string): Promise<Record<string, unknown> | undefined> {
   try {
     const content = await readFile(filePath, { encoding: 'utf-8' });
-    // Strip JSONC comments (// line and /* block */) before parsing. settings.json
-    // in Pi commonly uses comments; JSON.parse rejects them.
+    // Strip JSONC comments (// line and /* block */) before parsing. config.json
+    // commonly uses comments; JSON.parse rejects them.
     const stripped = stripJsonc(content);
     return JSON.parse(stripped) as Record<string, unknown>;
   } catch (error) {
@@ -252,11 +252,21 @@ function stripJsonc(text: string): string {
 }
 
 /**
+ * Per-extension config subdirectory under the agent dir / project config dir.
+ * Keeping config in a dedicated dir avoids key collisions in Pi's shared
+ * settings.json and survives package updates (the installed package dir is
+ * overwritten by `pi update`).
+ */
+const CONFIG_SUBDIR = path.join('@balaenis', 'pi-lsp');
+const CONFIG_FILENAME = 'config.json';
+
+/**
  * Get all configured LSP servers.
  *
- * Reads `lsp.servers` from `~/.pi/agent/settings.json` then `<cwd>/.pi/settings.json`
- * (project overrides global), normalizes user entries, then appends built-in
- * recipes detected on PATH for any languages the user has not already covered.
+ * Reads `servers` from `~/.pi/agent/@balaenis/pi-lsp/config.json` then
+ * `<cwd>/.pi/@balaenis/pi-lsp/config.json` (project overrides global),
+ * normalizes user entries, then appends built-in recipes detected on PATH for
+ * any languages the user has not already covered.
  *
  * - With no valid user config: returns just the autodetected recipes (zero-config).
  * - With user config: user server names and user-covered extensions win; recipes
@@ -265,12 +275,12 @@ function stripJsonc(text: string): string {
 export async function getAllLspServers(cwd: string): Promise<{
   servers: Record<string, ScopedLspServerConfig>;
 }> {
-  const globalPath = path.join(getAgentDir(), 'settings.json');
-  const projectPath = path.join(cwd, '.pi', 'settings.json');
+  const globalPath = path.join(getAgentDir(), CONFIG_SUBDIR, CONFIG_FILENAME);
+  const projectPath = path.join(cwd, '.pi', CONFIG_SUBDIR, CONFIG_FILENAME);
 
   const [globalSettings, projectSettings] = await Promise.all([
-    readSettingsFile(globalPath),
-    readSettingsFile(projectPath),
+    readConfigFile(globalPath),
+    readConfigFile(projectPath),
   ]);
 
   const globalServers = extractServers(globalSettings);
@@ -321,7 +331,7 @@ export async function getAllLspServers(cwd: string): Promise<{
   }
 
   if (Object.keys(servers).length === 0) {
-    logForDebugging('config: no user lsp.servers and no recipe binaries on PATH');
+    logForDebugging('config: no user servers and no recipe binaries on PATH');
     return { servers: {} };
   }
 
@@ -331,12 +341,12 @@ export async function getAllLspServers(cwd: string): Promise<{
   return { servers };
 }
 
-/** Extract the `lsp.servers` record from a parsed settings object. */
+/** Extract the `servers` record from a parsed config object. */
 function extractServers(
   settings: Record<string, unknown> | undefined
 ): Record<string, RawServerConfig> {
   if (!settings) return {};
-  const lsp = settings['lsp'] as RawLspConfig | undefined;
-  if (!lsp || typeof lsp !== 'object' || !lsp.servers) return {};
-  return lsp.servers as Record<string, RawServerConfig>;
+  const config = settings as RawLspConfig;
+  if (!config.servers) return {};
+  return config.servers as Record<string, RawServerConfig>;
 }

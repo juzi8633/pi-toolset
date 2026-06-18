@@ -25,7 +25,7 @@ Claude Code(下称 CC)的 LSP 模块中约 70% 是与宿主无关的纯逻辑(JS
 | `LSPTool`(9 种操作)                         | 工具注册       | `pi.registerTool({ parameters, execute })`                      | 低·机械改写     |
 | `formatters.ts` / `symbolContext.ts`        | 无             | 直接照搬                                                        | 低·直接复用     |
 | gitignore 过滤(`git check-ignore`)          | 无             | `ctx.exec("git", ...)` 或直接 spawn                             | 低·直接复用     |
-| **配置系统**(plugin `.lsp.json`)            | CC plugin 体系 | **需重写** → 读 `settings.json` 自定义段或内置配置表            | 中·必须重写     |
+| **配置系统**(plugin `.lsp.json`)            | CC plugin 体系 | **需重写** → 读独立 `@balaenis/pi-lsp/config.json` 或内置配置表 | 中·必须重写     |
 | UI 渲染(折叠/展开/推荐菜单)                 | CC 专有 UI     | `renderResult` 可选;推荐菜单用 `ctx.ui.select`                  | 低·可后置/裁剪  |
 | 错误通知轮询                                | CC hooks       | `ctx.ui.notify` + 定时器                                        | 低·可后置       |
 
@@ -66,7 +66,7 @@ Pi **没有** `file_edit` 事件。替代方案:监听 `tool_result` 事件,当 
 ## 4. 必须重写 / 无法照搬的部分
 
 1. **配置加载**(最大的一块)
-   CC 的 server 配置只来自 plugin(`.lsp.json` + `manifest.lspServers`),配套 Zod schema 校验、`${CLAUDE_PLUGIN_ROOT}` / `${user_config.KEY}` / `$VAR` 三层环境变量替换、`../` 目录穿越防护。Pi 没有这套 plugin 体系。替代:读 `settings.json` 自定义 `lsp` 段,或在扩展内置一份 server 配置表。环境变量替换与路径校验逻辑可保留。
+   CC 的 server 配置只来自 plugin(`.lsp.json` + `manifest.lspServers`),配套 Zod schema 校验、`${CLAUDE_PLUGIN_ROOT}` / `${user_config.KEY}` / `$VAR` 三层环境变量替换、`../` 目录穿越防护。Pi 没有这套 plugin 体系。替代:读独立 `@balaenis/pi-lsp/config.json`,或在扩展内置一份 server 配置表。环境变量替换与路径校验逻辑可保留。
 
 2. **生命周期时机**
    CC 在 `setup.ts` 启动。Pi **明确禁止在 factory 里 spawn 进程/起定时器/开 watcher**,必须延迟到 `session_start`。且 `session_shutdown` 在 `/reload`、`/new`、`/resume`、`/fork` 时都会触发,需要在新的 `session_start` 中重建 server。
@@ -90,6 +90,6 @@ Pi **没有** `file_edit` 事件。替代方案:监听 `tool_result` 事件,当 
 
 - **阶段一(MVP·核心链路)**:`LSPClient` + `LSPServerInstance` + 单 server,硬编码一个 server 配置(如 typescript-language-server),注册 `goToDefinition` / `findReferences` / `hover` 三个工具。验证 spawn / JSON-RPC / 工具调用链路打通。
 - **阶段二(被动诊断·差异化价值)**:搬运 `LSPDiagnosticRegistry`,接 `context` hook 推送诊断 + `tool_result` 触发 `didChange` / 清理。这是相对内置 grep 的核心增量价值。
-- **阶段三(多 server + 配置 + 补全)**:`LSPServerManager` 多语言路由、`settings.json` 配置加载、补齐 callHierarchy / workspaceSymbol、gitignore 过滤、可选 UI。
+- **阶段三(多 server + 配置 + 补全)**:`LSPServerManager` 多语言路由、`@balaenis/pi-lsp/config.json` 配置加载、补齐 callHierarchy / workspaceSymbol、gitignore 过滤、可选 UI。
 
 详细的模块划分、API 契约、目录结构与各阶段验收标准见[实现规格书](../specs/lsp-extension-spec.md)。

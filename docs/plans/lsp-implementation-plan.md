@@ -20,19 +20,19 @@ lifecycle timing, config source, and the tool harness — is rewritten against P
 Source lives in `src/`; Pi loads the built `dist/index.js` (or `src/index.ts` directly via jiti for
 local iteration). Every `.ts` file starts with two `// ABOUTME:` lines.
 
-| File                | Responsibility                                                                     | Phase                           | Porting source                                                        |
-| ------------------- | ---------------------------------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------- |
-| `index.ts`          | Entry `default (pi) => void`; session lifecycle wiring                             | 1 (extended 2)                  | new                                                                   |
-| `log.ts`            | `logForDebugging` / `logError` / `errorMessage` / `sleep` (stderr, `PI_LSP_DEBUG`) | 1                               | replaces CC `utils/debug`, `utils/log`, `utils/errors`, `utils/sleep` |
-| `types.ts`          | `LspServerState`, `ScopedLspServerConfig`, `LspToolDetails`                        | 1                               | CC `services/lsp/types`                                               |
-| `client.ts`         | `createLSPClient` — spawn + JSON-RPC transport                                     | 1                               | CC `LSPClient.ts`                                                     |
-| `instance.ts`       | `createLSPServerInstance` — state machine / retry / crash ceiling                  | 1                               | CC `LSPServerInstance.ts`                                             |
-| `manager.ts`        | `createLSPServerManager` + global singleton + `isLspConnected`                     | 1 (extended 3)                  | CC `LSPServerManager.ts` + `manager.ts`                               |
-| `config.ts`         | LSP server config source                                                           | 1 hardcoded → 3 `settings.json` | CC `services/lsp/config.ts` + `schemas.ts`                            |
-| `formatters.ts`     | LSP responses → readable text                                                      | 1 (3 ops) → 3 (all)             | CC `tools/LSPTool/formatters.ts`                                      |
-| `tools.ts`          | `registerTool` + input schema + execute flow                                       | 1 (3 ops) → 3 (9 ops)           | CC `tools/LSPTool/LSPTool.ts` + `schemas.ts` + `prompt.ts`            |
-| `diagnostics.ts`    | Dedup + throttle + edit-aware cleanup                                              | 2                               | CC `LSPDiagnosticRegistry.ts`                                         |
-| `symbol-context.ts` | Cursor symbol extraction (first 64KB)                                              | 3 (optional)                    | CC `tools/LSPTool/symbolContext.ts`                                   |
+| File                | Responsibility                                                                     | Phase                         | Porting source                                                        |
+| ------------------- | ---------------------------------------------------------------------------------- | ----------------------------- | --------------------------------------------------------------------- |
+| `index.ts`          | Entry `default (pi) => void`; session lifecycle wiring                             | 1 (extended 2)                | new                                                                   |
+| `log.ts`            | `logForDebugging` / `logError` / `errorMessage` / `sleep` (stderr, `PI_LSP_DEBUG`) | 1                             | replaces CC `utils/debug`, `utils/log`, `utils/errors`, `utils/sleep` |
+| `types.ts`          | `LspServerState`, `ScopedLspServerConfig`, `LspToolDetails`                        | 1                             | CC `services/lsp/types`                                               |
+| `client.ts`         | `createLSPClient` — spawn + JSON-RPC transport                                     | 1                             | CC `LSPClient.ts`                                                     |
+| `instance.ts`       | `createLSPServerInstance` — state machine / retry / crash ceiling                  | 1                             | CC `LSPServerInstance.ts`                                             |
+| `manager.ts`        | `createLSPServerManager` + global singleton + `isLspConnected`                     | 1 (extended 3)                | CC `LSPServerManager.ts` + `manager.ts`                               |
+| `config.ts`         | LSP server config source                                                           | 1 hardcoded → 3 `config.json` | CC `services/lsp/config.ts` + `schemas.ts`                            |
+| `formatters.ts`     | LSP responses → readable text                                                      | 1 (3 ops) → 3 (all)           | CC `tools/LSPTool/formatters.ts`                                      |
+| `tools.ts`          | `registerTool` + input schema + execute flow                                       | 1 (3 ops) → 3 (9 ops)         | CC `tools/LSPTool/LSPTool.ts` + `schemas.ts` + `prompt.ts`            |
+| `diagnostics.ts`    | Dedup + throttle + edit-aware cleanup                                              | 2                             | CC `LSPDiagnosticRegistry.ts`                                         |
+| `symbol-context.ts` | Cursor symbol extraction (first 64KB)                                              | 3 (optional)                  | CC `tools/LSPTool/symbolContext.ts`                                   |
 
 ---
 
@@ -52,7 +52,7 @@ schema. These corrections override the spec where they conflict.
    `extensions: [".ts", ...]` (array), but `textDocument/didOpen` requires a `languageId` per file.
    CC's real schema is `extensionToLanguage: Record<ext, languageId>`, and extension routing keys
    are derived from `Object.keys(extensionToLanguage)`. We adopt `extensionToLanguage` as canonical.
-   Phase 3's `settings.json` reader may still accept an `extensions` array as sugar by mapping it
+   Phase 3's `config.json` reader may still accept an `extensions` array as sugar by mapping it
    through a `guessLanguageId(ext)` table, but the internal config type stays `extensionToLanguage`.
 4. **Build must externalize the SDK + use `--target node`.** `.mise/tasks/build` had no
    `--external`, so the runtime imports of `Type` / `StringEnum` / `truncateTail` would bundle a
@@ -274,14 +274,14 @@ cache clear.
 
 ## 6. Phase 3 — Multi-server + config + remaining operations
 
-**Deliver:** `config.ts` reading `settings.json`; `manager` multi-language routing; the other 6
+**Deliver:** `config.ts` reading `config.json`; `manager` multi-language routing; the other 6
 operations; gitignore filtering; optional `symbol-context.ts`; optional reference-completeness
 priming for cold-start workspaces.
 
 ### Tasks
 
-- [x] `config.ts` — read `~/.pi/agent/settings.json` then `<cwd>/.pi/settings.json` (project
-      overrides global), parse the `lsp.servers` segment, validate (command without spaces unless
+- [x] `config.ts` — read `~/.pi/agent/@balaenis/pi-lsp/config.json` then `<cwd>/.pi/@balaenis/pi-lsp/config.json` (project
+      overrides global), parse the `servers` segment, validate (command without spaces unless
       absolute path; non-empty `extensionToLanguage`), apply `$VAR` / `${VAR}` env substitution.
       Make `getAllLspServers()` async (signature already compatible).
 - [x] Re-add the `restartOnCrash` / `shutdownTimeout` handling (or accept-and-ignore) in
@@ -306,15 +306,15 @@ priming for cold-start workspaces.
 Real-Pi verification uses the `fixtures/phase3-smoke` fixture (`bun run pi` loads the built
 extension into a real `pi -p` session with local `typescript-language-server` + `pyright`).
 
-- [x] `.ts` and `.py` route to different servers in one session. _(config: temp `.pi/settings.json`
+- [x] `.ts` and `.py` route to different servers in one session. _(config: temp `.pi/@balaenis/pi-lsp/config.json`
       `direct-route ts_server typescript py_server python`. **Real Pi**: stderr shows
       `loaded 2 LSP server(s): typescript, python`; `.ts` hover answered by the typescript server,
       `.py` hover on `src/caller.py` line 5 (the `def target` line) returns
       `(function) def target() -> Literal[1]` from the pyright server)_
-- [x] Adding/removing a server in `settings.json` takes effect after `/reload`. _(verified with
+- [x] Adding/removing a server in `config.json` takes effect after `/reload`. _(verified with
       `initializeManager` → `shutdownManager` → `initializeManager`: `first-session py_server,ts_server`,
       `second-session py_only`; config is read fresh on each `session_start`. **Interactive `/reload`
-      still needs a human** — run `bun run pi` in `fixtures/phase3-smoke`, edit `.pi/settings.json`,
+      still needs a human** — run `bun run pi` in `fixtures/phase3-smoke`, edit `.pi/@balaenis/pi-lsp/config.json`,
       `/reload`, re-test per the fixture README §A2.)_
 - [x] callHierarchy two-step returns incoming/outgoing calls. _(**Real Pi**: model drove the `lsp`
       tool; stderr shows `prepareCallHierarchy` → `callHierarchy/outgoingCalls` then
@@ -377,20 +377,20 @@ initialization and/or by answering `workspace/configuration` requests from `conf
 ## 7. UX optimization — Zero-config LSP activation
 
 **Deliver:** PATH-based autodetection backed by a small built-in LSP server recipe registry. With no
-`lsp.servers` configuration, `pi-lsp` should enable matching installed language servers
+`servers` configuration, `pi-lsp` should enable matching installed language servers
 automatically; with user configuration, recipes should supplement only uncovered languages. When no
 matching server is available on PATH, the first LSP trigger should surface a clear
 install/configuration hint through Pi's standard extension UI notification API.
 
-**Inputs:** User request to minimize configuration: keep `settings.json` user configuration, let user
+**Inputs:** User request to minimize configuration: keep `config.json` user configuration, let user
 entries override built-in recipes by server name and covered file extensions, use recipes to fill
 uncovered languages, and remind the user to install the corresponding LSP server when a file type has
 no available server.
 
 **Assumptions:**
 
-- User-owned `lsp.servers` entries in either `~/.pi/agent/settings.json` or
-  `<cwd>/.pi/settings.json` are authoritative for their server names and covered extensions. Built-in
+- User-owned `servers` entries in either `~/.pi/agent/@balaenis/pi-lsp/config.json` or
+  `<cwd>/.pi/@balaenis/pi-lsp/config.json` are authoritative for their server names and covered extensions. Built-in
   recipes may still be added for other languages, but a recipe is skipped when its server name
   collides with a user entry or any of its extensions are already covered by a user entry.
 - This optimization does not install binaries. It only detects existing executables on `PATH` and
@@ -532,7 +532,7 @@ clear install/configuration hint without interrupting the agent loop.
 
 **Validation:**
 
-- Run: a focused real-Pi smoke in a fixture without `.pi/settings.json` and without `pyright` on PATH,
+- Run: a focused real-Pi smoke in a fixture without `.pi/@balaenis/pi-lsp/config.json` and without `pyright` on PATH,
   then edit a `.py` file.
 - Expected: one warning notification explains how to install `pyright`; repeated edits in the same
   session do not repeat the same warning.
@@ -549,9 +549,9 @@ clear install/configuration hint without interrupting the agent loop.
 
 **Steps:**
 
-- [ ] Run a TypeScript fixture with `typescript-language-server` on PATH and no `.pi/settings.json`.
+- [ ] Run a TypeScript fixture with `typescript-language-server` on PATH and no `.pi/@balaenis/pi-lsp/config.json`.
       _(documented in `fixtures/phase3-smoke/README.md` Z0/Z1; pending real Pi smoke)_
-- [ ] Run a Python fixture with `pyright-langserver` on PATH and no `.pi/settings.json`.
+- [ ] Run a Python fixture with `pyright-langserver` on PATH and no `.pi/@balaenis/pi-lsp/config.json`.
       _(documented in `fixtures/phase3-smoke/README.md` Z0/Z1; pending real Pi smoke)_
 - [ ] Run a known-extension fixture where the relevant binary is absent from PATH (zero-config).
       _(documented in `fixtures/phase3-smoke/README.md` Z2; pending real Pi smoke)_
@@ -579,20 +579,20 @@ clear install/configuration hint without interrupting the agent loop.
 
 ### Acceptance
 
-- [ ] With no `lsp.servers` configuration and `typescript-language-server` on PATH, `.ts/.tsx/.js`
+- [ ] With no `servers` configuration and `typescript-language-server` on PATH, `.ts/.tsx/.js`
       files route to the autodetected TypeScript server. _(unit: `config.test.ts` — `returns the
 typescript recipe when typescript-language-server is on PATH`; real smoke: phase3 Z1)_
-- [ ] With no `lsp.servers` configuration and `pyright-langserver` on PATH, `.py` files route to the
+- [ ] With no `servers` configuration and `pyright-langserver` on PATH, `.py` files route to the
       autodetected Python server. _(unit: `config.test.ts` — `detects multiple recipes when
 multiple binaries exist`, plus `recipes.test.ts` extension mapping; real smoke: phase3 Z1)_
 - [ ] With no matching binary on PATH, the first LSP request or edit/write for a known extension shows
       one non-blocking `ctx.ui.notify(..., "warning")` install hint and the tool result includes the
       same actionable guidance. _(implemented in `notifications.ts` + tools.ts/index.ts; per-session
       dedup by extension/reason; real smoke: phase3 Z2)_
-- [ ] With user `lsp.servers` entries present, autodetected recipes are skipped only when they collide
+- [ ] With user `servers` entries present, autodetected recipes are skipped only when they collide
       by server name or covered extension; unrelated recipes are still added. _(unit:
       `config.test.ts` — user precedence and supplementation cases)_
-- [ ] `settings.json` remains supported exactly as documented, including project-over-global
+- [ ] `config.json` remains supported exactly as documented, including project-over-global
       override and `extensions` sugar. _(unit: `config.test.ts` — `project overrides global on
 server-name collision`; existing `extensions` sugar path in `normalizeServer` unchanged)_
 

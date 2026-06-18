@@ -26,14 +26,15 @@ function makeExecutable(dir: string, name: string): void {
 }
 
 function writeAgentSettings(content: string): void {
-  mkdirSync(agentDir, { recursive: true });
-  writeFileSync(path.join(agentDir, 'settings.json'), content);
+  const dir = path.join(agentDir, '@balaenis', 'pi-lsp');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'config.json'), content);
 }
 
 function writeProjectSettings(content: string): void {
-  const dir = path.join(cwdDir, '.pi');
+  const dir = path.join(cwdDir, '.pi', '@balaenis', 'pi-lsp');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, 'settings.json'), content);
+  writeFileSync(path.join(dir, 'config.json'), content);
 }
 
 beforeAll(() => {
@@ -88,13 +89,11 @@ describe('user config precedence', () => {
     makeExecutable(pathDir, 'typescript-language-server');
     writeProjectSettings(
       JSON.stringify({
-        lsp: {
-          servers: {
-            typescript: {
-              command: 'typescript-language-server',
-              args: ['--stdio', '--my-flag'],
-              extensionToLanguage: { '.ts': 'typescript' },
-            },
+        servers: {
+          typescript: {
+            command: 'typescript-language-server',
+            args: ['--stdio', '--my-flag'],
+            extensionToLanguage: { '.ts': 'typescript' },
           },
         },
       })
@@ -111,13 +110,11 @@ describe('user config precedence', () => {
     // User binds .ts to a custom server name; recipe extension overlap must skip the recipe.
     writeProjectSettings(
       JSON.stringify({
-        lsp: {
-          servers: {
-            'my-ts': {
-              command: 'typescript-language-server',
-              args: ['--stdio'],
-              extensionToLanguage: { '.ts': 'typescript' },
-            },
+        servers: {
+          'my-ts': {
+            command: 'typescript-language-server',
+            args: ['--stdio'],
+            extensionToLanguage: { '.ts': 'typescript' },
           },
         },
       })
@@ -130,13 +127,11 @@ describe('user config precedence', () => {
     makeExecutable(pathDir, 'pyright-langserver');
     writeProjectSettings(
       JSON.stringify({
-        lsp: {
-          servers: {
-            'my-ts': {
-              command: 'typescript-language-server',
-              args: ['--stdio'],
-              extensionToLanguage: { '.ts': 'typescript' },
-            },
+        servers: {
+          'my-ts': {
+            command: 'typescript-language-server',
+            args: ['--stdio'],
+            extensionToLanguage: { '.ts': 'typescript' },
           },
         },
       })
@@ -150,10 +145,8 @@ describe('user config precedence', () => {
     makeExecutable(pathDir, 'typescript-language-server');
     writeProjectSettings(
       JSON.stringify({
-        lsp: {
-          servers: {
-            broken: { extensionToLanguage: { '.foo': 'foo' } }, // missing command
-          },
+        servers: {
+          broken: { extensionToLanguage: { '.foo': 'foo' } }, // missing command
         },
       })
     );
@@ -164,24 +157,20 @@ describe('user config precedence', () => {
   it('project overrides global on server-name collision', async () => {
     writeAgentSettings(
       JSON.stringify({
-        lsp: {
-          servers: {
-            mysrv: {
-              command: '/abs/path/global-srv',
-              extensionToLanguage: { '.x': 'x' },
-            },
+        servers: {
+          mysrv: {
+            command: '/abs/path/global-srv',
+            extensionToLanguage: { '.x': 'x' },
           },
         },
       })
     );
     writeProjectSettings(
       JSON.stringify({
-        lsp: {
-          servers: {
-            mysrv: {
-              command: '/abs/path/project-srv',
-              extensionToLanguage: { '.x': 'x' },
-            },
+        servers: {
+          mysrv: {
+            command: '/abs/path/project-srv',
+            extensionToLanguage: { '.x': 'x' },
           },
         },
       })
