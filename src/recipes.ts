@@ -76,6 +76,93 @@ export const BUILTIN_RECIPES: readonly LspServerRecipe[] = [
     installHint:
       'Install `gopls` (for example `go install golang.org/x/tools/gopls@latest`) and ensure it is on PATH.',
   },
+  {
+    name: 'lua',
+    command: 'lua-language-server',
+    extensionToLanguage: {
+      '.lua': 'lua',
+    },
+    installHint:
+      'Install `lua-language-server` (for example `pacman -S lua-language-server`, `brew install lua-language-server`, or download a release from https://github.com/LuaLS/lua-language-server) and ensure it is on PATH.',
+  },
+  {
+    name: 'clangd',
+    command: 'clangd',
+    extensionToLanguage: {
+      '.c': 'c',
+      '.h': 'c',
+      '.cc': 'cpp',
+      '.cpp': 'cpp',
+      '.cxx': 'cpp',
+      '.c++': 'cpp',
+      '.hh': 'cpp',
+      '.hpp': 'cpp',
+      '.hxx': 'cpp',
+      '.h++': 'cpp',
+      '.m': 'objective-c',
+      '.mm': 'objective-cpp',
+    },
+    installHint:
+      'Install `clangd` (for example `pacman -S clang`, `brew install llvm`, or `apt install clangd`) and ensure it is on PATH.',
+  },
+  {
+    name: 'bash',
+    command: 'bash-language-server',
+    args: ['start'],
+    extensionToLanguage: {
+      '.sh': 'shellscript',
+      '.bash': 'shellscript',
+      '.zsh': 'shellscript',
+      '.ksh': 'shellscript',
+    },
+    installHint:
+      'Install `bash-language-server` (for example `npm install -g bash-language-server`) and ensure it is on PATH.',
+  },
+  {
+    name: 'json',
+    command: 'vscode-json-language-server',
+    args: ['--stdio'],
+    extensionToLanguage: {
+      '.json': 'json',
+      '.jsonc': 'jsonc',
+    },
+    installHint:
+      'Install `vscode-langservers-extracted` (for example `npm install -g vscode-langservers-extracted`) which provides `vscode-json-language-server` on PATH.',
+  },
+  {
+    name: 'yaml',
+    command: 'yaml-language-server',
+    args: ['--stdio'],
+    extensionToLanguage: {
+      '.yaml': 'yaml',
+      '.yml': 'yaml',
+    },
+    installHint:
+      'Install `yaml-language-server` (for example `npm install -g yaml-language-server`) and ensure it is on PATH.',
+  },
+  {
+    name: 'html',
+    command: 'vscode-html-language-server',
+    args: ['--stdio'],
+    extensionToLanguage: {
+      '.html': 'html',
+      '.htm': 'html',
+    },
+    installHint:
+      'Install `vscode-langservers-extracted` (for example `npm install -g vscode-langservers-extracted`) which provides `vscode-html-language-server` on PATH.',
+  },
+  {
+    name: 'css',
+    command: 'vscode-css-language-server',
+    args: ['--stdio'],
+    extensionToLanguage: {
+      '.css': 'css',
+      '.scss': 'scss',
+      '.less': 'less',
+    },
+    installHint:
+      'Install `vscode-langservers-extracted` (for example `npm install -g vscode-langservers-extracted`) which provides `vscode-css-language-server` on PATH.',
+  },
 ];
 
 /** Windows executable suffixes consulted when the command has no extension. */

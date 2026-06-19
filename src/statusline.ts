@@ -1,6 +1,8 @@
 // ABOUTME: Pure formatter for the LSP statusLine indicator.
 // ABOUTME: Maps {running, starting, error} into a colored display string.
 
+import type { ThemeColor } from '@earendil-works/pi-coding-agent';
+
 export interface LspStatusCounts {
   running: number;
   starting: number;
@@ -11,7 +13,7 @@ export interface LspStatusCounts {
  * Color function injected by the caller (typically `theme.fg`). The formatter
  * stays decoupled from the TUI so it can be unit-tested with an identity stub.
  */
-export type StatusColorFn = (color: 'border' | 'dim' | 'error', text: string) => string;
+export type StatusColorFn = (color: ThemeColor, text: string) => string;
 
 /**
  * Format the LSP statusLine segment from a live counts snapshot.
@@ -27,7 +29,7 @@ export function formatLspStatus(counts: LspStatusCounts, fg: StatusColorFn): str
     return undefined;
   }
 
-  const parts: string[] = [`${fg('border', '⚡')}LSP`];
+  const parts: string[] = [fg('border', '⚡LSP')];
   if (starting > 0) {
     parts.push(fg('dim', `…${starting}`));
   }

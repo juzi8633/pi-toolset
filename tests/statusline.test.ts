@@ -13,43 +13,43 @@ describe('formatLspStatus', () => {
 
   it('shows only the bare label when every server is healthy', () => {
     expect(formatLspStatus({ running: 2, starting: 0, error: 0 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP'
+      '[border]⚡LSP[/border]'
     );
   });
 
   it('shows the bare label even with a single running server', () => {
     expect(formatLspStatus({ running: 1, starting: 0, error: 0 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP'
+      '[border]⚡LSP[/border]'
     );
   });
 
   it('appends a dim starting segment when at least one server is starting', () => {
     expect(formatLspStatus({ running: 2, starting: 1, error: 0 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP [dim]…1[/dim]'
+      '[border]⚡LSP[/border] [dim]…1[/dim]'
     );
   });
 
   it('renders the starting segment when no servers have come up yet', () => {
     expect(formatLspStatus({ running: 0, starting: 1, error: 0 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP [dim]…1[/dim]'
+      '[border]⚡LSP[/border] [dim]…1[/dim]'
     );
   });
 
   it('appends a red error segment when at least one server has failed', () => {
     expect(formatLspStatus({ running: 2, starting: 0, error: 1 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP [error]✕1[/error]'
+      '[border]⚡LSP[/border] [error]✕1[/error]'
     );
   });
 
   it('renders starting before error in mixed states', () => {
     expect(formatLspStatus({ running: 1, starting: 2, error: 3 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP [dim]…2[/dim] [error]✕3[/error]'
+      '[border]⚡LSP[/border] [dim]…2[/dim] [error]✕3[/error]'
     );
   });
 
   it('keeps the recovery indicator visible when only errors remain', () => {
     expect(formatLspStatus({ running: 0, starting: 0, error: 2 }, markerFg)).toBe(
-      '[border]⚡[/border]LSP [error]✕2[/error]'
+      '[border]⚡LSP[/border] [error]✕2[/error]'
     );
   });
 });
