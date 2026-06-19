@@ -29,7 +29,7 @@ export function formatLspStatus(counts: LspStatusCounts, fg: StatusColorFn): str
     return undefined;
   }
 
-  const parts: string[] = [fg('border', '⚡LSP')];
+  const parts: string[] = [fg('success', '⚡LSP')];
   if (starting > 0) {
     parts.push(fg('dim', `…${starting}`));
   }

@@ -2,7 +2,7 @@
 // ABOUTME: Faithful port of Claude Code's LSPClient, adapted to Pi (ESM dynamic import + local logging).
 
 import { type ChildProcess, spawn } from 'node:child_process';
-import type { MessageConnection } from 'vscode-jsonrpc/node.js';
+import type { GenericRequestHandler, MessageConnection } from 'vscode-jsonrpc/node';
 import type {
   InitializeParams,
   InitializeResult,
@@ -116,7 +116,7 @@ export function createLSPClient(serverName: string, onCrash?: (error: Error) => 
         // Lazy-load vscode-jsonrpc so its transport code is only evaluated when
         // a server is actually started, not at module import time.
         const { createMessageConnection, StreamMessageReader, StreamMessageWriter, Trace } =
-          await import('vscode-jsonrpc/node.js');
+          await import('vscode-jsonrpc/node');
 
         // 1. Spawn LSP server process
         childProcess = spawn(command, args, {
@@ -268,7 +268,7 @@ export function createLSPClient(serverName: string, onCrash?: (error: Error) => 
 
         // 5. Apply any queued request handlers
         for (const { method, handler } of pendingRequestHandlers) {
-          connection.onRequest(method, handler);
+          connection.onRequest(method, handler as GenericRequestHandler<unknown, unknown>);
           logForDebugging(`Applied queued request handler for ${serverName}.${method}`);
         }
         pendingRequestHandlers.length = 0; // Clear the queue
@@ -381,7 +381,7 @@ export function createLSPClient(serverName: string, onCrash?: (error: Error) => 
 
       checkStartFailed();
 
-      connection.onRequest(method, handler);
+      connection.onRequest(method, handler as GenericRequestHandler<TResult, unknown>);
     },
 
     async stop(options?: { shutdownTimeout?: number }): Promise<void> {
