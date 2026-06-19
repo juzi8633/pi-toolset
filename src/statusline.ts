@@ -11,7 +11,7 @@ export interface LspStatusCounts {
  * Color function injected by the caller (typically `theme.fg`). The formatter
  * stays decoupled from the TUI so it can be unit-tested with an identity stub.
  */
-export type StatusColorFn = (color: 'dim' | 'error', text: string) => string;
+export type StatusColorFn = (color: 'border' | 'dim' | 'error', text: string) => string;
 
 /**
  * Format the LSP statusLine segment from a live counts snapshot.
@@ -25,12 +25,15 @@ export function formatLspStatus(counts: LspStatusCounts, fg: StatusColorFn): str
     return undefined;
   }
 
-  const parts: string[] = [`LSP ⚡ ${running}`];
+  const parts: string[] = [`${fg('border', '⚡')}LSP`];
+  if (running > 0) {
+    parts.push(`🟢${running}`);
+  }
   if (starting > 0) {
-    parts.push(fg('dim', `…${starting}`));
+    parts.push(fg('dim', `🟡${starting}`));
   }
   if (error > 0) {
-    parts.push(fg('error', `✕${error}`));
+    parts.push(fg('error', `🔴${error}`));
   }
   return parts.join(' ');
 }
