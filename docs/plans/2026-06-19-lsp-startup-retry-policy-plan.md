@@ -190,7 +190,7 @@ These failures should retry on the next `ensureServerStarted()` until the startu
 
 ## Final Validation
 
-- Run: `bun test tests/startup-errors.test.ts tests/instance-startup-retry.test.ts`
+- Run: `mise run test`
 - Expected: classifier and retry policy tests pass.
 - Run: `mise run typecheck`
 - Expected: TypeScript check passes.
