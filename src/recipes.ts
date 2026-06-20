@@ -77,6 +77,16 @@ export const BUILTIN_RECIPES: readonly LspServerRecipe[] = [
       'Install `gopls` (for example `go install golang.org/x/tools/gopls@latest`) and ensure it is on PATH.',
   },
   {
+    name: 'kotlin',
+    command: 'kotlin-lsp',
+    args: ['--stdio'],
+    extensionToLanguage: {
+      '.kt': 'kotlin',
+    },
+    installHint:
+      'Install JetBrains `kotlin-lsp` (for example `brew install JetBrains/utils/kotlin-lsp`, or download a release from https://github.com/Kotlin/kotlin-lsp and symlink `kotlin-lsp.sh` as `kotlin-lsp` on PATH) and ensure it is on PATH. Requires Java 17+.',
+  },
+  {
     name: 'lua',
     command: 'lua-language-server',
     extensionToLanguage: {

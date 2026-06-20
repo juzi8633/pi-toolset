@@ -116,6 +116,7 @@ describe('getDetectedRecipeServers', () => {
     makeExecutable(dir, 'typescript-language-server');
     makeExecutable(dir, 'pyright-langserver');
     makeExecutable(dir, 'gopls');
+    makeExecutable(dir, 'kotlin-lsp');
     makeExecutable(dir, 'lua-language-server');
     makeExecutable(dir, 'clangd');
     makeExecutable(dir, 'bash-language-server');
@@ -133,6 +134,7 @@ describe('getDetectedRecipeServers', () => {
       'go',
       'html',
       'json',
+      'kotlin',
       'lua',
       'python',
       'typescript',
@@ -141,6 +143,8 @@ describe('getDetectedRecipeServers', () => {
     ]);
     expect(detected.python!.extensionToLanguage['.py']).toBe('python');
     expect(detected.go!.extensionToLanguage['.go']).toBe('go');
+    expect(detected.kotlin!.extensionToLanguage['.kt']).toBe('kotlin');
+    expect(detected.kotlin!.args).toEqual(['--stdio']);
     expect(detected.lua!.extensionToLanguage['.lua']).toBe('lua');
     expect(detected.clangd!.extensionToLanguage['.cpp']).toBe('cpp');
     expect(detected.bash!.args).toEqual(['start']);
