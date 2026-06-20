@@ -5,13 +5,13 @@
     "": {
       "name": "pi-lsp",
       "dependencies": {
-        "@earendil-works/pi-agent-core": "^0.79.8",
-        "@earendil-works/pi-tui": "^0.79.8",
         "vscode-jsonrpc": "^9.0.0",
       },
       "devDependencies": {
+        "@earendil-works/pi-agent-core": "^0.79.8",
         "@earendil-works/pi-ai": "^0.79.8",
         "@earendil-works/pi-coding-agent": "^0.79.8",
+        "@earendil-works/pi-tui": "^0.79.8",
         "@eslint/js": "^10.0.1",
         "@types/node": "^26.0.0",
         "@typescript-eslint/eslint-plugin": "8.61.1",
@@ -26,8 +26,10 @@
         "vscode-languageserver-protocol": "^3.18.0",
       },
       "peerDependencies": {
+        "@earendil-works/pi-agent-core": "*",
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
         "typebox": "*",
       },
     },
