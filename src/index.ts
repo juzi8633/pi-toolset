@@ -1,6 +1,5 @@
 // ABOUTME: Pi LSP extension entry point and session lifecycle wiring.
-// ABOUTME: Lazily starts the LSP manager on session_start, injects passive
-// ABOUTME: diagnostics via the context hook, and re-syncs files after edits.
+// ABOUTME: Lazily starts the manager, registers tools/commands, and injects diagnostics.
 
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -15,6 +14,7 @@ import {
   waitForInitialization,
 } from './manager.ts';
 import { maybeNotifyMissingServer } from './notifications.ts';
+import { registerLspStatusCommand } from './status-command.ts';
 import { formatLspStatus } from './statusline.ts';
 import { registerLspTool } from './tools.ts';
 
@@ -28,6 +28,7 @@ export default function (pi: ExtensionAPI): void {
   // No process/timer/watcher work in the factory body — registering the tool is
   // pure metadata. All process spawning is deferred to first tool use.
   registerLspTool(pi);
+  registerLspStatusCommand(pi);
 
   let unsubscribeLspStatus: (() => void) | undefined;
 

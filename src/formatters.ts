@@ -10,7 +10,6 @@ import type {
   Hover,
   Location,
   LocationLink,
-  MarkedString,
   MarkupContent,
   SymbolInformation,
   SymbolKind,
@@ -246,9 +245,15 @@ export function symbolKindToString(kind: SymbolKind): string {
 }
 
 /**
- * Extracts text content from MarkupContent or MarkedString.
+ * Runtime-compatible hover content. LSP prefers MarkupContent, but some servers
+ * still return the older string/object shapes.
  */
-function extractMarkupText(contents: MarkupContent | MarkedString | MarkedString[]): string {
+type HoverContent = MarkupContent | string | { value: string } | Array<string | { value: string }>;
+
+/**
+ * Extracts text content from hover contents.
+ */
+function extractMarkupText(contents: HoverContent): string {
   if (Array.isArray(contents)) {
     return contents
       .map((item) => {
@@ -269,7 +274,7 @@ function extractMarkupText(contents: MarkupContent | MarkedString | MarkedString
     return contents.value;
   }
 
-  // MarkedString object
+  // Legacy object shape
   return contents.value;
 }
 

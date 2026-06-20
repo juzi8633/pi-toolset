@@ -35,6 +35,10 @@ LSP ⚡ 2 ✕1       — two running, one in error (red)
 
 The indicator is a live snapshot, not a `ready/total` summary: configured-but-stopped servers are not counted, and an `✗` failure clears as soon as a retry succeeds (e.g. crash auto-restart or a re-triggered tool call). The segment is hidden entirely when all tracked counts are zero so the footer stays quiet at session start.
 
+### Slash command
+
+Run `/lsp status` to inspect the current LSP runtime snapshot without starting any stopped servers. The command shows the manager state, server counts by lifecycle state, and per-server details including command, workspace, covered extensions, start time, restart count, and last error when present.
+
 ## Configuration
 
 LSP servers are configured through a dedicated config file (separate from Pi's shared `settings.json`, to avoid key collisions with other extensions). The extension reads two files (project overrides global):
