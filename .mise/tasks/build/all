@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#MISE description="Build All package"
+#MISE depends=["setup"]
+
+# Loop through all directories in the 'packages' folder
+for pkg in packages/*; do
+  # Check if the directory is a package
+  if [ -d "$pkg" ] && [ -f "$pkg/package.json" ]; then
+    # Run the build script for the package
+    mise run build --package "$pkg"
+  fi
+  done
