@@ -1,4 +1,4 @@
-// ABOUTME: Registers the /lsp slash command for inspecting status and starting/stopping servers.
+// ABOUTME: Registers the /lsp slash command (status, start/stop) and its subcommand handlers.
 // ABOUTME: /lsp status formats live state; /lsp start shows a picker to toggle each configured server.
 
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
@@ -19,7 +19,7 @@ const STATUS_SUBCOMMAND = 'status';
 const START_SUBCOMMAND = 'start';
 const SUBCOMMANDS = [STATUS_SUBCOMMAND, START_SUBCOMMAND];
 
-export function registerLspStatusCommand(pi: ExtensionAPI): void {
+export function registerLspCommand(pi: ExtensionAPI): void {
   pi.registerCommand('lsp', {
     description: 'Inspect LSP server status or start/stop configured servers',
     getArgumentCompletions(prefix: string): AutocompleteItem[] | null {
@@ -40,7 +40,8 @@ export function registerLspStatusCommand(pi: ExtensionAPI): void {
         return;
       }
 
-      if (subcommand !== STATUS_SUBCOMMAND) {
+      // Empty input defaults to status.
+      if (subcommand !== '' && subcommand !== STATUS_SUBCOMMAND) {
         ctx.ui.notify('Usage: /lsp status | /lsp start', 'info');
         return;
       }

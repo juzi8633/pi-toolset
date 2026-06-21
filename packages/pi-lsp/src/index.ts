@@ -14,7 +14,7 @@ import {
   waitForInitialization,
 } from './manager.ts';
 import { maybeNotifyMissingServer } from './notifications.ts';
-import { registerLspStatusCommand } from './status-command.ts';
+import { registerLspCommand } from './command.ts';
 import { formatLspStatus } from './statusline.ts';
 import { registerLspTool } from './tools.ts';
 
@@ -28,7 +28,7 @@ export default function (pi: ExtensionAPI): void {
   // No process/timer/watcher work in the factory body — registering the tool is
   // pure metadata. All process spawning is deferred to first tool use.
   registerLspTool(pi);
-  registerLspStatusCommand(pi);
+  registerLspCommand(pi);
 
   let unsubscribeLspStatus: (() => void) | undefined;
 

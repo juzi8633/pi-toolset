@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'bun:test';
 import type { LSPServerInstance } from '../src/instance.ts';
 import type { LSPServerManager } from '../src/manager.ts';
-import { formatLspStatusDetails } from '../src/status-command.ts';
+import { formatLspStatusDetails } from '../src/command.ts';
 import type { LspServerState, ScopedLspServerConfig } from '../src/types.ts';
 
 function fakeServer(
