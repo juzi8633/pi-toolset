@@ -32,6 +32,7 @@ export default function (pi: ExtensionAPI): void {
   registerLspCommand(pi);
 
   let unsubscribeLspStatus: (() => void) | undefined;
+  let unsubscribeDiagnostics: (() => void) | undefined;
 
   pi.on('session_start', (_event, ctx) => {
     // Synchronous, non-blocking, idempotent. Servers are lazily started on the
@@ -42,14 +43,18 @@ export default function (pi: ExtensionAPI): void {
     if (!manager) return;
 
     const render = (): void => {
-      const text = formatLspStatus(manager.getStateCounts(), (color, str) =>
-        ctx.ui.theme.fg(color, str)
+      const text = formatLspStatus(
+        manager.getStateCounts(),
+        (color, str) => ctx.ui.theme.fg(color, str),
+        diagnostics.hasDiagnostics()
       );
       ctx.ui.setStatus(LSP_STATUS_KEY, text);
     };
 
     unsubscribeLspStatus?.();
     unsubscribeLspStatus = manager.onServersChanged(render);
+    unsubscribeDiagnostics?.();
+    unsubscribeDiagnostics = diagnostics.onChanged(render);
     render();
   });
 
@@ -58,6 +63,8 @@ export default function (pi: ExtensionAPI): void {
     // and clears diagnostic state so the next session starts clean.
     unsubscribeLspStatus?.();
     unsubscribeLspStatus = undefined;
+    unsubscribeDiagnostics?.();
+    unsubscribeDiagnostics = undefined;
     ctx.ui.setStatus(LSP_STATUS_KEY, undefined);
 
     await shutdownManager();

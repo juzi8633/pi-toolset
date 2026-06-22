@@ -23,13 +23,23 @@ export type StatusColorFn = (color: ThemeColor, text: string) => string;
  * extra segments. Returns `undefined` when nothing is tracked so callers can
  * clear the segment via `setStatus(key, undefined)`.
  */
-export function formatLspStatus(counts: LspStatusCounts, fg: StatusColorFn): string | undefined {
+export function formatLspStatus(
+  counts: LspStatusCounts,
+  fg: StatusColorFn,
+  hasDiagnostics = false
+): string | undefined {
   const { running, starting, error } = counts;
   if (running === 0 && starting === 0 && error === 0) {
     return undefined;
   }
 
-  const parts: string[] = [fg('accent', '⚡LSP')];
+  // The bolt turns error-colored while any diagnostic is tracked so the user
+  // gets an ambient "something needs attention" cue; the "LSP" suffix keeps
+  // the accent color so the segment stays readable.
+  const label = hasDiagnostics
+    ? `${fg('error', '⚡')}${fg('accent', 'LSP')}`
+    : fg('accent', '⚡LSP');
+  const parts: string[] = [label];
   if (starting > 0) {
     parts.push(fg('dim', `…${starting}`));
   }

@@ -24,16 +24,19 @@ When no server is configured for a file type, or the server is still starting, t
 
 ### StatusLine indicator
 
-The extension renders a passive, non-interactive LSP health indicator in Pi's footer that reflects the live runtime state of LSP servers:
+The extension renders a passive, non-interactive LSP health indicator in Pi's footer that reflects the live runtime state of LSP servers and whether any diagnostics are currently tracked:
 
 ```
-LSP ⚡ 2          — two servers are running
-LSP ⚡ 2 …1       — two running, one starting (dim)
-LSP ⚡ 2 ✕1       — two running, one in error (red)
-(hidden)        — no servers are starting/running/in error
+⚡LSP             — servers running, no diagnostics
+⚡LSP …1          — one starting (dim)
+⚡LSP ✕1          — one in error (red)
+⚡LSP             — bolt is error-colored while diagnostics are present
+(hidden)         — no servers are starting/running/in error
 ```
 
-The indicator is a live snapshot, not a `ready/total` summary: configured-but-stopped servers are not counted, and an `✗` failure clears as soon as a retry succeeds (e.g. crash auto-restart or a re-triggered tool call). The segment is hidden entirely when all tracked counts are zero so the footer stays quiet at session start.
+The bolt uses the theme's `error` color whenever one or more diagnostics are currently tracked (from the initial LSP publish until the file is edited or the diagnostic state is reset); otherwise it keeps the accent color. The count segments keep their existing semantics: `…n` for starting servers and `✕n` for servers in error.
+
+The indicator is a live snapshot, not a `ready/total` summary: configured-but-stopped servers are not counted, and a `✕` failure clears as soon as a retry succeeds (e.g. crash auto-restart or a re-triggered tool call). The segment is hidden entirely when all tracked counts are zero so the footer stays quiet at session start.
 
 ### Slash command
 

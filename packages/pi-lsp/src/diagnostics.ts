@@ -119,6 +119,27 @@ function pendingKey(serverName: string, uri: string): string {
 // delivered. Bounds memory with a tiny LRU so a long session doesn't grow it.
 const deliveredDiagnostics = new LruMap<string, Set<string>>(MAX_DELIVERED_FILES);
 
+// Status consumers (e.g. the statusLine) subscribe here to re-render when the
+// presence of any tracked diagnostic changes. Notifications fire only on the
+// empty <-> non-empty transition so a high-frequency publish stream doesn't
+// thrash the UI.
+const listeners = new Set<() => void>();
+
+function diagnosticsPresent(): boolean {
+  return pendingDiagnostics.size > 0 || deliveredDiagnostics.size > 0;
+}
+
+function notifyIfChanged(before: boolean): void {
+  if (diagnosticsPresent() === before) return;
+  for (const listener of listeners) {
+    try {
+      listener();
+    } catch (error) {
+      logError(new Error(`diagnostics listener threw: ${errorMessage(error)}`));
+    }
+  }
+}
+
 function mapSeverity(lspSeverity: number | undefined): Severity {
   // LSP DiagnosticSeverity: 1=Error, 2=Warning, 3=Information, 4=Hint
   switch (lspSeverity) {
@@ -215,12 +236,14 @@ export function register(serverName: string, uri: string, diagnostics: LspDiagno
     return;
   }
 
+  const before = diagnosticsPresent();
   const key = pendingKey(serverName, uri);
   if (diagnostics.length === 0) {
     // Clean publish from this server: drop only its pending entry. Other
     // servers' diagnostics for the same URI remain pending.
     pendingDiagnostics.delete(key);
     logForDebugging(`diagnostics: cleared pending for ${uri} from ${serverName} (clean publish)`);
+    notifyIfChanged(before);
     return;
   }
 
@@ -229,6 +252,7 @@ export function register(serverName: string, uri: string, diagnostics: LspDiagno
   logForDebugging(
     `diagnostics: registered ${stored.length} diagnostic(s) for ${uri} from ${serverName}`
   );
+  notifyIfChanged(before);
 }
 
 /**
@@ -382,6 +406,7 @@ function formatBlock(
  * shown again even if they match previously delivered ones.
  */
 export function clearForFile(uri: string): void {
+  const before = diagnosticsPresent();
   // Drop pending entries for this URI from any server.
   const toDelete: string[] = [];
   for (const [key, entry] of pendingDiagnostics) {
@@ -392,6 +417,7 @@ export function clearForFile(uri: string): void {
     deliveredDiagnostics.delete(uri);
     logForDebugging(`diagnostics: cleared delivered tracking for ${uri}`);
   }
+  notifyIfChanged(before);
 }
 
 /**
@@ -399,7 +425,28 @@ export function clearForFile(uri: string): void {
  * clean and no cross-session leakage occurs.
  */
 export function resetAll(): void {
+  const before = diagnosticsPresent();
   pendingDiagnostics.clear();
   deliveredDiagnostics.clear();
   logForDebugging('diagnostics: reset all state');
+  notifyIfChanged(before);
+}
+
+/**
+ * Whether any diagnostics are currently tracked: pending (awaiting drain) or
+ * delivered (already injected but not cleared by a file edit).
+ */
+export function hasDiagnostics(): boolean {
+  return diagnosticsPresent();
+}
+
+/**
+ * Subscribe to changes in `hasDiagnostics()`. Fires only on the empty <->
+ * non-empty transition. Returns an unsubscribe function.
+ */
+export function onChanged(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }

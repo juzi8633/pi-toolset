@@ -3,7 +3,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { Diagnostic as LspDiagnostic } from 'vscode-languageserver-types';
-import { clearForFile, drain, register, resetAll } from '../src/diagnostics.ts';
+import {
+  clearForFile,
+  drain,
+  hasDiagnostics,
+  onChanged,
+  register,
+  resetAll,
+} from '../src/diagnostics.ts';
 
 function diag(message: string, source?: string, line = 0): LspDiagnostic {
   return {
@@ -80,5 +87,51 @@ describe('multi-server diagnostics', () => {
     clearForFile(uri);
 
     expect(drain()).toBeNull();
+  });
+});
+
+describe('diagnostic presence indicator', () => {
+  it('reflects pending and delivered state', () => {
+    expect(hasDiagnostics()).toBe(false);
+
+    register('ts', 'file:///x.ts', [diag('e')]);
+    expect(hasDiagnostics()).toBe(true);
+
+    drain();
+    expect(hasDiagnostics()).toBe(true);
+
+    clearForFile('file:///x.ts');
+    expect(hasDiagnostics()).toBe(false);
+  });
+
+  it('notifies onChanged only on the empty <-> non-empty transition', () => {
+    const calls: number[] = [];
+    let n = 0;
+    const off = onChanged(() => calls.push(++n));
+
+    register('ts', 'file:///x.ts', [diag('e')]);
+    expect(calls).toEqual([1]);
+
+    register('ts', 'file:///x.ts', [diag('e2')]);
+    expect(calls).toEqual([1]);
+
+    register('ts', 'file:///x.ts', []);
+    expect(calls).toEqual([1, 2]);
+
+    off();
+  });
+
+  it('does not notify when drain moves pending to delivered', () => {
+    const calls: number[] = [];
+    const off = onChanged(() => calls.push(1));
+
+    register('ts', 'file:///x.ts', [diag('e')]);
+    calls.length = 0;
+
+    drain();
+    expect(calls).toEqual([]);
+    expect(hasDiagnostics()).toBe(true);
+
+    off();
   });
 });

@@ -52,4 +52,20 @@ describe('formatLspStatus', () => {
       '[accent]⚡LSP[/accent] [error]✕2[/error]'
     );
   });
+
+  it('colors the bolt error while diagnostics are present', () => {
+    expect(formatLspStatus({ running: 2, starting: 0, error: 0 }, markerFg, true)).toBe(
+      '[error]⚡[/error][accent]LSP[/accent]'
+    );
+  });
+
+  it('keeps the error bolt with starting and error server segments', () => {
+    expect(formatLspStatus({ running: 1, starting: 1, error: 1 }, markerFg, true)).toBe(
+      '[error]⚡[/error][accent]LSP[/accent] [dim]…1[/dim] [error]✕1[/error]'
+    );
+  });
+
+  it('returns undefined even with diagnostics when no servers are tracked', () => {
+    expect(formatLspStatus({ running: 0, starting: 0, error: 0 }, markerFg, true)).toBeUndefined();
+  });
 });
