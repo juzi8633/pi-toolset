@@ -18,8 +18,9 @@ fi
 
 cd "${FIXTURE_DIR}"
 
-# PI_LSP_DEBUG=1 prints the diagnostic registry lifecycle (register/drain/reset)
-# and LSP protocol events to stderr. Remove it once you trust the pipeline.
-PI_LSP_DEBUG=0 \
+# PI_LSP_LOG_LEVEL=debug logs the diagnostic registry lifecycle (register/drain/reset)
+# and LSP protocol events to ~/.pi/pi-x-ide/debug.log (override with PI_LSP_LOG_FILE).
+# Remove it once you trust the pipeline.
+PI_LSP_LOG_LEVEL=debug \
   PATH="${FIXTURE_DIR}/node_modules/.bin:${REPO_ROOT}/node_modules/.bin:${PATH}" \
   "${PI_BIN}" -ne --approve -e "${EXTENSION_PATH}"

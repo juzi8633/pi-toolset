@@ -335,6 +335,6 @@ esac
 # Launch pi
 # ---------------------------------------------------------------------------
 
-PI_LSP_DEBUG=1 \
+PI_LSP_LOG_LEVEL=debug \
   PATH="${SMOKE_PATH}" \
   "${PI_BIN}" -ne --approve -e "${EXTENSION_PATH}"

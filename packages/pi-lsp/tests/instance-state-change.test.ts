@@ -2,7 +2,11 @@
 // ABOUTME: Uses an injectable fake LSP client so no real child process is needed.
 
 import { describe, expect, it } from 'bun:test';
-import type { InitializeParams, InitializeResult } from 'vscode-languageserver-protocol';
+import type {
+  InitializeParams,
+  InitializeResult,
+  ServerCapabilities,
+} from 'vscode-languageserver-protocol';
 import type { LSPClient } from '../src/client.ts';
 import { createLSPServerInstance, type LSPClientFactory } from '../src/instance.ts';
 import type { LspServerState, ScopedLspServerConfig } from '../src/types.ts';
@@ -21,30 +25,37 @@ function baseConfig(overrides: Partial<ScopedLspServerConfig> = {}): ScopedLspSe
 
 type Outcome = 'success' | Error;
 
-function makeFactory(outcomes: Outcome[]): {
+function makeFactory(
+  outcomes: Outcome[],
+  options: { serverCapabilities?: ServerCapabilities } = {}
+): {
   factory: LSPClientFactory;
   triggerCrash(error: Error): void;
+  initParams: InitializeParams[];
 } {
   let initialized = false;
   let crashHandler: ((error: Error) => void) | undefined;
+  const initParams: InitializeParams[] = [];
+  const serverCapabilities = options.serverCapabilities ?? {};
 
   const factory: LSPClientFactory = (_name, onCrash) => {
     crashHandler = onCrash;
     const client: LSPClient = {
       get capabilities() {
-        return initialized ? {} : undefined;
+        return initialized ? serverCapabilities : undefined;
       },
       get isInitialized() {
         return initialized;
       },
       async start() {},
-      async initialize(_params: InitializeParams): Promise<InitializeResult> {
+      async initialize(params: InitializeParams): Promise<InitializeResult> {
+        initParams.push(params);
         const outcome = outcomes.shift() ?? 'success';
         if (outcome instanceof Error) {
           throw outcome;
         }
         initialized = true;
-        return { capabilities: {} };
+        return { capabilities: serverCapabilities };
       },
       async sendRequest() {
         return undefined as never;
@@ -65,6 +76,7 @@ function makeFactory(outcomes: Outcome[]): {
       if (!crashHandler) throw new Error('no crash handler captured');
       crashHandler(error);
     },
+    initParams,
   };
 }
 
@@ -132,5 +144,37 @@ describe('LSPServerInstance onStateChange', () => {
     // Second start() call returns immediately; state stays running.
     await server.start();
     expect(transitions).toEqual(['starting', 'running']);
+  });
+
+  it('advertises workspace/configuration and pull diagnostic client capabilities', async () => {
+    const harness = makeFactory(['success']);
+    const server = createLSPServerInstance('typescript', baseConfig(), harness.factory);
+
+    await server.start();
+    expect(harness.initParams.length).toBe(1);
+    const params = harness.initParams[0]!;
+    expect(params.capabilities.workspace?.configuration).toBe(true);
+    const diagnostic = params.capabilities.textDocument?.diagnostic;
+    expect(diagnostic).toBeDefined();
+    expect(diagnostic!.dynamicRegistration).toBe(false);
+    expect((diagnostic as { relatedDocumentSupport?: boolean }).relatedDocumentSupport).toBe(false);
+  });
+
+  it('exposes server-reported diagnosticProvider capability after start', async () => {
+    const harness = makeFactory(['success'], {
+      serverCapabilities: {
+        diagnosticProvider: {
+          identifier: 'eslint',
+          interFileDependencies: false,
+          workspaceDiagnostics: false,
+        },
+      },
+    });
+    const server = createLSPServerInstance('eslint', baseConfig(), harness.factory);
+
+    await server.start();
+    const provider = server.capabilities?.diagnosticProvider;
+    expect(provider).toBeDefined();
+    expect(typeof provider === 'object' && provider && 'identifier' in provider).toBe(true);
   });
 });

@@ -41,7 +41,7 @@ export interface ScopedLspServerConfig {
   extensionToLanguage: Record<string, string>;
   env?: Record<string, string>;
   initializationOptions?: unknown;
-  /** Server settings pushed via workspace/didChangeConfiguration (optional). */
+  /** Server settings returned from workspace/configuration (optional). */
   settings?: unknown;
   workspaceFolder?: string;
   startupTimeout?: number;

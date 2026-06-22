@@ -17,6 +17,7 @@ import { maybeNotifyMissingServer } from './notifications.ts';
 import { registerLspCommand } from './command.ts';
 import { formatLspStatus } from './statusline.ts';
 import { registerLspTool } from './tools.ts';
+import { logForDebugging } from './log.ts';
 
 /** customType tag used for injected diagnostic blocks so they can be stripped. */
 const DIAGNOSTIC_CUSTOM_TYPE = 'lsp-diagnostics';
@@ -70,6 +71,7 @@ export default function (pi: ExtensionAPI): void {
     const messages = stripDiagnosticBlocks(event.messages);
     const block = diagnostics.drain(ctx.cwd);
     if (block) {
+      logForDebugging(`diagnostics: injecting block for ${ctx.cwd}`, { level: 'debug' });
       messages.push({
         role: 'custom',
         customType: DIAGNOSTIC_CUSTOM_TYPE,

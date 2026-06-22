@@ -28,6 +28,7 @@ function fakeServer(
     startTime: undefined,
     lastError: undefined,
     restartCount: 0,
+    capabilities: undefined,
     async start() {},
     async stop() {},
     async restart() {},

@@ -18,7 +18,7 @@ Once the extension is installed, the agent gains access to the `lsp` tool. All n
 | `incomingCalls`        | Find functions that call the target (two-step)       |
 | `outgoingCalls`        | Find functions called by the target (two-step)       |
 
-Results from location-returning operations (`findReferences`, `goToDefinition`, `goToImplementation`, `workspaceSymbol`) are filtered to exclude `.gitignore`d files. All `lsp` tool operations target the file's active primary server. Passive diagnostics, in contrast, are collected from every active server covering the file (primary + companions) so lint/type/etc. issues from different servers can coexist.
+Results from location-returning operations (`findReferences`, `goToDefinition`, `goToImplementation`, `workspaceSymbol`) are filtered to exclude `.gitignore`d files. All `lsp` tool operations target the file's active primary server. Passive diagnostics, in contrast, are collected from every active server covering the file (primary + companions) so lint/type/etc. issues from different servers can coexist. Diagnostics come from two sources: push servers (`textDocument/publishDiagnostics` notifications) and pull servers (`textDocument/diagnostic` requests fired after file sync when the server advertises `diagnosticProvider`).
 
 When no server is configured for a file type, or the server is still starting, the tool returns a clear text message instead of an error.
 
@@ -90,24 +90,24 @@ Both files use JSONC syntax (comments are allowed).
 
 ### Fields
 
-| Field                   | Required | Default                                | Description                                                                                                                 |
-| ----------------------- | -------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `command`               | yes      | —                                      | LSP server binary. Spaces only allowed for absolute paths.                                                                  |
-| `args`                  | no       | `[]`                                   | CLI arguments for the server.                                                                                               |
-| `extensionToLanguage`   | yes¹     | —                                      | Maps file extensions (leading dot) to LSP `languageId` values.                                                              |
-| `extensions`            | no²      | —                                      | Sugar: `[".ts", ".tsx"]` → languageId is guessed via a built-in table.                                                      |
-| `env`                   | no       | —                                      | Environment variables. `$VAR` and `${VAR}` are expanded from `process.env`.                                                 |
-| `initializationOptions` | no       | `{}`                                   | Passed to the server during `initialize`.                                                                                   |
-| `settings`              | no       | —                                      | Accepted for schema compatibility; **not delivered to the server** yet. See [optimization note](#future-optimization).      |
-| `workspaceFolder`       | no       | session cwd                            | Overrides the workspace root sent to the server.                                                                            |
-| `startupTimeout`        | no       | `30000`                                | Max ms to wait for server initialization before treating startup as retryable failure.                                      |
-| `shutdownTimeout`       | no       | `10000`                                | Max ms to wait for graceful shutdown before killing the process.                                                            |
-| `restartOnCrash`        | no       | `false`                                | Auto-restart the server when it crashes unexpectedly. Bounded by `maxRestarts`.                                             |
-| `maxRestarts`           | no       | `3`                                    | Max manual restart, crash-recovery, and retryable startup attempts.                                                         |
-| `transport`             | no       | `"stdio"`                              | Accepted for compatibility; only `"stdio"` is implemented.                                                                  |
-| `role`                  | no       | `"primary"`                            | `"primary"` (one per file, drives navigation) or `"companion"` (adds diagnostics alongside the primary).                    |
-| `startupMode`           | no       | `"auto"`                               | `"auto"` (joins routing automatically) or `"manual"` (only after `/lsp start`).                                             |
-| `conflictGroup`         | no       | primary: server name; companion: unset | Display-only grouping label for primary replacement scenarios, surfaced in `/lsp status`. Not yet enforced at routing time. |
+| Field                   | Required | Default                                | Description                                                                                                                       |
+| ----------------------- | -------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `command`               | yes      | —                                      | LSP server binary. Spaces only allowed for absolute paths.                                                                        |
+| `args`                  | no       | `[]`                                   | CLI arguments for the server.                                                                                                     |
+| `extensionToLanguage`   | yes¹     | —                                      | Maps file extensions (leading dot) to LSP `languageId` values.                                                                    |
+| `extensions`            | no²      | —                                      | Sugar: `[".ts", ".tsx"]` → languageId is guessed via a built-in table.                                                            |
+| `env`                   | no       | —                                      | Environment variables. `$VAR` and `${VAR}` are expanded from `process.env`.                                                       |
+| `initializationOptions` | no       | `{}`                                   | Passed to the server during `initialize`.                                                                                         |
+| `settings`              | no       | —                                      | Returned to the server from `workspace/configuration`; built-in ESLint uses defaults required by `vscode-eslint-language-server`. |
+| `workspaceFolder`       | no       | session cwd                            | Overrides the workspace root sent to the server.                                                                                  |
+| `startupTimeout`        | no       | `30000`                                | Max ms to wait for server initialization before treating startup as retryable failure.                                            |
+| `shutdownTimeout`       | no       | `10000`                                | Max ms to wait for graceful shutdown before killing the process.                                                                  |
+| `restartOnCrash`        | no       | `false`                                | Auto-restart the server when it crashes unexpectedly. Bounded by `maxRestarts`.                                                   |
+| `maxRestarts`           | no       | `3`                                    | Max manual restart, crash-recovery, and retryable startup attempts.                                                               |
+| `transport`             | no       | `"stdio"`                              | Accepted for compatibility; only `"stdio"` is implemented.                                                                        |
+| `role`                  | no       | `"primary"`                            | `"primary"` (one per file, drives navigation) or `"companion"` (adds diagnostics alongside the primary).                          |
+| `startupMode`           | no       | `"auto"`                               | `"auto"` (joins routing automatically) or `"manual"` (only after `/lsp start`).                                                   |
+| `conflictGroup`         | no       | primary: server name; companion: unset | Display-only grouping label for primary replacement scenarios, surfaced in `/lsp status`. Not yet enforced at routing time.       |
 
 ¹ Either `extensionToLanguage` or `extensions` must be present; `extensionToLanguage` takes precedence.
 ² When `extensions` is used without `extensionToLanguage`, the extension guesses `languageId` from a built-in table (covers TS/JS, Python, Rust, Go, Java, C/C++, C#, and ~20 others). Unknown extensions fall back to `"plaintext"`.
@@ -136,21 +136,22 @@ Retryable failures are tried again on the next LSP use until the startup attempt
 
 With no `servers` block in `config.json`, the extension scans `PATH` for the following built-in recipes and enables each one whose command is found:
 
-| Recipe     | Command                       | Args      | Extensions                                                                            | Install hint                                                                                                                          |
-| ---------- | ----------------------------- | --------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript | `typescript-language-server`  | `--stdio` | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts`                          | `npm install -g typescript typescript-language-server`                                                                                |
-| Python     | `pyright-langserver`          | `--stdio` | `.py`, `.pyw`                                                                         | `npm install -g pyright`                                                                                                              |
-| Rust       | `rust-analyzer`               | none      | `.rs`                                                                                 | `rustup component add rust-analyzer` (or an OS package)                                                                               |
-| Go         | `gopls`                       | none      | `.go`                                                                                 | `go install golang.org/x/tools/gopls@latest`                                                                                          |
-| Kotlin     | `kotlin-lsp`                  | `--stdio` | `.kt`                                                                                 | `brew install JetBrains/utils/kotlin-lsp` (or a release from https://github.com/Kotlin/kotlin-lsp, requires Java 17+)                 |
-| Lua        | `lua-language-server`         | none      | `.lua`                                                                                | `pacman -S lua-language-server` / `brew install lua-language-server` (or a release from https://github.com/LuaLS/lua-language-server) |
-| C/C++      | `clangd`                      | none      | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.hh`, `.hpp`, `.hxx`, `.h++`, `.m`, `.mm` | `pacman -S clang` / `brew install llvm` / `apt install clangd`                                                                        |
-| Bash       | `bash-language-server`        | `start`   | `.sh`, `.bash`, `.zsh`, `.ksh`                                                        | `npm install -g bash-language-server`                                                                                                 |
-| JSON       | `vscode-json-language-server` | `--stdio` | `.json`, `.jsonc`                                                                     | `npm install -g vscode-langservers-extracted`                                                                                         |
-| YAML       | `yaml-language-server`        | `--stdio` | `.yaml`, `.yml`                                                                       | `npm install -g yaml-language-server`                                                                                                 |
-| HTML       | `vscode-html-language-server` | `--stdio` | `.html`, `.htm`                                                                       | `npm install -g vscode-langservers-extracted`                                                                                         |
-| CSS        | `vscode-css-language-server`  | `--stdio` | `.css`, `.scss`, `.less`                                                              | `npm install -g vscode-langservers-extracted`                                                                                         |
-| Vue        | `vue-language-server`         | `--stdio` | `.vue`                                                                                | `npm install -g @vue/language-server`                                                                                                 |
+| Recipe     | Command                         | Args      | Extensions                                                                            | Install hint                                                                                                                          |
+| ---------- | ------------------------------- | --------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript | `typescript-language-server`    | `--stdio` | `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts`                          | `npm install -g typescript typescript-language-server`                                                                                |
+| ESLint     | `vscode-eslint-language-server` | `--stdio` | `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`, `.vue`                  | `npm install -g vscode-langservers-extracted`                                                                                         |
+| Python     | `pyright-langserver`            | `--stdio` | `.py`, `.pyw`                                                                         | `npm install -g pyright`                                                                                                              |
+| Rust       | `rust-analyzer`                 | none      | `.rs`                                                                                 | `rustup component add rust-analyzer` (or an OS package)                                                                               |
+| Go         | `gopls`                         | none      | `.go`                                                                                 | `go install golang.org/x/tools/gopls@latest`                                                                                          |
+| Kotlin     | `kotlin-lsp`                    | `--stdio` | `.kt`                                                                                 | `brew install JetBrains/utils/kotlin-lsp` (or a release from https://github.com/Kotlin/kotlin-lsp, requires Java 17+)                 |
+| Lua        | `lua-language-server`           | none      | `.lua`                                                                                | `pacman -S lua-language-server` / `brew install lua-language-server` (or a release from https://github.com/LuaLS/lua-language-server) |
+| C/C++      | `clangd`                        | none      | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.hh`, `.hpp`, `.hxx`, `.h++`, `.m`, `.mm` | `pacman -S clang` / `brew install llvm` / `apt install clangd`                                                                        |
+| Bash       | `bash-language-server`          | `start`   | `.sh`, `.bash`, `.zsh`, `.ksh`                                                        | `npm install -g bash-language-server`                                                                                                 |
+| JSON       | `vscode-json-language-server`   | `--stdio` | `.json`, `.jsonc`                                                                     | `npm install -g vscode-langservers-extracted`                                                                                         |
+| YAML       | `yaml-language-server`          | `--stdio` | `.yaml`, `.yml`                                                                       | `npm install -g yaml-language-server`                                                                                                 |
+| HTML       | `vscode-html-language-server`   | `--stdio` | `.html`, `.htm`                                                                       | `npm install -g vscode-langservers-extracted`                                                                                         |
+| CSS        | `vscode-css-language-server`    | `--stdio` | `.css`, `.scss`, `.less`                                                              | `npm install -g vscode-langservers-extracted`                                                                                         |
+| Vue        | `vue-language-server`           | `--stdio` | `.vue`                                                                                | `npm install -g @vue/language-server`                                                                                                 |
 
 User entries in `servers` are authoritative: a built-in recipe is skipped when its server name collides with a user entry **or** when its extensions are already covered by a user `primary` + `startupMode: "auto"` entry. Companion (`role: "companion"`) and manual (`startupMode: "manual"`) user entries do **not** suppress an auto-primary recipe, so you can layer e.g. ESLint alongside the built-in TypeScript recipe without losing navigation. Recipes still supplement uncovered languages. Invalid user entries do not disable autodetection for unrelated languages.
 
@@ -206,12 +207,21 @@ With this entry, the built-in `typescript` recipe is skipped because the user-co
       },
       "role": "companion",
       "startupMode": "auto",
+      // Required: vscode-eslint-language-server returns an empty pull
+      // diagnostic report unless validate is on and a working directory mode
+      // is configured. The built-in ESLint recipe ships these defaults, but a
+      // user-configured `eslint` entry must supply its own settings.
+      "settings": {
+        "validate": "on",
+        "useFlatConfig": true,
+        "workingDirectory": { "mode": "location" },
+      },
     },
   },
 }
 ```
 
-ESLint diagnostics surface alongside TypeScript diagnostics; navigation operations still target the built-in TypeScript primary.
+ESLint diagnostics surface alongside TypeScript diagnostics; navigation operations still target the built-in TypeScript primary. The built-in ESLint recipe also ships default `vscode-eslint-language-server` settings (e.g. `validate: 'on'`, `useFlatConfig: true`, `workingDirectory: { mode: 'location' }`) so pull diagnostics work out of the box. User-configured `eslint` entries do **not** inherit the recipe defaults — supply your own `settings` block as shown above.
 
 ### Example: Tailwind CSS manual companion
 
@@ -236,14 +246,14 @@ ESLint diagnostics surface alongside TypeScript diagnostics; navigation operatio
 
 The Tailwind server is configured and visible in `/lsp status` but inactive until you enable it for the session via `/lsp start`.
 
+## Logging
+
+Logging defaults to **error level** — only errors are written. Set `PI_LSP_LOG_LEVEL=debug` to enable debug output. Logs are streamed to `~/.pi/pi-x-ide/debug.log` (never to stdout/stderr) and the directory is created on first write. Override the destination with `PI_LSP_LOG_FILE=/absolute/path/to/file`. If the file cannot be written, logging is silently disabled for the rest of the session.
+
 ## Limitations
 
 - **`findReferences` cold start**: The extension opens files lazily. References in files the server has not indexed (e.g. outside `tsconfig.json`'s include set) may be missing on a cold start. Matching Claude Code's default, no eager workspace priming is performed.
 - **Primary server selection on overlap**: If two `primary` servers list the same extension, only the first registered server is used. Use a user-defined `primary` server to replace a built-in recipe, or set `conflictGroup` to make the replacement explicit.
-
-### Future optimization
-
-`settings` in the server config is accepted for schema compatibility but is not delivered to the LSP server. Claude Code has the same gap (schema describes `workspace/didChangeConfiguration` but the implementation answers `workspace/configuration` with `null` and never pushes settings). A future version may send `workspace/didChangeConfiguration` after initialization.
 
 ## Installation
 

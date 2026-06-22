@@ -22,8 +22,40 @@ export interface LspServerRecipe {
   extensionToLanguage: Record<string, string>;
   /** Human-readable install hint shown when the command is not on PATH. */
   installHint: string;
+  /** Server role in multi-server routing; defaults to primary. */
+  role?: ScopedLspServerConfig['role'];
   startupTimeout?: number;
+  /** Optional default settings returned to the server via workspace/configuration. */
+  settings?: unknown;
 }
+
+/**
+ * Default `vscode-eslint-language-server` settings required for the server to
+ * resolve ESLint and compute diagnostics. These mirror VS Code's defaults and
+ * are merged with the dynamic `workspaceFolder` at request time inside the
+ * manager.
+ */
+const ESLINT_DEFAULT_SETTINGS = {
+  validate: 'on',
+  packageManager: 'npm',
+  useESLintClass: true,
+  useFlatConfig: true,
+  experimental: { useFlatConfig: false },
+  nodePath: null,
+  workingDirectory: { mode: 'location' },
+  codeAction: {
+    disableRuleComment: { enable: true, location: 'separateLine' },
+    showDocumentation: { enable: true },
+  },
+  codeActionOnSave: { enable: false, mode: 'all' },
+  format: false,
+  onIgnoredFiles: 'off',
+  options: {},
+  problems: { shortenToSingleLine: false },
+  quiet: false,
+  rulesCustomizations: [],
+  run: 'onType',
+} as const;
 
 /**
  * The first-iteration built-in recipe set. Order is significant: the first
@@ -47,6 +79,26 @@ export const BUILTIN_RECIPES: readonly LspServerRecipe[] = [
     },
     installHint:
       'Install `typescript-language-server` and `typescript` (for example `npm install -g typescript typescript-language-server`) and ensure the command is on PATH.',
+  },
+  {
+    name: 'eslint',
+    command: 'vscode-eslint-language-server',
+    args: ['--stdio'],
+    extensionToLanguage: {
+      '.js': 'javascript',
+      '.jsx': 'javascriptreact',
+      '.mjs': 'javascript',
+      '.cjs': 'javascript',
+      '.ts': 'typescript',
+      '.tsx': 'typescriptreact',
+      '.mts': 'typescript',
+      '.cts': 'typescript',
+      '.vue': 'vue',
+    },
+    role: 'companion',
+    settings: ESLINT_DEFAULT_SETTINGS,
+    installHint:
+      'Install `vscode-langservers-extracted` (for example `npm install -g vscode-langservers-extracted`) which provides `vscode-eslint-language-server` on PATH.',
   },
   {
     name: 'python',
@@ -265,9 +317,10 @@ export function getDetectedRecipeServers(
       startupTimeout: recipe.startupTimeout ?? 10000,
       maxRestarts: 3,
       transport: 'stdio',
-      role: 'primary',
+      role: recipe.role ?? 'primary',
       startupMode: 'auto',
-      conflictGroup: recipe.name,
+      conflictGroup: recipe.role === 'companion' ? undefined : recipe.name,
+      ...(recipe.settings !== undefined ? { settings: recipe.settings } : {}),
     };
     logForDebugging(`recipes: detected ${recipe.name} (${recipe.command} -> ${resolved})`);
   }
@@ -276,15 +329,22 @@ export function getDetectedRecipeServers(
 
 /**
  * Look up the install hint for a known file extension. Returns undefined when
- * no built-in recipe handles the extension.
+ * no built-in recipe handles the extension. Primary recipes win over
+ * companions (e.g. `.vue` should surface the Vue install hint, not ESLint's),
+ * which matters when the agent reports a missing language server for a file
+ * type — navigation needs a primary, so the hint should drive the user toward
+ * installing one.
  */
 export function getRecipeHintForExtension(ext: string): string | undefined {
   if (!ext) return undefined;
   const normalized = ext.toLowerCase();
+  let companionHint: string | undefined;
   for (const recipe of BUILTIN_RECIPES) {
-    if (recipe.extensionToLanguage[normalized]) return recipe.installHint;
+    if (!recipe.extensionToLanguage[normalized]) continue;
+    if ((recipe.role ?? 'primary') === 'primary') return recipe.installHint;
+    if (companionHint === undefined) companionHint = recipe.installHint;
   }
-  return undefined;
+  return companionHint;
 }
 
 /**

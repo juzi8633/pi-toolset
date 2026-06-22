@@ -4,7 +4,12 @@
 import { readFile } from 'node:fs/promises';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { PublishDiagnosticsParams } from 'vscode-languageserver-protocol';
+import type {
+  DocumentDiagnosticParams,
+  DocumentDiagnosticReport,
+  PublishDiagnosticsParams,
+} from 'vscode-languageserver-protocol';
+import type { Diagnostic as LspDiagnostic } from 'vscode-languageserver-types';
 import { getAllLspServers } from './config.ts';
 import * as diagnostics from './diagnostics.ts';
 import { createLSPServerInstance, type LSPServerInstance } from './instance.ts';
@@ -23,6 +28,112 @@ export type LSPServerInstanceFactory = (
 
 const defaultInstanceFactory: LSPServerInstanceFactory = (name, config, onStateChange) =>
   createLSPServerInstance(name, config, undefined, () => onStateChange());
+
+/**
+ * Build the response value sent back to `workspace/configuration` requests.
+ *
+ * The LSP protocol expects an array with one entry per requested item. We
+ * return the same resolved settings for every item so a server asking for
+ * `eslint`, `eslint.format`, etc. receives the full configured object for
+ * each section. Servers without configured `settings` receive `null` entries
+ * — semantically equivalent to the previous "answer but don't configure"
+ * behavior.
+ */
+function getWorkspaceConfigurationResponse(
+  config: ScopedLspServerConfig,
+  items: Array<{ section?: string }>
+): unknown[] {
+  const value = buildServerSettings(config);
+  return items.map(() => value);
+}
+
+/**
+ * Resolve the settings value handed to the server. When `settings` is omitted
+ * we return `null` so the protocol shape stays the same as before. When
+ * `settings` is an object we merge in a dynamic `workspaceFolder` (the format
+ * `vscode-eslint-language-server` expects) unless the user already supplied
+ * one. Non-object settings (e.g. boolean/number/string) are returned as-is.
+ */
+function buildServerSettings(config: ScopedLspServerConfig): unknown {
+  const settings = config.settings;
+  if (settings === undefined) return null;
+  if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
+    return settings;
+  }
+  const workspaceFolder = config.workspaceFolder ?? process.cwd();
+  const obj = settings as Record<string, unknown>;
+  if (obj.workspaceFolder !== undefined) {
+    return { ...obj };
+  }
+  return {
+    ...obj,
+    workspaceFolder: {
+      uri: pathToFileURL(workspaceFolder).href,
+      name: path.basename(workspaceFolder),
+    },
+  };
+}
+
+/**
+ * True when the server advertises `textDocument/diagnostic` (pull diagnostics)
+ * support via its initialize result.
+ */
+function hasPullDiagnostics(server: LSPServerInstance): boolean {
+  return server.capabilities?.diagnosticProvider !== undefined;
+}
+
+/**
+ * Optional `identifier` value to forward in `DocumentDiagnosticParams`. Only
+ * returned when the provider is an object (LSP options form) with a non-empty
+ * string identifier; servers advertising the boolean form receive `undefined`.
+ */
+function getDiagnosticProviderIdentifier(server: LSPServerInstance): string | undefined {
+  const provider = server.capabilities?.diagnosticProvider;
+  if (!provider || typeof provider !== 'object') return undefined;
+  const identifier = (provider as { identifier?: unknown }).identifier;
+  return typeof identifier === 'string' && identifier.length > 0 ? identifier : undefined;
+}
+
+/**
+ * Extract diagnostics from a full document diagnostic report. Returns
+ * `undefined` for `kind: 'unchanged'` (we don't track previousResultId yet)
+ * and any malformed report.
+ */
+function extractFullDiagnostics(
+  report: DocumentDiagnosticReport | null | undefined
+): LspDiagnostic[] | undefined {
+  if (!report || typeof report !== 'object') return undefined;
+  if ((report as { kind?: unknown }).kind !== 'full') return undefined;
+  const items = (report as { items?: unknown }).items;
+  if (!Array.isArray(items)) return undefined;
+  return items as LspDiagnostic[];
+}
+
+/**
+ * Maximum time we'll wait for a single pull diagnostic response. Pull
+ * diagnostics are awaited inline by `openFile()` and `syncFileChange()`, both
+ * of which sit on the tool flow's hot path; a slow or hung companion server
+ * must not block edits or navigation requests. Picked to comfortably cover
+ * normal ESLint pulls (typically <500ms) while still bounding the worst case.
+ */
+const PULL_DIAGNOSTICS_TIMEOUT_MS = 2000;
+
+/**
+ * Race `promise` against a timer. Resolves with the promise's value, or
+ * rejects with a timeout error after `ms` milliseconds. The timer is always
+ * cleared so a fast resolution doesn't leak it.
+ */
+async function raceWithTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
 
 /**
  * LSP Server Manager interface.
@@ -206,14 +317,19 @@ export function createLSPServerManager(
         lastObservedState.set(serverName, instance.state);
 
         // Register handler for workspace/configuration requests from the server.
-        // Some servers (like TypeScript) send these even when we say we don't support them.
+        // Returns the configured `settings` object (merged with a dynamic
+        // workspaceFolder when settings is an object) so servers like
+        // vscode-eslint-language-server can resolve their runtime configuration.
+        // Servers without settings receive null, preserving the original
+        // behavior of acknowledging the request without supplying config.
         instance.onRequest(
           'workspace/configuration',
           (params: { items: Array<{ section?: string }> }) => {
-            logForDebugging(`LSP: Received workspace/configuration request from ${serverName}`);
-            // Return null config for each requested item - satisfies the protocol
-            // without providing actual configuration.
-            return params.items.map(() => null);
+            const items = params.items ?? [];
+            logForDebugging(
+              `LSP: Received workspace/configuration request from ${serverName} (${items.length} item(s))`
+            );
+            return getWorkspaceConfigurationResponse(config, items);
           }
         );
 
@@ -487,6 +603,7 @@ export function createLSPServerManager(
     const candidates = getServersForFile(filePath);
     if (candidates.length === 0) return;
     await Promise.all(candidates.map((server) => openOnServer(server, filePath, content)));
+    await pullDiagnosticsForFile(filePath);
   }
 
   async function changeFile(filePath: string, content: string): Promise<void> {
@@ -599,6 +716,47 @@ export function createLSPServerManager(
 
     await changeFile(filePath, content);
     await saveFile(filePath);
+    await pullDiagnosticsForFile(filePath);
+  }
+
+  async function pullDiagnosticsForFile(filePath: string): Promise<void> {
+    const candidates = getServersForFile(filePath);
+    if (candidates.length === 0) return;
+    const fileUri = pathToFileURL(path.resolve(filePath)).href;
+
+    await Promise.all(
+      candidates.map(async (server) => {
+        if (server.state !== 'running') return;
+        if (!isFileOpenInServer(fileUri, server.name)) return;
+        if (!hasPullDiagnostics(server)) return;
+
+        const identifier = getDiagnosticProviderIdentifier(server);
+        const params: DocumentDiagnosticParams = {
+          textDocument: { uri: fileUri },
+          ...(identifier ? { identifier } : {}),
+        };
+
+        try {
+          const report = await raceWithTimeout(
+            server.sendRequest<DocumentDiagnosticReport>('textDocument/diagnostic', params),
+            PULL_DIAGNOSTICS_TIMEOUT_MS,
+            `pull diagnostics timed out after ${PULL_DIAGNOSTICS_TIMEOUT_MS}ms`
+          );
+          const items = extractFullDiagnostics(report);
+          if (items === undefined) {
+            // 'unchanged' or non-conforming report. Without a previousResultId we
+            // can't act on this; just leave the prior pending entry intact.
+            logForDebugging(`LSP: pull diagnostics from ${server.name} unchanged for ${fileUri}`);
+            return;
+          }
+          diagnostics.register(server.name, fileUri, items);
+        } catch (error) {
+          logForDebugging(
+            `LSP: pull diagnostics failed for ${filePath} on ${server.name}: ${errorMessage(error)}`
+          );
+        }
+      })
+    );
   }
 
   function isFileOpen(filePath: string): boolean {
