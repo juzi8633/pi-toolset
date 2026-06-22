@@ -11,4 +11,5 @@ coverage/
 .bun.lockb
 .memory/
 .pi/pi-subagents
+.pi/APPEND_SYSTEM.md
 .worktrees
