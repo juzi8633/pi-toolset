@@ -3,7 +3,7 @@
 
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { InitializeParams } from 'vscode-languageserver-protocol';
+import type { InitializeParams, ServerCapabilities } from 'vscode-languageserver-protocol';
 import { createLSPClient, type LSPClient } from './client.ts';
 import { errorMessage, logError, logForDebugging, sleep } from './log.ts';
 import { classifyStartupFailure, type StartupFailureClassification } from './startup-errors.ts';
@@ -46,6 +46,8 @@ export type LSPServerInstance = {
   readonly lastError: Error | undefined;
   /** Number of times restart() has been called */
   readonly restartCount: number;
+  /** Capabilities reported by the server after initialize, if any. */
+  readonly capabilities: ServerCapabilities | undefined;
   /** Start the server and initialize it */
   start(): Promise<void>;
   /** Stop the server gracefully */
@@ -230,9 +232,9 @@ export function createLSPServerInstance(
         // Client capabilities - declare what features we support
         capabilities: {
           workspace: {
-            // Don't claim to support workspace/configuration since we don't implement it
-            // This prevents servers from requesting config we can't provide
-            configuration: false,
+            // The manager answers workspace/configuration requests with either
+            // the configured `settings` object or `null`, so we advertise support.
+            configuration: true,
             // Don't claim to support workspace folders changes since we don't handle
             // workspace/didChangeWorkspaceFolders notifications
             workspaceFolders: false,
@@ -252,6 +254,11 @@ export function createLSPServerInstance(
               versionSupport: false,
               codeDescriptionSupport: true,
               dataSupport: false,
+            },
+            diagnostic: {
+              dynamicRegistration: false,
+              relatedDocumentSupport: false,
+              markupMessageSupport: false,
             },
             hover: {
               dynamicRegistration: false,
@@ -513,6 +520,9 @@ export function createLSPServerInstance(
     },
     get restartCount() {
       return restartCount;
+    },
+    get capabilities() {
+      return client.capabilities;
     },
     start,
     stop,

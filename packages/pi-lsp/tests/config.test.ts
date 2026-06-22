@@ -179,3 +179,145 @@ describe('user config precedence', () => {
     expect(servers.mysrv!.command).toBe('/abs/path/project-srv');
   });
 });
+
+describe('role and startup mode normalization', () => {
+  it('defaults omitted role and startupMode to primary/auto for user servers', async () => {
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          mysrv: {
+            command: '/abs/path/srv',
+            extensionToLanguage: { '.x': 'x' },
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.mysrv!.role).toBe('primary');
+    expect(servers.mysrv!.startupMode).toBe('auto');
+    expect(servers.mysrv!.conflictGroup).toBe('mysrv');
+  });
+
+  it('preserves role: companion and startupMode: manual when provided', async () => {
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          tailwind: {
+            command: '/abs/path/tailwindcss-language-server',
+            extensionToLanguage: { '.ts': 'typescript' },
+            role: 'companion',
+            startupMode: 'manual',
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.tailwind!.role).toBe('companion');
+    expect(servers.tailwind!.startupMode).toBe('manual');
+    // Companion servers without an explicit conflictGroup leave it undefined.
+    expect(servers.tailwind!.conflictGroup).toBeUndefined();
+  });
+
+  it('rejects invalid role values while keeping valid sibling servers', async () => {
+    makeExecutable(pathDir, 'typescript-language-server');
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          bad: {
+            command: '/abs/path/srv',
+            extensionToLanguage: { '.x': 'x' },
+            role: 'auxiliary',
+          },
+          good: {
+            command: '/abs/path/srv2',
+            extensionToLanguage: { '.y': 'y' },
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.bad).toBeUndefined();
+    expect(servers.good).toBeDefined();
+    // Recipe still autodetected for unrelated extension.
+    expect(servers.typescript).toBeDefined();
+  });
+
+  it('rejects invalid startupMode values while keeping valid sibling servers', async () => {
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          bad: {
+            command: '/abs/path/srv',
+            extensionToLanguage: { '.x': 'x' },
+            startupMode: 'eager',
+          },
+          good: {
+            command: '/abs/path/srv2',
+            extensionToLanguage: { '.y': 'y' },
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.bad).toBeUndefined();
+    expect(servers.good).toBeDefined();
+  });
+});
+
+describe('recipe merge rules for role and startup mode', () => {
+  it('keeps the typescript recipe when a user eslint companion overlaps .ts', async () => {
+    makeExecutable(pathDir, 'typescript-language-server');
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          eslint: {
+            command: '/abs/path/eslint-lsp',
+            extensionToLanguage: { '.ts': 'typescript', '.js': 'javascript' },
+            role: 'companion',
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(Object.keys(servers).sort()).toEqual(['eslint', 'typescript']);
+    expect(servers.eslint!.role).toBe('companion');
+    expect(servers.typescript!.role).toBe('primary');
+  });
+
+  it('keeps the typescript recipe when a manual tailwindcss companion overlaps .ts', async () => {
+    makeExecutable(pathDir, 'typescript-language-server');
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          tailwindcss: {
+            command: '/abs/path/tailwindcss-language-server',
+            extensionToLanguage: { '.ts': 'typescript' },
+            role: 'companion',
+            startupMode: 'manual',
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(Object.keys(servers).sort()).toEqual(['tailwindcss', 'typescript']);
+    expect(servers.tailwindcss!.startupMode).toBe('manual');
+    expect(servers.typescript!.startupMode).toBe('auto');
+  });
+
+  it('does not let a manual primary user server suppress the auto primary recipe', async () => {
+    makeExecutable(pathDir, 'typescript-language-server');
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          'opt-in-ts': {
+            command: '/abs/path/some-ts-lsp',
+            extensionToLanguage: { '.ts': 'typescript' },
+            startupMode: 'manual',
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(Object.keys(servers).sort()).toEqual(['opt-in-ts', 'typescript']);
+  });
+});

@@ -19,13 +19,29 @@ export type LspServerState = 'stopped' | 'starting' | 'running' | 'stopping' | '
  */
 export type LspTransport = 'stdio' | 'socket';
 
+/**
+ * Role of an LSP server in multi-server routing.
+ *
+ * `primary` servers provide language understanding (navigation, hover, symbols)
+ * and at most one is consulted per file for tool requests. `companion` servers
+ * augment the primary with additional diagnostics or contextual help (e.g.
+ * lint, Tailwind CSS) and do not participate in primary-only operations.
+ */
+export type LspServerRole = 'primary' | 'companion';
+
+/**
+ * Whether a server participates automatically in routing or must be enabled
+ * per session via `/lsp start`.
+ */
+export type LspStartupMode = 'auto' | 'manual';
+
 export interface ScopedLspServerConfig {
   command: string;
   args?: string[];
   extensionToLanguage: Record<string, string>;
   env?: Record<string, string>;
   initializationOptions?: unknown;
-  /** Server settings pushed via workspace/didChangeConfiguration (optional). */
+  /** Server settings returned from workspace/configuration (optional). */
   settings?: unknown;
   workspaceFolder?: string;
   startupTimeout?: number;
@@ -36,6 +52,16 @@ export interface ScopedLspServerConfig {
   maxRestarts?: number;
   /** Accepted for compatibility; only 'stdio' is implemented. */
   transport?: LspTransport;
+  /** Server role in multi-server routing. Defaults to 'primary'. */
+  role?: LspServerRole;
+  /** Whether to participate in automatic routing. Defaults to 'auto'. */
+  startupMode?: LspStartupMode;
+  /**
+   * Optional grouping key for primary replacement scenarios (e.g. two TS-like
+   * servers should not both fire). Defaults to the server name for primary
+   * servers and is undefined for companions.
+   */
+  conflictGroup?: string;
 }
 
 /**

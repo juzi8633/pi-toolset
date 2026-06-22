@@ -109,6 +109,9 @@ describe('getDetectedRecipeServers', () => {
     expect(ts.args).toEqual(['--stdio']);
     expect(ts.extensionToLanguage['.ts']).toBe('typescript');
     expect(ts.transport).toBe('stdio');
+    expect(ts.role).toBe('primary');
+    expect(ts.startupMode).toBe('auto');
+    expect(ts.conflictGroup).toBe('typescript');
   });
 
   it('detects multiple recipes when several binaries exist', () => {
@@ -125,12 +128,14 @@ describe('getDetectedRecipeServers', () => {
     makeExecutable(dir, 'vscode-html-language-server');
     makeExecutable(dir, 'vscode-css-language-server');
     makeExecutable(dir, 'vue-language-server');
+    makeExecutable(dir, 'vscode-eslint-language-server');
     const detected = getDetectedRecipeServers(dir);
     const names = Object.keys(detected).sort();
     expect(names).toEqual([
       'bash',
       'clangd',
       'css',
+      'eslint',
       'go',
       'html',
       'json',
@@ -141,6 +146,18 @@ describe('getDetectedRecipeServers', () => {
       'vue',
       'yaml',
     ]);
+    expect(detected.eslint!.role).toBe('companion');
+    expect(detected.eslint!.conflictGroup).toBeUndefined();
+    expect(detected.eslint!.extensionToLanguage['.ts']).toBe('typescript');
+    expect(detected.eslint!.extensionToLanguage['.vue']).toBe('vue');
+    const eslintSettings = detected.eslint!.settings as Record<string, unknown>;
+    expect(eslintSettings).toBeDefined();
+    expect(eslintSettings.validate).toBe('on');
+    expect(eslintSettings.packageManager).toBe('npm');
+    expect(eslintSettings.useFlatConfig).toBe(true);
+    expect(eslintSettings.workingDirectory).toEqual({ mode: 'location' });
+    expect(detected.typescript!.role).toBe('primary');
+    expect(detected.typescript!.conflictGroup).toBe('typescript');
     expect(detected.python!.extensionToLanguage['.py']).toBe('python');
     expect(detected.go!.extensionToLanguage['.go']).toBe('go');
     expect(detected.kotlin!.extensionToLanguage['.kt']).toBe('kotlin');
@@ -171,6 +188,13 @@ describe('recipe hint helpers', () => {
     expect(getRecipeHintForExtension('')).toBeUndefined();
   });
 
+  it('returns the primary recipe hint for .vue, not the ESLint companion', () => {
+    const hint = getRecipeHintForExtension('.vue');
+    expect(hint).toBeDefined();
+    expect(hint!.toLowerCase().includes('@vue/language-server')).toBe(true);
+    expect(hint!.toLowerCase().includes('eslint')).toBe(false);
+  });
+
   it('recipeCoversExtension reports coverage', () => {
     expect(recipeCoversExtension('.go')).toBe(true);
     expect(recipeCoversExtension('.lua')).toBe(true);
@@ -180,6 +204,7 @@ describe('recipe hint helpers', () => {
     expect(recipeCoversExtension('.html')).toBe(true);
     expect(recipeCoversExtension('.css')).toBe(true);
     expect(recipeCoversExtension('.vue')).toBe(true);
+    expect(recipeCoversExtension('.mjs')).toBe(true);
     expect(recipeCoversExtension('.foo')).toBe(false);
   });
 });

@@ -17,6 +17,8 @@ function fakeServer(
     args: ['--stdio'],
     extensionToLanguage: { '.ts': 'typescript' },
     workspaceFolder: '/workspace',
+    role: 'primary',
+    startupMode: 'auto',
   };
 
   return {
@@ -26,6 +28,7 @@ function fakeServer(
     startTime: undefined,
     lastError: undefined,
     restartCount: 0,
+    capabilities: undefined,
     async start() {},
     async stop() {},
     async restart() {},
@@ -40,24 +43,42 @@ function fakeServer(
   };
 }
 
-function fakeManager(servers: LSPServerInstance[]): LSPServerManager {
+function fakeManager(
+  servers: LSPServerInstance[],
+  options: { manualActiveSet?: Set<string> } = {}
+): LSPServerManager {
   const serverMap = new Map(servers.map((server) => [server.name, server]));
+  const manualActive = options.manualActiveSet ?? new Set<string>();
 
   return {
     async initialize() {},
     async shutdown() {},
     getServerForFile: () => servers[0],
+    getConfiguredServersForFile: () => servers,
+    getServersForFile: () => servers,
+    getPrimaryServerForFile: () => servers[0],
     ensureServerStarted: async () => servers[0],
     sendRequest: async () => undefined,
     getAllServers: () => serverMap,
     getStateCounts: () => ({ running: 0, starting: 0, error: 0 }),
     onServersChanged: () => () => {},
+    markManualServerActive: (name) => {
+      manualActive.add(name);
+    },
+    markManualServerInactive: (name) => {
+      manualActive.delete(name);
+    },
+    isServerAutoActive: (server) => (server.config.startupMode ?? 'auto') !== 'manual',
+    isServerManuallyActive: (server) => manualActive.has(server.name),
+    isServerActive: (server) =>
+      (server.config.startupMode ?? 'auto') !== 'manual' || manualActive.has(server.name),
     async openFile() {},
     async changeFile() {},
     async saveFile() {},
     async closeFile() {},
     async syncFileChange() {},
     isFileOpen: () => false,
+    isFileOpenInServer: () => false,
   };
 }
 
@@ -118,5 +139,64 @@ describe('formatLspStatusDetails', () => {
     expect(output).toContain('- typescript: running');
     expect(output).toContain('  extensions: .ts, .tsx');
     expect(output).toContain('  started: 2026-06-20T00:00:00.000Z');
+    expect(output).toContain('  role: primary');
+    expect(output).toContain('  startup: auto');
+  });
+
+  it('shows role, startup mode, and manual active state for companion servers', () => {
+    const manual = new Set<string>(['tailwindcss']);
+    const output = formatLspStatusDetails(
+      fakeManager(
+        [
+          fakeServer('typescript', 'running', {
+            config: {
+              command: 'typescript-language-server',
+              args: ['--stdio'],
+              extensionToLanguage: { '.ts': 'typescript' },
+              workspaceFolder: '/repo',
+              role: 'primary',
+              startupMode: 'auto',
+              conflictGroup: 'typescript',
+            },
+          }),
+          fakeServer('eslint', 'stopped', {
+            config: {
+              command: 'eslint-lsp',
+              args: ['--stdio'],
+              extensionToLanguage: { '.ts': 'typescript' },
+              workspaceFolder: '/repo',
+              role: 'companion',
+              startupMode: 'auto',
+            },
+          }),
+          fakeServer('tailwindcss', 'running', {
+            config: {
+              command: 'tailwindcss-language-server',
+              args: ['--stdio'],
+              extensionToLanguage: { '.ts': 'typescript' },
+              workspaceFolder: '/repo',
+              role: 'companion',
+              startupMode: 'manual',
+            },
+          }),
+        ],
+        { manualActiveSet: manual }
+      )
+    );
+
+    // Primary auto: role + startup: auto, no manual active line.
+    expect(output).toContain('- typescript: running');
+    expect(output).toContain('  role: primary');
+    expect(output).toContain('  startup: auto');
+    expect(output).toContain('  conflictGroup: typescript');
+
+    // Companion auto.
+    expect(output).toContain('- eslint: stopped');
+    expect(output).toContain('  role: companion');
+
+    // Manual companion: must include startup: manual and manual active line.
+    expect(output).toContain('- tailwindcss: running');
+    expect(output).toContain('  startup: manual');
+    expect(output).toContain('  manual active: yes');
   });
 });

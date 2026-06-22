@@ -6,7 +6,12 @@ import * as path from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 import { logError, logForDebugging } from './log.ts';
 import { getDetectedRecipeServers } from './recipes.ts';
-import type { LspTransport, ScopedLspServerConfig } from './types.ts';
+import type {
+  LspServerRole,
+  LspStartupMode,
+  LspTransport,
+  ScopedLspServerConfig,
+} from './types.ts';
 
 /**
  * Raw server entry as it appears in config.json `servers.<name>`.
@@ -28,6 +33,9 @@ interface RawServerConfig {
   restartOnCrash?: boolean;
   maxRestarts?: number;
   transport?: LspTransport;
+  role?: string;
+  startupMode?: string;
+  conflictGroup?: string;
 }
 
 interface RawLspConfig {
@@ -165,6 +173,37 @@ function normalizeServer(name: string, raw: RawServerConfig): ScopedLspServerCon
     ? Object.fromEntries(Object.entries(raw.env).map(([k, v]) => [k, substituteEnv(v)]))
     : undefined;
 
+  let role: LspServerRole = 'primary';
+  if (raw.role !== undefined) {
+    if (raw.role !== 'primary' && raw.role !== 'companion') {
+      logError(
+        new Error(`LSP server '${name}': role must be 'primary' or 'companion' (got '${raw.role}')`)
+      );
+      return undefined;
+    }
+    role = raw.role;
+  }
+
+  let startupMode: LspStartupMode = 'auto';
+  if (raw.startupMode !== undefined) {
+    if (raw.startupMode !== 'auto' && raw.startupMode !== 'manual') {
+      logError(
+        new Error(
+          `LSP server '${name}': startupMode must be 'auto' or 'manual' (got '${raw.startupMode}')`
+        )
+      );
+      return undefined;
+    }
+    startupMode = raw.startupMode;
+  }
+
+  const conflictGroup =
+    typeof raw.conflictGroup === 'string' && raw.conflictGroup.length > 0
+      ? raw.conflictGroup
+      : role === 'primary'
+        ? name
+        : undefined;
+
   return {
     command,
     args,
@@ -178,6 +217,9 @@ function normalizeServer(name: string, raw: RawServerConfig): ScopedLspServerCon
     restartOnCrash: raw.restartOnCrash,
     maxRestarts: raw.maxRestarts,
     transport: raw.transport ?? 'stdio',
+    role,
+    startupMode,
+    conflictGroup,
   };
 }
 
@@ -302,8 +344,12 @@ export async function getAllLspServers(cwd: string): Promise<{
   }
 
   const recipes = getDetectedRecipeServers();
+  // Only auto primary user servers participate in extension-overlap suppression;
+  // companions overlap by design, and manual primary servers can be configured
+  // alongside an auto primary recipe until the user explicitly switches.
   const userCoveredExtensions = new Set<string>();
   for (const cfg of Object.values(userServers)) {
+    if (cfg.role !== 'primary' || cfg.startupMode !== 'auto') continue;
     for (const ext of Object.keys(cfg.extensionToLanguage)) {
       userCoveredExtensions.add(ext.toLowerCase());
     }

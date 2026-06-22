@@ -5,11 +5,15 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
+    "lint": "eslint src/**/*.ts",
     "reset": "bash scripts/reset.sh",
     "pi": "bash scripts/run-pi-lsp.sh"
   },
   "devDependencies": {
+    "eslint": "^10.5.0",
     "typescript": "^5.9.3",
-    "typescript-language-server": "^5.1.3"
+    "typescript-eslint": "^8.61.1",
+    "typescript-language-server": "^5.1.3",
+    "vscode-langservers-extracted": "^4.0.0"
   }
 }

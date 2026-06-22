@@ -35,7 +35,7 @@ import {
 } from './formatters.ts';
 import { filterGitIgnoredLocations } from './gitignore.ts';
 import { errorMessage, logError } from './log.ts';
-import { getManager, isLspConnected, waitForInitialization } from './manager.ts';
+import { getManager, waitForInitialization } from './manager.ts';
 import {
   formatFailedStartMessage,
   formatMissingServerMessage,
@@ -177,25 +177,75 @@ async function runLsp(
 
   const absolutePath = path.resolve(cwd, params.filePath);
 
-  if (!isLspConnected()) {
-    // Distinguish "server exists but failed to start" from "no server at all".
-    // The former shows the error reason; the latter shows an install hint.
-    const server = manager.getServerForFile(absolutePath);
-    if (server && server.state === 'error') {
-      const message = formatFailedStartMessage(server.name, server.lastError?.message);
-      maybeNotifyMissingServer(
-        params.filePath,
-        ctx,
-        'tool',
-        server.name,
-        server.lastError?.message
-      );
+  // Per-file routing checks decide messaging before any LSP request: a session
+  // may have running servers for other files while this file's candidates are
+  // all inactive/failed/starting, and a coarse "any server up?" gate would
+  // mask those cases. Each branch below corresponds to a distinct user-facing
+  // story (failed primary, inactive-only, companion-only, transient, no-config).
+  const configured = manager.getConfiguredServersForFile(absolutePath);
+  const active = manager.getServersForFile(absolutePath);
+  const primary = manager.getPrimaryServerForFile(absolutePath);
+
+  if (primary && primary.state === 'error') {
+    const message = formatFailedStartMessage(primary.name, primary.lastError?.message);
+    maybeNotifyMissingServer(
+      params.filePath,
+      ctx,
+      'tool',
+      primary.name,
+      primary.lastError?.message
+    );
+    return textResult(message, params, { ready: false });
+  }
+
+  if (configured.length > 0 && active.length === 0) {
+    const names = configured.map((s) => s.name).join(', ');
+    const message =
+      `LSP server${configured.length === 1 ? '' : 's'} '${names}' configured for ` +
+      `${path.extname(absolutePath)} but inactive. Start with /lsp start to enable.`;
+    maybeNotifyMissingServer(params.filePath, ctx, 'tool');
+    return textResult(message, params, { ready: false });
+  }
+
+  if (active.length > 0 && !primary) {
+    // Active companions only — navigation has no primary to route to.
+    // A configured manual primary that the user hasn't started yet shows up
+    // here; point them at `/lsp start` instead of the generic install hint.
+    // (Auto primaries are always active by construction even when stopped, so
+    // they reach this branch only if their `role`/`startupMode` filter them out.)
+    const inactivePrimaries = configured.filter(
+      (s) => (s.config.role ?? 'primary') === 'primary' && !manager.isServerActive(s)
+    );
+    if (inactivePrimaries.length > 0) {
+      const names = inactivePrimaries.map((s) => s.name).join(', ');
+      const message =
+        `Primary LSP server${inactivePrimaries.length === 1 ? '' : 's'} '${names}' configured ` +
+        `for ${path.extname(absolutePath)} but inactive. Start with /lsp start to enable.`;
+      maybeNotifyMissingServer(params.filePath, ctx, 'tool');
       return textResult(message, params, { ready: false });
     }
     const hint = formatMissingServerMessage(params.filePath);
-    maybeNotifyMissingServer(params.filePath, ctx, 'tool');
     const base =
-      'LSP server is not ready. It may still be starting, or no server is configured for this file type.';
+      `No primary LSP server is available for ${path.extname(absolutePath)}; ` +
+      'only companion servers are active and they do not handle navigation requests.';
+    maybeNotifyMissingServer(params.filePath, ctx, 'tool');
+    return textResult(hint ? `${base}\n\n${hint}` : base, params, { ready: false });
+  }
+
+  if (primary && primary.state !== 'running' && primary.state !== 'stopped') {
+    // 'starting' or 'stopping' — surface a transient "not ready" message.
+    return textResult(
+      `LSP server '${primary.name}' is not ready yet (state: ${primary.state}). Please retry.`,
+      params,
+      { ready: false }
+    );
+  }
+
+  if (!primary) {
+    // No configured server at all — fall back to install-hint message.
+    const hint = formatMissingServerMessage(params.filePath);
+    maybeNotifyMissingServer(params.filePath, ctx, 'tool');
+    const base = `No LSP server is configured for ${path.extname(absolutePath)} files.`;
     return textResult(hint ? `${base}\n\n${hint}` : base, params, { ready: false });
   }
 
@@ -281,7 +331,7 @@ async function runLsp(
     // When the server exists but failed to start (e.g. binary not on PATH,
     // bad args, crash), surface a "failed to start" message with the error
     // reason — NOT "no server configured", because a server IS configured.
-    const server = manager.getServerForFile(absolutePath);
+    const server = manager.getPrimaryServerForFile(absolutePath);
     if (server && server.state === 'error') {
       const message = formatFailedStartMessage(server.name, server.lastError?.message);
       maybeNotifyMissingServer(

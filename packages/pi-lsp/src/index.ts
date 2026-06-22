@@ -17,6 +17,7 @@ import { maybeNotifyMissingServer } from './notifications.ts';
 import { registerLspCommand } from './command.ts';
 import { formatLspStatus } from './statusline.ts';
 import { registerLspTool } from './tools.ts';
+import { logForDebugging } from './log.ts';
 
 /** customType tag used for injected diagnostic blocks so they can be stripped. */
 const DIAGNOSTIC_CUSTOM_TYPE = 'lsp-diagnostics';
@@ -70,6 +71,7 @@ export default function (pi: ExtensionAPI): void {
     const messages = stripDiagnosticBlocks(event.messages);
     const block = diagnostics.drain(ctx.cwd);
     if (block) {
+      logForDebugging(`diagnostics: injecting block for ${ctx.cwd}`, { level: 'debug' });
       messages.push({
         role: 'custom',
         customType: DIAGNOSTIC_CUSTOM_TYPE,
@@ -102,23 +104,50 @@ export default function (pi: ExtensionAPI): void {
       await waitForInitialization();
       const manager = getManager();
       if (manager) {
-        const server = manager.getServerForFile(absolutePath);
-        // Notify when no server covers the file, or when a configured server
-        // previously failed to start (e.g. binary not on PATH, bad args, crash).
-        if (!server || server.state === 'error') {
+        const configured = manager.getConfiguredServersForFile(absolutePath);
+        const active = manager.getServersForFile(absolutePath);
+        const primaryBefore = manager.getPrimaryServerForFile(absolutePath);
+        // Snapshot the state *value*, not the live instance: `instance.state`
+        // is a getter over mutable closure state, so re-reading after the
+        // `await syncFileChange` would mirror the latest state and break the
+        // "just transitioned to error" comparison below.
+        const primaryStateBefore = primaryBefore?.state;
+
+        // Surface a notification when:
+        // - no configured server covers the file (recipe-hint case)
+        // - only inactive manual servers cover the file (configured but dormant)
+        // - the active primary failed to start (lastError available)
+        if (configured.length === 0 || active.length === 0) {
+          maybeNotifyMissingServer(absolutePath, ctx, 'edit');
+        } else if (primaryBefore && primaryStateBefore === 'error') {
           maybeNotifyMissingServer(
             absolutePath,
             ctx,
             'edit',
-            server?.name,
-            server?.lastError?.message
+            primaryBefore.name,
+            primaryBefore.lastError?.message
           );
         }
+
         await manager.syncFileChange(absolutePath);
+
+        // syncFileChange swallows per-server start failures so one bad server
+        // can't block edit sync; re-check the active primary state after sync
+        // and surface a failed-start notice if it just transitioned to 'error'.
+        const primaryAfter = manager.getPrimaryServerForFile(absolutePath);
+        if (primaryAfter && primaryAfter.state === 'error' && primaryStateBefore !== 'error') {
+          maybeNotifyMissingServer(
+            absolutePath,
+            ctx,
+            'edit',
+            primaryAfter.name,
+            primaryAfter.lastError?.message
+          );
+        }
       }
     } catch (error) {
       const manager = getManager();
-      const server = manager?.getServerForFile(absolutePath);
+      const server = manager?.getPrimaryServerForFile(absolutePath);
       if (server?.state === 'error') {
         maybeNotifyMissingServer(absolutePath, ctx, 'edit', server.name, server.lastError?.message);
       }
