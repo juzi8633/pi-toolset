@@ -124,6 +124,7 @@ const deliveredDiagnostics = new LruMap<string, Set<string>>(MAX_DELIVERED_FILES
 // empty <-> non-empty transition so a high-frequency publish stream doesn't
 // thrash the UI.
 const listeners = new Set<() => void>();
+const diagnosticRegisteredListeners = new Set<() => void>();
 
 function diagnosticsPresent(): boolean {
   return pendingDiagnostics.size > 0 || deliveredDiagnostics.size > 0;
@@ -136,6 +137,16 @@ function notifyIfChanged(before: boolean): void {
       listener();
     } catch (error) {
       logError(new Error(`diagnostics listener threw: ${errorMessage(error)}`));
+    }
+  }
+}
+
+function notifyOnDiagnosticRegistered() {
+  for (const listener of diagnosticRegisteredListeners) {
+    try {
+      listener();
+    } catch (error) {
+      logError(new Error(`diagnostic registered listener threw: ${errorMessage(error)}`));
     }
   }
 }
@@ -253,6 +264,7 @@ export function register(serverName: string, uri: string, diagnostics: LspDiagno
     `diagnostics: registered ${stored.length} diagnostic(s) for ${uri} from ${serverName}`
   );
   notifyIfChanged(before);
+  notifyOnDiagnosticRegistered();
 }
 
 /**
@@ -367,7 +379,7 @@ function formatBlock(
   cwd?: string
 ): string {
   const lines: string[] = [
-    `New LSP diagnostics detected (${total} issue${total === 1 ? '' : 's'} across ${files.length} file${files.length === 1 ? '' : 's'}):`,
+    `The following new diagnostic were detected (${total} issue${total === 1 ? '' : 's'} across ${files.length} file${files.length === 1 ? '' : 's'}):`,
   ];
 
   for (const file of files) {
@@ -396,7 +408,7 @@ function formatBlock(
     lines.push(`(${truncated} additional diagnostic(s) truncated by volume caps)`);
   }
 
-  return lines.join('\n');
+  return `<system-reminder><new-diagnostics>${lines.join('\n')}</new-diagnostics></system-reminder>`;
 }
 
 /**
@@ -448,5 +460,12 @@ export function onChanged(listener: () => void): () => void {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
+  };
+}
+
+export function onDiagnosticRegistered(listener: () => void): () => void {
+  diagnosticRegisteredListeners.add(listener);
+  return () => {
+    diagnosticRegisteredListeners.delete(listener);
   };
 }

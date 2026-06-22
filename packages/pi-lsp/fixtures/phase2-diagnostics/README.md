@@ -60,10 +60,13 @@ The LSP server publishes diagnostics **asynchronously**. After an edit:
 - `syncFileChange` sends `didOpen` / `didSave` to the LSP server.
 - The LSP server re-indexes and publishes diagnostics via a `publishDiagnostics`
   notification.
-- The `context` hook fires BEFORE the same-turn LLM call, at which point the
-  server has typically not finished publishing yet.
+- The `before_agent_start` hook fires before the same-turn LLM call, at
+  which point the server has typically not finished publishing yet.
 - Diagnostics are stored in a registry and injected by the **next** user turn
   (or later continuation).
+- Once injected, the diagnostic block stays in the session transcript; the
+  registry only prevents the same diagnostic from being injected again until
+  the file changes.
 
 This matches Claude Code's behavior (diagnostics delivered on the next query).
 Each prompt below is therefore a **two-step** sequence: trigger the edit, then
@@ -73,7 +76,8 @@ You can watch the full lifecycle in `~/.pi/pi-x-ide/debug.log` when the launch
 script sets `PI_LSP_LOG_LEVEL=debug` (`tail -f ~/.pi/pi-x-ide/debug.log`). Look for:
 
 - `diagnostics: registered …` — publishDiagnostics handler stored diagnostics.
-- `diagnostics: delivering …` — the `context` hook drained and formatted them.
+- `diagnostics: delivering …` — the `before_agent_start` hook drained and
+  formatted them.
 - If you never see `registered`, the LSP server is not publishing or the handler
   is not firing. Check `LSP SERVER` / `LSP PROTOCOL` lines for clues.
 
@@ -126,9 +130,9 @@ Do NOT call the lsp tool.
 
 Expected:
 
-- No diagnostic for `src/app.ts` is injected.
-- Repeating the question without another edit should not re-deliver the old
-  diagnostic (cross-turn dedup).
+- No diagnostic for `src/app.ts` is injected again.
+- Repeating the question without another edit should not add a duplicate copy
+  of the old diagnostic (cross-turn dedup).
 
 ### 3. Per-file throttle with many diagnostics (two turns)
 

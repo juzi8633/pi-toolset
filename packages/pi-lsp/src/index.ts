@@ -3,7 +3,6 @@
 
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { isEditToolResult, isWriteToolResult } from '@earendil-works/pi-coding-agent';
 import * as diagnostics from './diagnostics.ts';
@@ -19,7 +18,7 @@ import { formatLspStatus } from './statusline.ts';
 import { registerLspTool } from './tools.ts';
 import { logForDebugging } from './log.ts';
 
-/** customType tag used for injected diagnostic blocks so they can be stripped. */
+/** customType tag used for hidden diagnostic messages. */
 const DIAGNOSTIC_CUSTOM_TYPE = 'lsp-diagnostics';
 
 /** Status segment key used to identify the LSP indicator in setStatus. */
@@ -33,6 +32,34 @@ export default function (pi: ExtensionAPI): void {
 
   let unsubscribeLspStatus: (() => void) | undefined;
   let unsubscribeDiagnostics: (() => void) | undefined;
+  let unsubscribeDiagnosticRegistered: (() => void) | undefined;
+  let diagnosticFlushScheduled = false;
+  let diagnosticFlushGeneration = 0;
+
+  const scheduleDiagnosticFlush = (cwd: string): void => {
+    logForDebugging(`diagnostics: scheduling flush for ${cwd}`);
+    if (diagnosticFlushScheduled) return;
+    diagnosticFlushScheduled = true;
+    const generation = diagnosticFlushGeneration;
+
+    queueMicrotask(() => {
+      diagnosticFlushScheduled = false;
+      if (generation !== diagnosticFlushGeneration) return;
+
+      const block = diagnostics.drain(cwd);
+      if (!block) return;
+
+      logForDebugging(`diagnostics: injecting block for ${cwd}`);
+      pi.sendMessage(
+        {
+          customType: DIAGNOSTIC_CUSTOM_TYPE,
+          content: block,
+          display: false,
+        },
+        { deliverAs: 'steer' }
+      );
+    });
+  };
 
   pi.on('session_start', (_event, ctx) => {
     // Synchronous, non-blocking, idempotent. Servers are lazily started on the
@@ -56,6 +83,14 @@ export default function (pi: ExtensionAPI): void {
     unsubscribeDiagnostics?.();
     unsubscribeDiagnostics = diagnostics.onChanged(render);
     render();
+
+    diagnosticFlushGeneration += 1;
+    diagnosticFlushScheduled = false;
+
+    unsubscribeDiagnosticRegistered?.();
+    unsubscribeDiagnosticRegistered = diagnostics.onDiagnosticRegistered(() => {
+      scheduleDiagnosticFlush(ctx.cwd);
+    });
   });
 
   pi.on('session_shutdown', async (_event, ctx) => {
@@ -65,29 +100,15 @@ export default function (pi: ExtensionAPI): void {
     unsubscribeLspStatus = undefined;
     unsubscribeDiagnostics?.();
     unsubscribeDiagnostics = undefined;
+    unsubscribeDiagnosticRegistered?.();
+    unsubscribeDiagnosticRegistered = undefined;
+    diagnosticFlushGeneration += 1;
+    diagnosticFlushScheduled = false;
+
     ctx.ui.setStatus(LSP_STATUS_KEY, undefined);
 
     await shutdownManager();
     diagnostics.resetAll();
-  });
-
-  // Inject passive diagnostics before each LLM call. Diagnostics drained here
-  // are ephemeral (transformContext output is not persisted to the transcript),
-  // so stripping prior blocks is a safety net rather than the common path.
-  pi.on('context', (event, ctx) => {
-    const messages = stripDiagnosticBlocks(event.messages);
-    const block = diagnostics.drain(ctx.cwd);
-    if (block) {
-      logForDebugging(`diagnostics: injecting block for ${ctx.cwd}`);
-      messages.push({
-        role: 'custom',
-        customType: DIAGNOSTIC_CUSTOM_TYPE,
-        content: block,
-        display: false,
-        timestamp: Date.now(),
-      });
-    }
-    return { messages };
   });
 
   // After the agent edits or writes a file, re-sync it to the LSP server so it
@@ -161,16 +182,5 @@ export default function (pi: ExtensionAPI): void {
       // Logged inside the manager; swallow here to keep the hook non-disruptive.
       void error;
     }
-  });
-}
-
-/**
- * Remove any previously injected diagnostic custom messages so they cannot
- * accumulate if a future change persists transformContext output.
- */
-function stripDiagnosticBlocks(messages: AgentMessage[]): AgentMessage[] {
-  return messages.filter((m) => {
-    if (m.role !== 'custom') return true;
-    return (m as { customType?: string }).customType !== DIAGNOSTIC_CUSTOM_TYPE;
   });
 }
