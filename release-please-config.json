@@ -9,6 +9,11 @@
       "component": "pi-lsp",
       "release-type": "node",
       "extra-files": ["src/version.ts"]
+    },
+    "packages/pi-format": {
+      "component": "pi-format",
+      "release-type": "node",
+      "extra-files": ["src/version.ts"]
     }
   }
 }

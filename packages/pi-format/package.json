@@ -1,0 +1,55 @@
+{
+  "name": "@balaenis/pi-format",
+  "version": "0.0.1",
+  "description": "pi format support",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "balaenis",
+    "email": "pzyyll@gmail.com"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "format",
+    "formatter",
+    "prettier",
+    "biome"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/balaenis/pi-toolset.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.79.8",
+    "@earendil-works/pi-ai": "^0.79.8",
+    "@earendil-works/pi-coding-agent": "^0.79.8",
+    "@earendil-works/pi-tui": "^0.79.8",
+    "typebox": "^1.2.17"
+  }
+}

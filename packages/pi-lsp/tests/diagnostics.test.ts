@@ -65,6 +65,29 @@ describe('multi-server diagnostics', () => {
     expect(block!).not.toContain('lint error');
   });
 
+  it('clears delivered diagnostics for the publishing server on clean publish', () => {
+    const uri = 'file:///tmp/b-delivered.ts';
+    register('typescript', uri, [diag('TS error', 'ts', 0)]);
+    register('eslint', uri, [diag('lint error', 'eslint', 1)]);
+    drain();
+
+    expect(formatDiagnosticsState()).toContain('Delivered (2 issues across 1 file)');
+    expect(hasDiagnostics()).toBe(true);
+
+    // ESLint reports a clean publish: its delivered tracking should go away.
+    register('eslint', uri, []);
+    expect(formatDiagnosticsState()).toContain('TS error');
+    expect(formatDiagnosticsState()).not.toContain('lint error');
+    expect(hasDiagnostics()).toBe(true);
+
+    // Once TypeScript also reports clean, nothing should remain.
+    register('typescript', uri, []);
+    expect(formatDiagnosticsState()).toBe(
+      'LSP diagnostics\n\nNo pending or delivered diagnostics.'
+    );
+    expect(hasDiagnostics()).toBe(false);
+  });
+
   it('keeps identical messages from different servers as separate diagnostics', () => {
     const uri = 'file:///tmp/c.ts';
     // Same message text but different originating servers must not be deduped.

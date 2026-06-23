@@ -4,9 +4,10 @@ A monorepo of [Pi](https://github.com/earendil-works/pi) extension packages. Eac
 
 ## Packages
 
-| Package                      | npm                | Description                                                                    |
-| ---------------------------- | ------------------ | ------------------------------------------------------------------------------ |
-| [`pi-lsp`](packages/pi-lsp/) | `@balaenis/pi-lsp` | LSP support for Pi (language-server lifecycle, diagnostics, tools, statusline) |
+| Package                            | npm                   | Description                                                                    |
+| ---------------------------------- | --------------------- | ------------------------------------------------------------------------------ |
+| [`pi-lsp`](packages/pi-lsp/)       | `@balaenis/pi-lsp`    | LSP support for Pi (language-server lifecycle, diagnostics, tools, statusline) |
+| [`pi-format`](packages/pi-format/) | `@balaenis/pi-format` | Format files via tool, `/format` command, and automatic post-write/edit hook   |
 
 See each package's `README.md` for usage and configuration.
 

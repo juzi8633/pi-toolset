@@ -264,9 +264,25 @@ export function register(serverName: string, uri: string, diagnostics: LspDiagno
   const before = diagnosticsPresent();
   const key = pendingKey(serverName, uri);
   if (diagnostics.length === 0) {
-    // Clean publish from this server: drop only its pending entry. Other
-    // servers' diagnostics for the same URI remain pending.
+    // Clean publish from this server: drop its pending entry and any delivered
+    // tracking for this URI/server pair. Other servers' diagnostics remain.
     pendingDiagnostics.delete(key);
+
+    const delivered = deliveredDiagnostics.get(uri);
+    if (delivered) {
+      for (const k of Array.from(delivered)) {
+        const parsed = parseDeliveredKey(k);
+        if (parsed && parsed.serverName === serverName) {
+          delivered.delete(k);
+        }
+      }
+      if (delivered.size === 0) {
+        deliveredDiagnostics.delete(uri);
+      } else {
+        deliveredDiagnostics.set(uri, delivered);
+      }
+    }
+
     logForDebugging(`diagnostics: cleared pending for ${uri} from ${serverName} (clean publish)`);
     notifyIfChanged(before);
     return;
