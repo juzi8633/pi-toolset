@@ -39,17 +39,15 @@
     "src"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.79.8",
-    "@earendil-works/pi-ai": "^0.79.8",
-    "@earendil-works/pi-coding-agent": "^0.79.8",
-    "@earendil-works/pi-tui": "^0.79.8",
-    "typebox": "^1.2.17"
+    "@earendil-works/pi-ai": "^0.80.1",
+    "@earendil-works/pi-coding-agent": "^0.80.1",
+    "@earendil-works/pi-tui": "^0.80.1",
+    "typebox": "^1.3.0"
   }
 }
