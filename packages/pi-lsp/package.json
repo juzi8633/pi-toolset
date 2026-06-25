@@ -50,7 +50,8 @@
     "typebox": "*"
   },
   "scripts": {
-    "gen:schema": "bun run scripts/gen-schema.ts"
+    "gen:schema": "bun run scripts/gen-schema.ts",
+    "postbuild": "bun run gen:schema"
   },
   "devDependencies": {
     "prettier": "^3.8.4",

@@ -16,7 +16,7 @@ mkdirSync(outDir, { recursive: true });
 const name = 'input-scoped-lsp-server-config';
 const json = {
   $schema: 'http://json-schema.org/draft-07/schema#',
-  $id: `https://balaenis.dev/pi-lsp/${name}.json`,
+  $id: `https://raw.githubusercontent.com/balaenis/pi-toolset/main/packages/pi-lsp/schemas/${name}.json`,
   ...InputScopedLspServerConfigSchema,
 };
 const file = resolve(outDir, `${name}.json`);

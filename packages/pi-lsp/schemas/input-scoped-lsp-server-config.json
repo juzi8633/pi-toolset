@@ -1,45 +1,86 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://balaenis.dev/pi-lsp/input-scoped-lsp-server-config.json",
+  "$id": "https://raw.githubusercontent.com/balaenis/pi-toolset/main/packages/pi-lsp/schemas/input-scoped-lsp-server-config.json",
   "type": "object",
   "properties": {
-    "command": { "type": "string" },
-    "args": { "type": "array", "items": { "type": "string" } },
+    "command": {
+      "type": "string",
+      "description": "Executable used to launch the LSP server process. May be omitted when a user entry only tweaks or disables a built-in recipe by name; runtime validation catches non-recipe entries."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Arguments passed to the server executable."
+    },
     "extensionToLanguage": {
       "type": "object",
-      "patternProperties": { "^.*$": { "type": "string" } }
+      "patternProperties": { "^.*$": { "type": "string" } },
+      "description": "Map from file extension (e.g. \".ts\") to an LSP languageId (e.g. \"typescript\"). Optional on input; merged with a built-in recipe when extending one."
     },
     "env": {
       "type": "object",
-      "patternProperties": { "^.*$": { "type": "string" } }
+      "patternProperties": { "^.*$": { "type": "string" } },
+      "description": "Environment variables added to the spawned server process."
     },
-    "initializationOptions": {},
-    "settings": {},
-    "workspaceFolder": { "type": "string" },
-    "startupTimeout": { "type": "number" },
-    "shutdownTimeout": { "type": "number" },
-    "restartOnCrash": { "type": "boolean" },
-    "maxRestarts": { "type": "number" },
+    "initializationOptions": {
+      "description": "Value forwarded as `initializationOptions` in the LSP `initialize` request."
+    },
+    "settings": {
+      "description": "Server settings returned in response to `workspace/configuration` requests."
+    },
+    "workspaceFolder": {
+      "type": "string",
+      "description": "Override the workspace root reported to the server. Defaults to the current working directory."
+    },
+    "startupTimeout": {
+      "type": "number",
+      "description": "Maximum time in milliseconds to wait for the server to finish initializing."
+    },
+    "shutdownTimeout": {
+      "type": "number",
+      "description": "Graceful shutdown timeout in milliseconds. Defaults to no timeout."
+    },
+    "restartOnCrash": {
+      "type": "boolean",
+      "description": "Auto-restart the server when it crashes. Defaults to false."
+    },
+    "maxRestarts": {
+      "type": "number",
+      "description": "Maximum number of automatic restart attempts when `restartOnCrash` is enabled."
+    },
     "transport": {
       "anyOf": [
         { "type": "string", "const": "stdio" },
         { "type": "string", "const": "socket" }
-      ]
+      ],
+      "description": "Transport used to talk to the LSP server. Only \"stdio\" is implemented; \"socket\" is accepted for config compatibility and ignored at runtime."
     },
     "role": {
       "anyOf": [
         { "type": "string", "const": "primary" },
         { "type": "string", "const": "companion" }
-      ]
+      ],
+      "description": "Role of the server in multi-server routing. \"primary\" servers provide language understanding (navigation, hover, symbols) and at most one is consulted per file for tool requests. \"companion\" servers augment the primary with extra diagnostics or contextual help (e.g. lint, Tailwind CSS) and do not participate in primary-only operations."
     },
     "startupMode": {
       "anyOf": [
         { "type": "string", "const": "auto" },
         { "type": "string", "const": "manual" }
-      ]
+      ],
+      "description": "Whether the server participates in routing automatically (\"auto\") or must be enabled per session via `/lsp start` (\"manual\")."
     },
-    "enabled": { "type": "boolean" },
-    "conflictGroup": { "type": "string" },
-    "extensions": { "type": "array", "items": { "type": "string" } }
+    "enabled": {
+      "type": "boolean",
+      "description": "When false, the server is disabled and excluded from routing entirely. Defaults to true."
+    },
+    "conflictGroup": {
+      "type": "string",
+      "description": "Grouping key for primary replacement scenarios (e.g. two TS-like servers should not both fire). Defaults to the server name for primary servers and is undefined for companions."
+    },
+    "extensions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Shorthand list of file extensions to attach the server to, using each extension as its own languageId. Merged with `extensionToLanguage` when both are present."
+    }
   }
 }

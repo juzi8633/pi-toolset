@@ -18,3 +18,7 @@ args=()
 for e in $EXTERNALS $EXTRA; do args+=(--external "$e"); done
 
 bun build ./src/index.ts --outdir dist --target node "${args[@]}"
+
+if jq -e '.scripts.postbuild' package.json; then
+  bun run postbuild
+fi
