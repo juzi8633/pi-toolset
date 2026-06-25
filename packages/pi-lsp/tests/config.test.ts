@@ -322,6 +322,72 @@ describe('recipe merge rules for role and startup mode', () => {
   });
 });
 
+describe('enabled flag', () => {
+  it('defaults enabled to true when omitted', async () => {
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          mysrv: {
+            command: '/abs/path/srv',
+            extensionToLanguage: { '.x': 'x' },
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.mysrv!.enabled).toBe(true);
+  });
+
+  it('excludes a disabled user server from the loaded set', async () => {
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          mysrv: {
+            command: '/abs/path/srv',
+            extensionToLanguage: { '.x': 'x' },
+            enabled: false,
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.mysrv).toBeUndefined();
+  });
+
+  it('disables a built-in recipe by name without adding the server', async () => {
+    makeExecutable(pathDir, 'typescript-language-server');
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          typescript: {
+            enabled: false,
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers.typescript).toBeUndefined();
+  });
+
+  it('does not let a disabled user server suppress a detected recipe', async () => {
+    makeExecutable(pathDir, 'typescript-language-server');
+    writeProjectSettings(
+      JSON.stringify({
+        servers: {
+          'disabled-custom-ts': {
+            command: '/abs/path/srv',
+            extensionToLanguage: { '.ts': 'typescript' },
+            enabled: false,
+          },
+        },
+      })
+    );
+    const { servers } = await getAllLspServers(cwdDir);
+    expect(servers['disabled-custom-ts']).toBeUndefined();
+    expect(servers.typescript).toBeDefined();
+  });
+});
+
 describe('recipe field-level overrides', () => {
   it('inherits recipe defaults when only command is overridden', async () => {
     makeExecutable(pathDir, 'typescript-language-server');

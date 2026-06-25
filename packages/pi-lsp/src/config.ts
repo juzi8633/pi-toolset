@@ -183,6 +183,7 @@ function normalizeServer(
 
   const role = merged.role ?? 'primary';
   const startupMode = merged.startupMode ?? 'auto';
+  const enabled = merged.enabled ?? true;
 
   const conflictGroup =
     typeof merged.conflictGroup === 'string' && merged.conflictGroup.length > 0
@@ -206,6 +207,7 @@ function normalizeServer(
     transport: merged.transport ?? 'stdio',
     role,
     startupMode,
+    enabled,
     conflictGroup,
   };
 }
@@ -354,19 +356,19 @@ export async function getAllLspServers(cwd: string): Promise<{
     logForDebugging(`User server '${name}': ${normalized?.command}`);
   }
 
-  // Only auto primary user servers participate in extension-overlap suppression;
-  // companions overlap by design, and manual primary servers can be configured
-  // alongside an auto primary recipe until the user explicitly switches.
+  // Only enabled auto primary user servers participate in extension-overlap
+  // suppression; companions overlap by design, manual primary servers can be
+  // configured alongside an auto primary recipe, and disabled servers are ignored.
   const userCoveredExtensions = new Set<string>();
   for (const cfg of Object.values(userServers)) {
-    if (cfg.role !== 'primary' || cfg.startupMode !== 'auto') continue;
+    if (cfg.enabled === false || cfg.role !== 'primary' || cfg.startupMode !== 'auto') continue;
     for (const ext of Object.keys(cfg.extensionToLanguage)) {
       userCoveredExtensions.add(ext.toLowerCase());
     }
   }
 
   // Add recipes that were not merged with user config, skipping any whose
-  // extensions overlap an auto-primary user-covered extension.
+  // extensions overlap an enabled auto-primary user-covered extension.
   const servers: Record<string, ScopedLspServerConfig> = { ...userServers };
   for (const [name, cfg] of Object.entries(detectedRecipes)) {
     if (servers[name]) {
@@ -382,6 +384,15 @@ export async function getAllLspServers(cwd: string): Promise<{
       continue;
     }
     servers[name] = cfg;
+  }
+
+  // Drop disabled servers after recipe merge so a disabled entry with the same
+  // name as a built-in recipe still suppresses the recipe.
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (cfg.enabled === false) {
+      logForDebugging(`config: skipping disabled server '${name}'`);
+      delete servers[name];
+    }
   }
 
   if (Object.keys(servers).length === 0) {

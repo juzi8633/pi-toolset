@@ -61,6 +61,8 @@ export const ScopedLspServerConfigSchema = Type.Object({
   role: Type.Optional(LspServerRoleSchema),
   /** Whether to participate in automatic routing. Defaults to 'auto'. */
   startupMode: Type.Optional(LspStartupModeSchema),
+  /** When false, the server is disabled and excluded from routing entirely. Defaults to true. */
+  enabled: Type.Optional(Type.Boolean()),
   /**
    * Optional grouping key for primary replacement scenarios (e.g. two TS-like
    * servers should not both fire). Defaults to the server name for primary
@@ -73,6 +75,9 @@ export type ScopedLspServerConfig = Type.Static<typeof ScopedLspServerConfigSche
 
 export const InputScopedLspServerConfigSchema = Type.Object({
   ...ScopedLspServerConfigSchema.properties,
+  // `command` may be omitted when a user entry only tweaks or disables a
+  // built-in recipe by name; runtime validation catches non-recipe entries.
+  command: Type.Optional(Type.String()),
   extensionToLanguage: Type.Optional(Type.Record(Type.String(), Type.String())),
   extensions: Type.Optional(Type.Array(Type.String())),
 });

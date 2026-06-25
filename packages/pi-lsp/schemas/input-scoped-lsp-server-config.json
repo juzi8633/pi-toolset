@@ -2,7 +2,6 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://balaenis.dev/pi-lsp/input-scoped-lsp-server-config.json",
   "type": "object",
-  "required": ["command"],
   "properties": {
     "command": { "type": "string" },
     "args": { "type": "array", "items": { "type": "string" } },
@@ -39,6 +38,7 @@
         { "type": "string", "const": "manual" }
       ]
     },
+    "enabled": { "type": "boolean" },
     "conflictGroup": { "type": "string" },
     "extensions": { "type": "array", "items": { "type": "string" } }
   }

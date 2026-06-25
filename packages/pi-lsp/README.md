@@ -90,6 +90,7 @@ Both files use JSONC syntax (comments are allowed).
       "restartOnCrash": false,
       "maxRestarts": 3,
       "transport": "stdio",
+      "enabled": true,
     },
   },
 }
@@ -99,10 +100,10 @@ Both files use JSONC syntax (comments are allowed).
 
 | Field                   | Required | Default                                | Description                                                                                                                       |
 | ----------------------- | -------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `command`               | yes      | —                                      | LSP server binary. Spaces only allowed for absolute paths.                                                                        |
+| `command`               | yes²     | —                                      | LSP server binary. Spaces only allowed for absolute paths. May be omitted when overriding or disabling a built-in recipe by name. |
 | `args`                  | no       | `[]`                                   | CLI arguments for the server.                                                                                                     |
 | `extensionToLanguage`   | yes¹     | —                                      | Maps file extensions (leading dot) to LSP `languageId` values.                                                                    |
-| `extensions`            | no²      | —                                      | Sugar: `[".ts", ".tsx"]` → languageId is guessed via a built-in table.                                                            |
+| `extensions`            | no³      | —                                      | Sugar: `[".ts", ".tsx"]` → languageId is guessed via a built-in table.                                                            |
 | `env`                   | no       | —                                      | Environment variables. `$VAR` and `${VAR}` are expanded from `process.env`.                                                       |
 | `initializationOptions` | no       | `{}`                                   | Passed to the server during `initialize`.                                                                                         |
 | `settings`              | no       | —                                      | Returned to the server from `workspace/configuration`; built-in ESLint uses defaults required by `vscode-eslint-language-server`. |
@@ -114,10 +115,12 @@ Both files use JSONC syntax (comments are allowed).
 | `transport`             | no       | `"stdio"`                              | Accepted for compatibility; only `"stdio"` is implemented.                                                                        |
 | `role`                  | no       | `"primary"`                            | `"primary"` (one per file, drives navigation) or `"companion"` (adds diagnostics alongside the primary).                          |
 | `startupMode`           | no       | `"auto"`                               | `"auto"` (joins routing automatically) or `"manual"` (only after `/lsp start`).                                                   |
+| `enabled`               | no       | `true`                                 | When `false`, the server is completely disabled: it is excluded from routing, diagnostics, and `/lsp status`.                     |
 | `conflictGroup`         | no       | primary: server name; companion: unset | Display-only grouping label for primary replacement scenarios, surfaced in `/lsp status`. Not yet enforced at routing time.       |
 
 ¹ Either `extensionToLanguage` or `extensions` must be present; `extensionToLanguage` takes precedence.
-² When `extensions` is used without `extensionToLanguage`, the extension guesses `languageId` from a built-in table (covers TS/JS, Python, Rust, Go, Java, C/C++, C#, and ~20 others). Unknown extensions fall back to `"plaintext"`.
+² `command` is required for custom (non-recipe) server entries. It may be omitted when the entry shares a name with a built-in recipe and only tweaks or disables that recipe.
+³ When `extensions` is used without `extensionToLanguage`, the extension guesses `languageId` from a built-in table (covers TS/JS, Python, Rust, Go, Java, C/C++, C#, and ~20 others). Unknown extensions fall back to `"plaintext"`.
 
 ### Startup failures and retries
 
@@ -189,6 +192,20 @@ Passive diagnostics from every active server (primary + active companions) are c
 ```
 
 Because this entry shares the recipe name `typescript`, it inherits the recipe's `extensionToLanguage`, `args`, `role`, `startupMode`, and other defaults. Only `command` is replaced.
+
+### Example: disable a built-in recipe
+
+```jsonc
+{
+  "servers": {
+    "typescript": {
+      "enabled": false,
+    },
+  },
+}
+```
+
+Because this entry shares the recipe name `typescript`, it inherits the recipe defaults and then disables the server entirely. The built-in TypeScript recipe will not be loaded, and no TypeScript language server will participate in routing or diagnostics.
 
 ### Example: primary replacement with a different server name (vtsls)
 

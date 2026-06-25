@@ -319,6 +319,7 @@ export function getDetectedRecipeServers(
       transport: 'stdio',
       role: recipe.role ?? 'primary',
       startupMode: 'auto',
+      enabled: true,
       conflictGroup: recipe.role === 'companion' ? undefined : recipe.name,
       ...(recipe.settings !== undefined ? { settings: recipe.settings } : {}),
     };
