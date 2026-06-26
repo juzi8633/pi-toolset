@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import type { AgentConfig } from '../src/agents.ts';
-import { validateCompletionOutput } from '../src/completion-guard.ts';
+import { validateCompletionOutput } from '../src/completion-check.ts';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {

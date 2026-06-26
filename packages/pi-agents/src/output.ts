@@ -56,7 +56,7 @@ const FAILURE_STOP_REASONS = new Set([
   'max_turns',
   'context_error',
   'isolation_error',
-  'completion_guard',
+  'completion_check',
   'template_error',
 ]);
 

@@ -12,7 +12,7 @@
 - Implement forked context through `ctx.sessionManager.createBranchedSession(ctx.sessionManager.getLeafId())` and spawn the child with `--session <branched-session-file>` instead of `--no-session`.
 - Generated code files must start with one `ABOUTME:` comment line and should keep comments minimal.
 
-**Architecture:** Split the current monolithic `src/index.ts` into discovery, schemas, execution, rendering, output, security, context, and workflow modules while preserving the public extension entrypoint. After the refactor, add frontmatter-driven capabilities in small layers: tool denial and depth guards, context inheritance controls, optional fork context, optional worktree isolation, completion guards, and structured chain output templates. Each phase should be independently testable and should update `README.md` when user-facing configuration or behavior changes.
+**Architecture:** Split the current monolithic `src/index.ts` into discovery, schemas, execution, rendering, output, security, context, and workflow modules while preserving the public extension entrypoint. After the refactor, add frontmatter-driven capabilities in small layers: tool denial and depth guards, context inheritance controls, optional fork context, optional worktree isolation, completion checks, and structured chain output templates. Each phase should be independently testable and should update `README.md` when user-facing configuration or behavior changes.
 
 **Tech Stack:** TypeScript, Bun test runner, Node `child_process`/`fs`/`os`/`path`, Pi extension API, TypeBox via `@earendil-works/pi-ai`, `@earendil-works/pi-tui`, git worktree, `mise` tasks.
 
@@ -33,17 +33,17 @@
 - Create: `packages/pi-agents/src/security.ts` — tool allow/deny merging, nested-agent depth checks, and project-agent trust helpers.
 - Create: `packages/pi-agents/src/context.ts` — fresh/fork context strategy resolution and session file preparation.
 - Create: `packages/pi-agents/src/worktree.ts` — optional git worktree creation, dirty-state detection, cleanup, and result details.
-- Create: `packages/pi-agents/src/completion-guard.ts` — output contract checks for agents with mutating capabilities.
+- Create: `packages/pi-agents/src/completion-check.ts` — output contract checks for agents with mutating capabilities.
 - Create: `packages/pi-agents/src/template.ts` — chain placeholder expansion for `{previous}` and `{outputs.name}`.
 - Create: `packages/pi-agents/tests/agents.test.ts` — frontmatter parsing, discovery precedence, and config normalization coverage.
 - Create: `packages/pi-agents/tests/output.test.ts` — output helper and byte-safe truncation coverage.
 - Create: `packages/pi-agents/tests/invocation.test.ts` — CLI argument and environment construction coverage.
 - Create: `packages/pi-agents/tests/security.test.ts` — tool denylist and nested-depth guard coverage.
 - Create: `packages/pi-agents/tests/template.test.ts` — chain placeholder replacement coverage.
-- Create: `packages/pi-agents/tests/completion-guard.test.ts` — output contract validation coverage.
+- Create: `packages/pi-agents/tests/completion-check.test.ts` — output contract validation coverage.
 - Create: `packages/pi-agents/tests/worktree.test.ts` — optional git worktree lifecycle coverage using a temporary repository.
 - Modify: `packages/pi-agents/agents/reviewer.md` — align reviewer configuration with enforced read-only behavior.
-- Modify: `packages/pi-agents/agents/worker.md` — require validation reporting for completion-guard compatibility.
+- Modify: `packages/pi-agents/agents/worker.md` — require validation reporting for completion-check compatibility.
 - Modify: `packages/pi-agents/prompts/implement.md` — document new acceptance expectations in the chain workflow.
 - Modify: `packages/pi-agents/prompts/implement-and-review.md` — require reviewer findings to gate the final worker step.
 - Modify: `packages/pi-agents/prompts/explore-and-plan.md` — keep plan-only behavior explicit under the refactored chain engine.
@@ -173,11 +173,11 @@
 
 **Steps:**
 
-- [x] Add these optional fields to `AgentConfig`: `excludeTools?: string[]`, `systemPromptMode?: 'append' | 'replace'`, `maxTurns?: number`, `noContextFiles?: boolean`, `noSkills?: boolean`, `defaultContext?: 'fresh' | 'fork'`, `isolation?: 'none' | 'worktree'`, and `completionGuard?: boolean`. Field names that map directly onto Pi CLI flags must match the flag name in camelCase (`--exclude-tools` → `excludeTools`, `--no-context-files` → `noContextFiles`, `--no-skills` → `noSkills`).
+- [x] Add these optional fields to `AgentConfig`: `excludeTools?: string[]`, `systemPromptMode?: 'append' | 'replace'`, `maxTurns?: number`, `noContextFiles?: boolean`, `noSkills?: boolean`, `defaultContext?: 'fresh' | 'fork'`, `isolation?: 'none' | 'worktree'`, and `completionCheck?: boolean`. Field names that map directly onto Pi CLI flags must match the flag name in camelCase (`--exclude-tools` → `excludeTools`, `--no-context-files` → `noContextFiles`, `--no-skills` → `noSkills`).
 - [x] Parse `excludeTools` as a comma-separated list with trimming and empty-item removal.
 - [x] Parse `systemPromptMode`; accept only `append` or `replace`; default to `append` when omitted.
 - [x] Parse `maxTurns` as a positive integer; ignore invalid values and leave it undefined.
-- [x] Parse `noContextFiles`, `noSkills`, and `completionGuard` from `true` or `false`; default `noContextFiles` and `noSkills` to `false` (inherit by default), and leave `completionGuard` undefined when omitted.
+- [x] Parse `noContextFiles`, `noSkills`, and `completionCheck` from `true` or `false`; default `noContextFiles` and `noSkills` to `false` (inherit by default), and leave `completionCheck` undefined when omitted.
 - [x] Parse `defaultContext`; accept only `fresh` or `fork`; default to `fresh`.
 - [x] Parse `isolation`; accept only `none` or `worktree`; default to `none`.
 - [x] Add an agents test where a markdown file containing all new fields normalizes to the expected `AgentConfig` values.
@@ -333,36 +333,36 @@
 - Run: `mise run build --package packages/pi-agents`
 - Expected: Bun builds successfully.
 
-### Task 10: Add completion guard for mutating agents
+### Task 10: Add completion check for mutating agents
 
 **Outcome:** Agents with mutating capability must produce a usable handoff summary and validation status before being treated as successful.
 
 **Files:**
 
-- Create: `packages/pi-agents/src/completion-guard.ts`
+- Create: `packages/pi-agents/src/completion-check.ts`
 - Modify: `packages/pi-agents/src/execution.ts`
 - Modify: `packages/pi-agents/src/tool.ts`
 - Modify: `packages/pi-agents/agents/worker.md`
-- Create: `packages/pi-agents/tests/completion-guard.test.ts`
+- Create: `packages/pi-agents/tests/completion-check.test.ts`
 - Modify: `packages/pi-agents/README.md`
 
 **Steps:**
 
-- [x] Add `agentCanMutate(agent)` in `completion-guard.ts`; return true when `agent.tools` is undefined, or when `agent.tools` includes `edit`, `write`, or `bash` and those tools are not excluded by `excludeTools`.
-- [x] Add `isCompletionGuardEnabled(agent)`; return `agent.completionGuard` when explicitly set, otherwise return `agentCanMutate(agent)`.
-- [x] Add `validateCompletionOutput(agent, output)`; when guard is disabled return success.
-- [x] When guard is enabled, require final output to contain headings matching `## Completed`, `## Files Changed`, and `## Validation`.
-- [x] If required headings are missing, mark the result failed by setting `stopReason = 'completion_guard'`, `errorMessage = 'Completion guard failed: missing <headings>'`, and `exitCode = 1`.
+- [x] Add `agentCanMutate(agent)` in `completion-check.ts`; return true when `agent.tools` is undefined, or when `agent.tools` includes `edit`, `write`, or `bash` and those tools are not excluded by `excludeTools`.
+- [x] Add `isCompletionCheckEnabled(agent)`; return whether `agent.completionCheck` is set and non-empty.
+- [x] Add `validateCompletionOutput(agent, output)`; when no headings are configured return success.
+- [x] When headings are configured, require the final output to contain each heading as an exact line.
+- [x] If required headings are missing, mark the result failed by setting `stopReason = 'completion_check'`, `errorMessage = 'Completion check failed: missing <headings>'`, and `exitCode = 1`.
 - [x] Update `worker.md` output format to include `## Validation` with either commands run and pass/fail results or `Not run: <specific reason>`.
-- [x] Add a completion-guard test where a mutating worker output missing `## Validation` fails with `completion_guard`.
-- [x] Add a completion-guard test where a reviewer with `excludeTools: edit, write, agent` and explicit `completionGuard: false` is not checked.
-- [x] Add a completion-guard test where valid worker output passes.
-- [x] Document completion guard defaults, required headings, and opt-out behavior in README.
+- [x] Add a completion-check test where a mutating worker output missing `## Validation` fails with `completion_check`.
+- [x] Add a completion-check test where a reviewer with `excludeTools: edit, write, agent` and explicit `completionCheck: false` is not checked.
+- [x] Add a completion-check test where valid worker output passes.
+- [x] Document completion check defaults, required headings, and opt-out behavior in README.
 
 **Validation:**
 
 - Run: `mise run test --package packages/pi-agents`
-- Expected: completion-guard tests pass.
+- Expected: completion-check tests pass.
 - Run: `mise run typecheck --package packages/pi-agents`
 - Expected: TypeScript reports no errors.
 
@@ -435,7 +435,7 @@
 ## Final Validation
 
 - Run: `mise run test --package packages/pi-agents`
-- Expected: all `pi-agents` tests pass, including output, agent parsing, invocation, security, template, completion guard, and worktree tests.
+- Expected: all `pi-agents` tests pass, including output, agent parsing, invocation, security, template, completion check, and worktree tests.
 - Run: `mise run typecheck --package packages/pi-agents`
 - Expected: TypeScript reports no errors.
 - Run: `mise run build --package packages/pi-agents`
@@ -446,7 +446,7 @@
 ## Rollout Notes
 
 - This plan preserves current defaults, so existing user agents should keep working unless they opt into new fields.
-- `excludeTools`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, and `completionGuard` are user-facing configuration options and must be documented in `packages/pi-agents/README.md` in the same change that implements them.
+- `excludeTools`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, and `completionCheck` are user-facing configuration options and must be documented in `packages/pi-agents/README.md` in the same change that implements them.
 - Worktree isolation creates paths under `<repo>/.worktrees/`; dirty worktrees are intentionally retained and must be surfaced in tool details so the parent agent can inspect or merge them.
 - Fork context requires a persisted parent session. In `--no-session` parent runs, fork mode must fail with the explicit persisted-session error rather than silently falling back to fresh context.
 - The plan intentionally excludes background agents, remote agents, dynamic fan-out, and persistent teammate/coordinator mode; those can be planned later after the core tool is modular and guarded.
@@ -458,5 +458,5 @@
 - `maxTurns` termination could drop the final buffered JSON line — Mitigate by processing any remaining stdout buffer in the `close` handler before returning the result.
 - Fork context could mutate the parent session if the wrong session file is passed — Mitigate by using only the file returned from `createBranchedSession()` and never passing the parent `ctx.sessionManager.getSessionFile()` directly.
 - Worktree cleanup could remove useful changes — Mitigate by checking `git status --porcelain` before cleanup and only removing clean worktrees.
-- Completion guard could reject valid non-standard outputs — Mitigate by making it default only for mutating agents and allowing `completionGuard: false` for specialized agents.
+- Completion check could reject valid non-standard outputs — Mitigate by making it default only for mutating agents and allowing `completionCheck: false` for specialized agents.
 - README drift from implemented behavior — Mitigate by requiring README updates in the same task that adds each user-facing field.

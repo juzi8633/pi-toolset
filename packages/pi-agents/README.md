@@ -163,7 +163,7 @@ System prompt for the agent goes here.
 | `noSkills`         | boolean               | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                        |
 | `defaultContext`   | `fresh` \| `fork`     | `fresh`      | `fork` branches the parent session via `SessionManager.createBranchedSession(getLeafId())` and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                      |
 | `isolation`        | `none` \| `worktree`  | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>/` created by `git worktree add --detach HEAD`. Clean worktrees are removed after the child exits; dirty worktrees are kept and reported on `SingleResult.worktreePath`. |
-| `completionCheck`  | comma list            | none         | Required final-message headings. When set, each configured heading must appear as an exact line; otherwise the result is marked `stopReason: completion_guard` with exit code `1`.                                                                                     |
+| `completionCheck`  | comma list            | none         | Required final-message headings. When set, each configured heading must appear as an exact line; otherwise the result is marked `stopReason: completion_check` with exit code `1`.                                                                                     |
 
 Invalid values (unknown enums, non-positive integers, non-boolean strings) are ignored and fall back to the default (`append`, `fresh`, `none`) for enum fields and to `undefined` for boolean / numeric fields. Empty comma lists are ignored.
 
@@ -177,7 +177,7 @@ Agents can declare their own final-output contract in frontmatter. The check:
 - Treats `completionCheck` as a comma-separated list of required headings, for example `completionCheck: "## Completed, ## Files Changed, ## Validation"`.
 - Inspects the final assistant message for each configured heading as an exact line (case-insensitive, line-anchored).
 - Does not infer behavior from `tools`, `excludeTools`, `edit`, `write`, or `bash`; agents opt in by configuration.
-- On failure, sets `stopReason: 'completion_guard'`, fills `errorMessage` with the missing headings, and forces exit code `1`. Failures propagate the same way other agent failures do (single-mode returns `isError`, chain-mode stops at the failing step).
+- On failure, sets `stopReason: 'completion_check'`, fills `errorMessage` with the missing headings, and forces exit code `1`. Failures propagate the same way other agent failures do (single-mode returns `isError`, chain-mode stops at the failing step).
 
 The bundled `worker.md` template declares `completionCheck: "## Completed, ## Files Changed, ## Validation"`; the `## Validation` section asks for the commands actually run plus their pass/fail status (or an explicit `Not run: <reason>`).
 
@@ -243,7 +243,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - **stopReason "max_turns"**: an agent exceeded its `maxTurns` budget; the child is `SIGTERM`'d
 - **stopReason "context_error"**: fork-context preparation failed before the child started (see _Fork Context_)
 - **stopReason "isolation_error"**: worktree isolation failed before the child started (see _Isolation: Git Worktree_)
-- **stopReason "completion_guard"**: an agent's final message is missing one of its configured `completionCheck` headings (see _Completion Check_)
+- **stopReason "completion_check"**: an agent's final message is missing one of its configured `completionCheck` headings (see _Completion Check_)
 - **stopReason "template_error"**: a chain step's task referenced `{outputs.<name>}` for a step that did not run or was not named
 - **Chain mode**: stops at the first failing step and reports which step failed
 

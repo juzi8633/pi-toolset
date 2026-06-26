@@ -14,7 +14,7 @@ import {
   getBuiltinAgentsDir,
 } from './agents.ts';
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
-import { validateCompletionOutput } from './completion-guard.ts';
+import { validateCompletionOutput } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
 import { mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from './execution.ts';
 import {
@@ -540,7 +540,7 @@ function enforceCompletionCheck(agent: AgentConfig, result: SingleResult): void 
   const validation = validateCompletionOutput(agent, finalOutput);
   if (validation.ok) return;
   const missing = validation.missing.join(', ');
-  result.stopReason = 'completion_guard';
+  result.stopReason = 'completion_check';
   result.errorMessage = `Completion check failed: missing ${missing}`;
   if (result.exitCode === 0) {
     result.exitCode = 1;
