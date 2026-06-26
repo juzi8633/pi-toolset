@@ -1,4 +1,5 @@
 // ABOUTME: Shared runtime types for subagent results, usage stats, and display items.
+// ABOUTME: Re-exported from agents.ts scope/source types and consumed across execution and rendering.
 
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentScope, AgentSource } from './agents.ts';

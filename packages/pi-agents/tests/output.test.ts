@@ -1,4 +1,5 @@
 // ABOUTME: Tests for output helpers — token formatting, final output extraction, and byte-safe truncation.
+// ABOUTME: Pure unit tests; no spawned processes or filesystem state.
 
 import { describe, expect, it } from 'bun:test';
 import type { Message } from '@earendil-works/pi-ai';
@@ -21,7 +22,7 @@ describe('formatTokens', () => {
 });
 
 describe('getFinalOutput', () => {
-  it('returns the last assistant text part', () => {
+  it('returns the first text part from the latest assistant message', () => {
     const messages: Message[] = [
       {
         role: 'assistant',
@@ -40,7 +41,6 @@ describe('getFinalOutput', () => {
       } as unknown as Message,
     ];
     expect(getFinalOutput(messages)).toBe('older');
-    // Walks from end and returns the first text part of the latest assistant message.
   });
 
   it('returns empty string when no assistant text exists', () => {
@@ -61,12 +61,13 @@ describe('truncateParallelOutput', () => {
     expect(truncateParallelOutput(small)).toBe(small);
   });
 
-  it('truncates strings over the cap with a notice', () => {
+  it('truncates oversize strings and keeps the pre-notice body within the cap', () => {
     const big = 'a'.repeat(PER_TASK_OUTPUT_CAP + 1024);
     const result = truncateParallelOutput(big);
     const noticeIdx = result.indexOf('\n\n[Output truncated:');
     expect(noticeIdx).toBeGreaterThan(-1);
     const preNotice = result.slice(0, noticeIdx);
+    // Pre-notice body must fit the cap; the appended notice intentionally pushes the total over.
     expect(Buffer.byteLength(preNotice, 'utf8')).toBeLessThanOrEqual(PER_TASK_OUTPUT_CAP);
     expect(result).toContain('[Output truncated:');
   });

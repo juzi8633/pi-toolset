@@ -1,4 +1,5 @@
 // ABOUTME: Pi CLI invocation helpers — argument construction, prompt temp-file, and runtime resolution.
+// ABOUTME: Resolves the right `pi` binary or current bundle entry and assembles `--mode json -p` argument lists.
 
 import * as fs from 'node:fs';
 import * as os from 'node:os';

@@ -65,13 +65,13 @@
 
 **Steps:**
 
-- [ ] Move `MAX_PARALLEL_TASKS`, `MAX_CONCURRENCY`, `COLLAPSED_ITEM_COUNT`, and `PER_TASK_OUTPUT_CAP` from `index.ts` into `constants.ts`.
-- [ ] Move `UsageStats`, `SingleResult`, `SubagentDetails`, and `DisplayItem` from `index.ts` into `types.ts`.
-- [ ] Move `formatTokens`, `formatUsageStats`, `getFinalOutput`, `isFailedResult`, `getResultOutput`, `truncateParallelOutput`, and `getDisplayItems` into `output.ts`.
-- [ ] Export all moved helpers with the same behavior and import them from `index.ts`.
-- [ ] Add an output test that `formatTokens(999)` returns `"999"`, `formatTokens(1500)` returns `"1.5k"`, and `formatTokens(1500000)` returns `"1.5M"`.
-- [ ] Add an output test that `getFinalOutput()` returns the last assistant text part from a message list and returns an empty string when no assistant text exists.
-- [ ] Add an output test that `truncateParallelOutput()` preserves strings under `PER_TASK_OUTPUT_CAP` and appends `"[Output truncated:"` for strings over the cap without exceeding the cap before the truncation notice.
+- [x] Move `MAX_PARALLEL_TASKS`, `MAX_CONCURRENCY`, `COLLAPSED_ITEM_COUNT`, and `PER_TASK_OUTPUT_CAP` from `index.ts` into `constants.ts`.
+- [x] Move `UsageStats`, `SingleResult`, `SubagentDetails`, and `DisplayItem` from `index.ts` into `types.ts`.
+- [x] Move `formatTokens`, `formatUsageStats`, `getFinalOutput`, `isFailedResult`, `getResultOutput`, `truncateParallelOutput`, and `getDisplayItems` into `output.ts`.
+- [x] Export all moved helpers with the same behavior and import them from `index.ts`.
+- [x] Add an output test that `formatTokens(999)` returns `"999"`, `formatTokens(1500)` returns `"1.5k"`, and `formatTokens(1500000)` returns `"1.5M"`.
+- [x] Add an output test that `getFinalOutput()` returns the last assistant text part from a message list and returns an empty string when no assistant text exists.
+- [x] Add an output test that `truncateParallelOutput()` preserves strings under `PER_TASK_OUTPUT_CAP` and appends `"[Output truncated:"` for strings over the cap without exceeding the cap before the truncation notice.
 
 **Validation:**
 
@@ -92,12 +92,12 @@
 
 **Steps:**
 
-- [ ] Move `TaskItem`, `ChainItem`, `AgentScopeSchema`, and `SubagentParams` into `schema.ts`.
-- [ ] Export a `SubagentParams` schema value from `schema.ts` and import it in `index.ts` for `pi.registerTool({ parameters })`.
-- [ ] Move `formatToolCall`, `renderCall`, and `renderResult` into `render.ts`.
-- [ ] Export `renderCall` and `renderResult` functions that accept the same arguments currently received by `pi.registerTool` render callbacks.
-- [ ] Replace inline `renderCall(args, theme) { ... }` and `renderResult(result, options, theme) { ... }` in `index.ts` with references to the exported render functions.
-- [ ] Keep `getMarkdownTheme`, `Container`, `Markdown`, `Spacer`, and `Text` imports inside `render.ts`, not `index.ts`.
+- [x] Move `TaskItem`, `ChainItem`, `AgentScopeSchema`, and `SubagentParams` into `schema.ts`.
+- [x] Export a `SubagentParams` schema value from `schema.ts` and import it in `index.ts` for `pi.registerTool({ parameters })`.
+- [x] Move `formatToolCall`, `renderCall`, and `renderResult` into `render.ts`.
+- [x] Export `renderCall` and `renderResult` functions that accept the same arguments currently received by `pi.registerTool` render callbacks.
+- [x] Replace inline `renderCall(args, theme) { ... }` and `renderResult(result, options, theme) { ... }` in `index.ts` with references to the exported render functions.
+- [x] Keep `getMarkdownTheme`, `Container`, `Markdown`, `Spacer`, and `Text` imports inside `render.ts`, not `index.ts`.
 
 **Validation:**
 
@@ -119,13 +119,13 @@
 
 **Steps:**
 
-- [ ] Move `writePromptToTempFile()` and `getPiInvocation()` into `invocation.ts`.
-- [ ] Add `buildPiArgs(agent, task, options)` in `invocation.ts` that returns the same arguments currently assembled in `runSingleAgent`: `--mode json -p --no-session`, optional `--model`, optional `--thinking`, optional `--tools`, optional `--append-system-prompt`, then `Task: <task>`.
-- [ ] Move `mapWithConcurrencyLimit()` and `runSingleAgent()` into `execution.ts`.
-- [ ] In `execution.ts`, keep the JSON event parsing behavior unchanged: process `message_end` events, process `tool_result_end` events, accumulate stderr, usage, model, stop reason, and error message.
-- [ ] Add an invocation test where an agent with `model`, `thinking`, `tools`, and a non-empty system prompt produces args containing `--model`, `--thinking`, `--tools`, `--append-system-prompt`, and `Task: <task>` in the same order as the current implementation.
-- [ ] Add an invocation test where an agent with no tools omits `--tools`.
-- [ ] Add an invocation test where `getPiInvocation()` returns `pi` when `process.execPath` is a generic runtime and the current script is not a real file.
+- [x] Move `writePromptToTempFile()` and `getPiInvocation()` into `invocation.ts`.
+- [x] Add `buildPiArgs(agent, task, options)` in `invocation.ts` that returns the same arguments currently assembled in `runSingleAgent`: `--mode json -p --no-session`, optional `--model`, optional `--thinking`, optional `--tools`, optional `--append-system-prompt`, then `Task: <task>`.
+- [x] Move `mapWithConcurrencyLimit()` and `runSingleAgent()` into `execution.ts`.
+- [x] In `execution.ts`, keep the JSON event parsing behavior unchanged: process `message_end` events, process `tool_result_end` events, accumulate stderr, usage, model, stop reason, and error message.
+- [x] Add an invocation test where an agent with `model`, `thinking`, `tools`, and a non-empty system prompt produces args containing `--model`, `--thinking`, `--tools`, `--append-system-prompt`, and `Task: <task>` in the same order as the current implementation.
+- [x] Add an invocation test where an agent with no tools omits `--tools`.
+- [x] Add an invocation test where `getPiInvocation()` returns `pi` when `process.execPath` is a generic runtime and the current script is not a real file.
 
 **Validation:**
 
@@ -145,13 +145,13 @@
 
 **Steps:**
 
-- [ ] Move the body of `execute()` from `index.ts` into `executeAgentTool(params, signal, onUpdate, ctx)` in `tool.ts`.
-- [ ] Move mode detection (`hasChain`, `hasTasks`, `hasSingle`, `modeCount`) into `tool.ts`.
-- [ ] Move project-agent confirmation logic into `tool.ts` without changing the prompt title or message.
-- [ ] Move single, parallel, and chain result assembly into `tool.ts`.
-- [ ] Keep `pi.on('before_agent_start', ...)` and `pi.registerTool(...)` in `index.ts`.
-- [ ] Ensure `index.ts` imports `SubagentParams` from `schema.ts`, `executeAgentTool` from `tool.ts`, and render callbacks from `render.ts`.
-- [ ] Check that `index.ts` remains below 120 lines after formatting.
+- [x] Move the body of `execute()` from `index.ts` into `executeAgentTool(params, signal, onUpdate, ctx)` in `tool.ts`.
+- [x] Move mode detection (`hasChain`, `hasTasks`, `hasSingle`, `modeCount`) into `tool.ts`.
+- [x] Move project-agent confirmation logic into `tool.ts` without changing the prompt title or message.
+- [x] Move single, parallel, and chain result assembly into `tool.ts`.
+- [x] Keep `pi.on('before_agent_start', ...)` and `pi.registerTool(...)` in `index.ts`.
+- [x] Ensure `index.ts` imports `SubagentParams` from `schema.ts`, `executeAgentTool` from `tool.ts`, and render callbacks from `render.ts`.
+- [x] Check that `index.ts` remains below 120 lines after formatting.
 
 **Validation:**
 

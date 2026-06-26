@@ -1,7 +1,8 @@
 // ABOUTME: Tests for invocation helpers — Pi CLI argument construction and runtime resolution.
+// ABOUTME: Uses temp directories for prompt writes; mutates process.execPath via Object.defineProperty.
 
 import { describe, expect, it } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentConfig } from '../src/agents.ts';
@@ -78,6 +79,9 @@ describe('writePromptToTempFile', () => {
     try {
       expect(existsSync(filePath)).toBe(true);
       expect(path.basename(filePath)).toBe('prompt-safe.name.md');
+      if (process.platform !== 'win32') {
+        expect(statSync(filePath).mode & 0o777).toBe(0o600);
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

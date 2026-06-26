@@ -1,4 +1,5 @@
 // ABOUTME: TypeBox parameter schemas for the `agent` tool — single, parallel, chain, and scope inputs.
+// ABOUTME: `SubagentParams` is registered with `pi.registerTool`; helper schemas back the parameter shape.
 
 import { StringEnum, Type } from '@earendil-works/pi-ai';
 

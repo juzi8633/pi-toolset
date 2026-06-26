@@ -1,4 +1,5 @@
 // ABOUTME: TUI rendering for the `agent` tool — tool-call previews and single/parallel/chain result views.
+// ABOUTME: Owns all pi-tui component construction and theme color usage so `index.ts` stays UI-free.
 
 import * as os from 'node:os';
 import type { Static } from '@earendil-works/pi-ai';

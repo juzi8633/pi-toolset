@@ -1,4 +1,5 @@
 // ABOUTME: Subprocess execution for the `agent` tool — concurrency limiter and single-agent run loop.
+// ABOUTME: Spawns a `pi` child per agent, consumes JSON event stream, and accumulates messages, usage, and stop reason.
 
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';

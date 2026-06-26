@@ -1,4 +1,5 @@
 // ABOUTME: Pure output helpers for subagent results: final output extraction, failure detection, and byte-safe truncation.
+// ABOUTME: Consumed by execution streaming, tool orchestration, and TUI rendering.
 
 import type { Message } from '@earendil-works/pi-ai';
 import { PER_TASK_OUTPUT_CAP } from './constants.ts';
