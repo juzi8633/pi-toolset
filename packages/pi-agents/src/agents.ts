@@ -5,10 +5,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from '@earendil-works/pi-coding-agent';
+import { discoverPackageAgentDirs } from './package-agents.ts';
 import type { DefaultContext, IsolationMode, SystemPromptMode } from './types.ts';
 
 export type AgentScope = 'user' | 'project' | 'both';
-export type AgentSource = 'builtin' | 'user' | 'project';
+export type AgentSource = 'builtin' | 'package' | 'user' | 'project';
 
 export interface AgentConfig {
   name: string;
@@ -28,6 +29,8 @@ export interface AgentConfig {
   isolation?: IsolationMode;
   completionCheck?: string[];
   maxSubagentDepth?: number;
+  localName?: string;
+  packageName?: string;
 }
 
 function parseCsvList(value: unknown): string[] | undefined {
@@ -108,42 +111,96 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
     if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
     const filePath = path.join(dir, entry.name);
-    let content: string;
-    try {
-      content = fs.readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
-    }
-
-    const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
-
-    if (typeof frontmatter.name !== 'string' || typeof frontmatter.description !== 'string') {
-      continue;
-    }
-
-    agents.push({
-      name: frontmatter.name,
-      description: frontmatter.description,
-      tools: parseCsvList(frontmatter.tools),
-      excludeTools: parseCsvList(frontmatter.excludeTools),
-      model: typeof frontmatter.model === 'string' ? frontmatter.model : undefined,
-      thinking: typeof frontmatter.thinking === 'string' ? frontmatter.thinking : undefined,
-      systemPrompt: body,
-      source,
-      filePath,
-      systemPromptMode:
-        parseEnum(frontmatter.systemPromptMode, ['append', 'replace'] as const) ?? 'append',
-      maxTurns: parsePositiveInt(frontmatter.maxTurns),
-      noContextFiles: parseBoolean(frontmatter.noContextFiles),
-      noSkills: parseBoolean(frontmatter.noSkills),
-      defaultContext: parseEnum(frontmatter.defaultContext, ['fresh', 'fork'] as const) ?? 'fresh',
-      isolation: parseEnum(frontmatter.isolation, ['none', 'worktree'] as const) ?? 'none',
-      completionCheck: parseCsvList(frontmatter.completionCheck),
-      maxSubagentDepth: parseNonNegativeInt(frontmatter.maxSubagentDepth),
-    });
+    const agent = loadAgentFromFile(filePath, source);
+    if (agent) agents.push(agent);
   }
 
   return agents;
+}
+
+function loadAgentFromFile(filePath: string, source: AgentSource): AgentConfig | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
+
+  if (typeof frontmatter.name !== 'string' || typeof frontmatter.description !== 'string') {
+    return null;
+  }
+
+  return {
+    name: frontmatter.name,
+    description: frontmatter.description,
+    tools: parseCsvList(frontmatter.tools),
+    excludeTools: parseCsvList(frontmatter.excludeTools),
+    model: typeof frontmatter.model === 'string' ? frontmatter.model : undefined,
+    thinking: typeof frontmatter.thinking === 'string' ? frontmatter.thinking : undefined,
+    systemPrompt: body,
+    source,
+    filePath,
+    systemPromptMode:
+      parseEnum(frontmatter.systemPromptMode, ['append', 'replace'] as const) ?? 'append',
+    maxTurns: parsePositiveInt(frontmatter.maxTurns),
+    noContextFiles: parseBoolean(frontmatter.noContextFiles),
+    noSkills: parseBoolean(frontmatter.noSkills),
+    defaultContext: parseEnum(frontmatter.defaultContext, ['fresh', 'fork'] as const) ?? 'fresh',
+    isolation: parseEnum(frontmatter.isolation, ['none', 'worktree'] as const) ?? 'none',
+    completionCheck: parseCsvList(frontmatter.completionCheck),
+    maxSubagentDepth: parseNonNegativeInt(frontmatter.maxSubagentDepth),
+  };
+}
+
+function loadAgentsFromPackagePath(
+  agentPath: string,
+  packageName: string,
+  packageRoot: string
+): AgentConfig[] {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(agentPath);
+  } catch {
+    return [];
+  }
+
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(packageRoot);
+  } catch {
+    return [];
+  }
+  const rootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+  const isContained = (target: string): boolean => {
+    let real: string;
+    try {
+      real = fs.realpathSync(target);
+    } catch {
+      return false;
+    }
+    return real === realRoot || real.startsWith(rootWithSep);
+  };
+
+  const collected: AgentConfig[] = [];
+  if (stat.isFile() && agentPath.endsWith('.md')) {
+    if (!isContained(agentPath)) return [];
+    const agent = loadAgentFromFile(agentPath, 'package');
+    if (agent) collected.push(agent);
+  } else if (stat.isDirectory()) {
+    for (const agent of loadAgentsFromDir(agentPath, 'package')) {
+      if (!isContained(agent.filePath)) continue;
+      collected.push(agent);
+    }
+  }
+
+  return collected.map((agent) => ({
+    ...agent,
+    localName: agent.name,
+    packageName,
+    name: `${packageName}.${agent.name}`,
+  }));
 }
 
 function isDirectory(p: string): boolean {
@@ -171,6 +228,12 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
   const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
   const builtinAgents = loadAgentsFromDir(BUILTIN_AGENTS_DIR, 'builtin');
+  const includePackage = scope === 'project' || scope === 'both';
+  const packageAgents = includePackage
+    ? discoverPackageAgentDirs(cwd).flatMap((pkg) =>
+        loadAgentsFromPackagePath(pkg.agentPath, pkg.packageName, pkg.packageRoot)
+      )
+    : [];
   const userAgents = scope === 'project' ? [] : loadAgentsFromDir(userDir, 'user');
   const projectAgents =
     scope === 'user' || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, 'project');
@@ -178,6 +241,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
   const agentMap = new Map<string, AgentConfig>();
 
   for (const agent of builtinAgents) agentMap.set(agent.name, agent);
+  for (const agent of packageAgents) agentMap.set(agent.name, agent);
   if (scope === 'both' || scope === 'user') {
     for (const agent of userAgents) agentMap.set(agent.name, agent);
   }

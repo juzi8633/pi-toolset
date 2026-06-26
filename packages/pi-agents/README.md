@@ -7,6 +7,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Isolated context** — every subagent runs in a fresh `pi` process
 - **Streaming output** — tool calls and progress arrive live
 - **Three execution modes** — single, parallel (max 8, 4 concurrent), and chained
+- **Package agents** — install agents from npm packages that declare `pi.agents`
 - **Markdown rendering** — final output is rendered with proper formatting in the expanded view
 - **Usage tracking** — turns, tokens, cost, and context shown per agent
 - **Abort support** — Ctrl+C propagates and kills active subprocesses
@@ -32,11 +33,13 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 
 **Project-local agents** (`.pi/agents/*.md`) are repo-controlled prompts that can instruct the model to read files, run bash commands, etc.
 
+**Package agents** are agents exposed by installed npm packages via their `package.json` `pi.agents` field. They behave like project agents: only loaded under `agentScope: "project"` or `"both"`, and gated by the same confirmation flow.
+
 **Default behavior:** Only loads **user-level agents** from `~/.pi/agent/agents`.
 
-To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
+To enable project-local and package agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust — package agents are loaded from your project's direct `dependencies` / `devDependencies` / `optionalDependencies` and run with the same privileges as project agents.
 
-When running interactively, the tool prompts for confirmation before running project-local agents. Set `confirmProjectAgents: false` to disable.
+When running interactively, the tool prompts for confirmation before running project-local or package agents. Set `confirmProjectAgents: false` to disable.
 
 ### Tool Permissions
 
@@ -228,8 +231,28 @@ In `--no-session` parent runs, `fork` does **not** silently fall back to fresh c
 
 - `~/.pi/agent/agents/*.md` — user-level (always loaded)
 - `.pi/agents/*.md` — project-level (only with `agentScope: "project"` or `"both"`)
+- `<package>/<pi.agents>/*.md` — package-level (only with `agentScope: "project"` or `"both"`)
 
 Project agents override user agents with the same name when `agentScope: "both"`.
+
+### Package Agents
+
+Any npm package can publish agents by declaring a `pi.agents` field in its `package.json`:
+
+```json
+{
+  "name": "@acme/pi-frontend",
+  "pi": {
+    "agents": ["./agents"]
+  }
+}
+```
+
+The field can be a string or an array of strings, and each entry may point to a directory of `.md` files or a single `.md` file relative to the package root.
+
+Discovered package agents are namespaced by the package name. An agent declared as `name: reviewer` inside `@acme/pi-frontend` is invocable as `@acme/pi-frontend.reviewer`. The original local name is preserved on `AgentConfig.localName`, and the publishing package name is on `AgentConfig.packageName`.
+
+Only packages listed in the host project's `dependencies`, `devDependencies`, or `optionalDependencies` are scanned, and only when `agentScope` is `"project"` or `"both"`. Package agents go through the same confirmation prompt as project agents because they run with the same privileges.
 
 ## Bundled Agents
 

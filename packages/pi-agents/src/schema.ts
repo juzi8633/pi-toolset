@@ -33,7 +33,7 @@ export const ChainItem = Type.Object({
 
 export const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
   description:
-    'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
+    'Which agent directories to use. Default: "user". Use "project" or "both" to include project-local and package agents.',
   default: 'user',
 });
 
@@ -51,7 +51,7 @@ export const SubagentParams = Type.Object({
   agentScope: Type.Optional(AgentScopeSchema),
   confirmProjectAgents: Type.Optional(
     Type.Boolean({
-      description: 'Prompt before running project-local agents. Default: true.',
+      description: 'Prompt before running project-local or package agents. Default: true.',
       default: true,
     })
   ),

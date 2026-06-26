@@ -103,20 +103,20 @@ export async function executeAgentTool(
     if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
     if (params.agent) requestedAgentNames.add(params.agent);
 
-    const projectAgentsRequested = Array.from(requestedAgentNames)
+    const elevatedAgentsRequested = Array.from(requestedAgentNames)
       .map((name) => agents.find((a) => a.name === name))
-      .filter((a): a is AgentConfig => a?.source === 'project');
+      .filter((a): a is AgentConfig => a?.source === 'project' || a?.source === 'package');
 
-    if (projectAgentsRequested.length > 0) {
-      const names = projectAgentsRequested.map((a) => a.name).join(', ');
-      const dir = discovery.projectAgentsDir ?? '(unknown)';
+    if (elevatedAgentsRequested.length > 0) {
+      const entries = elevatedAgentsRequested.map((a) => `${a.name} [${a.source}] (${a.filePath})`);
+      const projectDir = discovery.projectAgentsDir ?? '(unknown)';
       const ok = await ctx.ui.confirm(
-        'Run project-local agents?',
-        `Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`
+        'Run project-trust agents?',
+        `Agents:\n${entries.join('\n')}\nProject dir: ${projectDir}\n\nProject and package agents are repo-controlled. Only continue for trusted repositories.`
       );
       if (!ok)
         return {
-          content: [{ type: 'text', text: 'Canceled: project-local agents not approved.' }],
+          content: [{ type: 'text', text: 'Canceled: project-trust agents not approved.' }],
           details: makeDetails(hasChain ? 'chain' : hasTasks ? 'parallel' : 'single')([]),
         };
     }

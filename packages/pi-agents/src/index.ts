@@ -11,8 +11,9 @@ import { executeAgentTool } from './tool.ts';
 export default function (pi: ExtensionAPI) {
   pi.on('before_agent_start', async (event, ctx) => {
     const discovery = discoverAgents(ctx.cwd, 'both');
-    if (!shouldInjectAgentCatalogue(process.env, discovery.agents)) return;
-    const block = renderAgentCatalogue(discovery.agents);
+    const safeAgents = discovery.agents.filter((a) => a.source !== 'package');
+    if (!shouldInjectAgentCatalogue(process.env, safeAgents)) return;
+    const block = renderAgentCatalogue(safeAgents);
     return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
   });
 

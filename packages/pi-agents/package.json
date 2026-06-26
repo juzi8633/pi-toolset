@@ -24,6 +24,9 @@
     ],
     "prompts": [
       "./prompts"
+    ],
+    "agents": [
+      "./agents"
     ]
   },
   "repository": {
