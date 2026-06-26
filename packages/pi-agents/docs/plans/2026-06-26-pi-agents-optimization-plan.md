@@ -313,18 +313,18 @@
 
 **Steps:**
 
-- [ ] Extend `TaskItem`, `ChainItem`, and single-mode params with optional `isolation: 'none' | 'worktree'` where task-level isolation overrides agent frontmatter isolation.
-- [ ] Add `resolveIsolation(agent, params)` that returns task-level isolation when provided, otherwise `agent.isolation`, otherwise `none`.
-- [ ] Add `getGitRoot(cwd)` in `worktree.ts`; run `git -C <cwd> rev-parse --show-toplevel` and return the trimmed path.
-- [ ] If worktree isolation is requested and `getGitRoot()` fails, return an agent error result with `stderr: 'Worktree isolation requires a git repository.'`.
-- [ ] Add `createAgentWorktree(repoRoot, agentName, index)` that creates `.worktrees/pi-agent-<safe-agent-name>-<timestamp>-<index>` under the repo root using `git -C <repoRoot> worktree add --detach <path> HEAD`.
-- [ ] Run the child process with `cwd` set to the worktree path when worktree isolation is active.
-- [ ] Add `getWorktreeDirtyStatus(worktreePath)` that runs `git -C <worktreePath> status --porcelain`.
-- [ ] After the child exits, if dirty status is empty, remove the worktree with `git -C <repoRoot> worktree remove <worktreePath> --force` and delete the directory if it remains.
-- [ ] After the child exits, if dirty status is non-empty, keep the worktree and add `worktreePath` plus `worktreeDirty: true` to `SingleResult`.
-- [ ] Add a worktree test using a temporary git repository where an unchanged worktree is removed after cleanup.
-- [ ] Add a worktree test using a temporary git repository where a modified file causes the worktree to be kept and reported.
-- [ ] Document `isolation: worktree`, task-level override, cleanup behavior, and retained-worktree path reporting in README.
+- [x] Extend `TaskItem`, `ChainItem`, and single-mode params with optional `isolation: 'none' | 'worktree'` where task-level isolation overrides agent frontmatter isolation.
+- [x] Add `resolveIsolation(agent, params)` that returns task-level isolation when provided, otherwise `agent.isolation`, otherwise `none`.
+- [x] Add `getGitRoot(cwd)` in `worktree.ts`; run `git -C <cwd> rev-parse --show-toplevel` and return the trimmed path.
+- [x] If worktree isolation is requested and `getGitRoot()` fails, return an agent error result with `stderr: 'Worktree isolation requires a git repository.'`.
+- [x] Add `createAgentWorktree(repoRoot, agentName, index)` that creates `.worktrees/pi-agent-<safe-agent-name>-<timestamp>-<index>` under the repo root using `git -C <repoRoot> worktree add --detach <path> HEAD`.
+- [x] Run the child process with `cwd` set to the worktree path when worktree isolation is active.
+- [x] Add `getWorktreeDirtyStatus(worktreePath)` that runs `git -C <worktreePath> status --porcelain`.
+- [x] After the child exits, if dirty status is empty, remove the worktree with `git -C <repoRoot> worktree remove <worktreePath> --force` and delete the directory if it remains.
+- [x] After the child exits, if dirty status is non-empty, keep the worktree and add `worktreePath` plus `worktreeDirty: true` to `SingleResult`.
+- [x] Add a worktree test using a temporary git repository where an unchanged worktree is removed after cleanup.
+- [x] Add a worktree test using a temporary git repository where a modified file causes the worktree to be kept and reported.
+- [x] Document `isolation: worktree`, task-level override, cleanup behavior, and retained-worktree path reporting in README.
 
 **Validation:**
 
@@ -348,16 +348,16 @@
 
 **Steps:**
 
-- [ ] Add `agentCanMutate(agent)` in `completion-guard.ts`; return true when `agent.tools` is undefined, or when `agent.tools` includes `edit`, `write`, or `bash` and those tools are not excluded by `excludeTools`.
-- [ ] Add `isCompletionGuardEnabled(agent)`; return `agent.completionGuard` when explicitly set, otherwise return `agentCanMutate(agent)`.
-- [ ] Add `validateCompletionOutput(agent, output)`; when guard is disabled return success.
-- [ ] When guard is enabled, require final output to contain headings matching `## Completed`, `## Files Changed`, and `## Validation`.
-- [ ] If required headings are missing, mark the result failed by setting `stopReason = 'completion_guard'`, `errorMessage = 'Completion guard failed: missing <headings>'`, and `exitCode = 1`.
-- [ ] Update `worker.md` output format to include `## Validation` with either commands run and pass/fail results or `Not run: <specific reason>`.
-- [ ] Add a completion-guard test where a mutating worker output missing `## Validation` fails with `completion_guard`.
-- [ ] Add a completion-guard test where a reviewer with `excludeTools: edit, write, agent` and explicit `completionGuard: false` is not checked.
-- [ ] Add a completion-guard test where valid worker output passes.
-- [ ] Document completion guard defaults, required headings, and opt-out behavior in README.
+- [x] Add `agentCanMutate(agent)` in `completion-guard.ts`; return true when `agent.tools` is undefined, or when `agent.tools` includes `edit`, `write`, or `bash` and those tools are not excluded by `excludeTools`.
+- [x] Add `isCompletionGuardEnabled(agent)`; return `agent.completionGuard` when explicitly set, otherwise return `agentCanMutate(agent)`.
+- [x] Add `validateCompletionOutput(agent, output)`; when guard is disabled return success.
+- [x] When guard is enabled, require final output to contain headings matching `## Completed`, `## Files Changed`, and `## Validation`.
+- [x] If required headings are missing, mark the result failed by setting `stopReason = 'completion_guard'`, `errorMessage = 'Completion guard failed: missing <headings>'`, and `exitCode = 1`.
+- [x] Update `worker.md` output format to include `## Validation` with either commands run and pass/fail results or `Not run: <specific reason>`.
+- [x] Add a completion-guard test where a mutating worker output missing `## Validation` fails with `completion_guard`.
+- [x] Add a completion-guard test where a reviewer with `excludeTools: edit, write, agent` and explicit `completionGuard: false` is not checked.
+- [x] Add a completion-guard test where valid worker output passes.
+- [x] Document completion guard defaults, required headings, and opt-out behavior in README.
 
 **Validation:**
 
@@ -383,17 +383,17 @@
 
 **Steps:**
 
-- [ ] Extend `ChainItem` with optional `name: string`.
-- [ ] Add `renderTaskTemplate(template, context)` in `template.ts`.
-- [ ] Replace every `{previous}` with the prior successful step output.
-- [ ] Replace every `{outputs.<name>}` with the output stored for a previous chain step whose `name` equals `<name>`.
-- [ ] If a template references an unknown `{outputs.<name>}`, stop the chain before spawning the step and return an error result with `Unknown chain output: <name>`.
-- [ ] Store named outputs only after a step succeeds.
-- [ ] Add a template test where `{previous}` and `{outputs.plan}` are both replaced.
-- [ ] Add a template test where `{outputs.missing}` returns the unknown-output error.
-- [ ] Update `/implement` to name the explore step `context`, the planner step `plan`, and the worker step to reference `{outputs.plan}`.
-- [ ] Update `/implement-and-review` to name the first worker step `implementation`, reviewer step `review`, and final worker step to reference `{outputs.review}`.
-- [ ] Update README chain examples to show `name` and `{outputs.name}`.
+- [x] Extend `ChainItem` with optional `name: string`.
+- [x] Add `renderTaskTemplate(template, context)` in `template.ts`.
+- [x] Replace every `{previous}` with the prior successful step output.
+- [x] Replace every `{outputs.<name>}` with the output stored for a previous chain step whose `name` equals `<name>`.
+- [x] If a template references an unknown `{outputs.<name>}`, stop the chain before spawning the step and return an error result with `Unknown chain output: <name>`.
+- [x] Store named outputs only after a step succeeds.
+- [x] Add a template test where `{previous}` and `{outputs.plan}` are both replaced.
+- [x] Add a template test where `{outputs.missing}` returns the unknown-output error.
+- [x] Update `/implement` to name the explore step `context`, the planner step `plan`, and the worker step to reference `{outputs.plan}`.
+- [x] Update `/implement-and-review` to name the first worker step `implementation`, reviewer step `review`, and final worker step to reference `{outputs.review}`.
+- [x] Update README chain examples to show `name` and `{outputs.name}`.
 
 **Validation:**
 
@@ -417,13 +417,13 @@
 
 **Steps:**
 
-- [ ] Update `/implement` prompt to require the worker final output to include `## Completed`, `## Files Changed`, and `## Validation`.
-- [ ] Update `/implement-and-review` prompt so the final worker step must address every reviewer item under `## Critical (must fix)` and report remaining warnings separately.
-- [ ] Update `/implement-and-review` prompt so if the reviewer reports any Critical item that cannot be fixed safely, the final worker stops and reports the blocker instead of pretending completion.
-- [ ] Update `/explore-and-plan` prompt to state that no files should be modified and no worker should be invoked.
-- [ ] Update `reviewer.md` to explicitly classify an empty Critical section as `## Critical (must fix)\n- None.`.
-- [ ] Update `worker.md` to include validation command output or a precise reason validation was skipped.
-- [ ] Document these workflow acceptance expectations in README under Workflow Prompts.
+- [x] Update `/implement` prompt to require the worker final output to include `## Completed`, `## Files Changed`, and `## Validation`.
+- [x] Update `/implement-and-review` prompt so the final worker step must address every reviewer item under `## Critical (must fix)` and report remaining warnings separately.
+- [x] Update `/implement-and-review` prompt so if the reviewer reports any Critical item that cannot be fixed safely, the final worker stops and reports the blocker instead of pretending completion.
+- [x] Update `/explore-and-plan` prompt to state that no files should be modified and no worker should be invoked.
+- [x] Update `reviewer.md` to explicitly classify an empty Critical section as `## Critical (must fix)\n- None.`.
+- [x] Update `worker.md` to include validation command output or a precise reason validation was skipped.
+- [x] Document these workflow acceptance expectations in README under Workflow Prompts.
 
 **Validation:**
 

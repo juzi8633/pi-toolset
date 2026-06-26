@@ -50,8 +50,19 @@ export function getFinalOutput(messages: Message[]): string {
   return '';
 }
 
+const FAILURE_STOP_REASONS = new Set([
+  'error',
+  'aborted',
+  'max_turns',
+  'context_error',
+  'isolation_error',
+  'completion_guard',
+  'template_error',
+]);
+
 export function isFailedResult(result: SingleResult): boolean {
-  return result.exitCode !== 0 || result.stopReason === 'error' || result.stopReason === 'aborted';
+  if (result.exitCode !== 0) return true;
+  return result.stopReason !== undefined && FAILURE_STOP_REASONS.has(result.stopReason);
 }
 
 export function getResultOutput(result: SingleResult): string {

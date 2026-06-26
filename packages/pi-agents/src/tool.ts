@@ -14,6 +14,7 @@ import {
   getBuiltinAgentsDir,
 } from './agents.ts';
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
+import { validateCompletionOutput } from './completion-guard.ts';
 import { prepareAgentContext } from './context.ts';
 import { mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from './execution.ts';
 import {
@@ -24,7 +25,15 @@ import {
 } from './output.ts';
 import type { SubagentParams } from './schema.ts';
 import { assertDepthAllowed } from './security.ts';
-import type { SingleResult, SubagentDetails } from './types.ts';
+import { renderTaskTemplate } from './template.ts';
+import type { IsolationMode, SingleResult, SubagentDetails } from './types.ts';
+import {
+  type AgentWorktree,
+  createAgentWorktree,
+  getGitRoot,
+  getWorktreeDirtyStatus,
+  removeAgentWorktree,
+} from './worktree.ts';
 
 type Params = Static<typeof SubagentParams>;
 type Mode = 'single' | 'parallel' | 'chain';
@@ -126,6 +135,7 @@ export async function executeAgentTool(
       params.agent,
       params.task,
       params.cwd,
+      params.isolation,
       signal,
       onUpdate,
       makeDetails
@@ -149,10 +159,33 @@ async function runChain(
 ): Promise<AgentResult> {
   const results: SingleResult[] = [];
   let previousOutput = '';
+  const outputs = new Map<string, string>();
 
   for (let i = 0; i < chain.length; i++) {
     const step = chain[i];
-    const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+    const rendered = renderTaskTemplate(step.task, { previous: previousOutput, outputs });
+    if (!rendered.ok) {
+      const failure = synthesizeFailure(
+        step.agent,
+        undefined,
+        step.task,
+        i + 1,
+        'template_error',
+        `Unknown chain output: ${rendered.unknown}`
+      );
+      results.push(failure);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Chain stopped at step ${i + 1} (${step.agent}): Unknown chain output: ${rendered.unknown}`,
+          },
+        ],
+        details: makeDetails('chain')(results),
+        isError: true,
+      };
+    }
+    const taskWithContext = rendered.text;
 
     const chainUpdate: OnUpdateCallback | undefined = onUpdate
       ? (partial) => {
@@ -173,6 +206,8 @@ async function runChain(
       step.agent,
       taskWithContext,
       step.cwd,
+      step.isolation,
+      i,
       i + 1,
       signal,
       chainUpdate,
@@ -191,6 +226,7 @@ async function runChain(
       };
     }
     previousOutput = getFinalOutput(result.messages);
+    if (step.name) outputs.set(step.name, previousOutput);
   }
 
   return {
@@ -267,6 +303,8 @@ async function runParallel(
       t.agent,
       t.task,
       t.cwd,
+      t.isolation,
+      index,
       undefined,
       signal,
       (partial) => {
@@ -307,6 +345,7 @@ async function runSingle(
   agentName: string,
   task: string,
   cwd: string | undefined,
+  isolation: IsolationMode | undefined,
   signal: AbortSignal | undefined,
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
   makeDetails: DetailsFactory
@@ -317,6 +356,8 @@ async function runSingle(
     agentName,
     task,
     cwd,
+    isolation,
+    0,
     undefined,
     signal,
     onUpdate,
@@ -336,12 +377,51 @@ async function runSingle(
   };
 }
 
+function resolveIsolation(
+  agent: AgentConfig,
+  taskIsolation: IsolationMode | undefined
+): IsolationMode {
+  return taskIsolation ?? agent.isolation ?? 'none';
+}
+
+function synthesizeFailure(
+  agentName: string,
+  agent: AgentConfig | undefined,
+  task: string,
+  step: number | undefined,
+  stopReason: string,
+  message: string
+): SingleResult {
+  return {
+    agent: agentName,
+    agentSource: agent?.source ?? 'unknown',
+    task,
+    exitCode: 1,
+    messages: [],
+    stderr: message,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: 0,
+      contextTokens: 0,
+      turns: 0,
+    },
+    stopReason,
+    errorMessage: message,
+    step,
+  };
+}
+
 async function runStepWithContext(
   ctx: ExtensionContext,
   agents: AgentConfig[],
   agentName: string,
   task: string,
   cwd: string | undefined,
+  taskIsolation: IsolationMode | undefined,
+  taskIndex: number,
   step: number | undefined,
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
@@ -367,42 +447,102 @@ async function runStepWithContext(
     agentContext = prepareAgentContext(agent, ctx);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return {
-      agent: agentName,
-      agentSource: agent.source,
-      task,
-      exitCode: 1,
-      messages: [],
-      stderr: message,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        contextTokens: 0,
-        turns: 0,
-      },
-      stopReason: 'context_error',
-      errorMessage: message,
-      step,
-    };
+    return synthesizeFailure(agentName, agent, task, step, 'context_error', message);
+  }
+
+  const isolation = resolveIsolation(agent, taskIsolation);
+  let worktree: AgentWorktree | undefined;
+  let effectiveCwd = cwd;
+  if (isolation === 'worktree') {
+    const repoRoot = getGitRoot(cwd ?? ctx.cwd);
+    if (!repoRoot) {
+      await agentContext.cleanup();
+      return synthesizeFailure(
+        agentName,
+        agent,
+        task,
+        step,
+        'isolation_error',
+        'Worktree isolation requires a git repository.'
+      );
+    }
+    try {
+      worktree = createAgentWorktree(repoRoot, agentName, taskIndex);
+      effectiveCwd = worktree.path;
+    } catch (err) {
+      await agentContext.cleanup();
+      const message = err instanceof Error ? err.message : String(err);
+      return synthesizeFailure(agentName, agent, task, step, 'isolation_error', message);
+    }
   }
 
   try {
-    return await runSingleAgent(
+    const result = await runSingleAgent(
       ctx.cwd,
       agents,
       agentName,
       task,
-      cwd,
+      effectiveCwd,
       step,
       signal,
       onUpdate,
       makeDetails,
       { sessionFile: agentContext.sessionFile }
     );
+    if (worktree) {
+      finalizeWorktree(worktree, result);
+    }
+    enforceCompletionGuard(agent, result);
+    return result;
+  } catch (err) {
+    if (worktree) {
+      // Best-effort: mark the worktree path on a synthetic result is not possible here
+      // because we are about to rethrow; attempt status check + safe cleanup so we don't
+      // leak directories on abort. Dirty or unknown-status worktrees are retained.
+      const status = getWorktreeDirtyStatus(worktree.path);
+      if (status.ok && status.output.trim().length === 0) {
+        removeAgentWorktree(worktree);
+      }
+    }
+    throw err;
   } finally {
     await agentContext.cleanup();
+  }
+}
+
+function finalizeWorktree(worktree: AgentWorktree, result: SingleResult): void {
+  const status = getWorktreeDirtyStatus(worktree.path);
+  if (!status.ok) {
+    // Treat unknown status as dirty so we never delete data we can't verify.
+    result.worktreePath = worktree.path;
+    result.worktreeDirty = true;
+    result.stderr += result.stderr ? '\n' : '';
+    result.stderr += `Worktree status check failed: ${status.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+    return;
+  }
+  if (status.output.trim().length > 0) {
+    result.worktreePath = worktree.path;
+    result.worktreeDirty = true;
+    return;
+  }
+  const removal = removeAgentWorktree(worktree);
+  if (!removal.removed) {
+    result.worktreePath = worktree.path;
+    result.worktreeDirty = false;
+    result.stderr += result.stderr ? '\n' : '';
+    result.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+  }
+}
+
+function enforceCompletionGuard(agent: AgentConfig, result: SingleResult): void {
+  if (isFailedResult(result)) return;
+  const finalOutput = getFinalOutput(result.messages);
+  const validation = validateCompletionOutput(agent, finalOutput);
+  if (validation.ok) return;
+  const missing = validation.missing.join(', ');
+  result.stopReason = 'completion_guard';
+  result.errorMessage = `Completion guard failed: missing ${missing}`;
+  if (result.exitCode === 0) {
+    result.exitCode = 1;
   }
 }

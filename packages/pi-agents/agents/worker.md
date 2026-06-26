@@ -19,6 +19,10 @@ What was done.
 
 - `path/to/file.ts` - what changed
 
+## Validation
+
+List the commands actually run and their pass/fail result. If no validation was run, state `Not run: <specific reason>` (e.g. "Not run: no test command exists for this directory").
+
 ## Notes (if any)
 
 Anything the main agent should know.

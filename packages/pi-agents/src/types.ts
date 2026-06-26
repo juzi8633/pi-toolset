@@ -30,6 +30,8 @@ export interface SingleResult {
   stopReason?: string;
   errorMessage?: string;
   step?: number;
+  worktreePath?: string;
+  worktreeDirty?: boolean;
 }
 
 export interface SubagentDetails {
