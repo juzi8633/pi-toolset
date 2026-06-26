@@ -14,6 +14,7 @@ import {
   getBuiltinAgentsDir,
 } from './agents.ts';
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
+import { prepareAgentContext } from './context.ts';
 import { mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from './execution.ts';
 import {
   getFinalOutput,
@@ -166,8 +167,8 @@ async function runChain(
         }
       : undefined;
 
-    const result = await runSingleAgent(
-      ctx.cwd,
+    const result = await runStepWithContext(
+      ctx,
       agents,
       step.agent,
       taskWithContext,
@@ -260,8 +261,8 @@ async function runParallel(
   };
 
   const results = await mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (t, index) => {
-    const result = await runSingleAgent(
-      ctx.cwd,
+    const result = await runStepWithContext(
+      ctx,
       agents,
       t.agent,
       t.task,
@@ -310,8 +311,8 @@ async function runSingle(
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
   makeDetails: DetailsFactory
 ): Promise<AgentResult> {
-  const result = await runSingleAgent(
-    ctx.cwd,
+  const result = await runStepWithContext(
+    ctx,
     agents,
     agentName,
     task,
@@ -333,4 +334,75 @@ async function runSingle(
     content: [{ type: 'text', text: getFinalOutput(result.messages) || '(no output)' }],
     details: makeDetails('single')([result]),
   };
+}
+
+async function runStepWithContext(
+  ctx: ExtensionContext,
+  agents: AgentConfig[],
+  agentName: string,
+  task: string,
+  cwd: string | undefined,
+  step: number | undefined,
+  signal: AbortSignal | undefined,
+  onUpdate: OnUpdateCallback | undefined,
+  makeDetails: (results: SingleResult[]) => SubagentDetails
+): Promise<SingleResult> {
+  const agent = agents.find((a) => a.name === agentName);
+  if (!agent) {
+    return runSingleAgent(
+      ctx.cwd,
+      agents,
+      agentName,
+      task,
+      cwd,
+      step,
+      signal,
+      onUpdate,
+      makeDetails
+    );
+  }
+
+  let agentContext;
+  try {
+    agentContext = prepareAgentContext(agent, ctx);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      agent: agentName,
+      agentSource: agent.source,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: message,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 0,
+      },
+      stopReason: 'context_error',
+      errorMessage: message,
+      step,
+    };
+  }
+
+  try {
+    return await runSingleAgent(
+      ctx.cwd,
+      agents,
+      agentName,
+      task,
+      cwd,
+      step,
+      signal,
+      onUpdate,
+      makeDetails,
+      { sessionFile: agentContext.sessionFile }
+    );
+  } finally {
+    await agentContext.cleanup();
+  }
 }

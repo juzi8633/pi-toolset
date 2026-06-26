@@ -4,6 +4,8 @@ description: Creates implementation plans from context and requirements
 tools: read, grep, find, ls
 model: openai-codex/gpt-5.5
 thinking: xhigh
+noSkills: true
+maxTurns: 8
 ---
 
 You are a planning specialist. You receive context (from a explore) and requirements, then produce a clear implementation plan.

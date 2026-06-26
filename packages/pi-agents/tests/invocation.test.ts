@@ -55,6 +55,53 @@ describe('buildPiArgs', () => {
     expect(args[idx + 1]).toBe('write,edit');
   });
 
+  it('uses --system-prompt when systemPromptMode is replace', () => {
+    const args = buildPiArgs(makeAgent({ systemPromptMode: 'replace' }), 'go', {
+      tmpPromptPath: '/tmp/p.md',
+    });
+    expect(args).toContain('--system-prompt');
+    expect(args).not.toContain('--append-system-prompt');
+  });
+
+  it('uses --append-system-prompt when systemPromptMode is append (default)', () => {
+    const args = buildPiArgs(makeAgent({ systemPromptMode: 'append' }), 'go', {
+      tmpPromptPath: '/tmp/p.md',
+    });
+    expect(args).toContain('--append-system-prompt');
+    expect(args).not.toContain('--system-prompt');
+  });
+
+  it('adds --no-context-files when noContextFiles is true', () => {
+    const args = buildPiArgs(makeAgent({ noContextFiles: true }), 'go');
+    expect(args).toContain('--no-context-files');
+  });
+
+  it('omits --no-context-files when noContextFiles is false or undefined', () => {
+    expect(buildPiArgs(makeAgent({ noContextFiles: false }), 'go')).not.toContain(
+      '--no-context-files'
+    );
+    expect(buildPiArgs(makeAgent(), 'go')).not.toContain('--no-context-files');
+  });
+
+  it('adds --no-skills when noSkills is true', () => {
+    const args = buildPiArgs(makeAgent({ noSkills: true }), 'go');
+    expect(args).toContain('--no-skills');
+  });
+
+  it('uses --no-session in fresh context', () => {
+    const args = buildPiArgs(makeAgent(), 'go');
+    expect(args).toContain('--no-session');
+    expect(args).not.toContain('--session');
+  });
+
+  it('uses --session <file> when a fork session file is provided', () => {
+    const args = buildPiArgs(makeAgent(), 'go', { sessionFile: '/tmp/fork.jsonl' });
+    expect(args).toContain('--session');
+    const idx = args.indexOf('--session');
+    expect(args[idx + 1]).toBe('/tmp/fork.jsonl');
+    expect(args).not.toContain('--no-session');
+  });
+
   it('omits --tools when agent has no tools', () => {
     const args = buildPiArgs(makeAgent({ tools: [] }), 'go');
     expect(args).not.toContain('--tools');

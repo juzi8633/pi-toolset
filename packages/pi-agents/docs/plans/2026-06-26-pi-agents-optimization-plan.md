@@ -242,18 +242,18 @@
 
 **Steps:**
 
-- [ ] In `buildPiArgs()`, when `agent.systemPromptMode === 'replace'`, pass `--system-prompt <tmpPromptPath>` instead of `--append-system-prompt <tmpPromptPath>`.
-- [ ] In `buildPiArgs()`, when `agent.noContextFiles === true`, append `--no-context-files`.
-- [ ] In `buildPiArgs()`, when `agent.noSkills === true`, append `--no-skills`.
-- [ ] In `execution.ts`, after each assistant `message_end`, increment `currentResult.usage.turns` exactly once as currently done.
-- [ ] In `execution.ts`, if `agent.maxTurns` is set and `currentResult.usage.turns >= agent.maxTurns`, set `currentResult.stopReason = 'max_turns'`, set `currentResult.errorMessage = 'Agent exceeded maxTurns=<value>'`, terminate the child process with `SIGTERM`, and return exit code `1` if the process does not exit cleanly.
-- [ ] Update `explore.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
-- [ ] Update `planner.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
-- [ ] Add an invocation test where `systemPromptMode: replace` uses `--system-prompt` and does not include `--append-system-prompt`.
-- [ ] Add an invocation test where `noContextFiles: true` adds `--no-context-files`.
-- [ ] Add an invocation test where `noSkills: true` adds `--no-skills`.
-- [ ] Add a subprocess execution test with an injected fake child process stream that emits two assistant `message_end` events for an agent with `maxTurns: 1`; expected result has `stopReason: 'max_turns'` and an error message containing `maxTurns=1`.
-- [ ] Document `systemPromptMode`, `noContextFiles`, `noSkills`, and `maxTurns` in README.
+- [x] In `buildPiArgs()`, when `agent.systemPromptMode === 'replace'`, pass `--system-prompt <tmpPromptPath>` instead of `--append-system-prompt <tmpPromptPath>`.
+- [x] In `buildPiArgs()`, when `agent.noContextFiles === true`, append `--no-context-files`.
+- [x] In `buildPiArgs()`, when `agent.noSkills === true`, append `--no-skills`.
+- [x] In `execution.ts`, after each assistant `message_end`, increment `currentResult.usage.turns` exactly once as currently done.
+- [x] In `execution.ts`, if `agent.maxTurns` is set and `currentResult.usage.turns >= agent.maxTurns`, set `currentResult.stopReason = 'max_turns'`, set `currentResult.errorMessage = 'Agent exceeded maxTurns=<value>'`, terminate the child process with `SIGTERM`, and return exit code `1` if the process does not exit cleanly.
+- [x] Update `explore.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
+- [x] Update `planner.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
+- [x] Add an invocation test where `systemPromptMode: replace` uses `--system-prompt` and does not include `--append-system-prompt`.
+- [x] Add an invocation test where `noContextFiles: true` adds `--no-context-files`.
+- [x] Add an invocation test where `noSkills: true` adds `--no-skills`.
+- [x] Add a subprocess execution test with an injected fake child process stream that emits two assistant `message_end` events for an agent with `maxTurns: 1`; expected result has `stopReason: 'max_turns'` and an error message containing `maxTurns=1`.
+- [x] Document `systemPromptMode`, `noContextFiles`, `noSkills`, and `maxTurns` in README.
 
 **Validation:**
 
@@ -277,17 +277,18 @@
 
 **Steps:**
 
-- [ ] Add `prepareAgentContext(agent, ctx)` in `context.ts`.
-- [ ] For `agent.defaultContext === 'fresh'`, return `{ mode: 'fresh', sessionFile: undefined, cleanup: async () => {} }`.
-- [ ] For `agent.defaultContext === 'fork'`, read `const leafId = ctx.sessionManager.getLeafId()`.
-- [ ] If `leafId` is missing for `fork`, throw `Cannot fork parent context: current session has no leaf entry`.
-- [ ] Call `ctx.sessionManager.createBranchedSession(leafId)` for `fork`.
-- [ ] If `createBranchedSession()` returns undefined, throw `Cannot fork parent context: parent session is not persisted`.
-- [ ] In `buildPiArgs()`, use `--session <sessionFile>` when a fork session file is provided; otherwise use `--no-session`.
-- [ ] Ensure fork child sessions do not overwrite the parent session file by always using the branched file returned by `createBranchedSession()`.
-- [ ] Add an invocation test where fresh context includes `--no-session`.
-- [ ] Add an invocation test where fork context includes `--session /tmp/fork.jsonl` and omits `--no-session`.
-- [ ] Document `defaultContext: fresh | fork`, the persisted-session requirement, and the failure messages in README.
+- [x] Add `prepareAgentContext(agent, ctx)` in `context.ts`.
+- [x] For `agent.defaultContext === 'fresh'`, return `{ mode: 'fresh', sessionFile: undefined, cleanup: async () => {} }`.
+- [x] For `agent.defaultContext === 'fork'`, read `const leafId = ctx.sessionManager.getLeafId()`.
+- [x] If `leafId` is missing for `fork`, throw `Cannot fork parent context: current session has no leaf entry`.
+- [x] Open the parent session file with `SessionManager.open(parentSessionFile, getSessionDir?.())` and call `createBranchedSession(leafId)` on the opened manager (the readonly `ctx.sessionManager` does not expose this method; pattern borrowed from `pi-subagents/src/shared/fork-context.ts`).
+- [x] If `createBranchedSession()` returns undefined, throw `Cannot fork parent context: parent session is not persisted`.
+- [x] In `buildPiArgs()`, use `--session <sessionFile>` when a fork session file is provided; otherwise use `--no-session`.
+- [x] Ensure fork child sessions do not overwrite the parent session file by always using the branched file returned by `createBranchedSession()`.
+- [x] Add an invocation test where fresh context includes `--no-session`.
+- [x] Add an invocation test where fork context includes `--session /tmp/fork.jsonl` and omits `--no-session`.
+- [x] Add a context test that successfully forks a real `SessionManager` and returns a populated `sessionFile`.
+- [x] Document `defaultContext: fresh | fork`, the persisted-session requirement, the explicit error messages, and the `stopReason: context_error` classification in README.
 
 **Validation:**
 

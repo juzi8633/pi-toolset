@@ -39,6 +39,7 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 
 export interface BuildPiArgsOptions {
   tmpPromptPath?: string;
+  sessionFile?: string;
 }
 
 export function buildPiArgs(
@@ -46,11 +47,22 @@ export function buildPiArgs(
   task: string,
   options: BuildPiArgsOptions = {}
 ): string[] {
-  const args: string[] = ['--mode', 'json', '-p', '--no-session'];
+  const args: string[] = ['--mode', 'json', '-p'];
+  if (options.sessionFile) {
+    args.push('--session', options.sessionFile);
+  } else {
+    args.push('--no-session');
+  }
   if (agent.model) args.push('--model', agent.model);
   if (agent.thinking) args.push('--thinking', agent.thinking);
   args.push(...buildToolCliArgs(agent));
-  if (options.tmpPromptPath) args.push('--append-system-prompt', options.tmpPromptPath);
+  if (agent.noContextFiles) args.push('--no-context-files');
+  if (agent.noSkills) args.push('--no-skills');
+  if (options.tmpPromptPath) {
+    const promptFlag =
+      agent.systemPromptMode === 'replace' ? '--system-prompt' : '--append-system-prompt';
+    args.push(promptFlag, options.tmpPromptPath);
+  }
   args.push(`Task: ${task}`);
   return args;
 }

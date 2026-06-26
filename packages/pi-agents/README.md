@@ -144,25 +144,41 @@ System prompt for the agent goes here.
 
 ### Frontmatter Fields
 
-| Field              | Type                  | Default               | Description                                                                                                               |
-| ------------------ | --------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `name`             | string                | (required)            | Agent identifier used by the `agent` tool.                                                                                |
-| `description`      | string                | (required)            | Shown to the parent model in the agent catalogue.                                                                         |
-| `tools`            | comma list            | inherit all           | Allowlist passed to `pi --tools`.                                                                                         |
-| `excludeTools`     | comma list            | none                  | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                    |
-| `model`            | string                | host default          | Forwarded as `pi --model`.                                                                                                |
-| `thinking`         | string                | host default          | Forwarded as `pi --thinking`.                                                                                             |
-| `systemPromptMode` | `append` \| `replace` | `append`              | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`. |
-| `maxTurns`         | positive integer      | unbounded             | Maximum assistant turns; the child is terminated when exceeded.                                                           |
-| `noContextFiles`   | boolean               | `false`               | When `true`, runs the child with `--no-context-files`.                                                                    |
-| `noSkills`         | boolean               | `false`               | When `true`, runs the child with `--no-skills`.                                                                           |
-| `defaultContext`   | `fresh` \| `fork`     | `fresh`               | `fork` branches the parent session; `fresh` runs in `--no-session`.                                                       |
-| `isolation`        | `none` \| `worktree`  | `none`                | When `worktree`, the child runs in an isolated git worktree.                                                              |
-| `completionGuard`  | boolean               | inferred from `tools` | When enabled, the final message must include `## Completed`, `## Files Changed`, and `## Validation`.                     |
+| Field              | Type                  | Default               | Description                                                                                                                                                                                                                       |
+| ------------------ | --------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`             | string                | (required)            | Agent identifier used by the `agent` tool.                                                                                                                                                                                        |
+| `description`      | string                | (required)            | Shown to the parent model in the agent catalogue.                                                                                                                                                                                 |
+| `tools`            | comma list            | inherit all           | Allowlist passed to `pi --tools`.                                                                                                                                                                                                 |
+| `excludeTools`     | comma list            | none                  | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                            |
+| `model`            | string                | host default          | Forwarded as `pi --model`.                                                                                                                                                                                                        |
+| `thinking`         | string                | host default          | Forwarded as `pi --thinking`.                                                                                                                                                                                                     |
+| `systemPromptMode` | `append` \| `replace` | `append`              | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                         |
+| `maxTurns`         | positive integer      | unbounded             | Maximum assistant turns; the child is `SIGTERM`'d when exceeded and the result is marked with `stopReason: max_turns`.                                                                                                            |
+| `noContextFiles`   | boolean               | `false`               | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                            |
+| `noSkills`         | boolean               | `false`               | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                   |
+| `defaultContext`   | `fresh` \| `fork`     | `fresh`               | `fork` branches the parent session via `SessionManager.createBranchedSession(getLeafId())` and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`. |
+| `isolation`        | `none` \| `worktree`  | `none`                | _Parsed only; runtime effect lands in a later task._ Will run the child in an isolated git worktree when `worktree`.                                                                                                              |
+| `completionGuard`  | boolean               | inferred from `tools` | _Parsed only; runtime effect lands in a later task._ Will require `## Completed`, `## Files Changed`, and `## Validation` in the final message.                                                                                   |
 
 Invalid values (unknown enums, non-positive integers, non-boolean strings) are ignored and fall back to the default (`append`, `fresh`, `none`) for enum fields and to `undefined` for boolean / numeric fields.
 
-> Frontmatter fields are parsed and exposed on every `AgentConfig` today. Runtime effects for `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, and `completionGuard` land in later tasks; until then they only show up on the config object and have no observable behavior change.
+> Runtime behavior currently wired up: `tools`, `excludeTools`, `model`, `thinking`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`. The remaining fields (`isolation`, `completionGuard`) are parsed and stored on `AgentConfig`; their runtime effects land in later tasks.
+
+### Fork Context
+
+When an agent declares `defaultContext: fork`, the tool:
+
+1. Reads the parent session's leaf id and session file from `ctx.sessionManager`.
+2. Opens that file with `SessionManager.open()` and calls `createBranchedSession(leafId)` to materialize a new session file containing only the path to the current leaf.
+3. Spawns the child `pi` with `--session <branched-file>` (the parent's session file is never passed directly).
+
+Fork mode returns an error result with `stopReason: context_error` and one of these `stderr` messages when prerequisites are missing:
+
+- `Cannot fork parent context: parent session is not persisted` — the parent ran with `--no-session`, or `createBranchedSession` returned undefined.
+- `Cannot fork parent context: parent session file does not exist: <path>` — the recorded session file is gone from disk.
+- `Cannot fork parent context: current session has no leaf entry` — the session has no current leaf to fork from.
+
+In `--no-session` parent runs, `fork` does **not** silently fall back to fresh context.
 
 **Locations:**
 
@@ -193,6 +209,8 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - **Exit code != 0**: tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
 - **stopReason "aborted"**: user abort (Ctrl+C) kills subprocess, throws error
+- **stopReason "max_turns"**: an agent exceeded its `maxTurns` budget; the child is `SIGTERM`'d
+- **stopReason "context_error"**: fork-context preparation failed before the child started (see _Fork Context_)
 - **Chain mode**: stops at the first failing step and reports which step failed
 
 ## Limitations
