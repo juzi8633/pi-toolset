@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from '@earendil-works/pi-coding-agent';
+import type { DefaultContext, IsolationMode, SystemPromptMode } from './types.ts';
 
 export type AgentScope = 'user' | 'project' | 'both';
 export type AgentSource = 'builtin' | 'user' | 'project';
@@ -13,11 +14,53 @@ export interface AgentConfig {
   name: string;
   description: string;
   tools?: string[];
+  excludeTools?: string[];
   model?: string;
   thinking?: string;
   systemPrompt: string;
   source: AgentSource;
   filePath: string;
+  systemPromptMode?: SystemPromptMode;
+  maxTurns?: number;
+  noContextFiles?: boolean;
+  noSkills?: boolean;
+  defaultContext?: DefaultContext;
+  isolation?: IsolationMode;
+  completionGuard?: boolean;
+}
+
+function parseCsvList(value: unknown): string[] | undefined {
+  if (typeof value !== 'string') return undefined;
+  const items = value
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  return items.length > 0 ? items : undefined;
+}
+
+function parseEnum<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return (allowed as readonly string[]).includes(trimmed) ? (trimmed as T) : undefined;
+}
+
+function parseBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim().toLowerCase();
+    if (trimmed === 'true') return true;
+    if (trimmed === 'false') return false;
+  }
+  return undefined;
+}
+
+function parsePositiveInt(value: unknown): number | undefined {
+  let n: number;
+  if (typeof value === 'number') n = value;
+  else if (typeof value === 'string') n = Number(value.trim());
+  else return undefined;
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return undefined;
+  return n;
 }
 
 export interface AgentDiscoveryResult {
@@ -59,26 +102,30 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
       continue;
     }
 
-    const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+    const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
 
-    if (!frontmatter.name || !frontmatter.description) {
+    if (typeof frontmatter.name !== 'string' || typeof frontmatter.description !== 'string') {
       continue;
     }
-
-    const tools = frontmatter.tools
-      ?.split(',')
-      .map((t: string) => t.trim())
-      .filter(Boolean);
 
     agents.push({
       name: frontmatter.name,
       description: frontmatter.description,
-      tools: tools && tools.length > 0 ? tools : undefined,
-      model: frontmatter.model,
-      thinking: frontmatter.thinking,
+      tools: parseCsvList(frontmatter.tools),
+      excludeTools: parseCsvList(frontmatter.excludeTools),
+      model: typeof frontmatter.model === 'string' ? frontmatter.model : undefined,
+      thinking: typeof frontmatter.thinking === 'string' ? frontmatter.thinking : undefined,
       systemPrompt: body,
       source,
       filePath,
+      systemPromptMode:
+        parseEnum(frontmatter.systemPromptMode, ['append', 'replace'] as const) ?? 'append',
+      maxTurns: parsePositiveInt(frontmatter.maxTurns),
+      noContextFiles: parseBoolean(frontmatter.noContextFiles),
+      noSkills: parseBoolean(frontmatter.noSkills),
+      defaultContext: parseEnum(frontmatter.defaultContext, ['fresh', 'fork'] as const) ?? 'fresh',
+      isolation: parseEnum(frontmatter.isolation, ['none', 'worktree'] as const) ?? 'none',
+      completionGuard: parseBoolean(frontmatter.completionGuard),
     });
   }
 

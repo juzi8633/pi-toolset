@@ -38,6 +38,21 @@ To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only
 
 When running interactively, the tool prompts for confirmation before running project-local agents. Set `confirmProjectAgents: false` to disable.
 
+### Tool Permissions
+
+Agent permissions are expressed with two frontmatter fields that map directly onto the Pi CLI:
+
+- `tools` → `--tools <list>` (allowlist; omit to inherit every tool the host exposes)
+- `excludeTools` → `--exclude-tools <list>` (denylist; applied after the allowlist)
+
+The child `pi` process receives the merged flags exactly as the parent would. Tool names are passed through after trimming and lower-cased only when the agent author writes them that way.
+
+### Nested Agents and Depth Guard
+
+Each spawned child carries `PI_AGENT_CHILD=1` and `PI_AGENT_DEPTH=<n>` in its environment. The tool refuses to start a new child when `PI_AGENT_DEPTH >= PI_AGENT_MAX_DEPTH` (default `2`).
+
+The max depth can be raised by exporting `PI_AGENT_MAX_DEPTH` before launching `pi`. Anything past depth `2` will lift the chance of runaway fan-out, so raise it carefully.
+
 ## Usage
 
 ### Single agent
@@ -113,11 +128,41 @@ Agents are markdown files with YAML frontmatter:
 name: my-agent
 description: What this agent does
 tools: read, grep, find, ls
+excludeTools: write, edit
 model: claude-haiku-4-5
+systemPromptMode: append
+maxTurns: 8
+noContextFiles: false
+noSkills: false
+defaultContext: fresh
+isolation: none
+completionGuard: false
 ---
 
 System prompt for the agent goes here.
 ```
+
+### Frontmatter Fields
+
+| Field              | Type                  | Default               | Description                                                                                                               |
+| ------------------ | --------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `name`             | string                | (required)            | Agent identifier used by the `agent` tool.                                                                                |
+| `description`      | string                | (required)            | Shown to the parent model in the agent catalogue.                                                                         |
+| `tools`            | comma list            | inherit all           | Allowlist passed to `pi --tools`.                                                                                         |
+| `excludeTools`     | comma list            | none                  | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                    |
+| `model`            | string                | host default          | Forwarded as `pi --model`.                                                                                                |
+| `thinking`         | string                | host default          | Forwarded as `pi --thinking`.                                                                                             |
+| `systemPromptMode` | `append` \| `replace` | `append`              | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`. |
+| `maxTurns`         | positive integer      | unbounded             | Maximum assistant turns; the child is terminated when exceeded.                                                           |
+| `noContextFiles`   | boolean               | `false`               | When `true`, runs the child with `--no-context-files`.                                                                    |
+| `noSkills`         | boolean               | `false`               | When `true`, runs the child with `--no-skills`.                                                                           |
+| `defaultContext`   | `fresh` \| `fork`     | `fresh`               | `fork` branches the parent session; `fresh` runs in `--no-session`.                                                       |
+| `isolation`        | `none` \| `worktree`  | `none`                | When `worktree`, the child runs in an isolated git worktree.                                                              |
+| `completionGuard`  | boolean               | inferred from `tools` | When enabled, the final message must include `## Completed`, `## Files Changed`, and `## Validation`.                     |
+
+Invalid values (unknown enums, non-positive integers, non-boolean strings) are ignored and fall back to the default (`append`, `fresh`, `none`) for enum fields and to `undefined` for boolean / numeric fields.
+
+> Frontmatter fields are parsed and exposed on every `AgentConfig` today. Runtime effects for `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, and `completionGuard` land in later tasks; until then they only show up on the config object and have no observable behavior change.
 
 **Locations:**
 
@@ -128,12 +173,12 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 ## Bundled Agents
 
-| Agent      | Purpose              | Tools                      |
-| ---------- | -------------------- | -------------------------- |
-| `explore`  | Fast codebase recon  | read, grep, find, ls, bash |
-| `planner`  | Implementation plans | read, grep, find, ls       |
-| `reviewer` | Code review          | read, grep, find, ls, bash |
-| `worker`   | General-purpose      | (all default)              |
+| Agent      | Purpose              | Tools                                            |
+| ---------- | -------------------- | ------------------------------------------------ |
+| `explore`  | Fast codebase recon  | read, grep, find, ls, bash                       |
+| `planner`  | Implementation plans | read, grep, find, ls                             |
+| `reviewer` | Code review          | read, grep, find, ls, bash (no edit/write/agent) |
+| `worker`   | General-purpose      | (all default)                                    |
 
 ## Workflow Prompts
 

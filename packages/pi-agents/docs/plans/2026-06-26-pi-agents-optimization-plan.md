@@ -173,16 +173,16 @@
 
 **Steps:**
 
-- [ ] Add these optional fields to `AgentConfig`: `disallowedTools?: string[]`, `systemPromptMode?: 'append' | 'replace'`, `maxTurns?: number`, `inheritProjectContext?: boolean`, `inheritSkills?: boolean`, `defaultContext?: 'fresh' | 'fork'`, `isolation?: 'none' | 'worktree'`, and `completionGuard?: boolean`.
-- [ ] Parse `disallowedTools` as a comma-separated list with trimming and empty-item removal.
-- [ ] Parse `systemPromptMode`; accept only `append` or `replace`; default to `append` when omitted.
-- [ ] Parse `maxTurns` as a positive integer; ignore invalid values and leave it undefined.
-- [ ] Parse `inheritProjectContext`, `inheritSkills`, and `completionGuard` from `true` or `false`; default `inheritProjectContext` and `inheritSkills` to `true`, and leave `completionGuard` undefined when omitted.
-- [ ] Parse `defaultContext`; accept only `fresh` or `fork`; default to `fresh`.
-- [ ] Parse `isolation`; accept only `none` or `worktree`; default to `none`.
-- [ ] Add an agents test where a markdown file containing all new fields normalizes to the expected `AgentConfig` values.
-- [ ] Add an agents test where invalid enum and integer values are ignored or defaulted exactly as described above.
-- [ ] Add README documentation for every new frontmatter field with a complete markdown example.
+- [x] Add these optional fields to `AgentConfig`: `excludeTools?: string[]`, `systemPromptMode?: 'append' | 'replace'`, `maxTurns?: number`, `noContextFiles?: boolean`, `noSkills?: boolean`, `defaultContext?: 'fresh' | 'fork'`, `isolation?: 'none' | 'worktree'`, and `completionGuard?: boolean`. Field names that map directly onto Pi CLI flags must match the flag name in camelCase (`--exclude-tools` → `excludeTools`, `--no-context-files` → `noContextFiles`, `--no-skills` → `noSkills`).
+- [x] Parse `excludeTools` as a comma-separated list with trimming and empty-item removal.
+- [x] Parse `systemPromptMode`; accept only `append` or `replace`; default to `append` when omitted.
+- [x] Parse `maxTurns` as a positive integer; ignore invalid values and leave it undefined.
+- [x] Parse `noContextFiles`, `noSkills`, and `completionGuard` from `true` or `false`; default `noContextFiles` and `noSkills` to `false` (inherit by default), and leave `completionGuard` undefined when omitted.
+- [x] Parse `defaultContext`; accept only `fresh` or `fork`; default to `fresh`.
+- [x] Parse `isolation`; accept only `none` or `worktree`; default to `none`.
+- [x] Add an agents test where a markdown file containing all new fields normalizes to the expected `AgentConfig` values.
+- [x] Add an agents test where invalid enum and integer values are ignored or defaulted exactly as described above.
+- [x] Add README documentation for every new frontmatter field with a complete markdown example.
 
 **Validation:**
 
@@ -206,19 +206,19 @@
 
 **Steps:**
 
-- [ ] Add `PI_AGENT_CHILD`, `PI_AGENT_DEPTH`, and `PI_AGENT_MAX_DEPTH` constants to `constants.ts`.
-- [ ] Add `getCurrentAgentDepth(env)` in `security.ts`; it reads `PI_AGENT_DEPTH`, treats missing or invalid values as `0`, and returns a non-negative integer.
-- [ ] Add `assertDepthAllowed(env)` in `security.ts`; it reads `PI_AGENT_MAX_DEPTH`, defaults to `2`, and throws `Agent nesting depth exceeded: <depth>/<max>` when `depth >= max`.
-- [ ] Call `assertDepthAllowed(process.env)` at the start of `executeAgentTool()` before agent discovery.
-- [ ] Add `buildChildAgentEnv(parentEnv)` in `security.ts`; it sets `PI_AGENT_CHILD=1`, increments `PI_AGENT_DEPTH` by one, and preserves an existing valid `PI_AGENT_MAX_DEPTH` or sets it to `2`.
-- [ ] Pass the child environment to `spawn()` in `execution.ts`.
-- [ ] Add `buildToolCliArgs(agent)` in `security.ts`; it returns `--tools <tools>` when `agent.tools` is non-empty and `--exclude-tools <disallowedTools>` when `agent.disallowedTools` is non-empty.
-- [ ] Update `buildPiArgs()` to use `buildToolCliArgs(agent)` instead of appending only `--tools`.
-- [ ] Update `packages/pi-agents/agents/reviewer.md` frontmatter to include `disallowedTools: edit, write, agent` while keeping `bash` available for read-only git commands.
-- [ ] Add a security test that missing depth env allows execution and produces child depth `1`.
-- [ ] Add a security test that `PI_AGENT_DEPTH=2` and `PI_AGENT_MAX_DEPTH=2` throws `Agent nesting depth exceeded: 2/2`.
-- [ ] Add a security test that an agent with `tools: read, bash` and `disallowedTools: write, edit` produces both `--tools read,bash` and `--exclude-tools write,edit`.
-- [ ] Document depth guard behavior and `disallowedTools` in README.
+- [x] Add `PI_AGENT_CHILD`, `PI_AGENT_DEPTH`, and `PI_AGENT_MAX_DEPTH` constants to `constants.ts`.
+- [x] Add `getCurrentAgentDepth(env)` in `security.ts`; it reads `PI_AGENT_DEPTH`, treats missing or invalid values as `0`, and returns a non-negative integer.
+- [x] Add `assertDepthAllowed(env)` in `security.ts`; it reads `PI_AGENT_MAX_DEPTH`, defaults to `2`, and throws `Agent nesting depth exceeded: <depth>/<max>` when `depth >= max`.
+- [x] Call `assertDepthAllowed(process.env)` at the start of `executeAgentTool()` before agent discovery.
+- [x] Add `buildChildAgentEnv(parentEnv)` in `security.ts`; it sets `PI_AGENT_CHILD=1`, increments `PI_AGENT_DEPTH` by one, and preserves an existing valid `PI_AGENT_MAX_DEPTH` or sets it to `2`.
+- [x] Pass the child environment to `spawn()` in `execution.ts`.
+- [x] Add `buildToolCliArgs(agent)` in `security.ts`; it returns `--tools <tools>` when `agent.tools` is non-empty and `--exclude-tools <excludeTools>` when `agent.excludeTools` is non-empty.
+- [x] Update `buildPiArgs()` to use `buildToolCliArgs(agent)` instead of appending only `--tools`.
+- [x] Update `packages/pi-agents/agents/reviewer.md` frontmatter to include `excludeTools: edit, write, agent` while keeping `bash` available for read-only git commands.
+- [x] Add a security test that missing depth env allows execution and produces child depth `1`.
+- [x] Add a security test that `PI_AGENT_DEPTH=2` and `PI_AGENT_MAX_DEPTH=2` throws `Agent nesting depth exceeded: 2/2`.
+- [x] Add a security test that an agent with `tools: read, bash` and `excludeTools: write, edit` produces both `--tools read,bash` and `--exclude-tools write,edit`.
+- [x] Document depth guard behavior and `excludeTools` in README.
 
 **Validation:**
 
@@ -243,17 +243,17 @@
 **Steps:**
 
 - [ ] In `buildPiArgs()`, when `agent.systemPromptMode === 'replace'`, pass `--system-prompt <tmpPromptPath>` instead of `--append-system-prompt <tmpPromptPath>`.
-- [ ] In `buildPiArgs()`, when `agent.inheritProjectContext === false`, append `--no-context-files`.
-- [ ] In `buildPiArgs()`, when `agent.inheritSkills === false`, append `--no-skills`.
+- [ ] In `buildPiArgs()`, when `agent.noContextFiles === true`, append `--no-context-files`.
+- [ ] In `buildPiArgs()`, when `agent.noSkills === true`, append `--no-skills`.
 - [ ] In `execution.ts`, after each assistant `message_end`, increment `currentResult.usage.turns` exactly once as currently done.
 - [ ] In `execution.ts`, if `agent.maxTurns` is set and `currentResult.usage.turns >= agent.maxTurns`, set `currentResult.stopReason = 'max_turns'`, set `currentResult.errorMessage = 'Agent exceeded maxTurns=<value>'`, terminate the child process with `SIGTERM`, and return exit code `1` if the process does not exit cleanly.
-- [ ] Update `explore.md` frontmatter to set `inheritSkills: false` and `maxTurns: 8`.
-- [ ] Update `planner.md` frontmatter to set `inheritSkills: false` and `maxTurns: 8`.
+- [ ] Update `explore.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
+- [ ] Update `planner.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
 - [ ] Add an invocation test where `systemPromptMode: replace` uses `--system-prompt` and does not include `--append-system-prompt`.
-- [ ] Add an invocation test where `inheritProjectContext: false` adds `--no-context-files`.
-- [ ] Add an invocation test where `inheritSkills: false` adds `--no-skills`.
+- [ ] Add an invocation test where `noContextFiles: true` adds `--no-context-files`.
+- [ ] Add an invocation test where `noSkills: true` adds `--no-skills`.
 - [ ] Add a subprocess execution test with an injected fake child process stream that emits two assistant `message_end` events for an agent with `maxTurns: 1`; expected result has `stopReason: 'max_turns'` and an error message containing `maxTurns=1`.
-- [ ] Document `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, and `maxTurns` in README.
+- [ ] Document `systemPromptMode`, `noContextFiles`, `noSkills`, and `maxTurns` in README.
 
 **Validation:**
 
@@ -347,14 +347,14 @@
 
 **Steps:**
 
-- [ ] Add `agentCanMutate(agent)` in `completion-guard.ts`; return true when `agent.tools` is undefined, or when `agent.tools` includes `edit`, `write`, or `bash` and those tools are not excluded by `disallowedTools`.
+- [ ] Add `agentCanMutate(agent)` in `completion-guard.ts`; return true when `agent.tools` is undefined, or when `agent.tools` includes `edit`, `write`, or `bash` and those tools are not excluded by `excludeTools`.
 - [ ] Add `isCompletionGuardEnabled(agent)`; return `agent.completionGuard` when explicitly set, otherwise return `agentCanMutate(agent)`.
 - [ ] Add `validateCompletionOutput(agent, output)`; when guard is disabled return success.
 - [ ] When guard is enabled, require final output to contain headings matching `## Completed`, `## Files Changed`, and `## Validation`.
 - [ ] If required headings are missing, mark the result failed by setting `stopReason = 'completion_guard'`, `errorMessage = 'Completion guard failed: missing <headings>'`, and `exitCode = 1`.
 - [ ] Update `worker.md` output format to include `## Validation` with either commands run and pass/fail results or `Not run: <specific reason>`.
 - [ ] Add a completion-guard test where a mutating worker output missing `## Validation` fails with `completion_guard`.
-- [ ] Add a completion-guard test where a reviewer with `disallowedTools: edit, write, agent` and explicit `completionGuard: false` is not checked.
+- [ ] Add a completion-guard test where a reviewer with `excludeTools: edit, write, agent` and explicit `completionGuard: false` is not checked.
 - [ ] Add a completion-guard test where valid worker output passes.
 - [ ] Document completion guard defaults, required headings, and opt-out behavior in README.
 
@@ -445,7 +445,7 @@
 ## Rollout Notes
 
 - This plan preserves current defaults, so existing user agents should keep working unless they opt into new fields.
-- `disallowedTools`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `isolation`, and `completionGuard` are user-facing configuration options and must be documented in `packages/pi-agents/README.md` in the same change that implements them.
+- `excludeTools`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, and `completionGuard` are user-facing configuration options and must be documented in `packages/pi-agents/README.md` in the same change that implements them.
 - Worktree isolation creates paths under `<repo>/.worktrees/`; dirty worktrees are intentionally retained and must be surfaced in tool details so the parent agent can inspect or merge them.
 - Fork context requires a persisted parent session. In `--no-session` parent runs, fork mode must fail with the explicit persisted-session error rather than silently falling back to fresh context.
 - The plan intentionally excludes background agents, remote agents, dynamic fan-out, and persistent teammate/coordinator mode; those can be planned later after the core tool is modular and guarded.

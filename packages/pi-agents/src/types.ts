@@ -4,6 +4,10 @@
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentScope, AgentSource } from './agents.ts';
 
+export type SystemPromptMode = 'append' | 'replace';
+export type DefaultContext = 'fresh' | 'fork';
+export type IsolationMode = 'none' | 'worktree';
+
 export interface UsageStats {
   input: number;
   output: number;

@@ -48,6 +48,13 @@ describe('buildPiArgs', () => {
     ]);
   });
 
+  it('includes --exclude-tools when excludeTools is set', () => {
+    const args = buildPiArgs(makeAgent({ tools: ['read'], excludeTools: ['write', 'edit'] }), 'go');
+    expect(args).toContain('--exclude-tools');
+    const idx = args.indexOf('--exclude-tools');
+    expect(args[idx + 1]).toBe('write,edit');
+  });
+
   it('omits --tools when agent has no tools', () => {
     const args = buildPiArgs(makeAgent({ tools: [] }), 'go');
     expect(args).not.toContain('--tools');
