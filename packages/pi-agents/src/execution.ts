@@ -8,6 +8,7 @@ import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig } from './agents.ts';
 import { buildPiArgs, getPiInvocation, writePromptToTempFile } from './invocation.ts';
 import { getFinalOutput } from './output.ts';
+import { buildChildAgentEnv } from './security.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -113,6 +114,7 @@ export async function runSingleAgent(
       const invocation = getPiInvocation(args);
       const proc = spawn(invocation.command, invocation.args, {
         cwd: cwd ?? defaultCwd,
+        env: buildChildAgentEnv(process.env),
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
       });

@@ -6,6 +6,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig } from './agents.ts';
+import { buildToolCliArgs } from './security.ts';
 
 export async function writePromptToTempFile(
   agentName: string,
@@ -48,7 +49,7 @@ export function buildPiArgs(
   const args: string[] = ['--mode', 'json', '-p', '--no-session'];
   if (agent.model) args.push('--model', agent.model);
   if (agent.thinking) args.push('--thinking', agent.thinking);
-  if (agent.tools && agent.tools.length > 0) args.push('--tools', agent.tools.join(','));
+  args.push(...buildToolCliArgs(agent));
   if (options.tmpPromptPath) args.push('--append-system-prompt', options.tmpPromptPath);
   args.push(`Task: ${task}`);
   return args;

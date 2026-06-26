@@ -7,7 +7,12 @@ import type {
   AgentToolUpdateCallback,
   ExtensionContext,
 } from '@earendil-works/pi-coding-agent';
-import { type AgentConfig, type AgentScope, discoverAgents } from './agents.ts';
+import {
+  type AgentConfig,
+  type AgentScope,
+  discoverAgents,
+  getBuiltinAgentsDir,
+} from './agents.ts';
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
 import { mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from './execution.ts';
 import {
@@ -17,6 +22,7 @@ import {
   truncateParallelOutput,
 } from './output.ts';
 import type { SubagentParams } from './schema.ts';
+import { assertDepthAllowed } from './security.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
 
 type Params = Static<typeof SubagentParams>;
@@ -31,6 +37,24 @@ export async function executeAgentTool(
   ctx: ExtensionContext
 ): Promise<AgentResult> {
   const agentScope: AgentScope = params.agentScope ?? 'user';
+
+  try {
+    assertDepthAllowed(process.env);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      content: [{ type: 'text', text: message }],
+      details: {
+        mode: 'single',
+        agentScope,
+        projectAgentsDir: null,
+        builtinAgentsDir: getBuiltinAgentsDir(),
+        results: [],
+      },
+      isError: true,
+    };
+  }
+
   const discovery = discoverAgents(ctx.cwd, agentScope);
   const agents = discovery.agents;
   const confirmProjectAgents = params.confirmProjectAgents ?? true;

@@ -173,16 +173,16 @@
 
 **Steps:**
 
-- [ ] Add these optional fields to `AgentConfig`: `excludeTools?: string[]`, `systemPromptMode?: 'append' | 'replace'`, `maxTurns?: number`, `noContextFiles?: boolean`, `noSkills?: boolean`, `defaultContext?: 'fresh' | 'fork'`, `isolation?: 'none' | 'worktree'`, and `completionGuard?: boolean`. Field names that map directly onto Pi CLI flags must match the flag name in camelCase (`--exclude-tools` → `excludeTools`, `--no-context-files` → `noContextFiles`, `--no-skills` → `noSkills`).
-- [ ] Parse `excludeTools` as a comma-separated list with trimming and empty-item removal.
-- [ ] Parse `systemPromptMode`; accept only `append` or `replace`; default to `append` when omitted.
-- [ ] Parse `maxTurns` as a positive integer; ignore invalid values and leave it undefined.
-- [ ] Parse `noContextFiles`, `noSkills`, and `completionGuard` from `true` or `false`; default `noContextFiles` and `noSkills` to `false` (inherit by default), and leave `completionGuard` undefined when omitted.
-- [ ] Parse `defaultContext`; accept only `fresh` or `fork`; default to `fresh`.
-- [ ] Parse `isolation`; accept only `none` or `worktree`; default to `none`.
-- [ ] Add an agents test where a markdown file containing all new fields normalizes to the expected `AgentConfig` values.
-- [ ] Add an agents test where invalid enum and integer values are ignored or defaulted exactly as described above.
-- [ ] Add README documentation for every new frontmatter field with a complete markdown example.
+- [x] Add these optional fields to `AgentConfig`: `excludeTools?: string[]`, `systemPromptMode?: 'append' | 'replace'`, `maxTurns?: number`, `noContextFiles?: boolean`, `noSkills?: boolean`, `defaultContext?: 'fresh' | 'fork'`, `isolation?: 'none' | 'worktree'`, and `completionGuard?: boolean`. Field names that map directly onto Pi CLI flags must match the flag name in camelCase (`--exclude-tools` → `excludeTools`, `--no-context-files` → `noContextFiles`, `--no-skills` → `noSkills`).
+- [x] Parse `excludeTools` as a comma-separated list with trimming and empty-item removal.
+- [x] Parse `systemPromptMode`; accept only `append` or `replace`; default to `append` when omitted.
+- [x] Parse `maxTurns` as a positive integer; ignore invalid values and leave it undefined.
+- [x] Parse `noContextFiles`, `noSkills`, and `completionGuard` from `true` or `false`; default `noContextFiles` and `noSkills` to `false` (inherit by default), and leave `completionGuard` undefined when omitted.
+- [x] Parse `defaultContext`; accept only `fresh` or `fork`; default to `fresh`.
+- [x] Parse `isolation`; accept only `none` or `worktree`; default to `none`.
+- [x] Add an agents test where a markdown file containing all new fields normalizes to the expected `AgentConfig` values.
+- [x] Add an agents test where invalid enum and integer values are ignored or defaulted exactly as described above.
+- [x] Add README documentation for every new frontmatter field with a complete markdown example.
 
 **Validation:**
 
@@ -206,19 +206,19 @@
 
 **Steps:**
 
-- [ ] Add `PI_AGENT_CHILD`, `PI_AGENT_DEPTH`, and `PI_AGENT_MAX_DEPTH` constants to `constants.ts`.
-- [ ] Add `getCurrentAgentDepth(env)` in `security.ts`; it reads `PI_AGENT_DEPTH`, treats missing or invalid values as `0`, and returns a non-negative integer.
-- [ ] Add `assertDepthAllowed(env)` in `security.ts`; it reads `PI_AGENT_MAX_DEPTH`, defaults to `2`, and throws `Agent nesting depth exceeded: <depth>/<max>` when `depth >= max`.
-- [ ] Call `assertDepthAllowed(process.env)` at the start of `executeAgentTool()` before agent discovery.
-- [ ] Add `buildChildAgentEnv(parentEnv)` in `security.ts`; it sets `PI_AGENT_CHILD=1`, increments `PI_AGENT_DEPTH` by one, and preserves an existing valid `PI_AGENT_MAX_DEPTH` or sets it to `2`.
-- [ ] Pass the child environment to `spawn()` in `execution.ts`.
-- [ ] Add `buildToolCliArgs(agent)` in `security.ts`; it returns `--tools <tools>` when `agent.tools` is non-empty and `--exclude-tools <excludeTools>` when `agent.excludeTools` is non-empty.
-- [ ] Update `buildPiArgs()` to use `buildToolCliArgs(agent)` instead of appending only `--tools`.
-- [ ] Update `packages/pi-agents/agents/reviewer.md` frontmatter to include `excludeTools: edit, write, agent` while keeping `bash` available for read-only git commands.
-- [ ] Add a security test that missing depth env allows execution and produces child depth `1`.
-- [ ] Add a security test that `PI_AGENT_DEPTH=2` and `PI_AGENT_MAX_DEPTH=2` throws `Agent nesting depth exceeded: 2/2`.
-- [ ] Add a security test that an agent with `tools: read, bash` and `excludeTools: write, edit` produces both `--tools read,bash` and `--exclude-tools write,edit`.
-- [ ] Document depth guard behavior and `excludeTools` in README.
+- [x] Add `PI_AGENT_CHILD`, `PI_AGENT_DEPTH`, and `PI_AGENT_MAX_DEPTH` constants to `constants.ts`.
+- [x] Add `getCurrentAgentDepth(env)` in `security.ts`; it reads `PI_AGENT_DEPTH`, treats missing or invalid values as `0`, and returns a non-negative integer.
+- [x] Add `assertDepthAllowed(env)` in `security.ts`; it reads `PI_AGENT_MAX_DEPTH`, defaults to `2`, and throws `Agent nesting depth exceeded: <depth>/<max>` when `depth >= max`.
+- [x] Call `assertDepthAllowed(process.env)` at the start of `executeAgentTool()` before agent discovery.
+- [x] Add `buildChildAgentEnv(parentEnv)` in `security.ts`; it sets `PI_AGENT_CHILD=1`, increments `PI_AGENT_DEPTH` by one, and preserves an existing valid `PI_AGENT_MAX_DEPTH` or sets it to `2`.
+- [x] Pass the child environment to `spawn()` in `execution.ts`.
+- [x] Add `buildToolCliArgs(agent)` in `security.ts`; it returns `--tools <tools>` when `agent.tools` is non-empty and `--exclude-tools <excludeTools>` when `agent.excludeTools` is non-empty.
+- [x] Update `buildPiArgs()` to use `buildToolCliArgs(agent)` instead of appending only `--tools`.
+- [x] Update `packages/pi-agents/agents/reviewer.md` frontmatter to include `excludeTools: edit, write, agent` while keeping `bash` available for read-only git commands.
+- [x] Add a security test that missing depth env allows execution and produces child depth `1`.
+- [x] Add a security test that `PI_AGENT_DEPTH=2` and `PI_AGENT_MAX_DEPTH=2` throws `Agent nesting depth exceeded: 2/2`.
+- [x] Add a security test that an agent with `tools: read, bash` and `excludeTools: write, edit` produces both `--tools read,bash` and `--exclude-tools write,edit`.
+- [x] Document depth guard behavior and `excludeTools` in README.
 
 **Validation:**
 
