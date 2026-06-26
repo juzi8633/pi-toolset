@@ -13,6 +13,7 @@ import {
   discoverAgents,
   getBuiltinAgentsDir,
 } from './agents.ts';
+import { runChainWorkflow, synthesizeFailure } from './chain.ts';
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
 import { validateCompletionOutput } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
@@ -25,7 +26,6 @@ import {
 } from './output.ts';
 import type { SubagentParams } from './schema.ts';
 import { assertAgentDelegationAllowed } from './security.ts';
-import { renderTaskTemplate } from './template.ts';
 import type { IsolationMode, SingleResult, SubagentDetails } from './types.ts';
 import {
   type AgentWorktree,
@@ -157,87 +157,27 @@ async function runChain(
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
   makeDetails: DetailsFactory
 ): Promise<AgentResult> {
-  const results: SingleResult[] = [];
-  let previousOutput = '';
-  const outputs = new Map<string, string>();
-
-  for (let i = 0; i < chain.length; i++) {
-    const step = chain[i];
-    const rendered = renderTaskTemplate(step.task, { previous: previousOutput, outputs });
-    if (!rendered.ok) {
-      const failure = synthesizeFailure(
-        step.agent,
-        undefined,
-        step.task,
-        i + 1,
-        'template_error',
-        `Unknown chain output: ${rendered.unknown}`
-      );
-      results.push(failure);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Chain stopped at step ${i + 1} (${step.agent}): Unknown chain output: ${rendered.unknown}`,
-          },
-        ],
-        details: makeDetails('chain')(results),
-        isError: true,
-      };
-    }
-    const taskWithContext = rendered.text;
-
-    const chainUpdate: OnUpdateCallback | undefined = onUpdate
-      ? (partial) => {
-          const currentResult = partial.details?.results[0];
-          if (currentResult) {
-            const allResults = [...results, currentResult];
-            onUpdate({
-              content: partial.content,
-              details: makeDetails('chain')(allResults),
-            });
-          }
-        }
-      : undefined;
-
-    const result = await runStepWithContext(
-      ctx,
-      agents,
-      step.agent,
-      taskWithContext,
-      step.cwd,
-      step.isolation,
-      i,
-      i + 1,
-      signal,
-      chainUpdate,
-      makeDetails('chain')
-    );
-    results.push(result);
-
-    if (isFailedResult(result)) {
-      const errorMsg = getResultOutput(result);
-      return {
-        content: [
-          { type: 'text', text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` },
-        ],
-        details: makeDetails('chain')(results),
-        isError: true,
-      };
-    }
-    previousOutput = getFinalOutput(result.messages);
-    if (step.name) outputs.set(step.name, previousOutput);
-  }
-
-  return {
-    content: [
-      {
-        type: 'text',
-        text: getFinalOutput(results[results.length - 1].messages) || '(no output)',
-      },
-    ],
-    details: makeDetails('chain')(results),
-  };
+  const chainDetails = makeDetails('chain');
+  return runChainWorkflow({
+    chain,
+    signal,
+    onUpdate,
+    makeDetails: chainDetails,
+    runStep: (req) =>
+      runStepWithContext(
+        ctx,
+        agents,
+        req.agent,
+        req.task,
+        req.cwd,
+        req.isolation,
+        req.taskIndex,
+        req.step,
+        req.signal,
+        req.onUpdate,
+        chainDetails
+      ),
+  });
 }
 
 async function runParallel(
@@ -382,36 +322,6 @@ function resolveIsolation(
   taskIsolation: IsolationMode | undefined
 ): IsolationMode {
   return taskIsolation ?? agent.isolation ?? 'none';
-}
-
-function synthesizeFailure(
-  agentName: string,
-  agent: AgentConfig | undefined,
-  task: string,
-  step: number | undefined,
-  stopReason: string,
-  message: string
-): SingleResult {
-  return {
-    agent: agentName,
-    agentSource: agent?.source ?? 'unknown',
-    task,
-    exitCode: 1,
-    messages: [],
-    stderr: message,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cost: 0,
-      contextTokens: 0,
-      turns: 0,
-    },
-    stopReason,
-    errorMessage: message,
-    step,
-  };
 }
 
 async function runStepWithContext(
