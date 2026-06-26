@@ -383,17 +383,17 @@
 
 **Steps:**
 
-- [ ] Extend `ChainItem` with optional `name: string`.
-- [ ] Add `renderTaskTemplate(template, context)` in `template.ts`.
-- [ ] Replace every `{previous}` with the prior successful step output.
-- [ ] Replace every `{outputs.<name>}` with the output stored for a previous chain step whose `name` equals `<name>`.
-- [ ] If a template references an unknown `{outputs.<name>}`, stop the chain before spawning the step and return an error result with `Unknown chain output: <name>`.
-- [ ] Store named outputs only after a step succeeds.
-- [ ] Add a template test where `{previous}` and `{outputs.plan}` are both replaced.
-- [ ] Add a template test where `{outputs.missing}` returns the unknown-output error.
-- [ ] Update `/implement` to name the explore step `context`, the planner step `plan`, and the worker step to reference `{outputs.plan}`.
-- [ ] Update `/implement-and-review` to name the first worker step `implementation`, reviewer step `review`, and final worker step to reference `{outputs.review}`.
-- [ ] Update README chain examples to show `name` and `{outputs.name}`.
+- [x] Extend `ChainItem` with optional `name: string`.
+- [x] Add `renderTaskTemplate(template, context)` in `template.ts`.
+- [x] Replace every `{previous}` with the prior successful step output.
+- [x] Replace every `{outputs.<name>}` with the output stored for a previous chain step whose `name` equals `<name>`.
+- [x] If a template references an unknown `{outputs.<name>}`, stop the chain before spawning the step and return an error result with `Unknown chain output: <name>`.
+- [x] Store named outputs only after a step succeeds.
+- [x] Add a template test where `{previous}` and `{outputs.plan}` are both replaced.
+- [x] Add a template test where `{outputs.missing}` returns the unknown-output error.
+- [x] Update `/implement` to name the explore step `context`, the planner step `plan`, and the worker step to reference `{outputs.plan}`.
+- [x] Update `/implement-and-review` to name the first worker step `implementation`, reviewer step `review`, and final worker step to reference `{outputs.review}`.
+- [x] Update README chain examples to show `name` and `{outputs.name}`.
 
 **Validation:**
 
@@ -417,13 +417,13 @@
 
 **Steps:**
 
-- [ ] Update `/implement` prompt to require the worker final output to include `## Completed`, `## Files Changed`, and `## Validation`.
-- [ ] Update `/implement-and-review` prompt so the final worker step must address every reviewer item under `## Critical (must fix)` and report remaining warnings separately.
-- [ ] Update `/implement-and-review` prompt so if the reviewer reports any Critical item that cannot be fixed safely, the final worker stops and reports the blocker instead of pretending completion.
-- [ ] Update `/explore-and-plan` prompt to state that no files should be modified and no worker should be invoked.
-- [ ] Update `reviewer.md` to explicitly classify an empty Critical section as `## Critical (must fix)\n- None.`.
-- [ ] Update `worker.md` to include validation command output or a precise reason validation was skipped.
-- [ ] Document these workflow acceptance expectations in README under Workflow Prompts.
+- [x] Update `/implement` prompt to require the worker final output to include `## Completed`, `## Files Changed`, and `## Validation`.
+- [x] Update `/implement-and-review` prompt so the final worker step must address every reviewer item under `## Critical (must fix)` and report remaining warnings separately.
+- [x] Update `/implement-and-review` prompt so if the reviewer reports any Critical item that cannot be fixed safely, the final worker stops and reports the blocker instead of pretending completion.
+- [x] Update `/explore-and-plan` prompt to state that no files should be modified and no worker should be invoked.
+- [x] Update `reviewer.md` to explicitly classify an empty Critical section as `## Critical (must fix)\n- None.`.
+- [x] Update `worker.md` to include validation command output or a precise reason validation was skipped.
+- [x] Document these workflow acceptance expectations in README under Workflow Prompts.
 
 **Validation:**
 

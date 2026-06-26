@@ -17,9 +17,18 @@ export const TaskItem = Type.Object({
 
 export const ChainItem = Type.Object({
   agent: Type.String({ description: 'Name of the agent to invoke' }),
-  task: Type.String({ description: 'Task with optional {previous} placeholder for prior output' }),
+  task: Type.String({
+    description:
+      'Task with optional {previous} or {outputs.<name>} placeholders that reference earlier chain outputs',
+  }),
   cwd: Type.Optional(Type.String({ description: 'Working directory for the agent process' })),
   isolation: Type.Optional(IsolationSchema),
+  name: Type.Optional(
+    Type.String({
+      description:
+        'Name used to reference this step’s output as `{outputs.<name>}` from later chain steps',
+    })
+  ),
 });
 
 export const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {

@@ -4,7 +4,7 @@ description: Explore gathers context, planner creates implementation plan (no im
 
 Use the subagent tool with the chain parameter to execute this workflow:
 
-1. First, use the "explore" agent to find all code relevant to: $@
-2. Then, use the "planner" agent to create an implementation plan for "$@" using the context from the previous step (use {previous} placeholder)
+1. First, use the "explore" agent (named `context`) to find all code relevant to: $@
+2. Then, use the "planner" agent (named `plan`) to create an implementation plan for "$@" using `{previous}` for the explore output.
 
-Execute this as a chain, passing output between steps via {previous}. Do NOT implement - just return the plan.
+Execute as a chain. Do NOT modify any files and do NOT invoke a worker agent — return only the plan from step 2.

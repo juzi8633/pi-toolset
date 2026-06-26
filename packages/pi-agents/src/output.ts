@@ -57,6 +57,7 @@ const FAILURE_STOP_REASONS = new Set([
   'context_error',
   'isolation_error',
   'completion_guard',
+  'template_error',
 ]);
 
 export function isFailedResult(result: SingleResult): boolean {

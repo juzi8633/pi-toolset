@@ -27,6 +27,17 @@ Output format:
 
 ## Critical (must fix)
 
+When there are no critical items, write the section as exactly:
+
+```
+## Critical (must fix)
+- None.
+```
+
+This lets downstream consumers (e.g. the `/implement-and-review` worker) tell “no critical items” apart from real findings.
+
+Otherwise, list each finding on its own line:
+
 - `file.ts:42` - Issue description
 
 ## Warnings (should fix)

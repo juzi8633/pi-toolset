@@ -25,6 +25,7 @@ import {
 } from './output.ts';
 import type { SubagentParams } from './schema.ts';
 import { assertDepthAllowed } from './security.ts';
+import { renderTaskTemplate } from './template.ts';
 import type { IsolationMode, SingleResult, SubagentDetails } from './types.ts';
 import {
   type AgentWorktree,
@@ -158,10 +159,33 @@ async function runChain(
 ): Promise<AgentResult> {
   const results: SingleResult[] = [];
   let previousOutput = '';
+  const outputs = new Map<string, string>();
 
   for (let i = 0; i < chain.length; i++) {
     const step = chain[i];
-    const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+    const rendered = renderTaskTemplate(step.task, { previous: previousOutput, outputs });
+    if (!rendered.ok) {
+      const failure = synthesizeFailure(
+        step.agent,
+        undefined,
+        step.task,
+        i + 1,
+        'template_error',
+        `Unknown chain output: ${rendered.unknown}`
+      );
+      results.push(failure);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Chain stopped at step ${i + 1} (${step.agent}): Unknown chain output: ${rendered.unknown}`,
+          },
+        ],
+        details: makeDetails('chain')(results),
+        isError: true,
+      };
+    }
+    const taskWithContext = rendered.text;
 
     const chainUpdate: OnUpdateCallback | undefined = onUpdate
       ? (partial) => {
@@ -202,6 +226,7 @@ async function runChain(
       };
     }
     previousOutput = getFinalOutput(result.messages);
+    if (step.name) outputs.set(step.name, previousOutput);
   }
 
   return {

@@ -70,8 +70,13 @@ Run 2 explores in parallel: one to find models, one to find providers
 ### Chained workflow
 
 ```
-Use a chain: first have explore find the read tool, then have planner suggest improvements
+Use a chain:
+  - { agent: explore, name: context, task: "find the read tool" }
+  - { agent: planner, name: plan, task: "suggest improvements using {previous}" }
+  - { agent: worker,                  task: "implement {outputs.plan}" }
 ```
+
+Each step's text may reference `{previous}` (the immediately preceding step's final output) or `{outputs.<name>}` (any earlier step named via the optional `name` field). A reference to an unknown name stops the chain before spawning the step and returns `Unknown chain output: <name>` with `stopReason: 'template_error'`.
 
 ### Workflow prompts
 
@@ -83,11 +88,11 @@ Use a chain: first have explore find the read tool, then have planner suggest im
 
 ## Tool Modes
 
-| Mode     | Parameter          | Description                                            |
-| -------- | ------------------ | ------------------------------------------------------ |
-| Single   | `{ agent, task }`  | One agent, one task                                    |
-| Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
-| Chain    | `{ chain: [...] }` | Sequential with `{previous}` placeholder               |
+| Mode     | Parameter          | Description                                                      |
+| -------- | ------------------ | ---------------------------------------------------------------- |
+| Single   | `{ agent, task }`  | One agent, one task                                              |
+| Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent)           |
+| Chain    | `{ chain: [...] }` | Sequential with `{previous}` and `{outputs.<name>}` placeholders |
 
 ## Output Display
 
@@ -223,11 +228,11 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 ## Workflow Prompts
 
-| Prompt                          | Flow                       |
-| ------------------------------- | -------------------------- |
-| `/implement <query>`            | explore → planner → worker |
-| `/explore-and-plan <query>`     | explore → planner          |
-| `/implement-and-review <query>` | worker → reviewer → worker |
+| Prompt                          | Flow                       | Acceptance contract                                                                                                                                                                                                                                                                    |
+| ------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/implement <query>`            | explore → planner → worker | Steps named `context`, `plan`, and the worker references `{outputs.plan}`. Worker must end with `## Completed`, `## Files Changed`, and `## Validation` (commands run + pass/fail, or `Not run: <reason>`).                                                                            |
+| `/explore-and-plan <query>`     | explore → planner          | Steps named `context` and `plan`. Plan-only; no file changes; no worker invocation.                                                                                                                                                                                                    |
+| `/implement-and-review <query>` | worker → reviewer → worker | Steps named `implementation` and `review`. Reviewer must emit `## Critical (must fix)\n- None.` when empty. Final worker resolves every Critical item, reports remaining Warnings, and stops with the blocker if any Critical cannot be fixed safely instead of pretending completion. |
 
 ## Error Handling
 
@@ -238,6 +243,7 @@ Project agents override user agents with the same name when `agentScope: "both"`
 - **stopReason "context_error"**: fork-context preparation failed before the child started (see _Fork Context_)
 - **stopReason "isolation_error"**: worktree isolation failed before the child started (see _Isolation: Git Worktree_)
 - **stopReason "completion_guard"**: a mutating agent's final message is missing one of `## Completed`, `## Files Changed`, or `## Validation` (see _Completion Guard_)
+- **stopReason "template_error"**: a chain step's task referenced `{outputs.<name>}` for a step that did not run or was not named
 - **Chain mode**: stops at the first failing step and reports which step failed
 
 ## Limitations
