@@ -2,7 +2,9 @@
 // ABOUTME: Spawns a `pi` child per agent, consumes JSON event stream, and accumulates messages, usage, and stop reason.
 
 import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
+import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig } from './agents.ts';
@@ -10,6 +12,17 @@ import { buildPiArgs, getPiInvocation, writePromptToTempFile } from './invocatio
 import { getFinalOutput } from './output.ts';
 import { buildChildAgentEnv } from './security.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
+
+export interface SpawnedChild extends ChildProcess {
+  stdout: Readable;
+  stderr: Readable;
+}
+
+export type SpawnFn = (command: string, args: string[], options: object) => SpawnedChild;
+
+export interface RunSingleAgentOptions {
+  spawnFn?: SpawnFn;
+}
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
   items: TIn[],
@@ -42,7 +55,8 @@ export async function runSingleAgent(
   step: number | undefined,
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
-  makeDetails: (results: SingleResult[]) => SubagentDetails
+  makeDetails: (results: SingleResult[]) => SubagentDetails,
+  options: RunSingleAgentOptions = {}
 ): Promise<SingleResult> {
   const agent = agents.find((a) => a.name === agentName);
 
@@ -109,16 +123,51 @@ export async function runSingleAgent(
 
     const args = buildPiArgs(agent, task, { tmpPromptPath: tmpPromptPath ?? undefined });
     let wasAborted = false;
+    let maxTurnsExceeded = false;
 
     const exitCode = await new Promise<number>((resolve) => {
       const invocation = getPiInvocation(args);
-      const proc = spawn(invocation.command, invocation.args, {
+      const spawnFn = options.spawnFn ?? (spawn as unknown as SpawnFn);
+      const proc = spawnFn(invocation.command, invocation.args, {
         cwd: cwd ?? defaultCwd,
         env: buildChildAgentEnv(process.env),
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let buffer = '';
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      let hasClosed = false;
+      let settled = false;
+
+      const flushBuffer = () => {
+        if (buffer.trim()) {
+          const remaining = buffer;
+          buffer = '';
+          processLine(remaining);
+        }
+      };
+
+      const settle = (code: number) => {
+        if (settled) return;
+        settled = true;
+        flushBuffer();
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
+        resolve(code);
+      };
+
+      const triggerMaxTurns = () => {
+        if (maxTurnsExceeded || !agent.maxTurns) return;
+        maxTurnsExceeded = true;
+        currentResult.stopReason = 'max_turns';
+        currentResult.errorMessage = `Agent exceeded maxTurns=${agent.maxTurns}`;
+        proc.kill('SIGTERM');
+        killTimer = setTimeout(() => {
+          if (!hasClosed) proc.kill('SIGKILL');
+        }, 5000);
+      };
 
       const processLine = (line: string) => {
         if (!line.trim()) return;
@@ -147,10 +196,21 @@ export async function runSingleAgent(
               currentResult.usage.contextTokens = usage.totalTokens || 0;
             }
             if (!currentResult.model && msg.model) currentResult.model = msg.model;
-            if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-            if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+            if (!maxTurnsExceeded) {
+              if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+              if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+            }
           }
           emitUpdate();
+
+          if (
+            msg.role === 'assistant' &&
+            agent.maxTurns &&
+            currentResult.usage.turns >= agent.maxTurns &&
+            !maxTurnsExceeded
+          ) {
+            triggerMaxTurns();
+          }
         }
 
         if (evt.type === 'tool_result_end' && evt.message) {
@@ -171,12 +231,13 @@ export async function runSingleAgent(
       });
 
       proc.on('close', (code) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
+        hasClosed = true;
+        settle(maxTurnsExceeded ? (code ?? 1) : (code ?? 0));
       });
 
       proc.on('error', () => {
-        resolve(1);
+        hasClosed = true;
+        settle(1);
       });
 
       if (signal) {
@@ -192,7 +253,11 @@ export async function runSingleAgent(
       }
     });
 
-    currentResult.exitCode = exitCode;
+    if (maxTurnsExceeded && exitCode === 0) {
+      currentResult.exitCode = 1;
+    } else {
+      currentResult.exitCode = exitCode;
+    }
     if (wasAborted) throw new Error('Subagent was aborted');
     return currentResult;
   } finally {

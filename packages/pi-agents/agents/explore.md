@@ -4,6 +4,8 @@ description: Fast codebase recon that returns compressed context for handoff to 
 tools: read, grep, find, ls, bash
 model: ark/deepseek-v4-flash
 thinking: high
+noSkills: true
+maxTurns: 8
 ---
 
 You are a explorer. Quickly investigate a codebase and return structured findings that another agent can use without re-reading everything.

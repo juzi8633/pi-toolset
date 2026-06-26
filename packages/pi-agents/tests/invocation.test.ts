@@ -55,6 +55,39 @@ describe('buildPiArgs', () => {
     expect(args[idx + 1]).toBe('write,edit');
   });
 
+  it('uses --system-prompt when systemPromptMode is replace', () => {
+    const args = buildPiArgs(makeAgent({ systemPromptMode: 'replace' }), 'go', {
+      tmpPromptPath: '/tmp/p.md',
+    });
+    expect(args).toContain('--system-prompt');
+    expect(args).not.toContain('--append-system-prompt');
+  });
+
+  it('uses --append-system-prompt when systemPromptMode is append (default)', () => {
+    const args = buildPiArgs(makeAgent({ systemPromptMode: 'append' }), 'go', {
+      tmpPromptPath: '/tmp/p.md',
+    });
+    expect(args).toContain('--append-system-prompt');
+    expect(args).not.toContain('--system-prompt');
+  });
+
+  it('adds --no-context-files when noContextFiles is true', () => {
+    const args = buildPiArgs(makeAgent({ noContextFiles: true }), 'go');
+    expect(args).toContain('--no-context-files');
+  });
+
+  it('omits --no-context-files when noContextFiles is false or undefined', () => {
+    expect(buildPiArgs(makeAgent({ noContextFiles: false }), 'go')).not.toContain(
+      '--no-context-files'
+    );
+    expect(buildPiArgs(makeAgent(), 'go')).not.toContain('--no-context-files');
+  });
+
+  it('adds --no-skills when noSkills is true', () => {
+    const args = buildPiArgs(makeAgent({ noSkills: true }), 'go');
+    expect(args).toContain('--no-skills');
+  });
+
   it('omits --tools when agent has no tools', () => {
     const args = buildPiArgs(makeAgent({ tools: [] }), 'go');
     expect(args).not.toContain('--tools');

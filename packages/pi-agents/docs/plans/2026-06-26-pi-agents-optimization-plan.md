@@ -242,18 +242,18 @@
 
 **Steps:**
 
-- [ ] In `buildPiArgs()`, when `agent.systemPromptMode === 'replace'`, pass `--system-prompt <tmpPromptPath>` instead of `--append-system-prompt <tmpPromptPath>`.
-- [ ] In `buildPiArgs()`, when `agent.noContextFiles === true`, append `--no-context-files`.
-- [ ] In `buildPiArgs()`, when `agent.noSkills === true`, append `--no-skills`.
-- [ ] In `execution.ts`, after each assistant `message_end`, increment `currentResult.usage.turns` exactly once as currently done.
-- [ ] In `execution.ts`, if `agent.maxTurns` is set and `currentResult.usage.turns >= agent.maxTurns`, set `currentResult.stopReason = 'max_turns'`, set `currentResult.errorMessage = 'Agent exceeded maxTurns=<value>'`, terminate the child process with `SIGTERM`, and return exit code `1` if the process does not exit cleanly.
-- [ ] Update `explore.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
-- [ ] Update `planner.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
-- [ ] Add an invocation test where `systemPromptMode: replace` uses `--system-prompt` and does not include `--append-system-prompt`.
-- [ ] Add an invocation test where `noContextFiles: true` adds `--no-context-files`.
-- [ ] Add an invocation test where `noSkills: true` adds `--no-skills`.
-- [ ] Add a subprocess execution test with an injected fake child process stream that emits two assistant `message_end` events for an agent with `maxTurns: 1`; expected result has `stopReason: 'max_turns'` and an error message containing `maxTurns=1`.
-- [ ] Document `systemPromptMode`, `noContextFiles`, `noSkills`, and `maxTurns` in README.
+- [x] In `buildPiArgs()`, when `agent.systemPromptMode === 'replace'`, pass `--system-prompt <tmpPromptPath>` instead of `--append-system-prompt <tmpPromptPath>`.
+- [x] In `buildPiArgs()`, when `agent.noContextFiles === true`, append `--no-context-files`.
+- [x] In `buildPiArgs()`, when `agent.noSkills === true`, append `--no-skills`.
+- [x] In `execution.ts`, after each assistant `message_end`, increment `currentResult.usage.turns` exactly once as currently done.
+- [x] In `execution.ts`, if `agent.maxTurns` is set and `currentResult.usage.turns >= agent.maxTurns`, set `currentResult.stopReason = 'max_turns'`, set `currentResult.errorMessage = 'Agent exceeded maxTurns=<value>'`, terminate the child process with `SIGTERM`, and return exit code `1` if the process does not exit cleanly.
+- [x] Update `explore.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
+- [x] Update `planner.md` frontmatter to set `noSkills: true` and `maxTurns: 8`.
+- [x] Add an invocation test where `systemPromptMode: replace` uses `--system-prompt` and does not include `--append-system-prompt`.
+- [x] Add an invocation test where `noContextFiles: true` adds `--no-context-files`.
+- [x] Add an invocation test where `noSkills: true` adds `--no-skills`.
+- [x] Add a subprocess execution test with an injected fake child process stream that emits two assistant `message_end` events for an agent with `maxTurns: 1`; expected result has `stopReason: 'max_turns'` and an error message containing `maxTurns=1`.
+- [x] Document `systemPromptMode`, `noContextFiles`, `noSkills`, and `maxTurns` in README.
 
 **Validation:**
 
