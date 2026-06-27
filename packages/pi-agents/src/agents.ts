@@ -199,9 +199,22 @@ function loadAgentsFromPackagePath(
     const agent = loadAgentFromFile(agentPath, 'package');
     if (agent) collected.push(agent);
   } else if (stat.isDirectory()) {
-    for (const agent of loadAgentsFromDir(agentPath, 'package')) {
-      if (!isContained(agent.filePath)) continue;
-      collected.push(agent);
+    if (!isContained(agentPath)) return [];
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(agentPath, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    for (const entry of entries) {
+      if (!entry.name.endsWith('.md')) continue;
+      if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+      const filePath = path.join(agentPath, entry.name);
+      // Validate realpath containment BEFORE reading; symlinks pointing outside
+      // the package root must not even open the target file.
+      if (!isContained(filePath)) continue;
+      const agent = loadAgentFromFile(filePath, 'package');
+      if (agent) collected.push(agent);
     }
   }
 
@@ -238,12 +251,9 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
   const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 
   const builtinAgents = loadAgentsFromDir(BUILTIN_AGENTS_DIR, 'builtin');
-  const includePackage = scope === 'project' || scope === 'both';
-  const packageAgents = includePackage
-    ? discoverPackageAgentDirs(cwd).flatMap((pkg) =>
-        loadAgentsFromPackagePath(pkg.agentPath, pkg.packageName, pkg.packageRoot)
-      )
-    : [];
+  const packageAgents = discoverPackageAgentDirs(cwd, scope).flatMap((pkg) =>
+    loadAgentsFromPackagePath(pkg.agentPath, pkg.packageName, pkg.packageRoot)
+  );
   const userAgents = scope === 'project' ? [] : loadAgentsFromDir(userDir, 'user');
   const projectAgents =
     scope === 'user' || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, 'project');

@@ -37,13 +37,13 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 
 **Project-local agents** (`.pi/agents/*.md`) are repo-controlled prompts that can instruct the model to read files, run bash commands, etc.
 
-**Package agents** are agents exposed by installed npm packages via their `package.json` `pi.agents` field. They behave like project agents: only loaded under `agentScope: "project"` or `"both"`, and gated by the same confirmation flow.
+**Package agents** are agents exposed by packages installed via pi (`pi install ...`). They are discovered from the `packages[]` entries in `~/.pi/agent/settings.json` (user scope) and `.pi/settings.json` (project scope), by reading each package's `package.json#pi.agents` field. They run with the same privileges as project agents and are gated by the same confirmation flow.
 
-**Default behavior:** Only loads **user-level agents** from `~/.pi/agent/agents`.
+**Default behavior:** Loads **user-level agents** from `~/.pi/agent/agents` and **user-scope package agents** from packages listed in `~/.pi/agent/settings.json#packages`.
 
-To enable project-local and package agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust — package agents are loaded from your project's direct `dependencies` / `devDependencies` / `optionalDependencies` and run with the same privileges as project agents.
+To additionally enable project-local and project-scope package agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust — user-scope packages load under `"user"` / `"both"`, project-scope packages load under `"project"` / `"both"`.
 
-When running interactively, the tool prompts for confirmation before running project-local or package agents. Set `confirmProjectAgents: false` to disable.
+When running interactively, the tool prompts for confirmation before running project-local or package agents (any agent whose `source` is `project` or `package`). Set `confirmProjectAgents: false` to disable.
 
 `worktreeSetupHook` is a shell command sourced from an agent definition and runs in the project on `isolation: worktree` agents. Treat it the same as any other agent body: only declare it for trusted sources, and pair it with the project/package confirmation prompt. `criticalSystemReminder` is a prompt-level constraint, not a runtime sandbox; capability limits still need `tools` / `excludeTools` / `maxSubagentDepth`.
 
@@ -320,13 +320,13 @@ In `--no-session` parent runs, `fork` does **not** silently fall back to fresh c
 
 - `~/.pi/agent/agents/*.md` — user-level (always loaded)
 - `.pi/agents/*.md` — project-level (only with `agentScope: "project"` or `"both"`)
-- `<package>/<pi.agents>/*.md` — package-level (only with `agentScope: "project"` or `"both"`)
+- Package agents from `package.json#pi.agents` of packages listed in `~/.pi/agent/settings.json` (user scope, loaded under `"user"` / `"both"`) or in the nearest ancestor `.pi/settings.json` (project scope, loaded under `"project"` / `"both"`).
 
 Project agents override user agents with the same name when `agentScope: "both"`.
 
 ### Package Agents
 
-Any npm package can publish agents by declaring a `pi.agents` field in its `package.json`:
+Any pi-installed package can publish agents by declaring a `pi.agents` field in its `package.json`:
 
 ```json
 {
@@ -339,9 +339,16 @@ Any npm package can publish agents by declaring a `pi.agents` field in its `pack
 
 The field can be a string or an array of strings, and each entry may point to a directory of `.md` files or a single `.md` file relative to the package root.
 
+Packages are discovered from the `packages[]` arrays in pi's settings files:
+
+- `~/.pi/agent/settings.json` → user scope. `npm:` and `git:` sources resolve under `~/.pi/agent/{npm,git}/`. Bare `https://` / `ssh://` / `git://` URLs are also accepted as git sources; SCP shorthand (`git@host:path`) is only accepted with the explicit `git:` prefix, in line with pi's convention. Local sources accept absolute paths, `~`, `~/...`, `file:` / `file://`, or relative paths against `~/.pi/agent/`. As a final fallback for `npm:` sources, the global npm root (`npm root -g`) is consulted. Loaded under `agentScope: "user"` or `"both"` (default).
+- `.pi/settings.json` in the nearest ancestor of `cwd` → project scope. Sources resolve against `.pi/{npm,git}/`. Loaded under `agentScope: "project"` or `"both"`.
+
+When a package identity (`npm:<name>`, `git:<host>/<path>`, or `local:<absolute>`) appears in both user and project settings, the project entry wins.
+
 Discovered package agents are namespaced by the package name. An agent declared as `name: reviewer` inside `@acme/pi-frontend` is invocable as `@acme/pi-frontend.reviewer`. The original local name is preserved on `AgentConfig.localName`, and the publishing package name is on `AgentConfig.packageName`.
 
-Only packages listed in the host project's `dependencies`, `devDependencies`, or `optionalDependencies` are scanned, and only when `agentScope` is `"project"` or `"both"`. Package agents go through the same confirmation prompt as project agents because they run with the same privileges.
+Package agents go through the same confirmation prompt as project agents because they run with the same privileges. They are not pulled from a project's `dependencies` / `node_modules`; only packages explicitly listed in a pi settings file are considered.
 
 ## Bundled Agents
 

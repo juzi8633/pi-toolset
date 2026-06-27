@@ -99,7 +99,7 @@ export async function executeAgentTool(
     };
   }
 
-  if ((agentScope === 'project' || agentScope === 'both') && confirmProjectAgents && ctx.hasUI) {
+  if (confirmProjectAgents && ctx.hasUI) {
     const requestedAgentNames = new Set<string>();
     if (params.chain) {
       for (const step of params.chain) {
@@ -115,11 +115,28 @@ export async function executeAgentTool(
       .filter((a): a is AgentConfig => a?.source === 'project' || a?.source === 'package');
 
     if (elevatedAgentsRequested.length > 0) {
-      const entries = elevatedAgentsRequested.map((a) => `${a.name} [${a.source}] (${a.filePath})`);
-      const projectDir = discovery.projectAgentsDir ?? '(unknown)';
+      // Strip control characters so a hostile package name / file path cannot spoof
+      // the confirmation dialog with embedded newlines or terminal escapes.
+      const sanitize = (value: string): string =>
+        // eslint-disable-next-line no-control-regex
+        value.replace(/[\x00-\x1f\x7f]/g, '\uFFFD');
+      const formatEntry = (a: AgentConfig): string =>
+        `  - ${sanitize(a.name)} (${sanitize(a.filePath)})`;
+      const projectEntries = elevatedAgentsRequested.filter((a) => a.source === 'project');
+      const packageEntries = elevatedAgentsRequested.filter((a) => a.source === 'package');
+      const sections: string[] = [];
+      if (projectEntries.length > 0) {
+        const lines = projectEntries.map(formatEntry).join('\n');
+        const projectDir = sanitize(discovery.projectAgentsDir ?? '(unknown)');
+        sections.push(`Project agents (from ${projectDir}):\n${lines}`);
+      }
+      if (packageEntries.length > 0) {
+        const lines = packageEntries.map(formatEntry).join('\n');
+        sections.push(`Package agents:\n${lines}`);
+      }
       const ok = await ctx.ui.confirm(
         'Run project-trust agents?',
-        `Agents:\n${entries.join('\n')}\nProject dir: ${projectDir}\n\nProject and package agents are repo-controlled. Only continue for trusted repositories.`
+        `${sections.join('\n\n')}\n\nProject and package agents are repo- or package-controlled. Only continue for trusted repositories and packages.`
       );
       if (!ok)
         return {

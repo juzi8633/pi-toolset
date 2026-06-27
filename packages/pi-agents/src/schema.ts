@@ -66,7 +66,7 @@ export const ChainItem = Type.Union([SequentialChainItem, FanoutChainItem], {
 
 export const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
   description:
-    'Which agent directories to use. Default: "user". Use "project" or "both" to include project-local and package agents.',
+    'Which agent directories to use. Default: "user". "user" loads ~/.pi/agent/agents plus packages installed via `pi install` in user settings (~/.pi/agent/settings.json). "project" loads .pi/agents plus packages installed in project settings (.pi/settings.json). "both" merges them with project overriding user.',
   default: 'user',
 });
 

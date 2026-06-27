@@ -8,7 +8,7 @@
 
 - 保持当前默认行为不变：默认 `agentScope: "user"`，single / parallel / chain 参数继续可用，现有 `{previous}` 与 `{outputs.<name>}` 文本模板不破坏。
 - 第一轮不引入新的运行时依赖；`outputSchema` 使用本包内实现的 JSON Schema 子集校验器。如果后续要完整 JSON Schema draft 支持，再单独评估 `ajv` 等依赖并按项目规则验证当前文档。
-- Package agents 视为 project-trust 范畴：仅在 `agentScope: "project"` 或 `"both"` 时加载，并复用 project agent 的确认流程。
+- Package agents 按 pi `settings.json#packages[]` 发现：user-scope 包在默认 `agentScope: "user"` / `"both"` 加载，project-scope 包在 `"project"` / `"both"` 加载；两者在运行时都走与 project agent 相同的确认流程。
 - Chain 输出命名继续使用现有 `name` 字段；第一轮不新增 `as` 别名，避免同时维护两套语义。
 - 本计划不直接实现后台 async agent、长生命周期 mailbox 或 Claude Code 风格 prompt-cache fork。这些能力需要运行状态管理器和通知回灌机制，列为后续独立计划。
 - 所有新建 TypeScript 代码文件必须以两行 `ABOUTME:` 注释开头，并保持注释最少化。
@@ -88,7 +88,7 @@
 
 ### Task 2: Add package agent discovery
 
-**Outcome:** 安装在项目依赖或 workspace 中的包可以通过 package metadata 暴露 agents，调用时使用命名空间运行名。
+**Outcome:** 通过 pi 安装的包（`~/.pi/agent/settings.json` 与项目 `.pi/settings.json` 中的 `packages[]`）可以通过 package metadata 暴露 agents，调用时使用命名空间运行名；npm/git/local 三种 source 与 pi 官方 package manager 一致。
 
 **Files:**
 
@@ -105,16 +105,15 @@
 - [x] 扩展 `AgentSource` 为 `'builtin' | 'package' | 'user' | 'project'`。
 - [x] 扩展 `AgentConfig`：`localName?: string`、`packageName?: string`。
 - [x] 创建 `package-agents.ts`，文件头添加两行 `ABOUTME:` 注释，并实现 `discoverPackageAgentDirs(cwd: string): PackageAgentDir[]`。
-- [x] `discoverPackageAgentDirs` 从 `cwd` 向上找到最近的 `package.json`，读取 `dependencies`、`devDependencies`、`optionalDependencies` 中的包名。
-- [x] 对每个包名，从最近的 `node_modules` 向上解析 `<node_modules>/<package>/package.json`；scoped package 使用 `<node_modules>/@scope/name/package.json`。
-- [x] 读取目标包 `package.json` 的 `pi.agents` 字段；支持字符串或字符串数组。每个路径相对包目录解析，可指向目录或单个 `.md` 文件。
+- [x] `discoverPackageAgentDirs(cwd, scope)` 从 `~/.pi/agent/settings.json`（user 作用域）与最近祖先 `.pi/settings.json`（project 作用域）读取 `packages[]`，与 pi 官方 package manager 一致地解析 `npm:`、`git:`、本地路径三种 source 到 packageRoot。
+- [x] 对每个 packageRoot 读取 `package.json#pi.agents` 字段（字符串或字符串数组），路径相对 packageRoot 解析，可指向目录或单个 `.md` 文件；不再扫描项目 `node_modules` 或读取项目 `dependencies`。
 - [x] 加载 package agent 时保留 frontmatter 中的本地名到 `localName`，运行名设为 `${packageName}.${localName}`，例如 `@acme/pi-frontend.react-reviewer`。
 - [x] Package agent 的 `source` 设置为 `package`，`packageName` 设置为真实包名，`filePath` 指向 `.md` 文件。
-- [x] 修改 `discoverAgents(cwd, scope)`：合并顺序为 builtin → package → user → project；package agents 仅在 `scope === "project" || scope === "both"` 时加载。
-- [x] 修改 project agent 确认逻辑：当请求的 agent 来源是 `project` 或 `package`，且 `confirmProjectAgents !== false` 且 `ctx.hasUI`，确认弹窗列出 agent 名称和来源路径。
-- [x] 在 `package-agents.test.ts` 创建临时项目，写入 `package.json` 与 `node_modules/@acme/pi-demo/package.json`，其中 `pi.agents: ["./agents"]`，再写入 `agents/reviewer.md`。
-- [x] 测试 `discoverAgents(tempProject, "user")` 不包含 package agent。
-- [x] 测试 `discoverAgents(tempProject, "project")` 包含 `@acme/pi-demo.reviewer`，并且 `localName === "reviewer"`、`packageName === "@acme/pi-demo"`、`source === "package"`。
+- [x] 修改 `discoverAgents(cwd, scope)`：合并顺序为 builtin → package → user → project；user 作用域包仅在 `scope === "user" || scope === "both"` 时加载，project 作用域包仅在 `scope === "project" || scope === "both"` 时加载。
+- [x] 修改 project agent 确认逻辑：当请求的 agent 来源是 `project` 或 `package`，且 `confirmProjectAgents !== false` 且 `ctx.hasUI`，确认弹窗列出 agent 名称和来源路径（与 `agentScope` 无关，依据实际 source）。
+- [x] 在 `package-agents.test.ts` 用临时目录搭建假的 `~/.pi/agent/{settings.json, npm/node_modules/...}` 和 `<project>/.pi/{settings.json, npm/node_modules/..., git/...}`，覆盖 `npm:`、`git:`、本地路径与对象形式的 `{source}` 条目。
+- [x] 测试 `discoverAgents(tempProject, "project")` 不包含仅在 user `settings.json` 中声明的包 agent。
+- [x] 测试 `discoverAgents(tempProject, "user")` 或 `"both"` 包含 `@acme/pi-demo.reviewer`，并且 `localName === "reviewer"`、`packageName === "@acme/pi-demo"`、`source === "package"`。
 - [x] 测试无 `pi.agents` 或路径不存在的包被跳过，不抛异常。
 - [x] README 增加 package agent 发布格式、运行名、scope 与安全确认说明。
 
@@ -393,7 +392,7 @@
 ## Rollout Notes
 
 - 推荐按 phase 顺序合并，每个 phase 单独 PR 或单独 commit：Phase 0 纯重构；Phase 1 package agents；Phase 2 structured output；Phase 3 fanout；Phase 4 worktree hook；Phase 5 reminder。
-- Phase 1 改变 agent discovery，但默认 `agentScope: "user"` 不加载 package agents，因此默认安全边界不变。
+- Phase 1 改变 agent discovery：默认 `agentScope: "user"` 会加载 `~/.pi/agent/agents` 与 user-scope package agents（`~/.pi/agent/settings.json#packages`）。默认安全边界依靠 confirm 提示 + path-escape / symlink 防护，不再依靠 scope 的“不加载”。
 - Phase 2 和 Phase 3 都是 opt-in。没有 `outputSchema` 或 fanout step 的现有 chain 行为保持不变。
 - Phase 4 的 `worktreeSetupHook` 会运行 shell 命令，必须在 README 中明确只对可信 agent 来源使用。Project / package 来源仍走确认流程。
 - Phase 5 的 `criticalSystemReminder` 不是运行时 sandbox；它必须与 `tools` / `excludeTools`、`maxSubagentDepth` 搭配使用。
@@ -403,7 +402,7 @@
 
 - Risk: TypeBox union schema 让 tool 参数提示变复杂，模型更难正确调用 fanout。 — Mitigation: README 给完整 JSON 示例；schema descriptions 写清楚 sequential step 与 fanout step 二选一；保留旧 sequential shape 完全兼容。
 - Risk: 本地 JSON Schema 子集与用户预期的完整 JSON Schema 不一致。 — Mitigation: README 明确支持字段列表；校验错误返回具体路径；后续如需完整 draft 支持再引入专门依赖。
-- Risk: Package agents 来源路径扫描过宽，导致意外加载项目依赖中的 prompts。 — Mitigation: 只读取当前项目 `package.json` 显式依赖中的包；只加载包 `package.json` 明确声明的 `pi.agents` 路径；只在 `agentScope: "project"` 或 `"both"` 生效。
+- Risk: Package agents 来源路径扫描过宽，导致意外加载不受控的 prompts。 — Mitigation: 只读取 pi `settings.json` `packages[]` 中明确声明的包；只加载包 `package.json` 明确声明的 `pi.agents` 路径；user 与 project 作用域按 `agentScope` 独立加载，`project` 胜出 `user`。
 - Risk: Dynamic fanout 造成过多子进程或 token 消耗。 — Mitigation: 使用 `MAX_FANOUT_ITEMS = MAX_PARALLEL_TASKS`；并发上限仍受 `MAX_CONCURRENCY` 约束；超过上限时截断并在 collect 文本记录跳过数量。
 - Risk: Worktree setup hook 运行任意 shell 命令。 — Mitigation: hook 只来自 agent frontmatter；project / package agent 需要确认；README 明确安全模型；失败时保留 dirty worktree 供检查。
 - Risk: `criticalSystemReminder` 被误解为强安全边界。 — Mitigation: 文档明确它只是 prompt-level 约束，真正的工具能力仍由 `tools` / `excludeTools` 和深度守卫控制。
