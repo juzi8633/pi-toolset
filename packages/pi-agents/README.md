@@ -41,6 +41,8 @@ To enable project-local and package agents, pass `agentScope: "both"` (or `"proj
 
 When running interactively, the tool prompts for confirmation before running project-local or package agents. Set `confirmProjectAgents: false` to disable.
 
+`worktreeSetupHook` is a shell command sourced from an agent definition and runs in the project on `isolation: worktree` agents. Treat it the same as any other agent body: only declare it for trusted sources, and pair it with the project/package confirmation prompt. `criticalSystemReminder` is a prompt-level constraint, not a runtime sandbox; capability limits still need `tools` / `excludeTools` / `maxSubagentDepth`.
+
 ### Tool Permissions
 
 Agent permissions are expressed with two frontmatter fields that map directly onto the Pi CLI:
@@ -221,26 +223,52 @@ System prompt for the agent goes here.
 
 ### Frontmatter Fields
 
-| Field              | Type                  | Default      | Description                                                                                                                                                                                                                                                            |
-| ------------------ | --------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`             | string                | (required)   | Agent identifier used by the `agent` tool.                                                                                                                                                                                                                             |
-| `description`      | string                | (required)   | Shown to the parent model in the agent catalogue.                                                                                                                                                                                                                      |
-| `tools`            | comma list            | inherit all  | Allowlist passed to `pi --tools`.                                                                                                                                                                                                                                      |
-| `excludeTools`     | comma list            | none         | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                                                                 |
-| `model`            | string                | host default | Forwarded as `pi --model`.                                                                                                                                                                                                                                             |
-| `thinking`         | string                | host default | Forwarded as `pi --thinking`.                                                                                                                                                                                                                                          |
-| `systemPromptMode` | `append` \| `replace` | `append`     | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                                                              |
-| `maxTurns`         | positive integer      | unbounded    | Maximum assistant turns; the child is `SIGTERM`'d when exceeded and the result is marked with `stopReason: max_turns`.                                                                                                                                                 |
-| `noContextFiles`   | boolean               | `false`      | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                                                                 |
-| `noSkills`         | boolean               | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                        |
-| `defaultContext`   | `fresh` \| `fork`     | `fresh`      | `fork` branches the parent session via `SessionManager.createBranchedSession(getLeafId())` and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                      |
-| `isolation`        | `none` \| `worktree`  | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>/` created by `git worktree add --detach HEAD`. Clean worktrees are removed after the child exits; dirty worktrees are kept and reported on `SingleResult.worktreePath`. |
-| `completionCheck`  | comma list            | none         | Required final-message headings. When set, each configured heading must appear as an exact line; otherwise the result is marked `stopReason: completion_check` with exit code `1`.                                                                                     |
-| `maxSubagentDepth` | non-negative integer  | unset        | Caps how many further `agent` delegations may happen from inside the spawned agent. `0` removes the `agent` tool and the catalogue prompt for that child. When unset, the global `PI_AGENT_MAX_DEPTH` limit applies as before.                                         |
+| Field                    | Type                  | Default      | Description                                                                                                                                                                                                                                                            |
+| ------------------------ | --------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                   | string                | (required)   | Agent identifier used by the `agent` tool.                                                                                                                                                                                                                             |
+| `description`            | string                | (required)   | Shown to the parent model in the agent catalogue.                                                                                                                                                                                                                      |
+| `tools`                  | comma list            | inherit all  | Allowlist passed to `pi --tools`.                                                                                                                                                                                                                                      |
+| `excludeTools`           | comma list            | none         | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                                                                 |
+| `model`                  | string                | host default | Forwarded as `pi --model`.                                                                                                                                                                                                                                             |
+| `thinking`               | string                | host default | Forwarded as `pi --thinking`.                                                                                                                                                                                                                                          |
+| `systemPromptMode`       | `append` \| `replace` | `append`     | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                                                              |
+| `maxTurns`               | positive integer      | unbounded    | Maximum assistant turns; the child is `SIGTERM`'d when exceeded and the result is marked with `stopReason: max_turns`.                                                                                                                                                 |
+| `noContextFiles`         | boolean               | `false`      | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                                                                 |
+| `noSkills`               | boolean               | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                        |
+| `defaultContext`         | `fresh` \| `fork`     | `fresh`      | `fork` branches the parent session via `SessionManager.createBranchedSession(getLeafId())` and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                      |
+| `isolation`              | `none` \| `worktree`  | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>/` created by `git worktree add --detach HEAD`. Clean worktrees are removed after the child exits; dirty worktrees are kept and reported on `SingleResult.worktreePath`. |
+| `completionCheck`        | comma list            | none         | Required final-message headings. When set, each configured heading must appear as an exact line; otherwise the result is marked `stopReason: completion_check` with exit code `1`.                                                                                     |
+| `maxSubagentDepth`       | non-negative integer  | unset        | Caps how many further `agent` delegations may happen from inside the spawned agent. `0` removes the `agent` tool and the catalogue prompt for that child. When unset, the global `PI_AGENT_MAX_DEPTH` limit applies as before.                                         |
+| `worktreeSetupHook`      | non-empty string      | unset        | Shell command run inside the freshly created worktree before the child `pi` starts (only when `isolation: worktree`). Failure produces `stopReason: 'worktree_setup_error'` and stops the chain.                                                                       |
+| `criticalSystemReminder` | non-empty string      | unset        | Prompt-only constraint appended to the child's system prompt inside a `<critical-system-reminder>` block. Pair with `excludeTools` / `tools` / `maxSubagentDepth` for actual capability limits.                                                                        |
 
 Invalid values (unknown enums, non-positive integers for `maxTurns`, negative or non-integer values for `maxSubagentDepth`, non-boolean strings) are ignored and fall back to the default (`append`, `fresh`, `none`) for enum fields and to `undefined` for boolean / numeric fields. Empty comma lists are ignored.
 
-> Runtime behavior currently wired up: `tools`, `excludeTools`, `model`, `thinking`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, `completionCheck`, `maxSubagentDepth`. Every frontmatter field is now active.
+> Runtime behavior currently wired up: `tools`, `excludeTools`, `model`, `thinking`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, `completionCheck`, `maxSubagentDepth`, `worktreeSetupHook`, `criticalSystemReminder`. Every frontmatter field is now active.
+
+### Worktree Setup Hook
+
+Agents with `isolation: worktree` can declare a `worktreeSetupHook` shell command that runs inside the newly created worktree before the child `pi` is spawned. Typical uses are dependency installs or generated-file builds the child relies on (`bun install`, `pnpm install --frozen-lockfile`, `make bootstrap`).
+
+Behavior:
+
+- The hook is launched with `spawnSync(command, { cwd: worktreePath, shell: true })` and inherits the parent's environment.
+- A non-zero exit code or spawn error returns a synthetic failure with `stopReason: 'worktree_setup_error'`, exit code `1`, and a truncated tail of stderr/stdout in `errorMessage` / `worktreeSetupError`.
+- After a hook failure the worktree is removed when `git status --porcelain` is clean; otherwise it is retained and surfaced via `worktreePath` + `worktreeDirty: true`.
+- The hook is shell input from the agent definition. Only declare it in agents from sources you trust; project-local and package agents go through the same confirmation prompt as before.
+
+After a successful child run, dirty worktrees additionally expose:
+
+- `worktreeDiffStat` — output of `git diff --stat --no-ext-diff HEAD`.
+- `worktreeChangedFiles` — union of `git diff --name-only --no-ext-diff HEAD` and untracked files reported by `git ls-files --others --exclude-standard`.
+
+### Critical System Reminder
+
+`criticalSystemReminder` lets an agent author append a strong prompt-level constraint to the spawned child's system prompt. The text is wrapped in a `<critical-system-reminder>` block and concatenated after the existing system prompt (or used alone when no body is provided).
+
+This is not a runtime sandbox. It influences model behavior but does not remove tool capabilities. Combine it with `tools` / `excludeTools` for the reviewer / verifier pattern: reviewer-style agents pair the reminder ("do not edit files") with `excludeTools: edit, write, agent` so both the prompt-level intent and the actual tool surface agree.
+
+The bundled `reviewer.md` ships with a `criticalSystemReminder` that reinforces its read-only contract.
 
 ### Completion Check
 
@@ -340,6 +368,7 @@ Only packages listed in the host project's `dependencies`, `devDependencies`, or
 - **stopReason "template_error"**: a chain step's task referenced `{outputs.<name>}` for a step that did not run or was not named
 - **stopReason "structured_output_error"**: a chain step with `outputSchema` produced output that could not be parsed or failed schema validation
 - **stopReason "fanout_error"**: a dynamic fanout step could not read an array from a structured output or render its item tasks
+- **stopReason "worktree_setup_error"**: an agent declared `worktreeSetupHook` and the command exited non-zero, leaving a dirty worktree retained for inspection
 - **Chain mode**: stops at the first failing step and reports which step failed
 
 ## Limitations

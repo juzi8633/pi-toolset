@@ -69,15 +69,15 @@
 
 **Steps:**
 
-- [ ] 创建 `src/chain.ts`，文件头添加两行 `ABOUTME:` 注释。
-- [ ] 从 `tool.ts` 移出当前 `runChain()` 的核心循环，导出 `runChainWorkflow(options)`。
-- [ ] `runChainWorkflow` 参数包含：`ctx`、`agents`、`chain`、`signal`、`onUpdate`、`makeDetails`、`runStep`。其中 `runStep` 在生产路径调用当前 `runStepWithContext`，在测试路径返回合成 `SingleResult`。
-- [ ] 保留当前行为：按顺序执行；`{previous}` 替换上一步最终文本；`{outputs.<name>}` 替换命名步骤文本；未知输出返回 `template_error` 并停止；任一步失败则停止。
-- [ ] `tool.ts` 中的 chain 分支改为调用 `runChainWorkflow`，single / parallel 分支不改变。
-- [ ] 在 `chain.test.ts` 添加用例：两个步骤按顺序执行，第二步 task 收到第一步输出。
-- [ ] 在 `chain.test.ts` 添加用例：命名输出 `{outputs.plan}` 可被后续步骤替换。
-- [ ] 在 `chain.test.ts` 添加用例：引用 `{outputs.missing}` 时返回 `isError: true`、结果 `stopReason: "template_error"`，且不调用后续 `runStep`。
-- [ ] 在 `chain.test.ts` 添加用例：第一步合成失败时 chain 停止，不执行第二步。
+- [x] 创建 `src/chain.ts`，文件头添加两行 `ABOUTME:` 注释。
+- [x] 从 `tool.ts` 移出当前 `runChain()` 的核心循环，导出 `runChainWorkflow(options)`。
+- [x] `runChainWorkflow` 参数包含：`ctx`、`agents`、`chain`、`signal`、`onUpdate`、`makeDetails`、`runStep`。其中 `runStep` 在生产路径调用当前 `runStepWithContext`，在测试路径返回合成 `SingleResult`。
+- [x] 保留当前行为：按顺序执行；`{previous}` 替换上一步最终文本；`{outputs.<name>}` 替换命名步骤文本；未知输出返回 `template_error` 并停止；任一步失败则停止。
+- [x] `tool.ts` 中的 chain 分支改为调用 `runChainWorkflow`，single / parallel 分支不改变。
+- [x] 在 `chain.test.ts` 添加用例：两个步骤按顺序执行，第二步 task 收到第一步输出。
+- [x] 在 `chain.test.ts` 添加用例：命名输出 `{outputs.plan}` 可被后续步骤替换。
+- [x] 在 `chain.test.ts` 添加用例：引用 `{outputs.missing}` 时返回 `isError: true`、结果 `stopReason: "template_error"`，且不调用后续 `runStep`。
+- [x] 在 `chain.test.ts` 添加用例：第一步合成失败时 chain 停止，不执行第二步。
 
 **Validation:**
 
@@ -101,22 +101,22 @@
 
 **Steps:**
 
-- [ ] 在 `package.json` 的 `pi` 字段中增加 `"agents": ["./agents"]`，作为本包发布 package agents 的示例。
-- [ ] 扩展 `AgentSource` 为 `'builtin' | 'package' | 'user' | 'project'`。
-- [ ] 扩展 `AgentConfig`：`localName?: string`、`packageName?: string`。
-- [ ] 创建 `package-agents.ts`，文件头添加两行 `ABOUTME:` 注释，并实现 `discoverPackageAgentDirs(cwd: string): PackageAgentDir[]`。
-- [ ] `discoverPackageAgentDirs` 从 `cwd` 向上找到最近的 `package.json`，读取 `dependencies`、`devDependencies`、`optionalDependencies` 中的包名。
-- [ ] 对每个包名，从最近的 `node_modules` 向上解析 `<node_modules>/<package>/package.json`；scoped package 使用 `<node_modules>/@scope/name/package.json`。
-- [ ] 读取目标包 `package.json` 的 `pi.agents` 字段；支持字符串或字符串数组。每个路径相对包目录解析，可指向目录或单个 `.md` 文件。
-- [ ] 加载 package agent 时保留 frontmatter 中的本地名到 `localName`，运行名设为 `${packageName}.${localName}`，例如 `@acme/pi-frontend.react-reviewer`。
-- [ ] Package agent 的 `source` 设置为 `package`，`packageName` 设置为真实包名，`filePath` 指向 `.md` 文件。
-- [ ] 修改 `discoverAgents(cwd, scope)`：合并顺序为 builtin → package → user → project；package agents 仅在 `scope === "project" || scope === "both"` 时加载。
-- [ ] 修改 project agent 确认逻辑：当请求的 agent 来源是 `project` 或 `package`，且 `confirmProjectAgents !== false` 且 `ctx.hasUI`，确认弹窗列出 agent 名称和来源路径。
-- [ ] 在 `package-agents.test.ts` 创建临时项目，写入 `package.json` 与 `node_modules/@acme/pi-demo/package.json`，其中 `pi.agents: ["./agents"]`，再写入 `agents/reviewer.md`。
-- [ ] 测试 `discoverAgents(tempProject, "user")` 不包含 package agent。
-- [ ] 测试 `discoverAgents(tempProject, "project")` 包含 `@acme/pi-demo.reviewer`，并且 `localName === "reviewer"`、`packageName === "@acme/pi-demo"`、`source === "package"`。
-- [ ] 测试无 `pi.agents` 或路径不存在的包被跳过，不抛异常。
-- [ ] README 增加 package agent 发布格式、运行名、scope 与安全确认说明。
+- [x] 在 `package.json` 的 `pi` 字段中增加 `"agents": ["./agents"]`，作为本包发布 package agents 的示例。
+- [x] 扩展 `AgentSource` 为 `'builtin' | 'package' | 'user' | 'project'`。
+- [x] 扩展 `AgentConfig`：`localName?: string`、`packageName?: string`。
+- [x] 创建 `package-agents.ts`，文件头添加两行 `ABOUTME:` 注释，并实现 `discoverPackageAgentDirs(cwd: string): PackageAgentDir[]`。
+- [x] `discoverPackageAgentDirs` 从 `cwd` 向上找到最近的 `package.json`，读取 `dependencies`、`devDependencies`、`optionalDependencies` 中的包名。
+- [x] 对每个包名，从最近的 `node_modules` 向上解析 `<node_modules>/<package>/package.json`；scoped package 使用 `<node_modules>/@scope/name/package.json`。
+- [x] 读取目标包 `package.json` 的 `pi.agents` 字段；支持字符串或字符串数组。每个路径相对包目录解析，可指向目录或单个 `.md` 文件。
+- [x] 加载 package agent 时保留 frontmatter 中的本地名到 `localName`，运行名设为 `${packageName}.${localName}`，例如 `@acme/pi-frontend.react-reviewer`。
+- [x] Package agent 的 `source` 设置为 `package`，`packageName` 设置为真实包名，`filePath` 指向 `.md` 文件。
+- [x] 修改 `discoverAgents(cwd, scope)`：合并顺序为 builtin → package → user → project；package agents 仅在 `scope === "project" || scope === "both"` 时加载。
+- [x] 修改 project agent 确认逻辑：当请求的 agent 来源是 `project` 或 `package`，且 `confirmProjectAgents !== false` 且 `ctx.hasUI`，确认弹窗列出 agent 名称和来源路径。
+- [x] 在 `package-agents.test.ts` 创建临时项目，写入 `package.json` 与 `node_modules/@acme/pi-demo/package.json`，其中 `pi.agents: ["./agents"]`，再写入 `agents/reviewer.md`。
+- [x] 测试 `discoverAgents(tempProject, "user")` 不包含 package agent。
+- [x] 测试 `discoverAgents(tempProject, "project")` 包含 `@acme/pi-demo.reviewer`，并且 `localName === "reviewer"`、`packageName === "@acme/pi-demo"`、`source === "package"`。
+- [x] 测试无 `pi.agents` 或路径不存在的包被跳过，不抛异常。
+- [x] README 增加 package agent 发布格式、运行名、scope 与安全确认说明。
 
 **Validation:**
 
@@ -137,18 +137,18 @@
 
 **Steps:**
 
-- [ ] 创建 `src/structured-output.ts`，文件头添加两行 `ABOUTME:` 注释。
-- [ ] 定义 `JsonValue`、`JsonObject`、`JsonSchemaSubset` 类型。Schema 子集支持：`type`、`properties`、`required`、`items`、`enum`、`additionalProperties`、`minItems`、`maxItems`。
-- [ ] 实现 `extractJsonFromFinalOutput(text: string): { ok: true; value: JsonValue } | { ok: false; error: string }`。
-- [ ] `extractJsonFromFinalOutput` 接受两种格式：trim 后是完整 JSON；或整段文本只包含一个 fenced code block，语言为 `json` 或空语言，block 内容是完整 JSON。
-- [ ] 实现 `validateStructuredOutput(value: JsonValue, schema: JsonSchemaSubset): string[]`，返回人类可读错误路径，例如 `$.items[0].path: expected string`。
-- [ ] `validateStructuredOutput` 对 `type: "object"` 检查 plain object；按 `required` 检查缺失字段；按 `properties` 递归检查已声明字段；当 `additionalProperties === false` 时拒绝未声明字段。
-- [ ] `validateStructuredOutput` 对 `type: "array"` 检查数组；按 `items` 递归检查每个元素；按 `minItems` / `maxItems` 检查长度。
-- [ ] `validateStructuredOutput` 对 `string`、`number`、`integer`、`boolean`、`null` 执行类型检查；`integer` 必须 `Number.isInteger(value)`。
-- [ ] `validateStructuredOutput` 对 `enum` 使用 JSON 字符串化后的严格相等比较。
-- [ ] 实现 `buildStructuredOutputInstruction(schema)`，返回要追加到 task 的明确契约：最终 assistant message 必须只输出符合 schema 的 JSON，不要 Markdown、解释或 fenced block。
-- [ ] 在 `types.ts` 给 `SingleResult` 增加 `finalOutput?: string`、`structuredOutput?: unknown`、`structuredOutputError?: string`。
-- [ ] 在 `structured-output.test.ts` 覆盖：纯 JSON 成功、fenced JSON 成功、普通 Markdown 失败、缺失 required 字段失败、数组 items 类型失败、`additionalProperties: false` 失败、enum 成功与失败。
+- [x] 创建 `src/structured-output.ts`，文件头添加两行 `ABOUTME:` 注释。
+- [x] 定义 `JsonValue`、`JsonObject`、`JsonSchemaSubset` 类型。Schema 子集支持：`type`、`properties`、`required`、`items`、`enum`、`additionalProperties`、`minItems`、`maxItems`。
+- [x] 实现 `extractJsonFromFinalOutput(text: string): { ok: true; value: JsonValue } | { ok: false; error: string }`。
+- [x] `extractJsonFromFinalOutput` 接受两种格式：trim 后是完整 JSON；或整段文本只包含一个 fenced code block，语言为 `json` 或空语言，block 内容是完整 JSON。
+- [x] 实现 `validateStructuredOutput(value: JsonValue, schema: JsonSchemaSubset): string[]`，返回人类可读错误路径，例如 `$.items[0].path: expected string`。
+- [x] `validateStructuredOutput` 对 `type: "object"` 检查 plain object；按 `required` 检查缺失字段；按 `properties` 递归检查已声明字段；当 `additionalProperties === false` 时拒绝未声明字段。
+- [x] `validateStructuredOutput` 对 `type: "array"` 检查数组；按 `items` 递归检查每个元素；按 `minItems` / `maxItems` 检查长度。
+- [x] `validateStructuredOutput` 对 `string`、`number`、`integer`、`boolean`、`null` 执行类型检查；`integer` 必须 `Number.isInteger(value)`。
+- [x] `validateStructuredOutput` 对 `enum` 使用 JSON 字符串化后的严格相等比较。
+- [x] 实现 `buildStructuredOutputInstruction(schema)`，返回要追加到 task 的明确契约：最终 assistant message 必须只输出符合 schema 的 JSON，不要 Markdown、解释或 fenced block。
+- [x] 在 `types.ts` 给 `SingleResult` 增加 `finalOutput?: string`、`structuredOutput?: unknown`、`structuredOutputError?: string`。
+- [x] 在 `structured-output.test.ts` 覆盖：纯 JSON 成功、fenced JSON 成功、普通 Markdown 失败、缺失 required 字段失败、数组 items 类型失败、`additionalProperties: false` 失败、enum 成功与失败。
 
 **Validation:**
 
@@ -174,22 +174,22 @@
 
 **Steps:**
 
-- [ ] 在 `schema.ts` 的 sequential chain item 中增加 `outputSchema: Type.Optional(Type.Any({ description: ... }))`。
-- [ ] 在 `types.ts` 增加 `ChainOutputEntry`：`{ text: string; structured?: unknown; agent: string; step: number }`。
-- [ ] 在 `SubagentDetails` 增加可选 `outputs?: Record<string, ChainOutputEntry>`。
-- [ ] 在 `template.ts` 把 `TemplateContext.outputs` 从 `Map<string, string>` 改为 `Map<string, ChainOutputEntry>`，`{outputs.<name>}` 仍替换为 entry 的 `text`，保持兼容。
-- [ ] 在 `chain.ts` 执行有 `outputSchema` 的步骤前，把 `buildStructuredOutputInstruction(schema)` 追加到该步 task 后面。
-- [ ] 在步骤完成后，把 `getFinalOutput(result.messages)` 写入 `result.finalOutput`。
-- [ ] 当步骤有 `outputSchema` 时，调用 `extractJsonFromFinalOutput(result.finalOutput)` 和 `validateStructuredOutput`。
-- [ ] 如果解析或校验失败，把该 result 标记为失败：`exitCode = 1`、`stopReason = "structured_output_error"`、`structuredOutputError` 与 `errorMessage` 填入具体原因；chain 停止在该步。
-- [ ] 如果成功，把解析后的值写入 `result.structuredOutput`。
-- [ ] 当步骤有 `name` 时，写入 outputs map：`text` 为最终文本，`structured` 为 `result.structuredOutput`，`agent` 与 `step` 来自当前步骤。
-- [ ] `chain.ts` 最终返回的 `details` 带上 `outputs` 对象，key 为 step `name`。
-- [ ] 在 `output.ts` 的失败集合中加入 `structured_output_error`。
-- [ ] `chain.test.ts` 添加成功用例：第一步 `outputSchema` 要求 `{ files: string[] }`，合成输出 `{"files":["a.ts"]}`，details 中 `outputs.context.structured.files[0] === "a.ts"`。
-- [ ] `chain.test.ts` 添加失败用例：schema 要求 `files`，合成输出 `{}`，chain 停止，`stopReason === "structured_output_error"`。
-- [ ] `template.test.ts` 添加兼容用例：`{outputs.plan}` 仍替换 entry.text。
-- [ ] README 添加 chain `outputSchema` 示例和失败行为说明。
+- [x] 在 `schema.ts` 的 sequential chain item 中增加 `outputSchema: Type.Optional(Type.Any({ description: ... }))`。
+- [x] 在 `types.ts` 增加 `ChainOutputEntry`：`{ text: string; structured?: unknown; agent: string; step: number }`。
+- [x] 在 `SubagentDetails` 增加可选 `outputs?: Record<string, ChainOutputEntry>`。
+- [x] 在 `template.ts` 把 `TemplateContext.outputs` 从 `Map<string, string>` 改为 `Map<string, ChainOutputEntry>`，`{outputs.<name>}` 仍替换为 entry 的 `text`，保持兼容。
+- [x] 在 `chain.ts` 执行有 `outputSchema` 的步骤前，把 `buildStructuredOutputInstruction(schema)` 追加到该步 task 后面。
+- [x] 在步骤完成后，把 `getFinalOutput(result.messages)` 写入 `result.finalOutput`。
+- [x] 当步骤有 `outputSchema` 时，调用 `extractJsonFromFinalOutput(result.finalOutput)` 和 `validateStructuredOutput`。
+- [x] 如果解析或校验失败，把该 result 标记为失败：`exitCode = 1`、`stopReason = "structured_output_error"`、`structuredOutputError` 与 `errorMessage` 填入具体原因；chain 停止在该步。
+- [x] 如果成功，把解析后的值写入 `result.structuredOutput`。
+- [x] 当步骤有 `name` 时，写入 outputs map：`text` 为最终文本，`structured` 为 `result.structuredOutput`，`agent` 与 `step` 来自当前步骤。
+- [x] `chain.ts` 最终返回的 `details` 带上 `outputs` 对象，key 为 step `name`。
+- [x] 在 `output.ts` 的失败集合中加入 `structured_output_error`。
+- [x] `chain.test.ts` 添加成功用例：第一步 `outputSchema` 要求 `{ files: string[] }`，合成输出 `{"files":["a.ts"]}`，details 中 `outputs.context.structured.files[0] === "a.ts"`。
+- [x] `chain.test.ts` 添加失败用例：schema 要求 `files`，合成输出 `{}`，chain 停止，`stopReason === "structured_output_error"`。
+- [x] `template.test.ts` 添加兼容用例：`{outputs.plan}` 仍替换 entry.text。
+- [x] README 添加 chain `outputSchema` 示例和失败行为说明。
 
 **Validation:**
 
@@ -216,31 +216,31 @@
 
 **Steps:**
 
-- [ ] 在 `constants.ts` 增加 `MAX_FANOUT_ITEMS = MAX_PARALLEL_TASKS`，默认最大动态展开数量与现有 parallel 上限一致。
-- [ ] 创建 `json-pointer.ts`，文件头添加两行 `ABOUTME:` 注释，并实现 `readJsonPointer(value, pointer)`。支持空指针 `""` 返回根值；支持 `/items/0/path`；支持 JSON Pointer 转义 `~0` → `~`、`~1` → `/`。
-- [ ] `readJsonPointer` 返回 `{ ok: true; value }` 或 `{ ok: false; error }`，错误包含缺失路径段。
-- [ ] 在 `schema.ts` 添加 fanout chain item schema：
+- [x] 在 `constants.ts` 增加 `MAX_FANOUT_ITEMS = MAX_PARALLEL_TASKS`，默认最大动态展开数量与现有 parallel 上限一致。
+- [x] 创建 `json-pointer.ts`，文件头添加两行 `ABOUTME:` 注释，并实现 `readJsonPointer(value, pointer)`。支持空指针 `""` 返回根值；支持 `/items/0/path`；支持 JSON Pointer 转义 `~0` → `~`、`~1` → `/`。
+- [x] `readJsonPointer` 返回 `{ ok: true; value }` 或 `{ ok: false; error }`，错误包含缺失路径段。
+- [x] 在 `schema.ts` 添加 fanout chain item schema：
   - `expand: { from: { output: string, path: string }, maxItems?: number }`
   - `parallel: { agent: string, task: string, cwd?: string, isolation?: IsolationSchema, outputSchema?: Type.Any() }`
   - `collect: { name: string }`
   - `concurrency?: number`
-- [ ] 把 `SubagentParams.chain` 从 `Type.Array(ChainItem)` 改为 sequential item 与 fanout item 的 union。
-- [ ] 在 `template.ts` 支持 `{item}`；当 item 是 object 或 array 时替换为 `JSON.stringify(item)`，其他 JSON 值用 `String(value)`，`null` 替换为 `null`。
-- [ ] 在 `chain.ts` 检测 fanout item：先从 outputs map 中读取 `expand.from.output`，必须存在且有 `structured` 值。
-- [ ] 使用 `readJsonPointer(entry.structured, expand.from.path)` 读取数组。若输出不存在、无 structured 值、路径不存在或路径结果不是数组，创建合成失败 result，`stopReason = "fanout_error"`，chain 停止。
-- [ ] fanout 数组长度超过 `maxItems ?? MAX_FANOUT_ITEMS` 时，截断到上限并在 collect 文本中记录被跳过数量；如果调用方提供的 `maxItems` 大于 `MAX_FANOUT_ITEMS`，仍按 `MAX_FANOUT_ITEMS` 上限执行。
-- [ ] 对每个 item 渲染 `parallel.task`，模板上下文包含 `previous`、`outputs`、`item`。
-- [ ] 使用现有 `mapWithConcurrencyLimit` 执行 fanout 子任务，实际并发为 `Math.min(step.concurrency ?? MAX_CONCURRENCY, MAX_CONCURRENCY)`。
-- [ ] fanout 子任务传入 `taskIndex` 时使用原 chain step index 加 fanout item index，确保 worktree 名称不冲突。
-- [ ] 如果 `parallel.outputSchema` 存在，对每个 fanout 子任务执行与 Task 4 相同的结构化输出解析和校验。
-- [ ] 所有 fanout 子任务完成后，如果任一 result 失败，chain 返回 `isError: true`，content 文本包含 `Fanout failed: <success>/<total> succeeded`，details 保留所有结果。
-- [ ] 如果全部成功，`collect.name` 写入 outputs map：`structured` 为数组，数组元素取 `result.structuredOutput ?? result.finalOutput ?? getFinalOutput(result.messages)`；`text` 为该数组的 pretty JSON。
-- [ ] 在 `output.ts` 的失败集合中加入 `fanout_error`。
-- [ ] `json-pointer.test.ts` 覆盖根指针、数组索引、对象属性、`~0` / `~1` 转义、缺失路径。
-- [ ] `chain.test.ts` 添加 fanout 成功用例：前一步 structured 输出 `{ "items": ["a", "b"] }`，fanout worker 收到 `Process a` 与 `Process b`，collect 输出 structured 数组长度为 2。
-- [ ] `chain.test.ts` 添加 fanout 路径非数组失败用例，断言 `stopReason === "fanout_error"`。
-- [ ] `chain.test.ts` 添加 fanout 子任务失败用例，断言所有已展开任务执行完后 chain 返回错误摘要。
-- [ ] README 添加 dynamic fanout 示例，包含 `expand.from.output`、JSON Pointer path、`{item}`、`collect.name` 和上限说明。
+- [x] 把 `SubagentParams.chain` 从 `Type.Array(ChainItem)` 改为 sequential item 与 fanout item 的 union。
+- [x] 在 `template.ts` 支持 `{item}`；当 item 是 object 或 array 时替换为 `JSON.stringify(item)`，其他 JSON 值用 `String(value)`，`null` 替换为 `null`。
+- [x] 在 `chain.ts` 检测 fanout item：先从 outputs map 中读取 `expand.from.output`，必须存在且有 `structured` 值。
+- [x] 使用 `readJsonPointer(entry.structured, expand.from.path)` 读取数组。若输出不存在、无 structured 值、路径不存在或路径结果不是数组，创建合成失败 result，`stopReason = "fanout_error"`，chain 停止。
+- [x] fanout 数组长度超过 `maxItems ?? MAX_FANOUT_ITEMS` 时，截断到上限并在 collect 文本中记录被跳过数量；如果调用方提供的 `maxItems` 大于 `MAX_FANOUT_ITEMS`，仍按 `MAX_FANOUT_ITEMS` 上限执行。
+- [x] 对每个 item 渲染 `parallel.task`，模板上下文包含 `previous`、`outputs`、`item`。
+- [x] 使用现有 `mapWithConcurrencyLimit` 执行 fanout 子任务，实际并发为 `Math.min(step.concurrency ?? MAX_CONCURRENCY, MAX_CONCURRENCY)`。
+- [x] fanout 子任务传入 `taskIndex` 时使用原 chain step index 加 fanout item index，确保 worktree 名称不冲突。
+- [x] 如果 `parallel.outputSchema` 存在，对每个 fanout 子任务执行与 Task 4 相同的结构化输出解析和校验。
+- [x] 所有 fanout 子任务完成后，如果任一 result 失败，chain 返回 `isError: true`，content 文本包含 `Fanout failed: <success>/<total> succeeded`，details 保留所有结果。
+- [x] 如果全部成功，`collect.name` 写入 outputs map：`structured` 为数组，数组元素取 `result.structuredOutput ?? result.finalOutput ?? getFinalOutput(result.messages)`；`text` 为该数组的 pretty JSON。
+- [x] 在 `output.ts` 的失败集合中加入 `fanout_error`。
+- [x] `json-pointer.test.ts` 覆盖根指针、数组索引、对象属性、`~0` / `~1` 转义、缺失路径。
+- [x] `chain.test.ts` 添加 fanout 成功用例：前一步 structured 输出 `{ "items": ["a", "b"] }`，fanout worker 收到 `Process a` 与 `Process b`，collect 输出 structured 数组长度为 2。
+- [x] `chain.test.ts` 添加 fanout 路径非数组失败用例，断言 `stopReason === "fanout_error"`。
+- [x] `chain.test.ts` 添加 fanout 子任务失败用例，断言所有已展开任务执行完后 chain 返回错误摘要。
+- [x] README 添加 dynamic fanout 示例，包含 `expand.from.output`、JSON Pointer path、`{item}`、`collect.name` 和上限说明。
 
 **Validation:**
 
@@ -268,20 +268,20 @@
 
 **Steps:**
 
-- [ ] 在 `AgentConfig` 增加 `worktreeSetupHook?: string`。
-- [ ] 在 `agents.ts` 解析 frontmatter `worktreeSetupHook`，仅接受非空字符串；空字符串忽略。
-- [ ] 在 `SingleResult` 增加 `worktreeDiffStat?: string`、`worktreeChangedFiles?: string[]`、`worktreeSetupError?: string`。
-- [ ] 在 `worktree.ts` 添加 `runWorktreeSetupHook(worktreePath: string, command: string)`，使用 `spawnSync(command, { cwd: worktreePath, shell: true, encoding: "utf-8" })` 执行。
-- [ ] `runWorktreeSetupHook` 成功时返回 stdout / stderr；失败时返回 exit code 和 stderr / stdout 摘要。
-- [ ] 在创建 worktree 后、spawn 子 `pi` 前执行 hook；如果 hook 失败，返回合成失败 result：`exitCode = 1`、`stopReason = "worktree_setup_error"`、`errorMessage` 包含命令与退出码。
-- [ ] Hook 失败时对 worktree 执行安全清理：若 `git status --porcelain` 干净则删除；脏或状态未知则保留并设置 `worktreePath` / `worktreeDirty`。
-- [ ] 在 `worktree.ts` 添加 `getWorktreeDiffSummary(worktreePath)`，dirty worktree 时执行 `git diff --stat --no-ext-diff` 和 `git diff --name-only --no-ext-diff`。
-- [ ] 在 `finalizeWorktree` dirty 分支写入 `result.worktreeDiffStat` 和 `result.worktreeChangedFiles`。
-- [ ] 在 `output.ts` 的失败集合中加入 `worktree_setup_error`。
-- [ ] `agents.test.ts` 覆盖 `worktreeSetupHook: "bun install"` 解析成功，空字符串被忽略。
-- [ ] `worktree.test.ts` 添加成功 hook 用例：hook 写入一个文件，子代理模拟成功后 worktree dirty，被保留，并返回 changed files。
-- [ ] `worktree.test.ts` 添加失败 hook 用例：hook `exit 7`，返回 `worktree_setup_error`，clean worktree 被删除。
-- [ ] README 记录 hook 运行时机、安全模型、失败行为、diff metadata 字段。
+- [x] 在 `AgentConfig` 增加 `worktreeSetupHook?: string`。
+- [x] 在 `agents.ts` 解析 frontmatter `worktreeSetupHook`，仅接受非空字符串；空字符串忽略。
+- [x] 在 `SingleResult` 增加 `worktreeDiffStat?: string`、`worktreeChangedFiles?: string[]`、`worktreeSetupError?: string`。
+- [x] 在 `worktree.ts` 添加 `runWorktreeSetupHook(worktreePath: string, command: string)`，使用 `spawnSync(command, { cwd: worktreePath, shell: true, encoding: "utf-8" })` 执行。
+- [x] `runWorktreeSetupHook` 成功时返回 stdout / stderr；失败时返回 exit code 和 stderr / stdout 摘要。
+- [x] 在创建 worktree 后、spawn 子 `pi` 前执行 hook；如果 hook 失败，返回合成失败 result：`exitCode = 1`、`stopReason = "worktree_setup_error"`、`errorMessage` 包含命令与退出码。
+- [x] Hook 失败时对 worktree 执行安全清理：若 `git status --porcelain` 干净则删除；脏或状态未知则保留并设置 `worktreePath` / `worktreeDirty`。
+- [x] 在 `worktree.ts` 添加 `getWorktreeDiffSummary(worktreePath)`，dirty worktree 时执行 `git diff --stat --no-ext-diff` 和 `git diff --name-only --no-ext-diff`。
+- [x] 在 `finalizeWorktree` dirty 分支写入 `result.worktreeDiffStat` 和 `result.worktreeChangedFiles`。
+- [x] 在 `output.ts` 的失败集合中加入 `worktree_setup_error`。
+- [x] `agents.test.ts` 覆盖 `worktreeSetupHook: "bun install"` 解析成功，空字符串被忽略。
+- [x] `worktree.test.ts` 添加成功 hook 用例：hook 写入一个文件，子代理模拟成功后 worktree dirty，被保留，并返回 changed files。
+- [x] `worktree.test.ts` 添加失败 hook 用例：hook `exit 7`，返回 `worktree_setup_error`，clean worktree 被删除。
+- [x] README 记录 hook 运行时机、安全模型、失败行为、diff metadata 字段。
 
 **Validation:**
 
@@ -306,15 +306,15 @@
 
 **Steps:**
 
-- [ ] 在 `AgentConfig` 增加 `criticalSystemReminder?: string`。
-- [ ] 在 `agents.ts` 解析 frontmatter `criticalSystemReminder`，仅接受非空字符串。
-- [ ] 在 `invocation.ts` 增加 `buildAgentSystemPrompt(agent)`：返回 `agent.systemPrompt`；如果有 `criticalSystemReminder`，追加一个明确分隔块：`<critical-system-reminder>\n...\n</critical-system-reminder>`。
-- [ ] 在 `execution.ts` 写临时 system prompt 文件时改用 `buildAgentSystemPrompt(agent)`，而不是直接写 `agent.systemPrompt`。
-- [ ] 保持 `systemPromptMode` 行为不变：`replace` 仍使用 `--system-prompt`，`append` 仍使用 `--append-system-prompt`。
-- [ ] 在 `agents/reviewer.md` 增加 `criticalSystemReminder`，内容明确：reviewer 只做审查，不编辑文件，不修复代码，输出 findings。
-- [ ] `agents.test.ts` 覆盖字段解析。
-- [ ] `invocation.test.ts` 覆盖 `buildAgentSystemPrompt`：无 reminder 时原样返回，有 reminder 时包含 XML-like 分隔块和原始 system prompt。
-- [ ] README 记录该能力不是 Claude Code 的“每轮注入”，而是在子代理 system prompt 中追加强约束；适合和 `excludeTools` 一起使用。
+- [x] 在 `AgentConfig` 增加 `criticalSystemReminder?: string`。
+- [x] 在 `agents.ts` 解析 frontmatter `criticalSystemReminder`，仅接受非空字符串。
+- [x] 在 `invocation.ts` 增加 `buildAgentSystemPrompt(agent)`：返回 `agent.systemPrompt`；如果有 `criticalSystemReminder`，追加一个明确分隔块：`<critical-system-reminder>\n...\n</critical-system-reminder>`。
+- [x] 在 `execution.ts` 写临时 system prompt 文件时改用 `buildAgentSystemPrompt(agent)`，而不是直接写 `agent.systemPrompt`。
+- [x] 保持 `systemPromptMode` 行为不变：`replace` 仍使用 `--system-prompt`，`append` 仍使用 `--append-system-prompt`。
+- [x] 在 `agents/reviewer.md` 增加 `criticalSystemReminder`，内容明确：reviewer 只做审查，不编辑文件，不修复代码，输出 findings。
+- [x] `agents.test.ts` 覆盖字段解析。
+- [x] `invocation.test.ts` 覆盖 `buildAgentSystemPrompt`：无 reminder 时原样返回，有 reminder 时包含 XML-like 分隔块和原始 system prompt。
+- [x] README 记录该能力不是 Claude Code 的“每轮注入”，而是在子代理 system prompt 中追加强约束；适合和 `excludeTools` 一起使用。
 
 **Validation:**
 
@@ -335,14 +335,14 @@
 
 **Steps:**
 
-- [ ] 在 README “Features” 中增加 package agents、structured chain outputs、dynamic fanout、worktree setup / diff、critical reminder。
-- [ ] 在 README “Tool Modes” 中保留原 single / parallel / chain 表，并新增 “Structured chain output” 与 “Dynamic fanout” 小节。
-- [ ] 给 `outputSchema` 提供完整可复制 JSON 示例：先用 `explore` 输出 `{ "files": [...] }`，再由 `planner` 使用 `{outputs.context}`。
-- [ ] 给 dynamic fanout 提供完整可复制示例：先输出 `{ "items": [...] }`，再 `expand.from.path: "/items"`，`parallel.task: "Process {item}"`，`collect.name: "results"`。
-- [ ] 在 README “Agent Definitions” 表中新增 `worktreeSetupHook` 与 `criticalSystemReminder`。
-- [ ] 在 README “Security Model” 中说明 package agents 和 project agents 一样需要信任项目；worktree setup hook 是 shell 命令，来自 agent 定义，必须只在可信来源运行。
-- [ ] 在 README “Limitations” 中加入：dynamic fanout 最多展开 `MAX_FANOUT_ITEMS` 项；`outputSchema` 使用本包 JSON Schema 子集，不等同完整 JSON Schema draft。
-- [ ] 如果修改 workflow prompt，保持 prompt 仍使用现有 `agent` tool 参数，不引入尚未实现的 `as` 字段。
+- [x] 在 README “Features” 中增加 package agents、structured chain outputs、dynamic fanout、worktree setup / diff、critical reminder。
+- [x] 在 README “Tool Modes” 中保留原 single / parallel / chain 表，并新增 “Structured chain output” 与 “Dynamic fanout” 小节。
+- [x] 给 `outputSchema` 提供完整可复制 JSON 示例：先用 `explore` 输出 `{ "files": [...] }`，再由 `planner` 使用 `{outputs.context}`。
+- [x] 给 dynamic fanout 提供完整可复制示例：先输出 `{ "items": [...] }`，再 `expand.from.path: "/items"`，`parallel.task: "Process {item}"`，`collect.name: "results"`。
+- [x] 在 README “Agent Definitions” 表中新增 `worktreeSetupHook` 与 `criticalSystemReminder`。
+- [x] 在 README “Security Model” 中说明 package agents 和 project agents 一样需要信任项目；worktree setup hook 是 shell 命令，来自 agent 定义，必须只在可信来源运行。
+- [x] 在 README “Limitations” 中加入：dynamic fanout 最多展开 `MAX_FANOUT_ITEMS` 项；`outputSchema` 使用本包 JSON Schema 子集，不等同完整 JSON Schema draft。
+- [x] 如果修改 workflow prompt，保持 prompt 仍使用现有 `agent` tool 参数，不引入尚未实现的 `as` 字段。
 
 **Validation:**
 
@@ -361,12 +361,12 @@
 
 **Steps:**
 
-- [ ] 运行 package 全量测试。
-- [ ] 运行 package TypeScript 检查。
-- [ ] 运行 package build。
-- [ ] 运行 repo-wide lint / format check。
-- [ ] 如果 `hk check` 修改建议只涉及格式，运行 `hk fix` 后重新跑 `hk check`。
-- [ ] 手动检查 `packages/pi-agents/README.md` 中的新示例没有使用未实现字段。
+- [x] 运行 package 全量测试。
+- [x] 运行 package TypeScript 检查。
+- [x] 运行 package build。
+- [x] 运行 repo-wide lint / format check。
+- [x] 如果 `hk check` 修改建议只涉及格式，运行 `hk fix` 后重新跑 `hk check`。
+- [x] 手动检查 `packages/pi-agents/README.md` 中的新示例没有使用未实现字段。
 
 **Validation:**
 
