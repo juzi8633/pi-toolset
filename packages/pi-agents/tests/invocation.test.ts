@@ -88,6 +88,29 @@ describe('buildPiArgs', () => {
     expect(args).toContain('--no-skills');
   });
 
+  it('adds --no-skills and --skill <path> for each resolvedSkillPaths', () => {
+    const args = buildPiArgs(makeAgent(), 'go', {
+      resolvedSkillPaths: ['/abs/librarian/SKILL.md', '/abs/reviewer/SKILL.md'],
+    });
+    expect(args).toContain('--no-skills');
+    const skillValues = args.filter((_, i) => i > 0 && args[i - 1] === '--skill');
+    expect(skillValues).toEqual(['/abs/librarian/SKILL.md', '/abs/reviewer/SKILL.md']);
+  });
+
+  it('resolvedSkillPaths takes precedence over noSkills and emits --skill', () => {
+    const args = buildPiArgs(makeAgent({ noSkills: true }), 'go', {
+      resolvedSkillPaths: ['/abs/librarian/SKILL.md'],
+    });
+    expect(args.filter((a) => a === '--skill').length).toBe(1);
+    expect(args).toContain('--no-skills');
+  });
+
+  it('omits skill flags when resolvedSkillPaths is empty', () => {
+    const args = buildPiArgs(makeAgent(), 'go', { resolvedSkillPaths: [] });
+    expect(args).not.toContain('--no-skills');
+    expect(args).not.toContain('--skill');
+  });
+
   it('uses --no-session in fresh context', () => {
     const args = buildPiArgs(makeAgent(), 'go');
     expect(args).toContain('--no-session');

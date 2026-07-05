@@ -238,6 +238,7 @@ systemPromptMode: append
 maxTurns: 8
 noContextFiles: false
 noSkills: false
+skills: librarian, code-reviewer
 defaultContext: fresh
 isolation: none
 completionCheck: '## Completed, ## Files Changed, ## Validation'
@@ -249,27 +250,28 @@ System prompt for the agent goes here.
 
 ### Frontmatter Fields
 
-| Field               | Type                  | Default      | Description                                                                                                                                                                                                                                                            |
-| ------------------- | --------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`              | string                | (required)   | Agent identifier used by the `agent` tool.                                                                                                                                                                                                                             |
-| `description`       | string                | (required)   | Shown to the parent model in the agent catalogue.                                                                                                                                                                                                                      |
-| `tools`             | comma list            | inherit all  | Allowlist passed to `pi --tools`.                                                                                                                                                                                                                                      |
-| `excludeTools`      | comma list            | none         | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                                                                 |
-| `model`             | string                | host default | Forwarded as `pi --model`.                                                                                                                                                                                                                                             |
-| `thinking`          | string                | host default | Forwarded as `pi --thinking`.                                                                                                                                                                                                                                          |
-| `systemPromptMode`  | `append` \| `replace` | `append`     | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                                                              |
-| `maxTurns`          | positive integer      | unbounded    | Maximum assistant turns; the child is `SIGTERM`'d when exceeded and the result is marked with `stopReason: max_turns`.                                                                                                                                                 |
-| `noContextFiles`    | boolean               | `false`      | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                                                                 |
-| `noSkills`          | boolean               | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                        |
-| `defaultContext`    | `fresh` \| `fork`     | `fresh`      | `fork` branches the parent session via `SessionManager.createBranchedSession(getLeafId())` and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                      |
-| `isolation`         | `none` \| `worktree`  | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>/` created by `git worktree add --detach HEAD`. Clean worktrees are removed after the child exits; dirty worktrees are kept and reported on `SingleResult.worktreePath`. |
-| `completionCheck`   | comma list            | none         | Required final-message headings. When set, each configured heading must appear as an exact line; otherwise the result is marked `stopReason: completion_check` with exit code `1`.                                                                                     |
-| `maxSubagentDepth`  | non-negative integer  | unset        | Caps how many further `agent` delegations may happen from inside the spawned agent. `0` removes the `agent` tool and the catalogue prompt for that child. When unset, the global `PI_AGENT_MAX_DEPTH` limit applies as before.                                         |
-| `worktreeSetupHook` | non-empty string      | unset        | Shell command run inside the freshly created worktree before the child `pi` starts (only when `isolation: worktree`). Failure produces `stopReason: 'worktree_setup_error'` and stops the chain.                                                                       |
+| Field               | Type                  | Default      | Description                                                                                                                                                                                                                                                                                           |
+| ------------------- | --------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`              | string                | (required)   | Agent identifier used by the `agent` tool.                                                                                                                                                                                                                                                            |
+| `description`       | string                | (required)   | Shown to the parent model in the agent catalogue.                                                                                                                                                                                                                                                     |
+| `tools`             | comma list            | inherit all  | Allowlist passed to `pi --tools`.                                                                                                                                                                                                                                                                     |
+| `excludeTools`      | comma list            | none         | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                                                                                                |
+| `model`             | string                | host default | Forwarded as `pi --model`.                                                                                                                                                                                                                                                                            |
+| `thinking`          | string                | host default | Forwarded as `pi --thinking`.                                                                                                                                                                                                                                                                         |
+| `systemPromptMode`  | `append` \| `replace` | `append`     | `replace` swaps the host system prompt with the agent body via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                                                                                             |
+| `maxTurns`          | positive integer      | unbounded    | Maximum assistant turns; the child is `SIGTERM`'d when exceeded and the result is marked with `stopReason: max_turns`.                                                                                                                                                                                |
+| `noContextFiles`    | boolean               | `false`      | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                                                                                                |
+| `noSkills`          | boolean               | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                                                       |
+| `skills`            | comma list            | none         | Skill **names** to allowlist for the child. When set, the child runs with `--no-skills` plus one `--skill <path>` per resolved name, loading only those skills. Names resolve against the host's discovered skills (see [Skills](#skills)). Unresolvable names fail with `stopReason: 'skill_error'`. |
+| `defaultContext`    | `fresh` \| `fork`     | `fresh`      | `fork` branches the parent session via `SessionManager.createBranchedSession(getLeafId())` and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                                                     |
+| `isolation`         | `none` \| `worktree`  | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>/` created by `git worktree add --detach HEAD`. Clean worktrees are removed after the child exits; dirty worktrees are kept and reported on `SingleResult.worktreePath`.                                |
+| `completionCheck`   | comma list            | none         | Required final-message headings. When set, each configured heading must appear as an exact line; otherwise the result is marked `stopReason: completion_check` with exit code `1`.                                                                                                                    |
+| `maxSubagentDepth`  | non-negative integer  | unset        | Caps how many further `agent` delegations may happen from inside the spawned agent. `0` removes the `agent` tool and the catalogue prompt for that child. When unset, the global `PI_AGENT_MAX_DEPTH` limit applies as before.                                                                        |
+| `worktreeSetupHook` | non-empty string      | unset        | Shell command run inside the freshly created worktree before the child `pi` starts (only when `isolation: worktree`). Failure produces `stopReason: 'worktree_setup_error'` and stops the chain.                                                                                                      |
 
 Invalid values (unknown enums, non-positive integers for `maxTurns`, negative or non-integer values for `maxSubagentDepth`, non-boolean strings) are ignored and fall back to the default (`append`, `fresh`, `none`) for enum fields and to `undefined` for boolean / numeric fields. Empty comma lists are ignored.
 
-> Runtime behavior currently wired up: `tools`, `excludeTools`, `model`, `thinking`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, `completionCheck`, `maxSubagentDepth`, `worktreeSetupHook`. Every frontmatter field is now active.
+> Runtime behavior currently wired up: `tools`, `excludeTools`, `model`, `thinking`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `skills`, `defaultContext`, `isolation`, `completionCheck`, `maxSubagentDepth`, `worktreeSetupHook`. Every frontmatter field is now active.
 
 ### Config Overrides
 
@@ -295,7 +297,7 @@ Merging is field-level: project scope overrides only the fields it specifies; an
 }
 ```
 
-Key is the full agent name as it appears in the catalogue (package agents are namespaced as `<packageName>.<localName>`). Allowed fields match the frontmatter set above: `description`, `model`, `thinking`, `tools`, `excludeTools`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `defaultContext`, `isolation`, `completionCheck`, `maxSubagentDepth`, `worktreeSetupHook`. `name`, `systemPrompt` (the markdown body), `source`, and `filePath` are not overridable. Invalid values are dropped using the same rules as frontmatter parsing.
+Key is the full agent name as it appears in the catalogue (package agents are namespaced as `<packageName>.<localName>`). Allowed fields match the frontmatter set above: `description`, `model`, `thinking`, `tools`, `excludeTools`, `systemPromptMode`, `maxTurns`, `noContextFiles`, `noSkills`, `skills`, `defaultContext`, `isolation`, `completionCheck`, `maxSubagentDepth`, `worktreeSetupHook`. `name`, `systemPrompt` (the markdown body), `source`, and `filePath` are not overridable. Invalid values are dropped using the same rules as frontmatter parsing.
 
 ### Worktree Setup Hook
 
@@ -363,6 +365,27 @@ In `--no-session` parent runs, `fork` does **not** silently fall back to fresh c
 
 Project agents override user agents with the same name when `agentScope: "both"`.
 
+### Skills
+
+An agent can restrict the child to a specific set of skills by **name** via the `skills` frontmatter field:
+
+```markdown
+---
+name: my-agent
+description: only load these skills
+skills: librarian, code-reviewer
+---
+```
+
+Behavior:
+
+- `skills` is a comma-separated list of skill **names** (as they appear in the host's `<available_skills>` catalogue), not paths.
+- When non-empty, the child is launched with `--no-skills` plus one `--skill <path>` per resolved name, so only the listed skills are loaded — the child's default skill discovery is disabled.
+- Name→path resolution uses the skills the host already discovered. The `before_agent_start` hook captures `event.systemPromptOptions.skills` and caches the name→`filePath` mapping; the cache refreshes on every host agent loop.
+- Unresolvable names fail the step before the child is spawned, with `stopReason: 'skill_error'` and a message listing the missing names plus the available ones.
+- `skills` takes precedence over `noSkills`: a non-empty list always emits `--no-skills` + `--skill`, even when `noSkills: true`. Use `noSkills: true` alone to disable all skills; use `skills` to allowlist specific ones.
+- Resolved paths are the skill `filePath` values reported by the host (absolute), so they stay valid regardless of the child's working directory, including worktree isolation.
+
 ### Package Agents
 
 Any pi-installed package can publish agents by declaring a `pi.agents` field in its `package.json`:
@@ -419,6 +442,7 @@ Package agents run with the same privileges as project agents. They are not pull
 - **stopReason "structured_output_error"**: a chain step with `outputSchema` produced output that could not be parsed or failed schema validation
 - **stopReason "fanout_error"**: a dynamic fanout step could not read an array from a structured output or render its item tasks
 - **stopReason "worktree_setup_error"**: an agent declared `worktreeSetupHook` and the command exited non-zero, leaving a dirty worktree retained for inspection
+- **stopReason "skill_error"**: an agent declared `skills` but one or more names could not be resolved against the host's discovered skills; the child was not spawned
 - **Chain mode**: stops at the first failing step and reports which step failed
 
 ## Limitations

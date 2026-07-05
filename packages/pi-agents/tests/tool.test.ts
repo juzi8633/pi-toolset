@@ -1,10 +1,14 @@
 // ABOUTME: Integration-style tests for executeAgentTool() background dispatch and argument compatibility.
 // ABOUTME: Uses an injected fake background manager and a fake workflow runner to avoid spawning real agents.
 
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { AgentToolResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { executeAgentTool, type ExecuteAgentToolOptions } from '../src/tool.ts';
 import type { BackgroundManager } from '../src/background.ts';
+import { clearDiscoveredSkills, setDiscoveredSkills } from '../src/skills.ts';
 import type { SubagentDetails } from '../src/types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
@@ -225,5 +229,61 @@ describe('normalizeAgentArgs', () => {
     const { normalizeAgentArgs } = await import('../src/index.ts');
     const input = { agent: 'noop', task: 'go' };
     expect(normalizeAgentArgs(input)).toBe(input);
+  });
+});
+
+describe('executeAgentTool skill resolution', () => {
+  const piAgentKeys = [
+    'PI_AGENT_CHILD',
+    'PI_AGENT_DEPTH',
+    'PI_AGENT_MAX_DEPTH',
+    'PI_AGENT_TOOL_AVAILABLE',
+  ] as const;
+  const savedEnv: Record<string, string | undefined> = {};
+  let tmpCwd: string | null = null;
+
+  beforeEach(() => {
+    for (const key of piAgentKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    clearDiscoveredSkills();
+  });
+
+  afterEach(() => {
+    for (const key of piAgentKeys) {
+      const value = savedEnv[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (tmpCwd) {
+      rmSync(tmpCwd, { recursive: true, force: true });
+      tmpCwd = null;
+    }
+    clearDiscoveredSkills();
+  });
+
+  it('returns skill_error without spawning when a declared skill name is missing', async () => {
+    tmpCwd = mkdtempSync(path.join(os.tmpdir(), 'pi-skills-int-'));
+    const agentsDir = path.join(tmpCwd, '.pi', 'agents');
+    mkdirSync(agentsDir, { recursive: true });
+    writeFileSync(
+      path.join(agentsDir, 'picky.md'),
+      `---\nname: picky\ndescription: wants skills\nskills: ghost, librarian\n---\nBody.`
+    );
+    setDiscoveredSkills([]);
+
+    const result = await executeAgentTool(
+      { agent: 'picky', task: 'go' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpCwd })
+    );
+
+    expect(result.isError).toBe(true);
+    const single = result.details?.results[0];
+    expect(single?.stopReason).toBe('skill_error');
+    expect(single?.errorMessage).toContain('ghost');
+    expect(single?.errorMessage).toContain('librarian');
   });
 });

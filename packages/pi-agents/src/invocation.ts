@@ -41,6 +41,7 @@ export interface BuildPiArgsOptions {
   tmpPromptPath?: string;
   sessionFile?: string;
   disableAgentTool?: boolean;
+  resolvedSkillPaths?: string[];
 }
 
 export function buildPiArgs(
@@ -58,7 +59,14 @@ export function buildPiArgs(
   if (agent.thinking) args.push('--thinking', agent.thinking);
   args.push(...buildToolCliArgs(agent, { disableAgentTool: options.disableAgentTool }));
   if (agent.noContextFiles) args.push('--no-context-files');
-  if (agent.noSkills) args.push('--no-skills');
+  if (options.resolvedSkillPaths && options.resolvedSkillPaths.length > 0) {
+    args.push('--no-skills');
+    for (const skillPath of options.resolvedSkillPaths) {
+      args.push('--skill', skillPath);
+    }
+  } else if (agent.noSkills) {
+    args.push('--no-skills');
+  }
   if (options.tmpPromptPath) {
     const promptFlag =
       agent.systemPromptMode === 'replace' ? '--system-prompt' : '--append-system-prompt';

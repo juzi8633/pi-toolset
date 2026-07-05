@@ -23,6 +23,7 @@ export type SpawnFn = (command: string, args: string[], options: object) => Spaw
 export interface RunSingleAgentOptions {
   spawnFn?: SpawnFn;
   sessionFile?: string;
+  resolvedSkillPaths?: string[];
 }
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -129,6 +130,7 @@ export async function runSingleAgent(
       tmpPromptPath: tmpPromptPath ?? undefined,
       sessionFile: options.sessionFile,
       disableAgentTool,
+      resolvedSkillPaths: options.resolvedSkillPaths,
     });
     let wasAborted = false;
     let maxTurnsExceeded = false;

@@ -42,6 +42,7 @@ systemPromptMode: replace
 maxTurns: 4
 noContextFiles: true
 noSkills: true
+skills: librarian, code-reviewer
 defaultContext: fork
 isolation: worktree
 completionCheck: "## Completed, ## Files Changed, ## Validation"
@@ -59,6 +60,7 @@ System prompt body.`
     expect(a!.maxTurns).toBe(4);
     expect(a!.noContextFiles).toBe(true);
     expect(a!.noSkills).toBe(true);
+    expect(a!.skills).toEqual(['librarian', 'code-reviewer']);
     expect(a!.defaultContext).toBe('fork');
     expect(a!.isolation).toBe('worktree');
     expect(a!.completionCheck).toEqual(['## Completed', '## Files Changed', '## Validation']);
@@ -84,6 +86,7 @@ Body.`
     expect(a.maxTurns).toBeUndefined();
     expect(a.noContextFiles).toBeUndefined();
     expect(a.noSkills).toBeUndefined();
+    expect(a.skills).toBeUndefined();
     expect(a.defaultContext).toBe('fresh');
     expect(a.isolation).toBe('none');
     expect(a.completionCheck).toBeUndefined();
@@ -296,7 +299,7 @@ describe('agent config overrides', () => {
       path.join(projectConfigDir, 'config.json'),
       JSON.stringify({
         agents: {
-          target: { model: 'project-model', maxTurns: 5 },
+          target: { model: 'project-model', maxTurns: 5, skills: 'librarian, planner' },
         },
       })
     );
@@ -308,6 +311,7 @@ describe('agent config overrides', () => {
     expect(a.systemPromptMode).toBe('replace');
     expect(a.tools).toEqual(['read', 'grep']);
     expect(a.maxTurns).toBe(5);
+    expect(a.skills).toEqual(['librarian', 'planner']);
   });
 
   it('drops invalid override values and leaves frontmatter intact', () => {

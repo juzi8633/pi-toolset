@@ -152,6 +152,34 @@ describe('runSingleAgent agent capability propagation', () => {
     const idx = ctx.captured.args.indexOf('--exclude-tools');
     expect(idx).toBe(-1);
   });
+
+  it('forwards resolvedSkillPaths to spawn args as --no-skills + --skill', async () => {
+    const ctx = captureSpawn();
+    const agent = makeAgent({ name: 'skilled' });
+    const promise = runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      { spawnFn: ctx.spawnFn, resolvedSkillPaths: ['/abs/a/SKILL.md', '/abs/b/SKILL.md'] }
+    );
+    setImmediate(() => {
+      ctx.fake.stdout.push(null);
+      ctx.fake.stderr.push(null);
+      ctx.fake.emit('close', 0);
+    });
+    await promise;
+    expect(ctx.captured.args).toContain('--no-skills');
+    const skillValues = ctx.captured.args.filter(
+      (_, i) => i > 0 && ctx.captured.args[i - 1] === '--skill'
+    );
+    expect(skillValues).toEqual(['/abs/a/SKILL.md', '/abs/b/SKILL.md']);
+  });
 });
 
 describe('runSingleAgent maxTurns', () => {

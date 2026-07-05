@@ -28,6 +28,7 @@ export interface AgentConfig {
   maxTurns?: number;
   noContextFiles?: boolean;
   noSkills?: boolean;
+  skills?: string[];
   defaultContext?: DefaultContext;
   isolation?: IsolationMode;
   completionCheck?: string[];
@@ -157,6 +158,7 @@ function loadAgentFromFile(filePath: string, source: AgentSource): AgentConfig |
     maxTurns: parsePositiveInt(frontmatter.maxTurns),
     noContextFiles: parseBoolean(frontmatter.noContextFiles),
     noSkills: parseBoolean(frontmatter.noSkills),
+    skills: parseCsvList(frontmatter.skills),
     defaultContext: parseEnum(frontmatter.defaultContext, ['fresh', 'fork'] as const) ?? 'fresh',
     isolation: parseEnum(frontmatter.isolation, ['none', 'worktree'] as const) ?? 'none',
     completionCheck: parseCsvList(frontmatter.completionCheck),
@@ -193,6 +195,9 @@ function parseAgentOverride(raw: unknown): AgentOverride {
   if (noContextFiles !== undefined) out.noContextFiles = noContextFiles;
   const noSkills = parseBoolean(entry.noSkills);
   if (noSkills !== undefined) out.noSkills = noSkills;
+
+  const skills = parseCsvList(entry.skills);
+  if (skills) out.skills = skills;
 
   const defaultContext = parseEnum(entry.defaultContext, ['fresh', 'fork'] as const);
   if (defaultContext) out.defaultContext = defaultContext;

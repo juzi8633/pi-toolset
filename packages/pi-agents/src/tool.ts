@@ -18,6 +18,7 @@ import { runChainWorkflow, synthesizeFailure } from './chain.ts';
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
 import { validateCompletionOutput } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
+import { listAvailableSkillNames, resolveSkillNames } from './skills.ts';
 import { mapWithConcurrencyLimit, type OnUpdateCallback, runSingleAgent } from './execution.ts';
 import {
   getFinalOutput,
@@ -494,6 +495,30 @@ async function runStepWithContext(
     );
   }
 
+  let resolvedSkillPaths: string[] | undefined;
+  if (agent.skills && agent.skills.length > 0) {
+    const { resolved, missing } = resolveSkillNames(agent.skills);
+    if (missing.length > 0) {
+      const available = listAvailableSkillNames();
+      const MAX_LIST = 20;
+      const availableText =
+        available.length === 0
+          ? 'none'
+          : available.length > MAX_LIST
+            ? `${available.slice(0, MAX_LIST).join(', ')}, +${available.length - MAX_LIST} more`
+            : available.join(', ');
+      return synthesizeFailure(
+        agentName,
+        agent,
+        task,
+        step,
+        'skill_error',
+        `Cannot resolve skill name(s): ${missing.join(', ')}. Available skills: ${availableText}.`
+      );
+    }
+    resolvedSkillPaths = resolved;
+  }
+
   let agentContext;
   try {
     agentContext = prepareAgentContext(agent, ctx);
@@ -547,7 +572,7 @@ async function runStepWithContext(
       signal,
       onUpdate,
       makeDetails,
-      { sessionFile: agentContext.sessionFile }
+      { sessionFile: agentContext.sessionFile, resolvedSkillPaths }
     );
     if (worktree) {
       finalizeWorktree(worktree, result);
