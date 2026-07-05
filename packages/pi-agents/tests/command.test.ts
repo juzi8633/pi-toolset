@@ -10,7 +10,9 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   Skill,
+  Theme,
 } from '@earendil-works/pi-coding-agent';
+import type { Component, TUI } from '@earendil-works/pi-tui';
 import { registerAgentCommand } from '../src/command.ts';
 import { executeAgentTool } from '../src/tool.ts';
 import {
@@ -24,7 +26,10 @@ import type { SubagentDetails } from '../src/types.ts';
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 type Params = Parameters<typeof executeAgentTool>[0];
 type ExecCall = { params: Params };
-type WidgetUpdate = { key: string; value: string[] | undefined };
+type WidgetComponent = Component & { dispose?(): void };
+type WidgetFactory = (tui: TUI, theme: Theme) => WidgetComponent;
+type WidgetValue = string[] | WidgetFactory | undefined;
+type WidgetUpdate = { key: string; value: WidgetValue; component?: WidgetComponent };
 
 let tmpRoot: string;
 let userAgentDir: string;
@@ -91,6 +96,12 @@ function fakeCtx(
   const notifications: Array<{ message: string; type: string }> = [];
   const widgets: WidgetUpdate[] = [];
   const state = { idleCalls: 0 };
+  const fakeTui = { requestRender: () => undefined } as TUI;
+  const fakeTheme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  } as Theme;
+  let currentWidget: WidgetComponent | undefined;
   const ctx = {
     cwd,
     signal: undefined,
@@ -101,10 +112,18 @@ function fakeCtx(
     ui: {
       notify: (message: string, type?: 'info' | 'warning' | 'error') =>
         notifications.push({ message, type: type ?? 'info' }),
-      setWidget: (key: string, value?: string[]) => widgets.push({ key, value }),
+      setWidget: (key: string, value?: WidgetValue) => {
+        currentWidget?.dispose?.();
+        currentWidget = typeof value === 'function' ? value(fakeTui, fakeTheme) : undefined;
+        widgets.push({ key, value, component: currentWidget });
+      },
     },
   } as unknown as ExtensionCommandContext;
   return { ctx, notifications, widgets, state };
+}
+
+function renderWidget(update: WidgetUpdate): string {
+  return update.component?.render(80).join('\n') ?? '';
 }
 
 function okResult(text: string): AgentResult {
@@ -297,15 +316,15 @@ describe('registerAgentCommand', () => {
     await commands.get('agent:myagent')!.handler('find the auth code', ctx);
 
     expect(exec.calls).toHaveLength(1);
-    expect(widgets[0]).toEqual({
-      key: 'pi-agent-command',
-      value: ['Agent: myagent', 'Task: find the auth code', 'Status: starting...', 'Turns: 0'],
-    });
-    expect(widgets[1].key).toBe('pi-agent-command');
-    expect(widgets[1].value).toContain('Status: running...');
-    expect(widgets[1].value).toContain('Turns: 2');
-    expect(widgets[1].value).toContain('Latest: searching files');
-    expect(widgets.at(-1)).toEqual({ key: 'pi-agent-command', value: undefined });
+    expect(widgets[0].key).toBe('pi-agent-command');
+    expect(typeof widgets[0].value).toBe('function');
+    const rendered = renderWidget(widgets[0]);
+    expect(rendered).toContain('subagent myagent');
+    expect(rendered).toContain('Task: find the auth code');
+    expect(rendered).toContain('Status: running...');
+    expect(rendered).toContain('Turns: 2');
+    expect(rendered).toContain('Latest: searching files');
+    expect(widgets.at(-1)).toMatchObject({ key: 'pi-agent-command', value: undefined });
     expect(notifications[0].message).toBe('final result');
   });
 
@@ -321,9 +340,9 @@ describe('registerAgentCommand', () => {
 
     await commands.get('agent:myagent')!.handler('go', ctx);
 
-    expect(widgets[0].value).toContain('Status: starting...');
-    expect(widgets[1].value).toContain('Latest: working before failure');
-    expect(widgets.at(-1)).toEqual({ key: 'pi-agent-command', value: undefined });
+    expect(typeof widgets[0].value).toBe('function');
+    expect(renderWidget(widgets[0])).toContain('Latest: working before failure');
+    expect(widgets.at(-1)).toMatchObject({ key: 'pi-agent-command', value: undefined });
     expect(notifications[0].type).toBe('error');
     expect(notifications[0].message).toContain('spawn failed');
   });

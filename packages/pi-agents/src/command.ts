@@ -1,12 +1,21 @@
 // ABOUTME: Registers /agent (list only) and /agent:<name> (invoke) slash commands for discovered agents.
 // ABOUTME: Reuses executeAgentTool for orchestration; foreground-only, with an injected executor test seam.
 
-import type {
-  AgentToolResult,
-  ExtensionAPI,
-  ExtensionCommandContext,
+import {
+  DynamicBorder,
+  type AgentToolResult,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type Theme,
 } from '@earendil-works/pi-coding-agent';
-import type { AutocompleteItem } from '@earendil-works/pi-tui';
+import {
+  type AutocompleteItem,
+  Container,
+  Loader,
+  Spacer,
+  Text,
+  type TUI,
+} from '@earendil-works/pi-tui';
 import { type AgentConfig, discoverAgents } from './agents.ts';
 import type { BackgroundManager } from './background.ts';
 import { setDiscoveredSkillsFromOptions } from './skills.ts';
@@ -133,18 +142,73 @@ function createAgentWidgetUpdater(
   agentName: string,
   task: string
 ): AgentWidgetUpdater {
+  let widget: AgentStatusWidget | undefined;
+  ctx.ui.setWidget(AGENT_WIDGET_KEY, (tui: TUI, widgetTheme: Theme) => {
+    widget = new AgentStatusWidget(tui, widgetTheme, agentName, task);
+    return widget;
+  });
+
   return (partial?: AgentResult) => {
-    const result = partial?.details?.results[0];
-    const lines = [
-      `Agent: ${agentName}`,
-      `Task: ${truncateWidgetText(task, 120)}`,
-      `Status: ${partial ? 'running...' : 'starting...'}`,
-      `Turns: ${result?.usage.turns ?? 0}`,
-    ];
-    const latest = partial ? truncateWidgetText(extractResultText(partial), 160) : '';
-    if (latest) lines.push(`Latest: ${latest}`);
-    ctx.ui.setWidget(AGENT_WIDGET_KEY, lines);
+    widget?.update(partial);
   };
+}
+
+class AgentStatusWidget extends Container {
+  private readonly content = new Container();
+  private readonly loader: Loader;
+  private latest = '';
+  private status = 'starting...';
+  private turns = 0;
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly widgetTheme: Theme,
+    private readonly agentName: string,
+    private readonly task: string
+  ) {
+    super();
+    const borderColor = (text: string) => this.widgetTheme.fg('bashMode', text);
+    this.loader = new Loader(
+      tui,
+      (spinner) => this.widgetTheme.fg('bashMode', spinner),
+      (text) => this.widgetTheme.fg('muted', text),
+      'Starting subagent...'
+    );
+
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder(borderColor));
+    this.addChild(this.content);
+    this.addChild(new DynamicBorder(borderColor));
+    this.rebuild();
+  }
+
+  update(partial?: AgentResult): void {
+    const result = partial?.details?.results[0];
+    this.status = partial ? 'running...' : 'starting...';
+    this.turns = result?.usage.turns ?? 0;
+    this.latest = partial ? truncateWidgetText(extractResultText(partial), 160) : '';
+    this.loader.setMessage(partial ? 'Running subagent...' : 'Starting subagent...');
+    this.rebuild();
+    this.tui.requestRender();
+  }
+
+  dispose(): void {
+    this.loader.stop();
+  }
+
+  private rebuild(): void {
+    const color = (text: string) => this.widgetTheme.fg('bashMode', text);
+    const muted = (text: string) => this.widgetTheme.fg('muted', text);
+    this.content.clear();
+    this.content.addChild(
+      new Text(color(this.widgetTheme.bold(`subagent ${this.agentName}`)), 1, 0)
+    );
+    this.content.addChild(new Text(muted(`Task: ${truncateWidgetText(this.task, 120)}`), 1, 0));
+    this.content.addChild(new Text(muted(`Status: ${this.status}`), 1, 0));
+    this.content.addChild(new Text(muted(`Turns: ${this.turns}`), 1, 0));
+    if (this.latest) this.content.addChild(new Text(muted(`Latest: ${this.latest}`), 1, 0));
+    this.content.addChild(this.loader);
+  }
 }
 
 function truncateWidgetText(value: string, max: number): string {
