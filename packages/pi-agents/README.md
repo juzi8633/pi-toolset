@@ -11,7 +11,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Structured chain outputs** — per-step `outputSchema` extracts and validates JSON before passing it forward as `{outputs.<name>}`
 - **Dynamic fanout** — chain steps can expand a prior step's array output into parallel subtasks with a collected result
 - **Package agents** — install agents from npm packages that declare `pi.agents`
-- **Slash-command invocation** — run any discovered agent directly from the prompt via `/agent <name> <task>` or `/agent:<name> <task>`
+- **Slash-command invocation** — run any discovered agent directly from the prompt via `/agent:<name> <task>`; use `/agent list` to enumerate discovered agents
 - **Worktree isolation + setup hook** — run agents in a throw-away git worktree with an optional shell `worktreeSetupHook` and per-run diff metadata
 - **Critical system reminder** — pair tool-level limits with a strong `<critical-system-reminder>` prompt block
 - **Markdown rendering** — final output is rendered with proper formatting in the expanded view
@@ -112,16 +112,14 @@ Agents can also be invoked directly from the prompt as slash commands, without g
 
 ```
 /agent list
-/agent explore find all authentication code
 /agent:explore find all authentication code
 /agent:@balaenis/pi-agents.reviewer review the recent changes
 ```
 
 - `/agent list` lists every discovered agent (builtin, user, project, and package) with its source and description.
-- `/agent <name> <task...>` invokes `<name>` with the remaining text as the task.
-- `/agent:<name> <task...>` is the shorthand for a specific agent and appears in slash autocomplete with the agent's description.
+- `/agent:<name> <task...>` invokes a specific agent and appears in slash autocomplete with the agent's description.
 
-`<name>` is the full agent name as it appears in the catalogue. Package agents are namespaced, e.g. `@acme/pi-frontend.reviewer`. The `/agent <name>` fallback always discovers fresh, so it works for agents added mid-session. The per-agent `/agent:<name>` commands are registered once at extension load time; add or remove agent files and run `pi reload` (or restart pi) to refresh the shorthand command list. Completions for `/agent` (the `list` subcommand plus every agent name) also re-discover on each invocation.
+`<name>` is the full agent name as it appears in the catalogue. Package agents are namespaced, e.g. `@acme/pi-frontend.reviewer`. The per-agent `/agent:<name>` commands are registered once at extension load time; add or remove agent files and run `pi reload` (or restart pi) to refresh the shorthand command list. `/agent` only accepts the `list` subcommand (argument completions offer `list`); to invoke an agent, use the `/agent:<name>` form.
 
 Command invocations are foreground: the command waits for the agent to finish streaming (`waitForIdle`), shows live progress in a temporary widget, then reports the agent's final output or error via `ctx.ui.notify`. Background invocation is available through the `agent` tool (`runInBackground: true`) rather than the slash commands.
 

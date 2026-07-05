@@ -1,4 +1,4 @@
-// ABOUTME: Registers /agent and /agent:<name> slash commands that actively invoke discovered agents.
+// ABOUTME: Registers /agent (list only) and /agent:<name> (invoke) slash commands for discovered agents.
 // ABOUTME: Reuses executeAgentTool for orchestration; foreground-only, with an injected executor test seam.
 
 import type {
@@ -28,7 +28,7 @@ export interface RegisterAgentCommandOptions {
 const LIST_KEYWORD = 'list';
 const AGENT_WIDGET_KEY = 'pi-agent-command';
 const AGENT_COMMAND_DESCRIPTION =
-  'Invoke a discovered subagent: /agent list | /agent <name> <task...>';
+  'List discovered subagents (/agent list); invoke a specific one via /agent:<name> <task...>';
 
 export function registerAgentCommand(
   pi: ExtensionAPI,
@@ -39,9 +39,9 @@ export function registerAgentCommand(
 
   pi.registerCommand('agent', {
     description: AGENT_COMMAND_DESCRIPTION,
-    getArgumentCompletions: (prefix) => agentArgumentCompletions(registrationCwd, prefix),
+    getArgumentCompletions: (prefix) => agentArgumentCompletions(prefix),
     handler: async (args, ctx) => {
-      await runAgentFallbackCommand(args, ctx, execute, options);
+      await runAgentFallbackCommand(args, ctx);
     },
   });
 
@@ -56,35 +56,16 @@ export function registerAgentCommand(
   }
 }
 
-async function runAgentFallbackCommand(
-  args: string,
-  ctx: ExtensionCommandContext,
-  execute: AgentExecutor,
-  options: RegisterAgentCommandOptions
-): Promise<void> {
+async function runAgentFallbackCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
   await ctx.waitForIdle();
 
   const trimmed = args.trim();
-  if (trimmed.length === 0) {
-    ctx.ui.notify(usageText(ctx.cwd), 'warning');
-    return;
-  }
-
-  const spaceIndex = trimmed.indexOf(' ');
-  const firstToken = spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
-  const rest = spaceIndex === -1 ? '' : trimmed.slice(spaceIndex + 1).trim();
-
-  if (firstToken.toLowerCase() === LIST_KEYWORD) {
+  if (trimmed.toLowerCase() === LIST_KEYWORD) {
     ctx.ui.notify(renderAgentList(discoverAgents(ctx.cwd, 'both').agents), 'info');
     return;
   }
 
-  if (rest.length === 0) {
-    ctx.ui.notify(`Missing task for agent "${firstToken}".\n${usageText(ctx.cwd)}`, 'warning');
-    return;
-  }
-
-  await invokeAgent(firstToken, rest, ctx, execute, options);
+  ctx.ui.notify(usageText(ctx.cwd), 'warning');
 }
 
 async function runNamedAgentCommand(
@@ -172,13 +153,10 @@ function truncateWidgetText(value: string, max: number): string {
   return `${normalized.slice(0, Math.max(0, max - 1))}…`;
 }
 
-function agentArgumentCompletions(cwd: string, prefix: string): AutocompleteItem[] {
+function agentArgumentCompletions(prefix: string): AutocompleteItem[] {
   const items: AutocompleteItem[] = [
     { value: LIST_KEYWORD, label: LIST_KEYWORD, description: 'List all discovered agents' },
   ];
-  for (const a of discoverAgents(cwd, 'both').agents) {
-    items.push({ value: a.name, label: a.name, description: a.description });
-  }
   const lower = prefix.toLowerCase();
   return lower.length === 0 ? items : items.filter((i) => i.value.toLowerCase().startsWith(lower));
 }
@@ -204,8 +182,7 @@ function usageText(cwd: string): string {
   return [
     'Usage:',
     '  /agent list              List discovered agents',
-    '  /agent <name> <task...>  Invoke <name> with the remaining text as task',
-    '  /agent:<name> <task...>  Shorthand for a specific agent',
+    '  /agent:<name> <task...>  Invoke a specific agent',
     `Available agents: ${available}`,
   ].join('\n');
 }

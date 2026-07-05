@@ -244,20 +244,32 @@ describe('registerAgentCommand', () => {
     expect(notifications[0].message).toContain('myagent');
   });
 
-  it('/agent <name> <task> invokes the executor with agent and task', async () => {
+  it('shows usage when called with a non-list argument', async () => {
     const cwd = makeProjectCwd('myagent', 'does a thing');
     const { pi, commands } = fakePi();
-    const exec = fakeExec(okResult('result text'));
+    const exec = fakeExec(okResult('nope'));
     registerAgentCommand(pi, { cwd, execute: exec.execute });
-    const { ctx, notifications, state } = fakeCtx(cwd);
+    const { ctx, notifications } = fakeCtx(cwd);
+
+    await commands.get('agent')!.handler('myagent', ctx);
+
+    expect(exec.calls).toHaveLength(0);
+    expect(notifications[0].type).toBe('warning');
+    expect(notifications[0].message).toContain('Usage:');
+  });
+
+  it('shows usage when /agent <name> <task> is used instead of /agent:<name>', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    const exec = fakeExec(okResult('nope'));
+    registerAgentCommand(pi, { cwd, execute: exec.execute });
+    const { ctx, notifications } = fakeCtx(cwd);
 
     await commands.get('agent')!.handler('myagent find the auth code', ctx);
 
-    expect(state.idleCalls).toBe(1);
-    expect(exec.calls).toHaveLength(1);
-    expect(exec.calls[0].params).toEqual({ agent: 'myagent', task: 'find the auth code' });
-    expect(notifications[0].type).toBe('info');
-    expect(notifications[0].message).toBe('result text');
+    expect(exec.calls).toHaveLength(0);
+    expect(notifications[0].type).toBe('warning');
+    expect(notifications[0].message).toContain('Usage:');
   });
 
   it('/agent:<name> <task> invokes the named agent', async () => {
@@ -330,33 +342,19 @@ describe('registerAgentCommand', () => {
     expect(notifications[0].message).toContain('Missing task');
   });
 
-  it('warns when /agent <name> has no task text', async () => {
-    const cwd = makeProjectCwd('myagent', 'does a thing');
-    const { pi, commands } = fakePi();
-    const exec = fakeExec(okResult('nope'));
-    registerAgentCommand(pi, { cwd, execute: exec.execute });
-    const { ctx, notifications } = fakeCtx(cwd);
-
-    await commands.get('agent')!.handler('myagent', ctx);
-
-    expect(exec.calls).toHaveLength(0);
-    expect(notifications[0].type).toBe('warning');
-    expect(notifications[0].message).toContain('Missing task');
-  });
-
-  it('notifies error for an unknown agent and does not invoke the executor', async () => {
+  it('notifies error for an unknown /agent:<name> when the agent file is removed mid-session', async () => {
     const cwd = makeProjectCwd('myagent', 'does a thing');
     const { pi, commands } = fakePi();
     const exec = fakeExec(okResult('should not run'));
     registerAgentCommand(pi, { cwd, execute: exec.execute });
+    rmSync(path.join(cwd, '.pi', 'agents', 'myagent.md'));
     const { ctx, notifications } = fakeCtx(cwd);
 
-    await commands.get('agent')!.handler('ghost do something', ctx);
+    await commands.get('agent:myagent')!.handler('do something', ctx);
 
     expect(exec.calls).toHaveLength(0);
     expect(notifications[0].type).toBe('error');
     expect(notifications[0].message).toContain('Unknown agent');
-    expect(notifications[0].message).toContain('ghost');
     expect(notifications[0].message).toContain('myagent');
   });
 
@@ -388,7 +386,7 @@ describe('registerAgentCommand', () => {
     expect(notifications[0].message).toContain('spawn failed');
   });
 
-  it('completes /agent arguments with list and agent names', () => {
+  it('completes /agent arguments with only the list subcommand', () => {
     const cwd = makeProjectCwd('myagent', 'does a thing');
     const { pi, commands } = fakePi();
     registerAgentCommand(pi, { cwd, execute: fakeExec(okResult('x')).execute });
@@ -397,9 +395,7 @@ describe('registerAgentCommand', () => {
       value: string;
     }>;
     const values = completions.map((c) => c.value);
-    expect(values).toContain('list');
-    expect(values).toContain('myagent');
-    expect(values).toContain('explore');
+    expect(values).toEqual(['list']);
   });
 
   it('filters completions by prefix', () => {
@@ -407,11 +403,11 @@ describe('registerAgentCommand', () => {
     const { pi, commands } = fakePi();
     registerAgentCommand(pi, { cwd, execute: fakeExec(okResult('x')).execute });
 
-    const completions = commands.get('agent')!.getArgumentCompletions!('my') as Array<{
+    const completions = commands.get('agent')!.getArgumentCompletions!('li') as Array<{
       value: string;
     }>;
     const values = completions.map((c) => c.value);
-    expect(values).toEqual(['myagent']);
+    expect(values).toEqual(['list']);
   });
 
   it('invokes a builtin agent via /agent:<name>', async () => {
@@ -445,36 +441,18 @@ describe('registerAgentCommand', () => {
     expect(notifications[0].message).toBe('done');
   });
 
-  it('refreshes skill cache from system prompt options before /agent <name> executes', async () => {
-    const cwd = makeProjectCwd('skilled', 'uses a skill', 'librarian');
-    const { pi, commands } = fakePi();
-    const exec = cacheProbingExec(okResult('done'), ['librarian']);
-    registerAgentCommand(pi, { cwd, execute: exec.execute });
-    const { ctx, notifications } = fakeCtx(cwd, {
-      skills: [makeSkill('librarian', '/abs/librarian/SKILL.md')],
-    });
-
-    await commands.get('agent')!.handler('skilled do the thing', ctx);
-
-    const probed = exec.probe();
-    expect(probed.missing).toEqual([]);
-    expect(probed.resolved).toEqual(['/abs/librarian/SKILL.md']);
-    expect(notifications[0].message).toBe('done');
-  });
-
   it('does not refresh skill cache when agent is unknown', async () => {
     const cwd = makeProjectCwd('myagent', 'does a thing');
     const { pi, commands } = fakePi();
     const exec = fakeExec(okResult('done'));
     registerAgentCommand(pi, { cwd, execute: exec.execute });
-    // Pre-populate the cache with a stale path; an unknown agent should not
-    // overwrite it because the existence check returns before the refresh.
+    rmSync(path.join(cwd, '.pi', 'agents', 'myagent.md'));
     setDiscoveredSkills([makeSkill('librarian', '/stale/librarian/SKILL.md')]);
     const { ctx, notifications } = fakeCtx(cwd, {
       skills: [makeSkill('librarian', '/fresh/librarian/SKILL.md')],
     });
 
-    await commands.get('agent')!.handler('ghost do something', ctx);
+    await commands.get('agent:myagent')!.handler('do something', ctx);
 
     expect(exec.calls).toHaveLength(0);
     expect(resolveSkillNames(['librarian']).resolved).toEqual(['/stale/librarian/SKILL.md']);
