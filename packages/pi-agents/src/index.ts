@@ -10,6 +10,7 @@ import {
   renderBackgroundMessage,
 } from './background.ts';
 import { renderAgentCatalogue, shouldInjectAgentCatalogue } from './catalogue.ts';
+import { registerAgentCommand } from './command.ts';
 import { renderCall, renderResult } from './render.ts';
 import { SubagentParams } from './schema.ts';
 import { setDiscoveredSkills } from './skills.ts';
@@ -68,4 +69,6 @@ Reach for this when the task matches an available agent type, when you have inde
     renderCall,
     renderResult,
   });
+
+  registerAgentCommand(pi, { backgroundManager });
 }
