@@ -1,12 +1,17 @@
-// ABOUTME: Caches skills discovered by the host (captured from before_agent_start) for name→path resolution.
+// ABOUTME: Caches skills discovered by the host for name→path resolution, refreshed before agent runs.
 // ABOUTME: Lets agent definitions restrict loaded skills by name without re-discovering resources.
 
-import type { Skill } from '@earendil-works/pi-coding-agent';
+import type { BuildSystemPromptOptions, Skill } from '@earendil-works/pi-coding-agent';
 
 let discoveredSkills: Skill[] = [];
 
 export function setDiscoveredSkills(skills: Skill[]): void {
   discoveredSkills = [...skills];
+}
+
+/** Refresh the cache from the host's system prompt options (the skills source of truth). */
+export function setDiscoveredSkillsFromOptions(options: BuildSystemPromptOptions): void {
+  setDiscoveredSkills(options.skills ?? []);
 }
 
 export function clearDiscoveredSkills(): void {

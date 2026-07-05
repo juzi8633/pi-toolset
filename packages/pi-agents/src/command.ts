@@ -9,6 +9,7 @@ import type {
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { type AgentConfig, discoverAgents } from './agents.ts';
 import type { BackgroundManager } from './background.ts';
+import { setDiscoveredSkillsFromOptions } from './skills.ts';
 import { executeAgentTool } from './tool.ts';
 import type { SubagentDetails } from './types.ts';
 
@@ -115,6 +116,10 @@ async function invokeAgent(
     ctx.ui.notify(`Unknown agent: "${agentName}".\n${availableAgentsText(agents)}`, 'error');
     return;
   }
+
+  // Slash commands bypass before_agent_start, so refresh the skill cache from the
+  // host's system prompt options before executeAgentTool resolves agent.skills.
+  setDiscoveredSkillsFromOptions(ctx.getSystemPromptOptions());
 
   let result: AgentResult;
   try {

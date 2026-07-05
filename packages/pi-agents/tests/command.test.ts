@@ -9,9 +9,16 @@ import type {
   AgentToolResult,
   ExtensionAPI,
   ExtensionCommandContext,
+  Skill,
 } from '@earendil-works/pi-coding-agent';
 import { registerAgentCommand } from '../src/command.ts';
 import { executeAgentTool } from '../src/tool.ts';
+import {
+  clearDiscoveredSkills,
+  resolveSkillNames,
+  setDiscoveredSkills,
+  type SkillResolution,
+} from '../src/skills.ts';
 import type { SubagentDetails } from '../src/types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
@@ -35,16 +42,23 @@ afterAll(() => {
 beforeEach(() => {
   userAgentDir = mkdtempSync(path.join(tmpRoot, 'user-'));
   process.env.PI_CODING_AGENT_DIR = userAgentDir;
+  clearDiscoveredSkills();
 });
 
-function makeProjectCwd(agentName: string, description: string): string {
+function makeProjectCwd(agentName: string, description: string, skills?: string): string {
   const cwd = mkdtempSync(path.join(tmpRoot, 'proj-'));
   const agentsDir = path.join(cwd, '.pi', 'agents');
   mkdirSync(agentsDir, { recursive: true });
-  writeFileSync(
-    path.join(agentsDir, `${agentName}.md`),
-    `---\nname: ${agentName}\ndescription: ${description}\n---\nBody.`
-  );
+  const frontmatter = [
+    '---',
+    `name: ${agentName}`,
+    `description: ${description}`,
+    skills ? `skills: ${skills}` : '',
+    '---',
+  ]
+    .filter((l) => l.length > 0)
+    .join('\n');
+  writeFileSync(path.join(agentsDir, `${agentName}.md`), `${frontmatter}\nBody.`);
   return cwd;
 }
 
@@ -64,7 +78,10 @@ function fakePi(): { pi: ExtensionAPI; commands: Map<string, CapturedCommand> } 
   return { pi, commands };
 }
 
-function fakeCtx(cwd: string): {
+function fakeCtx(
+  cwd: string,
+  options: { skills?: Skill[] } = {}
+): {
   ctx: ExtensionCommandContext;
   notifications: Array<{ message: string; type: string }>;
   state: { idleCalls: number };
@@ -77,6 +94,7 @@ function fakeCtx(cwd: string): {
     waitForIdle: async () => {
       state.idleCalls++;
     },
+    getSystemPromptOptions: () => ({ cwd, skills: options.skills ?? [] }),
     ui: {
       notify: (message: string, type?: 'info' | 'warning' | 'error') =>
         notifications.push({ message, type: type ?? 'info' }),
@@ -109,6 +127,30 @@ function fakeExec(result: AgentResult): { execute: typeof executeAgentTool; call
     return result;
   };
   return { execute, calls };
+}
+
+function makeSkill(name: string, filePath: string, disableModelInvocation = false): Skill {
+  return {
+    name,
+    description: `${name} skill`,
+    filePath,
+    baseDir: filePath.replace(/\/[^/]+$/, ''),
+    sourceInfo: { path: filePath, source: 'user', scope: 'user', origin: 'top-level' },
+    disableModelInvocation,
+  };
+}
+
+/** Fake executor that probes the skills cache at execution time to assert refresh timing. */
+function cacheProbingExec(
+  result: AgentResult,
+  probeNames: string[]
+): { execute: typeof executeAgentTool; probe: () => SkillResolution } {
+  let probed: SkillResolution = { resolved: [], missing: [] };
+  const execute: typeof executeAgentTool = async () => {
+    probed = resolveSkillNames(probeNames);
+    return result;
+  };
+  return { execute, probe: () => probed };
 }
 
 describe('registerAgentCommand', () => {
@@ -295,5 +337,75 @@ describe('registerAgentCommand', () => {
     expect(exec.calls).toHaveLength(1);
     expect(exec.calls[0].params).toEqual({ agent: 'explore', task: 'find auth code' });
     expect(notifications[0].message).toBe('explored');
+  });
+
+  it('refreshes skill cache from system prompt options before /agent:<name> executes', async () => {
+    const cwd = makeProjectCwd('skilled', 'uses a skill', 'librarian');
+    const { pi, commands } = fakePi();
+    const exec = cacheProbingExec(okResult('done'), ['librarian']);
+    registerAgentCommand(pi, { cwd, execute: exec.execute });
+    const { ctx, notifications } = fakeCtx(cwd, {
+      skills: [makeSkill('librarian', '/abs/librarian/SKILL.md')],
+    });
+
+    await commands.get('agent:skilled')!.handler('do the thing', ctx);
+
+    const probed = exec.probe();
+    expect(probed.missing).toEqual([]);
+    expect(probed.resolved).toEqual(['/abs/librarian/SKILL.md']);
+    expect(notifications[0].message).toBe('done');
+  });
+
+  it('refreshes skill cache from system prompt options before /agent <name> executes', async () => {
+    const cwd = makeProjectCwd('skilled', 'uses a skill', 'librarian');
+    const { pi, commands } = fakePi();
+    const exec = cacheProbingExec(okResult('done'), ['librarian']);
+    registerAgentCommand(pi, { cwd, execute: exec.execute });
+    const { ctx, notifications } = fakeCtx(cwd, {
+      skills: [makeSkill('librarian', '/abs/librarian/SKILL.md')],
+    });
+
+    await commands.get('agent')!.handler('skilled do the thing', ctx);
+
+    const probed = exec.probe();
+    expect(probed.missing).toEqual([]);
+    expect(probed.resolved).toEqual(['/abs/librarian/SKILL.md']);
+    expect(notifications[0].message).toBe('done');
+  });
+
+  it('does not refresh skill cache when agent is unknown', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    const exec = fakeExec(okResult('done'));
+    registerAgentCommand(pi, { cwd, execute: exec.execute });
+    // Pre-populate the cache with a stale path; an unknown agent should not
+    // overwrite it because the existence check returns before the refresh.
+    setDiscoveredSkills([makeSkill('librarian', '/stale/librarian/SKILL.md')]);
+    const { ctx, notifications } = fakeCtx(cwd, {
+      skills: [makeSkill('librarian', '/fresh/librarian/SKILL.md')],
+    });
+
+    await commands.get('agent')!.handler('ghost do something', ctx);
+
+    expect(exec.calls).toHaveLength(0);
+    expect(resolveSkillNames(['librarian']).resolved).toEqual(['/stale/librarian/SKILL.md']);
+    expect(notifications[0].type).toBe('error');
+    expect(notifications[0].message).toContain('Unknown agent');
+  });
+
+  it('still excludes disabled skills after refresh', async () => {
+    const cwd = makeProjectCwd('skilled', 'uses a disabled skill', 'hidden');
+    const { pi, commands } = fakePi();
+    const exec = cacheProbingExec(okResult('done'), ['hidden']);
+    registerAgentCommand(pi, { cwd, execute: exec.execute });
+    const { ctx } = fakeCtx(cwd, {
+      skills: [makeSkill('hidden', '/abs/hidden/SKILL.md', true)],
+    });
+
+    await commands.get('agent:skilled')!.handler('go', ctx);
+
+    const probed = exec.probe();
+    expect(probed.resolved).toEqual([]);
+    expect(probed.missing).toEqual(['hidden']);
   });
 });

@@ -8,6 +8,7 @@ import {
   listAvailableSkillNames,
   resolveSkillNames,
   setDiscoveredSkills,
+  setDiscoveredSkillsFromOptions,
 } from '../src/skills.ts';
 
 function makeSkill(name: string, filePath: string): Skill {
@@ -79,5 +80,19 @@ describe('skills cache', () => {
     expect(resolved).toEqual(['/abs/visible/SKILL.md']);
     expect(missing).toEqual(['hidden']);
     expect(listAvailableSkillNames()).toEqual(['visible']);
+  });
+
+  it('setDiscoveredSkillsFromOptions refreshes the cache from system prompt options', () => {
+    setDiscoveredSkillsFromOptions({
+      cwd: '/proj',
+      skills: [makeSkill('librarian', '/abs/librarian/SKILL.md')],
+    });
+    expect(resolveSkillNames(['librarian']).resolved).toEqual(['/abs/librarian/SKILL.md']);
+  });
+
+  it('setDiscoveredSkillsFromOptions treats missing skills as empty', () => {
+    setDiscoveredSkills([makeSkill('librarian', '/abs/librarian/SKILL.md')]);
+    setDiscoveredSkillsFromOptions({ cwd: '/proj' });
+    expect(resolveSkillNames(['librarian']).missing).toEqual(['librarian']);
   });
 });

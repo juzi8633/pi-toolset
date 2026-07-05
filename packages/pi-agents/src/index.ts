@@ -13,7 +13,7 @@ import { renderAgentCatalogue, shouldInjectAgentCatalogue } from './catalogue.ts
 import { registerAgentCommand } from './command.ts';
 import { renderCall, renderResult } from './render.ts';
 import { SubagentParams } from './schema.ts';
-import { setDiscoveredSkills } from './skills.ts';
+import { setDiscoveredSkillsFromOptions } from './skills.ts';
 import { executeAgentTool } from './tool.ts';
 
 type RawArgs = Record<string, unknown> & { run_in_background?: unknown };
@@ -41,7 +41,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
-    setDiscoveredSkills(event.systemPromptOptions.skills ?? []);
+    setDiscoveredSkillsFromOptions(event.systemPromptOptions);
     const discovery = discoverAgents(ctx.cwd, 'both');
     const safeAgents = discovery.agents.filter((a) => a.source !== 'package');
     if (!shouldInjectAgentCatalogue(process.env, safeAgents)) return;

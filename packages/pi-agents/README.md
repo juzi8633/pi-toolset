@@ -401,7 +401,7 @@ Behavior:
 
 - `skills` is a comma-separated list of skill **names** (as they appear in the host's `<available_skills>` catalogue), not paths.
 - When non-empty, the child is launched with `--no-skills` plus one `--skill <path>` per resolved name, so only the listed skills are loaded — the child's default skill discovery is disabled.
-- Name→path resolution uses the skills the host already discovered. The `before_agent_start` hook captures `event.systemPromptOptions.skills` and caches the name→`filePath` mapping; the cache refreshes on every host agent loop.
+- Name→path resolution uses the skills the host already discovered. The `before_agent_start` hook captures `event.systemPromptOptions.skills` and caches the name→`filePath` mapping; the cache refreshes on every host agent loop and before `/agent` slash-command invocation (which bypasses `before_agent_start`).
 - Unresolvable names fail the step before the child is spawned, with `stopReason: 'skill_error'` and a message listing the missing names plus the available ones.
 - `skills` takes precedence over `noSkills`: a non-empty list always emits `--no-skills` + `--skill`, even when `noSkills: true`. Use `noSkills: true` alone to disable all skills; use `skills` to allowlist specific ones.
 - Resolved paths are the skill `filePath` values reported by the host (absolute), so they stay valid regardless of the child's working directory, including worktree isolation.
