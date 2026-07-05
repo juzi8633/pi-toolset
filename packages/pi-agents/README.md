@@ -123,7 +123,7 @@ Agents can also be invoked directly from the prompt as slash commands, without g
 
 `<name>` is the full agent name as it appears in the catalogue. Package agents are namespaced, e.g. `@acme/pi-frontend.reviewer`. The `/agent <name>` fallback always discovers fresh, so it works for agents added mid-session. The per-agent `/agent:<name>` commands are registered once at extension load time; add or remove agent files and run `pi reload` (or restart pi) to refresh the shorthand command list. Completions for `/agent` (the `list` subcommand plus every agent name) also re-discover on each invocation.
 
-Command invocations are foreground: the command waits for the agent to finish streaming (`waitForIdle`), then reports the agent's final output or error via `ctx.ui.notify`. Background/streaming invocation is available through the `agent` tool (`runInBackground: true`) rather than the slash commands.
+Command invocations are foreground: the command waits for the agent to finish streaming (`waitForIdle`), shows live progress in a temporary widget, then reports the agent's final output or error via `ctx.ui.notify`. Background invocation is available through the `agent` tool (`runInBackground: true`) rather than the slash commands.
 
 ## Tool Modes
 

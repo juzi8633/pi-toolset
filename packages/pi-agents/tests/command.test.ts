@@ -24,6 +24,7 @@ import type { SubagentDetails } from '../src/types.ts';
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 type Params = Parameters<typeof executeAgentTool>[0];
 type ExecCall = { params: Params };
+type WidgetUpdate = { key: string; value: string[] | undefined };
 
 let tmpRoot: string;
 let userAgentDir: string;
@@ -84,9 +85,11 @@ function fakeCtx(
 ): {
   ctx: ExtensionCommandContext;
   notifications: Array<{ message: string; type: string }>;
+  widgets: WidgetUpdate[];
   state: { idleCalls: number };
 } {
   const notifications: Array<{ message: string; type: string }> = [];
+  const widgets: WidgetUpdate[] = [];
   const state = { idleCalls: 0 };
   const ctx = {
     cwd,
@@ -98,9 +101,10 @@ function fakeCtx(
     ui: {
       notify: (message: string, type?: 'info' | 'warning' | 'error') =>
         notifications.push({ message, type: type ?? 'info' }),
+      setWidget: (key: string, value?: string[]) => widgets.push({ key, value }),
     },
   } as unknown as ExtensionCommandContext;
-  return { ctx, notifications, state };
+  return { ctx, notifications, widgets, state };
 }
 
 function okResult(text: string): AgentResult {
@@ -120,11 +124,55 @@ function errorResult(text: string): AgentResult {
   return { ...okResult(text), isError: true };
 }
 
+function progressResult(text: string, turns: number): AgentResult {
+  return {
+    content: [{ type: 'text', text }],
+    details: {
+      mode: 'single',
+      agentScope: 'both',
+      projectAgentsDir: null,
+      builtinAgentsDir: '/builtin',
+      results: [
+        {
+          agent: 'myagent',
+          agentSource: 'project',
+          task: 'task',
+          exitCode: 0,
+          messages: [],
+          stderr: '',
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            contextTokens: 0,
+            turns,
+          },
+        },
+      ],
+    },
+  };
+}
+
 function fakeExec(result: AgentResult): { execute: typeof executeAgentTool; calls: ExecCall[] } {
   const calls: ExecCall[] = [];
   const execute: typeof executeAgentTool = async (params) => {
     calls.push({ params: params as Params });
     return result;
+  };
+  return { execute, calls };
+}
+
+function streamingExec(
+  finalResult: AgentResult,
+  partialResult: AgentResult
+): { execute: typeof executeAgentTool; calls: ExecCall[] } {
+  const calls: ExecCall[] = [];
+  const execute: typeof executeAgentTool = async (params, _signal, onUpdate) => {
+    calls.push({ params: params as Params });
+    onUpdate?.(partialResult);
+    return finalResult;
   };
   return { execute, calls };
 }
@@ -225,6 +273,47 @@ describe('registerAgentCommand', () => {
     expect(exec.calls[0].params).toEqual({ agent: 'myagent', task: 'do the thing' });
     expect(notifications[0].type).toBe('info');
     expect(notifications[0].message).toBe('named result');
+  });
+
+  it('shows a live widget while /agent:<name> is running and clears it afterwards', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    const exec = streamingExec(okResult('final result'), progressResult('searching files', 2));
+    registerAgentCommand(pi, { cwd, execute: exec.execute });
+    const { ctx, notifications, widgets } = fakeCtx(cwd);
+
+    await commands.get('agent:myagent')!.handler('find the auth code', ctx);
+
+    expect(exec.calls).toHaveLength(1);
+    expect(widgets[0]).toEqual({
+      key: 'pi-agent-command',
+      value: ['Agent: myagent', 'Task: find the auth code', 'Status: starting...', 'Turns: 0'],
+    });
+    expect(widgets[1].key).toBe('pi-agent-command');
+    expect(widgets[1].value).toContain('Status: running...');
+    expect(widgets[1].value).toContain('Turns: 2');
+    expect(widgets[1].value).toContain('Latest: searching files');
+    expect(widgets.at(-1)).toEqual({ key: 'pi-agent-command', value: undefined });
+    expect(notifications[0].message).toBe('final result');
+  });
+
+  it('clears the live widget when executor throws', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    const exec: typeof executeAgentTool = async (_params, _signal, onUpdate) => {
+      onUpdate?.(progressResult('working before failure', 1));
+      throw new Error('spawn failed');
+    };
+    registerAgentCommand(pi, { cwd, execute: exec });
+    const { ctx, notifications, widgets } = fakeCtx(cwd);
+
+    await commands.get('agent:myagent')!.handler('go', ctx);
+
+    expect(widgets[0].value).toContain('Status: starting...');
+    expect(widgets[1].value).toContain('Latest: working before failure');
+    expect(widgets.at(-1)).toEqual({ key: 'pi-agent-command', value: undefined });
+    expect(notifications[0].type).toBe('error');
+    expect(notifications[0].message).toContain('spawn failed');
   });
 
   it('warns when /agent:<name> is called without a task', async () => {

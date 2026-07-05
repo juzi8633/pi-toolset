@@ -15,6 +15,7 @@ import type { SubagentDetails } from './types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 type AgentExecutor = typeof executeAgentTool;
+type AgentWidgetUpdater = (partial?: AgentResult) => void;
 
 export interface RegisterAgentCommandOptions {
   backgroundManager?: BackgroundManager;
@@ -25,6 +26,7 @@ export interface RegisterAgentCommandOptions {
 }
 
 const LIST_KEYWORD = 'list';
+const AGENT_WIDGET_KEY = 'pi-agent-command';
 const AGENT_COMMAND_DESCRIPTION =
   'Invoke a discovered subagent: /agent list | /agent <name> <task...>';
 
@@ -121,15 +123,20 @@ async function invokeAgent(
   // host's system prompt options before executeAgentTool resolves agent.skills.
   setDiscoveredSkillsFromOptions(ctx.getSystemPromptOptions());
 
+  const updateWidget = createAgentWidgetUpdater(ctx, agentName, task);
+  updateWidget();
+
   let result: AgentResult;
   try {
-    result = await execute({ agent: agentName, task }, ctx.signal, undefined, ctx, {
+    result = await execute({ agent: agentName, task }, ctx.signal, updateWidget, ctx, {
       backgroundManager: options.backgroundManager,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     ctx.ui.notify(`Agent "${agentName}" failed: ${message}`, 'error');
     return;
+  } finally {
+    ctx.ui.setWidget(AGENT_WIDGET_KEY, undefined);
   }
 
   const text = extractResultText(result);
@@ -138,6 +145,31 @@ async function invokeAgent(
     return;
   }
   ctx.ui.notify(text || `Agent "${agentName}" completed.`, 'info');
+}
+
+function createAgentWidgetUpdater(
+  ctx: ExtensionCommandContext,
+  agentName: string,
+  task: string
+): AgentWidgetUpdater {
+  return (partial?: AgentResult) => {
+    const result = partial?.details?.results[0];
+    const lines = [
+      `Agent: ${agentName}`,
+      `Task: ${truncateWidgetText(task, 120)}`,
+      `Status: ${partial ? 'running...' : 'starting...'}`,
+      `Turns: ${result?.usage.turns ?? 0}`,
+    ];
+    const latest = partial ? truncateWidgetText(extractResultText(partial), 160) : '';
+    if (latest) lines.push(`Latest: ${latest}`);
+    ctx.ui.setWidget(AGENT_WIDGET_KEY, lines);
+  };
+}
+
+function truncateWidgetText(value: string, max: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(0, max - 1))}…`;
 }
 
 function agentArgumentCompletions(cwd: string, prefix: string): AutocompleteItem[] {
