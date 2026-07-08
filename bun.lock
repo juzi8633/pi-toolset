@@ -18,6 +18,10 @@
         "typescript-eslint": "^8.61.1",
       },
     },
+    "internal/pi-log": {
+      "name": "@balaenis/pi-log",
+      "version": "0.0.0",
+    },
     "packages/pi-agents": {
       "name": "@balaenis/pi-agents",
       "version": "0.0.1",
@@ -40,6 +44,7 @@
       "name": "@balaenis/pi-format",
       "version": "0.0.1",
       "devDependencies": {
+        "@balaenis/pi-log": "workspace:*",
         "@earendil-works/pi-ai": "^0.80.1",
         "@earendil-works/pi-coding-agent": "^0.80.1",
         "@earendil-works/pi-tui": "^0.80.1",
@@ -59,6 +64,7 @@
         "vscode-jsonrpc": "^9.0.0",
       },
       "devDependencies": {
+        "@balaenis/pi-log": "workspace:*",
         "@earendil-works/pi-ai": "^0.80.1",
         "@earendil-works/pi-coding-agent": "^0.80.1",
         "@earendil-works/pi-tui": "^0.80.1",
@@ -133,6 +139,8 @@
     "@balaenis/pi-agents": ["@balaenis/pi-agents@workspace:packages/pi-agents"],
 
     "@balaenis/pi-format": ["@balaenis/pi-format@workspace:packages/pi-format"],
+
+    "@balaenis/pi-log": ["@balaenis/pi-log@workspace:internal/pi-log"],
 
     "@balaenis/pi-lsp": ["@balaenis/pi-lsp@workspace:packages/pi-lsp"],
 

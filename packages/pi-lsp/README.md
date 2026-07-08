@@ -288,7 +288,7 @@ The Tailwind server is configured and visible in `/lsp status` but inactive unti
 
 ## Logging
 
-Logging defaults to **error level** — only errors are written. Set `PI_LSP_LOG_LEVEL=debug` to enable debug output. Logs are streamed to `~/.pi/pi-x-ide/debug.log` (never to stdout/stderr) and the directory is created on first write. Override the destination with `PI_LSP_LOG_FILE=/absolute/path/to/file`. If the file cannot be written, logging is silently disabled for the rest of the session.
+Logging defaults to **error level** — only errors are written. Set `PI_LSP_LOG_LEVEL=debug` to enable debug output. Logs are streamed to `~/.pi/@balaenis/pi-lsp/default.log` (never to stdout/stderr) and the directory is created on first write. Override the destination with `PI_LSP_LOG_FILE=/absolute/path/to/file`. If the file cannot be written, logging is silently disabled for the rest of the session.
 
 ## Limitations
 

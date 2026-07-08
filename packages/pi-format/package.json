@@ -42,6 +42,7 @@
     "typebox": "*"
   },
   "devDependencies": {
+    "@balaenis/pi-log": "workspace:*",
     "@earendil-works/pi-ai": "^0.80.1",
     "@earendil-works/pi-coding-agent": "^0.80.1",
     "@earendil-works/pi-tui": "^0.80.1",

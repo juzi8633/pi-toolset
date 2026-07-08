@@ -4,7 +4,8 @@
   "license": "Apache-2.0",
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "internal/*"
   ],
   "devDependencies": {
     "@eslint/js": "^10.0.1",

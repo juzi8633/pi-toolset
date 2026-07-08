@@ -49,7 +49,7 @@ The script (`scripts/run-pi-lsp.sh`):
   `typescript-language-server` and `pyright-langserver` are spawnable;
 - loads **only** the built local extension (`-ne --no-extensions -e ../../dist/index.js`);
 - sets `PI_LSP_LOG_LEVEL=debug` so the manager lifecycle and gitignore filter decisions
-  are written to `~/.pi/pi-x-ide/debug.log` (override with `PI_LSP_LOG_FILE`).
+  are written to `~/.pi/@balaenis/pi-lsp/default.log` (override with `PI_LSP_LOG_FILE`).
 
 > Always launch with `bun run pi`. Launching `pi -e ../../dist/index.js` from a
 > shell where this fixture's `node_modules/.bin` is not on `PATH` will make the
@@ -120,7 +120,7 @@ Expected:
 
 - `src/main.ts` is answered by the autodetected **typescript** recipe.
 - `src/caller.py` is answered by the autodetected **python** recipe.
-- In `~/.pi/pi-x-ide/debug.log` (`PI_LSP_LOG_LEVEL=debug`) you see recipe detection for
+- In `~/.pi/@balaenis/pi-lsp/default.log` (`PI_LSP_LOG_LEVEL=debug`) you see recipe detection for
   `typescript-language-server` and `pyright-langserver` before the servers are
   started lazily by the tool calls.
 
@@ -431,7 +431,7 @@ Expected:
   with exit code 1. Check that the configured command is installed and on
   PATH."** — the error reason (`crashed with exit code 1`) tells the user the
   command spawned but failed; combined with the stderr line
-  `error: unknown option '--my-flag'` (visible in `~/.pi/pi-x-ide/debug.log` with `PI_LSP_LOG_LEVEL=debug`), the
+  `error: unknown option '--my-flag'` (visible in `~/.pi/@balaenis/pi-lsp/default.log` with `PI_LSP_LOG_LEVEL=debug`), the
   user can pinpoint the bad arg.
 - The text does **not** say "No LSP server is configured" and does **not**
   include the recipe install hint.
@@ -456,7 +456,7 @@ Expected:
   TypeScript signature for `target`).
 - `src/caller.py` is answered by the **python** server (pyright returns a
   Python hover/signature for `target`).
-- In `~/.pi/pi-x-ide/debug.log` (`PI_LSP_LOG_LEVEL=debug`) you see two different servers started, routed by
+- In `~/.pi/@balaenis/pi-lsp/default.log` (`PI_LSP_LOG_LEVEL=debug`) you see two different servers started, routed by
   extension via `extensionToLanguage`.
 
 ### A2 — adding/removing a server takes effect after `/reload`
@@ -510,7 +510,7 @@ Expected:
   use on line 16).
 - The declaration in `src/ignored.ts` is **not** listed, because
   `filterGitIgnoredLocations` dropped it via `git check-ignore`.
-- In `~/.pi/pi-x-ide/debug.log` (`PI_LSP_LOG_LEVEL=debug`) you see the gitignore filter remove
+- In `~/.pi/@balaenis/pi-lsp/default.log` (`PI_LSP_LOG_LEVEL=debug`) you see the gitignore filter remove
   `src/ignored.ts`.
 
 > This works because the fixture lives inside the pi-lsp git repository, so

@@ -51,10 +51,11 @@
     "postbuild": "bun run gen:schema"
   },
   "devDependencies": {
-    "prettier": "^3.8.4",
+    "@balaenis/pi-log": "workspace:*",
     "@earendil-works/pi-ai": "^0.80.1",
     "@earendil-works/pi-coding-agent": "^0.80.1",
     "@earendil-works/pi-tui": "^0.80.1",
+    "prettier": "^3.8.4",
     "typebox": "^1.2.17",
     "vscode-languageserver-protocol": "^3.18.0",
     "vscode-languageserver-types": "^3.18.0"
