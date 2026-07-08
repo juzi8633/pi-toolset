@@ -72,8 +72,8 @@ This matches Claude Code's behavior (diagnostics delivered on the next query).
 Each prompt below is therefore a **two-step** sequence: trigger the edit, then
 send a second message to read the injected diagnostics.
 
-You can watch the full lifecycle in `~/.pi/pi-x-ide/debug.log` when the launch
-script sets `PI_LSP_LOG_LEVEL=debug` (`tail -f ~/.pi/pi-x-ide/debug.log`). Look for:
+You can watch the full lifecycle in `~/.pi/@balaenis/pi-lsp/default.log` when the launch
+script sets `PI_LSP_LOG_LEVEL=debug` (`tail -f ~/.pi/@balaenis/pi-lsp/default.log`). Look for:
 
 - `diagnostics: registered …` — publishDiagnostics handler stored diagnostics.
 - `diagnostics: delivering …` — the `before_agent_start` hook drained and
