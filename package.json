@@ -22,7 +22,7 @@
   },
   "pi": {
     "extensions": [
-      "packages/*"
+      "packages/*/src/index.ts"
     ]
   }
 }

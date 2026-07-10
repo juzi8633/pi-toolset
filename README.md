@@ -12,14 +12,6 @@ A monorepo of [Pi](https://github.com/earendil-works/pi) extension packages. Eac
 
 See each package's `README.md` for usage and configuration.
 
-Install every extension directly from the Git repository:
-
-```sh
-pi install git:github.com/balaenis/pi-toolset
-```
-
-To install a single package from npm instead, use the command in that package's README.
-
 ## Repository Layout
 
 ```
