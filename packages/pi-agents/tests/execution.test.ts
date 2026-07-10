@@ -263,6 +263,111 @@ describe('runSingleAgent model/thinking overrides', () => {
   });
 });
 
+describe('runSingleAgent runtime override', () => {
+  function captureSpawn(): {
+    fake: FakeChild;
+    spawnFn: SpawnFn;
+    captured: { command: string; args: string[] };
+  } {
+    const fake = new FakeChild();
+    const captured = { command: '', args: [] as string[] };
+    const spawnFn: SpawnFn = ((command: string, args: string[]) => {
+      captured.command = command;
+      captured.args = args;
+      return fake as unknown as SpawnedChild;
+    }) as SpawnFn;
+    return { fake, spawnFn, captured };
+  }
+
+  it('forces a pi-configured agent through the grok runtime', async () => {
+    const ctx = captureSpawn();
+    const agent = makeAgent({ name: 'p' });
+    const promise = runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      { spawnFn: ctx.spawnFn, runtimeOverride: 'grok' }
+    );
+    setImmediate(() => {
+      ctx.fake.stdout.push(
+        JSON.stringify({ type: 'text', data: 'ok' }) +
+          '\n' +
+          JSON.stringify({ type: 'end', stopReason: 'EndTurn' }) +
+          '\n'
+      );
+      ctx.fake.stdout.push(null);
+      ctx.fake.stderr.push(null);
+      ctx.fake.emit('close', 0);
+    });
+    const result = await promise;
+    expect(ctx.captured.command).toBe('grok');
+    expect(ctx.captured.args).toContain('--no-subagents');
+    expect(ctx.captured.args).not.toContain('--mode');
+    expect(result.model).toBeUndefined();
+  });
+
+  it('forces a grok-configured agent through the pi runtime', async () => {
+    const ctx = captureSpawn();
+    const agent = makeAgent({ name: 'g', runtime: 'grok', model: 'grok-4.5' });
+    const promise = runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      { spawnFn: ctx.spawnFn, runtimeOverride: 'pi' }
+    );
+    setImmediate(() => {
+      ctx.fake.stdout.push(null);
+      ctx.fake.stderr.push(null);
+      ctx.fake.emit('close', 0);
+    });
+    const result = await promise;
+    expect(ctx.captured.command).not.toBe('grok');
+    expect(ctx.captured.args).toContain('--mode');
+    expect(ctx.captured.args[ctx.captured.args.indexOf('--mode') + 1]).toBe('json');
+    expect(ctx.captured.args).not.toContain('--no-subagents');
+    // model from the agent config still flows through the pi builder
+    expect(ctx.captured.args[ctx.captured.args.indexOf('--model') + 1]).toBe('grok-4.5');
+    expect(result.model).toBe('grok-4.5');
+  });
+
+  it('falls back to the agent config runtime when no override is given', async () => {
+    const ctx = captureSpawn();
+    const agent = makeAgent({ name: 'g', runtime: 'grok' });
+    const promise = runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      { spawnFn: ctx.spawnFn }
+    );
+    setImmediate(() => {
+      ctx.fake.stdout.push(JSON.stringify({ type: 'end', stopReason: 'EndTurn' }) + '\n');
+      ctx.fake.stdout.push(null);
+      ctx.fake.stderr.push(null);
+      ctx.fake.emit('close', 0);
+    });
+    await promise;
+    expect(ctx.captured.command).toBe('grok');
+  });
+});
+
 describe('runSingleAgent maxTurns', () => {
   it('terminates the child and reports max_turns once the budget is exceeded', async () => {
     const fake = new FakeChild();
@@ -507,7 +612,7 @@ describe('runSingleAgentGrok', () => {
     expect(result.messages[0].content[0]).toEqual({ type: 'text', text: 'Hello' });
   });
 
-  it('throws when aborted', async () => {
+  it('throws when aborted', () => {
     const ctx = captureGrokSpawn();
     const agent = makeAgent({ name: 'g', runtime: 'grok' });
     const controller = new AbortController();
@@ -531,7 +636,7 @@ describe('runSingleAgentGrok', () => {
         ctx.fake.emit('close', 1);
       });
     });
-    await expect(promise).rejects.toThrow('Subagent was aborted');
+    expect(promise).rejects.toThrow('Subagent was aborted');
     expect(ctx.fake.killSignals).toContain('SIGTERM');
   });
 

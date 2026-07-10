@@ -8,6 +8,11 @@ export const IsolationSchema = StringEnum(['none', 'worktree'] as const, {
     'Per-task isolation. "worktree" runs the child in a fresh git worktree under .worktrees/.',
 });
 
+export const RuntimeSchema = StringEnum(['pi', 'grok'] as const, {
+  description:
+    "Temporarily override the agent config `runtime` for every agent invoked in this call (single/parallel/chain/fanout). `pi` (default) spawns the pi CLI; `grok` spawns the Grok CLI. Defaults to each agent's configured runtime.",
+});
+
 export const TaskItem = Type.Object({
   agent: Type.String({ description: 'Name of the agent to invoke' }),
   task: Type.String({ description: 'Task to delegate to the agent' }),
@@ -106,4 +111,5 @@ export const SubagentParams = Type.Object({
         "Temporarily override the agent config `thinking` for every agent invoked in this call (single/parallel/chain/fanout). Defaults to each agent's configured thinking; set only when you need a specific thinking level for this run.",
     })
   ),
+  runtime: Type.Optional(RuntimeSchema),
 });

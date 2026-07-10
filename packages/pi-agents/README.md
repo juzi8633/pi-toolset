@@ -133,20 +133,24 @@ Command invocations are foreground: the command waits for the agent to finish st
 
 Any of the three modes can be wrapped with `runInBackground: true` to launch the workflow asynchronously. The tool returns immediately with an `agent-bg-*` job id. When the job completes or fails, a follow-up custom message is delivered to the parent session and triggers a new turn so the model can react. When the job is cancelled (for example by `session_shutdown`), the same custom message is recorded but the parent model is not re-entered.
 
-### Per-invocation model / thinking override
+### Per-invocation model / thinking / runtime override
 
-The tool accepts optional top-level `model` and `thinking` parameters that temporarily override each agent's configured `model` / `thinking` for the duration of a single tool call. They apply to every agent spawned by the call (single, parallel, chain, and fanout steps) and take precedence over both the agent frontmatter and any config-file overrides. Leave them unset to keep each agent's own model/thinking.
+The tool accepts optional top-level `model`, `thinking`, and `runtime` parameters that temporarily override each agent's configured `model` / `thinking` / `runtime` for the duration of a single tool call. They apply to every agent spawned by the call (single, parallel, chain, and fanout steps) and take precedence over both the agent frontmatter and any config-file overrides. Leave them unset to keep each agent's own configuration.
 
 ```json
 {
   "agent": "worker",
   "task": "Refactor the session store.",
   "model": "gpt-5",
-  "thinking": "high"
+  "thinking": "high",
+  "runtime": "pi"
 }
 ```
 
-This is intended as a dynamic adjustment point: the orchestrating agent (e.g. the `worker`) can pin a specific model for a particular run without editing agent definitions or config files. The effective model/thinking is forwarded to the child as `pi --model` / `pi --thinking` (or `grok --model` / `grok --effort` for the grok runtime) and recorded on the result's `model` / `thinking` fields.
+This is intended as a dynamic adjustment point: the orchestrating agent (e.g. the `worker`) can pin a specific model, thinking level, or runtime for a particular run without editing agent definitions or config files.
+
+- `model` / `thinking` are forwarded to the child as `pi --model` / `pi --thinking` (or `grok --model` / `grok --effort` for the grok runtime) and recorded on the result's `model` / `thinking` fields.
+- `runtime` selects which CLI is spawned: `"pi"` (default) or `"grok"`. Overriding it switches the child between the pi and Grok runtimes, so all runtime-dependent behavior (skill resolution, context preparation, invocation flags) follows the effective runtime for that call. See [Grok runtime](#grok-runtime) for the grok-specific flag and thinking→effort mapping.
 
 ### Background agents
 

@@ -10,6 +10,7 @@ import type {
 import {
   type AgentConfig,
   type AgentScope,
+  type Runtime,
   discoverAgents,
   getBuiltinAgentsDir,
 } from './agents.ts';
@@ -148,7 +149,8 @@ export async function executeAgentTool(
           workflowOnUpdate,
           makeDetails,
           params.model,
-          params.thinking
+          params.thinking,
+          params.runtime
         )
     );
   }
@@ -171,7 +173,8 @@ export async function executeAgentTool(
           workflowOnUpdate,
           makeDetails,
           params.model,
-          params.thinking
+          params.thinking,
+          params.runtime
         )
     );
   }
@@ -197,7 +200,8 @@ export async function executeAgentTool(
           workflowOnUpdate,
           makeDetails,
           params.model,
-          params.thinking
+          params.thinking,
+          params.runtime
         )
     );
   }
@@ -314,7 +318,8 @@ async function runChain(
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
   makeDetails: DetailsFactory,
   modelOverride?: string,
-  thinkingOverride?: string
+  thinkingOverride?: string,
+  runtimeOverride?: Runtime
 ): Promise<AgentResult> {
   const chainDetails = (results: SingleResult[], outputs?: Record<string, ChainOutputEntry>) => ({
     ...makeDetails('chain')(results),
@@ -342,6 +347,7 @@ async function runChain(
           skipCompletionCheck: req.skipCompletionCheck,
           modelOverride,
           thinkingOverride,
+          runtimeOverride,
         }
       ),
   });
@@ -355,7 +361,8 @@ async function runParallel(
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
   makeDetails: DetailsFactory,
   modelOverride?: string,
-  thinkingOverride?: string
+  thinkingOverride?: string,
+  runtimeOverride?: Runtime
 ): Promise<AgentResult> {
   if (tasks.length > MAX_PARALLEL_TASKS)
     return {
@@ -424,7 +431,7 @@ async function runParallel(
         }
       },
       makeDetails('parallel'),
-      { modelOverride, thinkingOverride }
+      { modelOverride, thinkingOverride, runtimeOverride }
     );
     allResults[index] = result;
     emitParallelUpdate();
@@ -461,7 +468,8 @@ async function runSingle(
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
   makeDetails: DetailsFactory,
   modelOverride?: string,
-  thinkingOverride?: string
+  thinkingOverride?: string,
+  runtimeOverride?: Runtime
 ): Promise<AgentResult> {
   const result = await runStepWithContext(
     ctx,
@@ -475,7 +483,7 @@ async function runSingle(
     signal,
     onUpdate,
     makeDetails('single'),
-    { modelOverride, thinkingOverride }
+    { modelOverride, thinkingOverride, runtimeOverride }
   );
   if (isFailedResult(result)) {
     const errorMsg = getResultOutput(result);
@@ -514,6 +522,7 @@ async function runStepWithContext(
     skipCompletionCheck?: boolean;
     modelOverride?: string;
     thinkingOverride?: string;
+    runtimeOverride?: Runtime;
   } = {}
 ): Promise<SingleResult> {
   const agent = agents.find((a) => a.name === agentName);
@@ -528,12 +537,18 @@ async function runStepWithContext(
       signal,
       onUpdate,
       makeDetails,
-      { modelOverride: options.modelOverride, thinkingOverride: options.thinkingOverride }
+      {
+        modelOverride: options.modelOverride,
+        thinkingOverride: options.thinkingOverride,
+        runtimeOverride: options.runtimeOverride,
+      }
     );
   }
 
+  const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
+
   let resolvedSkillPaths: string[] | undefined;
-  if (agent.runtime === GROK_RUNTIME) {
+  if (effectiveRuntime === GROK_RUNTIME) {
     if (agent.skills && agent.skills.length > 0) {
       ctx.ui.notify(
         `Agent "${agentName}" uses runtime: grok; skills are ignored (not transferable to Grok).`,
@@ -565,7 +580,7 @@ async function runStepWithContext(
 
   let agentContext;
   try {
-    if (agent.runtime === GROK_RUNTIME) {
+    if (effectiveRuntime === GROK_RUNTIME) {
       if (agent.defaultContext === 'fork') {
         ctx.ui.notify(
           `Agent "${agentName}" uses runtime: grok; defaultContext: fork is ignored (runs as fresh).`,
@@ -635,6 +650,7 @@ async function runStepWithContext(
         resolvedSkillPaths,
         modelOverride: options.modelOverride,
         thinkingOverride: options.thinkingOverride,
+        runtimeOverride: options.runtimeOverride,
       }
     );
     if (worktree) {

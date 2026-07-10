@@ -7,7 +7,7 @@ import * as fs from 'node:fs';
 import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
-import type { AgentConfig } from './agents.ts';
+import type { AgentConfig, Runtime } from './agents.ts';
 import { GROK_RUNTIME } from './constants.ts';
 import { buildGrokArgs, getGrokInvocation } from './grok-invocation.ts';
 import { parseGrokEvent } from './grok-parser.ts';
@@ -29,6 +29,7 @@ export interface RunSingleAgentOptions {
   resolvedSkillPaths?: string[];
   modelOverride?: string;
   thinkingOverride?: string;
+  runtimeOverride?: Runtime;
 }
 
 export async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -91,13 +92,15 @@ export async function runSingleAgent(
 
   const effectiveModel = options.modelOverride ?? agent.model;
   const effectiveThinking = options.thinkingOverride ?? agent.thinking;
+  const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
   const effectiveAgent: AgentConfig = {
     ...agent,
     model: effectiveModel,
     thinking: effectiveThinking,
+    runtime: effectiveRuntime,
   };
 
-  if (agent.runtime === GROK_RUNTIME) {
+  if (effectiveRuntime === GROK_RUNTIME) {
     return runSingleAgentGrok(
       defaultCwd,
       agents,
@@ -336,10 +339,12 @@ async function runSingleAgentGrok(
 
   const effectiveModel = options.modelOverride ?? agent.model;
   const effectiveThinking = options.thinkingOverride ?? agent.thinking;
+  const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
   const effectiveAgent: AgentConfig = {
     ...agent,
     model: effectiveModel,
     thinking: effectiveThinking,
+    runtime: effectiveRuntime,
   };
 
   const currentResult: SingleResult = {
