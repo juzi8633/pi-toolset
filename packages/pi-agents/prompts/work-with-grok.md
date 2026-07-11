@@ -2,9 +2,11 @@
 description: Delegate a task to the worker agent on the Grok ACP runtime (structured tool calls + usage)
 ---
 
-Use the `agent` tool to delegate the following task to the `worker` agent: $@
+Use the `worker` agent to complete the following task:
 
-Pass these per-call overrides:
+$@
+
+Per-call overrides for the `worker` agent:
 
 - `runtime`: `grok-acp`
 - `model`: `grok-4.5`
