@@ -3,7 +3,8 @@
 
 import { describe, expect, it } from 'bun:test';
 import type { SingleResult } from '../src/types.ts';
-import { parseGrokEvent } from '../src/grok-parser.ts';
+import { createGrokParserState, parseGrokEvent } from '../src/grok-parser.ts';
+import { getFinalOutput } from '../src/output.ts';
 
 function makeResult(model?: string): SingleResult {
   return {
@@ -32,7 +33,8 @@ function parseLines(lines: string[], result: SingleResult): number {
   const onUpdate = () => {
     updateCount++;
   };
-  for (const line of lines) parseGrokEvent(line, result, onUpdate);
+  const state = createGrokParserState();
+  for (const line of lines) parseGrokEvent(line, result, onUpdate, state);
   return updateCount;
 }
 
@@ -147,6 +149,122 @@ describe('parseGrokEvent thought events', () => {
     const result = makeResult();
     const updates = parseLines([JSON.stringify({ type: 'thought', data: 'hmm' })], result);
     expect(updates).toBe(0);
+  });
+});
+
+describe('parseGrokEvent turn boundaries', () => {
+  it('splits text into separate messages when thought follows text', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'text', data: 'Preamble one.' }),
+        JSON.stringify({ type: 'thought', data: 'Now I should do X.' }),
+        JSON.stringify({ type: 'text', data: 'Preamble two.' }),
+        JSON.stringify({ type: 'thought', data: 'Now I should do Y.' }),
+        JSON.stringify({ type: 'text', data: '## Completed\n\nFinal output.' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(result.messages).toHaveLength(3);
+    expect((result.messages[0].content[0] as { text: string }).text).toBe('Preamble one.');
+    expect((result.messages[1].content[0] as { text: string }).text).toBe('Preamble two.');
+    expect((result.messages[2].content[0] as { text: string }).text).toBe(
+      '## Completed\n\nFinal output.'
+    );
+  });
+
+  it('getFinalOutput returns only the last turn', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'text', data: 'First preamble.' }),
+        JSON.stringify({ type: 'thought', data: 'thinking' }),
+        JSON.stringify({ type: 'text', data: '## Completed\n\nDone.' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(getFinalOutput(result.messages)).toBe('## Completed\n\nDone.');
+  });
+
+  it('counts turns from assistant message count', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'text', data: 'Turn 1.' }),
+        JSON.stringify({ type: 'thought', data: 'thinking' }),
+        JSON.stringify({ type: 'text', data: 'Turn 2.' }),
+        JSON.stringify({ type: 'thought', data: 'thinking' }),
+        JSON.stringify({ type: 'text', data: 'Turn 3.' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(result.usage.turns).toBe(3);
+  });
+
+  it('does not split when thoughts precede text (first-turn thinking)', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'thought', data: 'Let me think...' }),
+        JSON.stringify({ type: 'thought', data: '...about this.' }),
+        JSON.stringify({ type: 'text', data: 'Answer.' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(result.messages).toHaveLength(1);
+    expect((result.messages[0].content[0] as { text: string }).text).toBe('Answer.');
+    expect(result.usage.turns).toBe(1);
+  });
+
+  it('preserves newlines within a single turn', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'text', data: 'Line1' }),
+        JSON.stringify({ type: 'text', data: '\n\n' }),
+        JSON.stringify({ type: 'text', data: 'Line2' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(result.messages).toHaveLength(1);
+    expect((result.messages[0].content[0] as { text: string }).text).toBe('Line1\n\nLine2');
+  });
+
+  it('handles multiple thoughts between turns without extra splits', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'text', data: 'First.' }),
+        JSON.stringify({ type: 'thought', data: 'a' }),
+        JSON.stringify({ type: 'thought', data: 'b' }),
+        JSON.stringify({ type: 'thought', data: 'c' }),
+        JSON.stringify({ type: 'text', data: 'Second.' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(result.messages).toHaveLength(2);
+  });
+
+  it('sets stopReason on the last message', () => {
+    const result = makeResult();
+    parseLines(
+      [
+        JSON.stringify({ type: 'text', data: 'First.' }),
+        JSON.stringify({ type: 'thought', data: 'thinking' }),
+        JSON.stringify({ type: 'text', data: 'Second.' }),
+        JSON.stringify({ type: 'end', stopReason: 'EndTurn' }),
+      ],
+      result
+    );
+    expect(result.messages).toHaveLength(2);
+    expect((result.messages[0] as { stopReason?: string }).stopReason).toBeUndefined();
+    expect((result.messages[1] as { stopReason?: string }).stopReason).toBe('end');
   });
 });
 

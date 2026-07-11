@@ -505,8 +505,8 @@ Hardcoded flags: `--no-auto-update`, `--always-approve`, `--output-format stream
 
 **Caveats and limitations:**
 
-- **No usage stats** - Grok's streaming-json does not expose token counts or cost. `SingleResult.usage` is all zeros; only `turns` is set (to 1 on completion).
-- **No tool call visibility** - Grok handles tools transparently. Tool executions are not in the output stream, so `SingleResult.messages` contains only the final assistant text.
+- **No usage stats** - Grok's streaming-json does not expose token counts or cost. `SingleResult.usage` is all zeros; `turns` reflects the number of assistant turns detected via thought boundaries.
+- **No tool call visibility** - Grok handles tools transparently. Tool executions are not in the output stream, so `SingleResult.messages` contains no `toolCall` parts. Text is split into one assistant message per turn using `thought` events as turn boundaries (Grok emits no tool-call/result events); `getFinalOutput()` returns only the last turn.
 - **stopReason mapping** - Grok's `EndTurn` maps to pi's `end`; `Cancelled` (max turns reached, exit code 1) maps to `max_turns`.
 - **Skills are no-ops** - pi skills are not transferable to Grok. Skill name resolution is skipped for Grok agents (a warning is emitted if `skills` is set). Use `pi` runtime if skills are needed.
 - **`worktreeSetupHook` still runs** - when `isolation: worktree`, the setup hook runs inside the worktree before the Grok child is spawned (same as the pi path).

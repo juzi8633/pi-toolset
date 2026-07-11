@@ -10,7 +10,7 @@ import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig, Runtime } from './agents.ts';
 import { GROK_RUNTIME } from './constants.ts';
 import { buildGrokArgs, getGrokInvocation } from './grok-invocation.ts';
-import { parseGrokEvent } from './grok-parser.ts';
+import { createGrokParserState, parseGrokEvent } from './grok-parser.ts';
 import { buildPiArgs, getPiInvocation, writePromptToTempFile } from './invocation.ts';
 import { getFinalOutput } from './output.ts';
 import { buildChildAgentEnv, isAgentDelegationAllowed } from './security.ts';
@@ -396,12 +396,13 @@ async function runSingleAgentGrok(
     let buffer = '';
     let hasClosed = false;
     let settled = false;
+    const parserState = createGrokParserState();
 
     const flushBuffer = () => {
       if (buffer.trim()) {
         const remaining = buffer;
         buffer = '';
-        parseGrokEvent(remaining, currentResult, emitUpdate);
+        parseGrokEvent(remaining, currentResult, emitUpdate, parserState);
       }
     };
 
@@ -416,7 +417,7 @@ async function runSingleAgentGrok(
       buffer += data.toString();
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
-      for (const line of lines) parseGrokEvent(line, currentResult, emitUpdate);
+      for (const line of lines) parseGrokEvent(line, currentResult, emitUpdate, parserState);
     });
 
     proc.stderr.on('data', (data) => {
