@@ -3,6 +3,31 @@
 Practical recipes for specific tasks. Each guide assumes you have [built and
 loaded the extension](./tutorials.md#1-build-and-load-the-extension).
 
+## Trigger agents with natural language
+
+You don't have to write JSON - describe the delegation in plain language and Pi
+calls the `agent` tool for you. Name the agent (and optionally inline per-call
+overrides); the rest of the sentence becomes the task.
+
+**Implement a plan with the worker agent:**
+
+> Use the worker agent to implement the plan.
+
+Pi invokes `worker` in single mode with your task.
+
+**Implement a plan with the worker agent on the Grok ACP runtime:**
+
+> Use the worker agent (runtime: grok-acp, model: grok-4.5, thinking: high) to
+> implement the plan.
+
+Pi passes `runtime`, `model`, and `thinking` as per-call overrides, so the
+worker runs on Grok ACP with the `grok-4.5` model and `high` thinking for this
+call only - the agent's own config is untouched. See
+[Per-invocation overrides](./reference.md#per-invocation-overrides).
+
+Natural-language triggers work in any language; what matters is naming the
+agent and, optionally, the override fields.
+
 ## Run agents in parallel
 
 Pass multiple `{ agent, task }` items under `tasks`:
