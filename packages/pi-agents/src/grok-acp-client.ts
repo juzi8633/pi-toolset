@@ -46,6 +46,7 @@ export type GrokAcpLifecycleStage =
   | 'shutdown';
 
 const DEFAULT_STAGE_TIMEOUT_MS = 60_000;
+const DEFAULT_PROMPT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_CANCEL_GRACE_MS = 2_000;
 const HARD_KILL_MS = 5_000;
 const MAX_STDERR_CHARS = 16 * 1024;
@@ -74,6 +75,7 @@ export interface GrokAcpClientOptions {
   task: string;
   onSessionUpdate?: (notification: SessionNotification) => void;
   stageTimeoutMs?: number;
+  promptTimeoutMs?: number;
   cancelGraceMs?: number;
   /** Test seam: override auth selection. */
   selectAuthMethod?: (init: InitializeResponse, env: NodeJS.ProcessEnv) => string | null;
@@ -301,6 +303,7 @@ export async function runGrokAcpClient(
   options: GrokAcpClientOptions
 ): Promise<GrokAcpClientResult> {
   const stageTimeoutMs = options.stageTimeoutMs ?? DEFAULT_STAGE_TIMEOUT_MS;
+  const promptTimeoutMs = options.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
   const cancelGraceMs = options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
   const spawnFn = options.spawnFn ?? (spawn as unknown as GrokAcpSpawnFn);
   const selectAuth = options.selectAuthMethod ?? selectGrokAcpAuthMethod;
@@ -472,7 +475,7 @@ export async function runGrokAcpClient(
         const promptParams = buildGrokAcpPromptParams(session.sessionId, options.task);
         const promptPromise = withTimeout(
           ctx.request(methods.agent.session.prompt, promptParams),
-          stageTimeoutMs,
+          promptTimeoutMs,
           'prompt',
           () => handle?.stderr ?? ''
         );

@@ -569,6 +569,28 @@ describe('runGrokAcpClient in-process via fake stdio agent', () => {
     expect(fake.killSignals).toContain('SIGKILL');
   }, 15_000);
 
+  it('times out the prompt stage using promptTimeoutMs, not stageTimeoutMs', async () => {
+    const { fake, spawnFn } = spawnFake({ hangPrompt: true });
+    const err = await runGrokAcpClient({
+      command: 'grok',
+      args: ['agent', 'stdio'],
+      cwd: '/tmp',
+      env: process.env,
+      spawnFn,
+      initializeParams: buildGrokAcpInitializeParams(),
+      sessionNewParams: { cwd: '/tmp', mcpServers: [] },
+      task: 'hang',
+      stageTimeoutMs: 5_000,
+      promptTimeoutMs: 50,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(GrokAcpClientError);
+    expect((err as GrokAcpClientError).stage).toBe('prompt');
+    expect((err as GrokAcpClientError).message).toBe('Grok ACP prompt timed out after 50ms');
+    expect(fake.promptReceived).toBe(true);
+    expect(fake.killSignals).toContain('SIGTERM');
+  }, 10_000);
+
   it('classifies auth method selection failure as authenticate stage', async () => {
     const { spawnFn } = spawnFake({
       authMethods: [{ id: 'oauth_browser', name: 'Browser' }],
