@@ -2,7 +2,6 @@
 name: planner
 description: Creates implementation plans from context and requirements
 tools: read, grep, find, ls, write
-noSkills: true
 maxSubagentDepth: 0
 completionCheck: '## Goal, ## Plan, ## Files to Modify, ## Risks'
 ---

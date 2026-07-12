@@ -454,6 +454,56 @@ describe('renderResult single', () => {
     expect(firstLine).toContain('Explore');
     expect(startsWithSpinnerFrame(firstLine)).toBe(true);
   });
+
+  it('truncates a long read path in the collapsed activity line to width', async () => {
+    const { visibleWidth } = await import('@earendil-works/pi-tui');
+    const { context } = makeContext();
+    const longPath =
+      '/data/repos/my/pi-toolset/packages/pi-agents/very/deeply/nested/long/path/to/a/source/file.ts';
+    const r = singleResult({
+      status: 'running',
+      exitCode: -1,
+      messages: assistantMessages([{ type: 'toolCall', name: 'read', path: longPath }]),
+    });
+    const width = 50;
+    const text = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'run' }], details: singleDetails(r) },
+        { expanded: false, isPartial: true },
+        theme,
+        context
+      ),
+      width
+    );
+    const activityLines = text.split('\n').filter((l) => l.includes('└'));
+    expect(activityLines).toHaveLength(1);
+    const line = activityLines[0]!;
+    // Whole line, prefix included, must not exceed the available width (ANSI-safe truncation).
+    expect(visibleWidth(line.trimEnd())).toBeLessThanOrEqual(width);
+    expect(line).toContain('…');
+    expect(line).toContain('read');
+    expect(text).not.toContain(longPath);
+  });
+
+  it('keeps the full read path in the expanded transcript (no truncation)', () => {
+    const { context } = makeContext();
+    const longPath =
+      '/data/repos/my/pi-toolset/packages/pi-agents/very/deeply/nested/long/path/to/a/source/file.ts';
+    const r = singleResult({
+      status: 'completed',
+      messages: assistantMessages([{ type: 'toolCall', name: 'read', path: longPath }]),
+    });
+    const text = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(r) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    expect(text).toContain(longPath);
+    expect(text).not.toContain('…');
+  });
 });
 
 describe('renderResult parallel', () => {

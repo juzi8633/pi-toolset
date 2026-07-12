@@ -395,14 +395,20 @@ function formatActivityLine(
   item: DisplayItem,
   theme: Theme,
   themeFg: ThemeFg,
+  width: number,
   prefix = ''
 ): string {
+  const prefixStr = theme.fg('muted', `  └ ${prefix}`);
   if (item.type === 'toolCall') {
-    return theme.fg('muted', `  └ ${prefix}`) + formatToolCall(item.name, item.args, themeFg);
+    return fitActivityLine(prefixStr + formatToolCall(item.name, item.args, themeFg), width);
   }
   const preview = item.text.split('\n')[0] ?? '';
-  const short = truncateText(preview, 80);
-  return theme.fg('muted', `  └ ${prefix}`) + theme.fg('toolOutput', short);
+  return fitActivityLine(prefixStr + theme.fg('toolOutput', preview), width);
+}
+
+/** Truncate a collapsed activity line to the available width (ANSI-safe, single `…`). */
+function fitActivityLine(line: string, width: number): string {
+  return width > 0 ? truncateToWidth(line, width, '…') : line;
 }
 
 interface SummaryParts {
@@ -592,7 +598,7 @@ function renderSingleCollapsed(
 
     if (status === 'running') {
       const latest = getLatestActivity(r.messages);
-      if (latest) text += `\n${formatActivityLine(latest, theme, themeFg)}`;
+      if (latest) text += `\n${formatActivityLine(latest, theme, themeFg, width)}`;
     } else if (status === 'failed' && r.errorMessage) {
       text += `\n${theme.fg('error', `  Error: ${r.errorMessage}`)}`;
     }
@@ -628,7 +634,7 @@ function renderParallelCollapsed(
       );
       if (status === 'running') {
         const latest = getLatestActivity(r.messages);
-        if (latest) lines.push(formatActivityLine(latest, theme, themeFg));
+        if (latest) lines.push(formatActivityLine(latest, theme, themeFg, width));
       }
     }
     const completed = results.filter((r) => resolveExecutionStatus(r) === 'completed').length;
@@ -789,7 +795,7 @@ function renderChainCollapsed(
         lines.push(formatSummaryLine(parts, width, theme));
         if (step.status === 'running' && r) {
           const latest = getLatestActivity(r.messages);
-          if (latest) lines.push(formatActivityLine(latest, theme, themeFg));
+          if (latest) lines.push(formatActivityLine(latest, theme, themeFg, width));
         }
       } else {
         const items = fanoutResultsForStep(details.results, step.step);
@@ -810,7 +816,9 @@ function renderChainCollapsed(
             if (activity) {
               const total = step.executedCount || latestItem.fanout?.count || items.length;
               const oneBased = (step.latestIndex ?? 0) + 1;
-              lines.push(formatActivityLine(activity, theme, themeFg, `[${oneBased}/${total}] `));
+              lines.push(
+                formatActivityLine(activity, theme, themeFg, width, `[${oneBased}/${total}] `)
+              );
             }
           }
         }
