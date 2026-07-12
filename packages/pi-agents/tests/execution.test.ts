@@ -549,6 +549,39 @@ describe('runSingleAgentGrok', () => {
     expect(result.stderr).toContain('max turns reached');
   });
 
+  it('returns an actionable cwd_error without spawning when cwd does not exist', async () => {
+    let spawned = false;
+    const missingCwd = `/definitely/missing/pi-agent-cwd-${process.pid}`;
+    const result = await runSingleAgent(
+      process.cwd(),
+      [makeAgent()],
+      'maxie',
+      'go',
+      missingCwd,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      {
+        spawnFn: (() => {
+          spawned = true;
+          return new FakeChild() as unknown as SpawnedChild;
+        }) as SpawnFn,
+      }
+    );
+
+    expect(spawned).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('cwd_error');
+    expect(result.errorMessage).toBe(
+      `Cannot start agent: working directory does not exist: ${missingCwd}`
+    );
+    expect(result.stderr).toBe(
+      `Cannot start agent: working directory does not exist: ${missingCwd}`
+    );
+  });
+
   it('surfaces spawn errors on stderr and stopReason', async () => {
     const fake = new FakeChild();
     const spawnFn: SpawnFn = (() => fake as unknown as SpawnedChild) as SpawnFn;

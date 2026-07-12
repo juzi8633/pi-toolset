@@ -192,6 +192,7 @@ time; run `pi reload` (or restart) after adding/removing agent files.
 | `aborted`                 | User abort (Ctrl+C) killed the subprocess.                                                       |
 | `max_turns`               | Agent exceeded its `maxTurns` budget; child was `SIGTERM`'d. (`grok-acp` does not enforce this.) |
 | `context_error`           | Fork-context preparation failed before the child started.                                        |
+| `cwd_error`               | The requested working directory is missing, inaccessible, or not a directory.                    |
 | `isolation_error`         | Worktree isolation failed before the child started (e.g. not in a git repo).                     |
 | `completion_check`        | Final message is missing a configured `completionCheck` heading.                                 |
 | `template_error`          | A chain step referenced `{outputs.<name>}` for a step that did not run or was not named.         |

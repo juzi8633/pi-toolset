@@ -191,6 +191,22 @@ function finalizeCancelled(currentResult: SingleResult): void {
   }
 }
 
+function getWorkingDirectoryError(cwd: string): string | undefined {
+  try {
+    if (!fs.statSync(cwd).isDirectory()) {
+      return `Cannot start agent: working directory is not a directory: ${cwd}`;
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return `Cannot start agent: working directory does not exist: ${cwd}`;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return `Cannot start agent: cannot access working directory ${cwd}: ${message}`;
+  }
+  return undefined;
+}
+
 export async function runSingleAgent(
   defaultCwd: string,
   agents: AgentConfig[],
@@ -232,6 +248,27 @@ export async function runSingleAgent(
     thinking: effectiveThinking,
     runtime: effectiveRuntime,
   };
+
+  const workCwd = cwd ?? defaultCwd;
+  const cwdError = getWorkingDirectoryError(workCwd);
+  if (cwdError) {
+    return {
+      agent: agentName,
+      agentSource: agent.source,
+      task,
+      title: options.title,
+      exitCode: 1,
+      status: 'failed',
+      messages: [],
+      stderr: cwdError,
+      usage: emptyUsage(),
+      model: effectiveModel,
+      thinking: effectiveThinking,
+      step,
+      errorMessage: cwdError,
+      stopReason: 'cwd_error',
+    };
+  }
 
   if (effectiveRuntime === GROK_ACP_RUNTIME) {
     return runSingleAgentGrokAcp(
