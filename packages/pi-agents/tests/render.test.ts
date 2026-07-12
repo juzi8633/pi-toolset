@@ -188,8 +188,8 @@ afterEach(() => {
 });
 
 describe('RUNNING_STATUS_GLYPH', () => {
-  it('is the static hourglass-with-bars glyph for non-animated fallbacks', () => {
-    expect(RUNNING_STATUS_GLYPH).toBe('⧗');
+  it('is the static outlined-square glyph for non-animated fallbacks', () => {
+    expect(RUNNING_STATUS_GLYPH).toBe('▣');
   });
 });
 
@@ -566,7 +566,7 @@ describe('renderResult parallel', () => {
     expect(text.trimStart().startsWith('─── Task ───')).toBe(true);
     expect(text).not.toMatch(/^parallel /i);
     expect(text).toContain('✔ A');
-    expect(text).toContain('⧗ B');
+    expect(text).toContain('▣ B');
     expect(text).toContain('─── Task ───');
     expect(text).toContain('t1');
     expect(text).toContain('t2');

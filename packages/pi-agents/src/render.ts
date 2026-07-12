@@ -45,7 +45,7 @@ export const SPINNER_FRAMES = ['▫', '▪', '□', '■', '□', '▪', '▫'] 
 export const SPINNER_INTERVAL_MS = 150;
 
 /** Static running glyph: background launches and non-animated fallbacks. */
-export const RUNNING_STATUS_GLYPH = '⧗';
+export const RUNNING_STATUS_GLYPH = '▣';
 
 const QUEUED_GLYPH = '·';
 const SKIPPED_GLYPH = '–';
