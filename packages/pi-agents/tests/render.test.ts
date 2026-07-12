@@ -1,17 +1,19 @@
-// ABOUTME: Tests for agent tool TUI rendering — update-driven spinner frames and static background status.
-// ABOUTME: Uses a fake Theme and row state; no real TUI, timers, or agent subprocesses.
+// ABOUTME: Tests agent tool TUI rendering, including continuous spinner invalidation and cleanup.
+// ABOUTME: Uses fake renderer contexts and real short timers without agent subprocesses.
 
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { Theme } from '@earendil-works/pi-coding-agent';
 import type { Component } from '@earendil-works/pi-tui';
 import {
-  type AgentRenderContext,
+  activeSpinnerCount,
   type AgentRenderState,
-  clearSpinnerState,
+  type AgentToolRenderContext,
   renderResult,
   runningStatusGlyph,
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
+  stopAllSpinners,
+  stopSpinner,
 } from '../src/render.ts';
 import type { SingleResult, SubagentDetails } from '../src/types.ts';
 
@@ -32,11 +34,21 @@ function fakeTheme(): Theme {
   } as Theme;
 }
 
-function makeContext(state: AgentRenderState = {}): {
-  context: AgentRenderContext;
+let nextToolCallId = 0;
+
+function makeContext(
+  state: AgentRenderState = {},
+  invalidate: () => void = () => {}
+): {
+  context: AgentToolRenderContext;
   state: AgentRenderState;
 } {
-  return { context: { state }, state };
+  const context = {
+    toolCallId: `tool-${nextToolCallId++}`,
+    state,
+    invalidate,
+  } as AgentToolRenderContext;
+  return { context, state };
 }
 
 function singleResult(overrides: Partial<SingleResult> = {}): SingleResult {
@@ -59,6 +71,16 @@ function singleDetails(result: SingleResult): SubagentDetails {
     projectAgentsDir: null,
     builtinAgentsDir: '/builtin',
     results: [result],
+  };
+}
+
+function chainDetails(results: SingleResult[]): SubagentDetails {
+  return {
+    mode: 'chain',
+    agentScope: 'user',
+    projectAgentsDir: null,
+    builtinAgentsDir: '/builtin',
+    results,
   };
 }
 
@@ -96,6 +118,9 @@ function backgroundDetails(): SubagentDetails {
 function renderText(component: Component): string {
   return component.render(120).join('\n');
 }
+
+beforeEach(stopAllSpinners);
+afterEach(stopAllSpinners);
 
 describe('runningStatusGlyph', () => {
   it('falls back to hourglass without context', () => {
@@ -187,12 +212,10 @@ describe('renderResult spinner', () => {
       expect(done.startsWith('✓')).toBe(true);
       expect(state.spinnerStartedAt).toBeUndefined();
 
-      // Host dropped the row without a terminal render: only startedAt remains,
-      // and clearSpinnerState models session_shutdown / explicit teardown.
-      // There is never an interval to leak.
+      // Explicit teardown models a lifecycle fallback when the row disappears.
       renderResult(partial, { expanded: false, isPartial: true }, theme, context);
       expect(state.spinnerStartedAt).toBeDefined();
-      clearSpinnerState(state);
+      stopSpinner(context);
       expect(state.spinnerStartedAt).toBeUndefined();
       now += SPINNER_INTERVAL_MS * 100;
       expect(state.spinnerStartedAt).toBeUndefined();
@@ -314,44 +337,93 @@ describe('renderResult spinner', () => {
     }
   });
 
-  it('clears a prior running marker when rendering background result', () => {
-    const { context, state } = makeContext();
-    state.spinnerStartedAt = 99;
+  it('stops prior tickers on background, empty, and chain paths', () => {
+    const paths = [
+      { content: [{ type: 'text', text: 'launched' }], details: backgroundDetails() },
+      { content: [{ type: 'text', text: 'empty' }], details: undefined },
+      {
+        content: [{ type: 'text', text: 'chain' }],
+        details: chainDetails([singleResult({ step: 1 })]),
+      },
+    ];
+
+    for (const result of paths) {
+      const { context, state } = makeContext();
+      const partial = {
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult()),
+      };
+      renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+      expect(activeSpinnerCount()).toBe(1);
+      renderResult(result, { expanded: false, isPartial: false }, theme, context);
+      expect(activeSpinnerCount()).toBe(0);
+      expect(state.spinnerStartedAt).toBeUndefined();
+    }
+  });
+
+  it('continuously invalidates without partial updates and stops on completion', async () => {
+    let invalidations = 0;
+    const { context } = makeContext({}, () => invalidations++);
+    const partial = {
+      content: [{ type: 'text', text: 'running' }],
+      details: singleDetails(singleResult()),
+    };
+
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    await new Promise((resolve) => setTimeout(resolve, SPINNER_INTERVAL_MS * 3 + 30));
+    expect(invalidations).toBeGreaterThanOrEqual(2);
+
+    renderResult(partial, { expanded: false, isPartial: false }, theme, context);
+    const stoppedAt = invalidations;
+    await new Promise((resolve) => setTimeout(resolve, SPINNER_INTERVAL_MS * 2));
+    expect(invalidations).toBe(stoppedAt);
+    expect(activeSpinnerCount()).toBe(0);
+  });
+
+  it('does not create duplicate tickers for repeated renders', () => {
+    const { context } = makeContext();
+    const partial = {
+      content: [{ type: 'text', text: 'running' }],
+      details: singleDetails(singleResult()),
+    };
+
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    renderResult(partial, { expanded: true, isPartial: true }, theme, context);
+    expect(activeSpinnerCount()).toBe(1);
+    stopSpinner(context);
+    expect(activeSpinnerCount()).toBe(0);
+  });
+
+  it('self-stops when invalidate throws for a stale runtime', async () => {
+    const { context, state } = makeContext({}, () => {
+      throw new Error('stale runtime');
+    });
     renderResult(
       {
-        content: [{ type: 'text', text: 'launched' }],
-        details: backgroundDetails(),
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult()),
       },
-      { expanded: false, isPartial: false },
+      { expanded: false, isPartial: true },
       theme,
       context
     );
+
+    await new Promise((resolve) => setTimeout(resolve, SPINNER_INTERVAL_MS + 30));
+    expect(activeSpinnerCount()).toBe(0);
     expect(state.spinnerStartedAt).toBeUndefined();
   });
 
-  it('does not install intervals — wall wait after partial render is idle', async () => {
-    const { context, state } = makeContext();
-    const realNow = Date.now;
-    Date.now = () => 40_000;
-    try {
-      renderResult(
-        {
-          content: [{ type: 'text', text: 'running' }],
-          details: singleDetails(singleResult()),
-        },
-        { expanded: false, isPartial: true },
-        theme,
-        context
-      );
-      expect(state.spinnerStartedAt).toBe(40_000);
-      const startedAt = state.spinnerStartedAt;
-
-      await new Promise((r) => setTimeout(r, SPINNER_INTERVAL_MS + 40));
-      // No background tick mutates state while the host is idle.
-      expect(state.spinnerStartedAt).toBe(startedAt);
-      expect(Object.keys(state)).toEqual(['spinnerStartedAt']);
-    } finally {
-      Date.now = realNow;
-    }
+  it('stops all tickers and releases their contexts', () => {
+    const first = makeContext();
+    const second = makeContext();
+    const partial = {
+      content: [{ type: 'text', text: 'running' }],
+      details: singleDetails(singleResult()),
+    };
+    renderResult(partial, { expanded: false, isPartial: true }, theme, first.context);
+    renderResult(partial, { expanded: false, isPartial: true }, theme, second.context);
+    expect(activeSpinnerCount()).toBe(2);
+    stopAllSpinners();
+    expect(activeSpinnerCount()).toBe(0);
   });
 });

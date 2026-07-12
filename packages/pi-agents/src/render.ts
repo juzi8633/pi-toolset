@@ -19,14 +19,10 @@ type ThemeFg = (color: ThemeColor, text: string) => string;
 
 /** Braille spinner frames (same set as pi-tui Loader). */
 export const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
-/** Frame step used when deriving the glyph from elapsed time between host re-renders. */
+/** Frame step used for invalidation and elapsed-time frame selection. */
 export const SPINNER_INTERVAL_MS = 80;
 
-/**
- * Row-local renderer state for `registerTool<..., AgentRenderState>`.
- * No timers: pi's ToolExecutionComponent has no dispose hook, so intervals that
- * call invalidate() would leak across chat clear/compaction/session teardown.
- */
+/** Row-local renderer state for `registerTool<..., AgentRenderState>`. */
 export interface AgentRenderState {
   /** Wall-clock start of the current running phase; cleared when not running. */
   spinnerStartedAt?: number;
@@ -42,8 +38,15 @@ export type AgentToolRenderContext = Parameters<
   >
 >[3];
 
-/** Minimal context surface used by render helpers (state only). */
+/** Minimal context surface used by frame calculation helpers. */
 export type AgentRenderContext = Pick<AgentToolRenderContext, 'state'>;
+
+type SpinnerTicker = {
+  context: AgentToolRenderContext;
+  interval: ReturnType<typeof setInterval>;
+};
+
+const spinnerTickers = new Map<string, SpinnerTicker>();
 
 /** Clear spinner bookkeeping. Safe on missing/partial state. */
 export function clearSpinnerState(state: AgentRenderState | undefined): void {
@@ -51,13 +54,53 @@ export function clearSpinnerState(state: AgentRenderState | undefined): void {
   state.spinnerStartedAt = undefined;
 }
 
-export const stopSpinner = clearSpinnerState;
+export function startSpinner(context: AgentToolRenderContext | undefined): void {
+  if (!context) return;
+  const existing = spinnerTickers.get(context.toolCallId);
+  if (existing) {
+    existing.context = context;
+    return;
+  }
+
+  const toolCallId = context.toolCallId;
+  const interval = setInterval(() => {
+    const ticker = spinnerTickers.get(toolCallId);
+    if (!ticker) return;
+    try {
+      ticker.context.invalidate();
+    } catch {
+      stopSpinner(toolCallId);
+    }
+  }, SPINNER_INTERVAL_MS);
+  interval.unref();
+  spinnerTickers.set(context.toolCallId, { context, interval });
+}
+
+export function stopSpinner(context: AgentToolRenderContext | string | undefined): void {
+  if (!context) return;
+  const toolCallId = typeof context === 'string' ? context : context.toolCallId;
+  const ticker = spinnerTickers.get(toolCallId);
+  if (!ticker) {
+    if (typeof context !== 'string') clearSpinnerState(context.state);
+    return;
+  }
+  clearInterval(ticker.interval);
+  clearSpinnerState(ticker.context.state);
+  if (typeof context !== 'string' && context !== ticker.context) clearSpinnerState(context.state);
+  spinnerTickers.delete(toolCallId);
+}
+
+export function stopAllSpinners(): void {
+  for (const toolCallId of [...spinnerTickers.keys()]) stopSpinner(toolCallId);
+}
+
+export function activeSpinnerCount(): number {
+  return spinnerTickers.size;
+}
 
 /**
- * Running-status glyph driven by host re-renders (tool onUpdate / isPartial
- * flips), not by setInterval. Frame index is elapsed-time based so successive
- * partial renders animate without retaining TUI/component references.
- * Without context, falls back to a static hourglass for non-TUI callers.
+ * Running-status glyph uses elapsed time so delayed ticks do not cause frame drift.
+ * Without context, it falls back to a static hourglass for non-TUI callers.
  */
 export function runningStatusGlyph(
   isRunning: boolean,
@@ -256,7 +299,7 @@ export function renderResult(
   result: RenderResultInput,
   { expanded, isPartial = false }: RenderResultOptions,
   theme: Theme,
-  context?: AgentRenderContext | AgentToolRenderContext
+  context?: AgentToolRenderContext
 ): Component {
   const details = result.details;
   const mdTheme = getMarkdownTheme();
@@ -264,7 +307,7 @@ export function renderResult(
 
   if (details && details.mode === 'background') {
     // Background is a one-shot launch notice — keep the static hourglass, no spinner.
-    clearSpinnerState(context?.state);
+    stopSpinner(context);
     const launches = details.background ?? [];
     if (launches.length > 0) {
       const launch = launches[0];
@@ -280,7 +323,7 @@ export function renderResult(
   }
 
   if (!details || details.results.length === 0) {
-    clearSpinnerState(context?.state);
+    stopSpinner(context);
     const text = result.content[0];
     return new Text(text?.type === 'text' ? (text.text ?? '(no output)') : '(no output)', 0, 0);
   }
@@ -306,12 +349,13 @@ export function renderResult(
     const isError = isFailedResult(r);
     let icon: string;
     if (isError) {
-      clearSpinnerState(context?.state);
+      stopSpinner(context);
       icon = theme.fg('error', '✗');
     } else if (isPartial) {
+      startSpinner(context);
       icon = theme.fg('warning', runningStatusGlyph(true, context));
     } else {
-      clearSpinnerState(context?.state);
+      stopSpinner(context);
       icon = theme.fg('success', '✓');
     }
     const displayItems = getDisplayItems(r.messages);
@@ -372,7 +416,7 @@ export function renderResult(
   }
 
   if (details.mode === 'chain') {
-    clearSpinnerState(context?.state);
+    stopSpinner(context);
     const successCount = details.results.filter((r) => r.exitCode === 0).length;
     const icon =
       successCount === details.results.length ? theme.fg('success', '✓') : theme.fg('error', '✗');
@@ -459,6 +503,8 @@ export function renderResult(
     ).length;
     const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
     const isRunning = running > 0;
+    if (isRunning) startSpinner(context);
+    else stopSpinner(context);
     const runningGlyph = runningStatusGlyph(isRunning, context);
     const icon = isRunning
       ? theme.fg('warning', runningGlyph)
@@ -540,7 +586,7 @@ export function renderResult(
     return new Text(text, 0, 0);
   }
 
-  clearSpinnerState(context?.state);
+  stopSpinner(context);
   const text = result.content[0];
   return new Text(text?.type === 'text' ? (text.text ?? '(no output)') : '(no output)', 0, 0);
 }
