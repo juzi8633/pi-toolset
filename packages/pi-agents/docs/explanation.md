@@ -234,7 +234,7 @@ Zero/unknown fields are never printed as misleading zeros.
 
 ## Output display
 
-The collapsed view is a live snapshot: status icon (⏳ while streaming, ✓/✗ when
+The collapsed view is a live snapshot: status icon (⧗ while streaming, ✓/✗ when
 finished), agent name, the last 5-10 items, and usage stats as fields arrive.
 The expanded view (Ctrl+O) adds the full task text, every tool call with
 formatted arguments, and the final output rendered as Markdown. Tool-call

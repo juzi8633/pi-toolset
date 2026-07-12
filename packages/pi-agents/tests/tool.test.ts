@@ -57,7 +57,7 @@ function fakeManager(): {
       launches.push({ description: request.description, mode: request.mode });
       runs.push(request.run(new AbortController().signal) as Promise<AgentResult>);
       return {
-        content: [{ type: 'text', text: `⏳ launched ${request.mode}` }],
+        content: [{ type: 'text', text: `⧗ launched ${request.mode}` }],
         details: {
           mode: 'background',
           agentScope: request.agentScope,

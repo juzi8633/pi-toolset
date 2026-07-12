@@ -209,7 +209,7 @@ export function createBackgroundManager(
     if (job) job.promise = runPromise;
 
     const launchText =
-      `⏳ Background agent launched (${jobId}).\n` +
+      `⧗ Background agent launched (${jobId}).\n` +
       `Mode: ${request.mode}. ${request.description}\n` +
       `You will receive a follow-up message when it completes.`;
 
@@ -305,7 +305,7 @@ export function renderBackgroundMessage(
       case 'cancelled':
         return theme.fg('warning', '⊘');
       default:
-        return theme.fg('warning', '⏳');
+        return theme.fg('warning', '⧗');
     }
   })();
 

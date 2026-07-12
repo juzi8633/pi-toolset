@@ -41,7 +41,7 @@ Pi calls the `agent` tool, which spawns an isolated `pi` subprocess with the
 While the agent runs, the collapsed view shows a live status icon, the agent
 name, and the last few tool calls.
 
-- **Collapsed view** (default): status icon (✓/✗/⏳), agent name, last 5-10
+- **Collapsed view** (default): status icon (✓/✗/⧗), agent name, last 5-10
   items, and usage stats. Fields appear as they become known (for `grok-acp`,
   ctx can stream mid-turn; the full `turns ↑input ↓output cache ctx model` line
   appears at turn end).
@@ -59,7 +59,7 @@ Give Pi several independent tasks at once:
 Run 2 explores in parallel: one to find models, one to find providers
 ```
 
-The parallel view shows every task with live status (⏳ running, ✓ done, ✗
+The parallel view shows every task with live status (⧗ running, ✓ done, ✗
 failed) and a "2/3 done, 1 running" summary. Each completed task's final output
 is returned to the parent, capped at 50 KB per task.
 

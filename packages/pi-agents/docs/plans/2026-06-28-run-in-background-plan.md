@@ -128,7 +128,7 @@
 **Steps:**
 
 - [ ] In `renderCall()`, append a muted `[background]` marker when `args.runInBackground` is true.
-- [ ] In `renderResult()`, add a `details.mode === "background"` branch that renders `⏳ background <jobId>` plus the description and “you will be notified when it completes”.
+- [ ] In `renderResult()`, add a `details.mode === "background"` branch that renders `⧗ background <jobId>` plus the description and “you will be notified when it completes”.
 - [ ] Export `renderBackgroundMessage(message, options, theme)` from `background.ts` or a small render helper.
 - [ ] In `index.ts`, call `pi.registerMessageRenderer(BACKGROUND_MESSAGE_TYPE, renderBackgroundMessage)`.
 - [ ] For completed notifications, render `✓ background <jobId>` and show the result summary in collapsed view.
