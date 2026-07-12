@@ -47,7 +47,7 @@ Running (glyph animates through ▫ ▪ □ ■):
 
 ```text
 ▪ explore (探索当前项目的整体结构...) · 9 turns ↑20k ↓6.5k R148k ctx:9.4k grok-4.5 • high
-  └ read ~/workspace/my/pi-myagent/.gitignore
+  └─ read ~/workspace/my/pi-myagent/.gitignore
 (Ctrl+O to expand)
 ```
 
@@ -125,7 +125,7 @@ One summary line per task in input order. At most one latest-activity line under
 ```text
 ✔ explore (探索项目结构...) · 5 turns ↑12k ↓2k grok-4.5 • high
 ▪ reviewer (审查模型服务...) · 4 turns ↑8k ↓1k openai-codex/gpt-5.6 • high
-  └ read src/services/models.rs
+  └─ read src/services/models.rs
 · worker (queued task...) ·
 Total: 1/2 completed · 9 turns ↑20k ↓3k R40k ctx:max 12k
 (Ctrl+O to expand)
@@ -148,7 +148,7 @@ One line per started logical step. Queued future steps are omitted. At most one 
 ```text
 ✔ 1. explore (分析当前实现...) · 5 turns ↑12k ↓2k grok-4.5 • high
 ▪ 2. planner (制定实施计划...) · 4 turns ↑8k ↓1k openai-codex/gpt-5.6 • high
-  └ read docs/spec.md
+  └─ read docs/spec.md
 Chain: step 2/3 · 1 completed · 9 turns ↑20k ↓3k R40k ctx:max 12k
 (Ctrl+O to expand)
 ```
@@ -196,7 +196,7 @@ A fanout is one logical Chain step in collapse regardless of how many items exec
 ```text
 ✔ 1. planner (生成审查目标...) · 4 turns ↑8k ↓1k grok-4.5 • high
 ▪ 2. reviewer fanout (审查每个目标...) · 3/8 done, 4 running, 1 queued · 12 turns ↑24k ↓4k
-  └ [5/8] read src/models.ts
+  └─ [5/8] read src/models.ts
 Chain: step 2/3 · 1 completed · 16 turns ↑32k ↓5k R60k ctx:max 14k
 (Ctrl+O to expand)
 ```

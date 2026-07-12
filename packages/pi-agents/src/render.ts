@@ -398,7 +398,7 @@ function formatActivityLine(
   width: number,
   prefix = ''
 ): string {
-  const prefixStr = theme.fg('muted', `  └ ${prefix}`);
+  const prefixStr = theme.fg('muted', `  └─ ${prefix}`);
   if (item.type === 'toolCall') {
     return fitActivityLine(prefixStr + formatToolCall(item.name, item.args, themeFg), width);
   }

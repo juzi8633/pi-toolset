@@ -291,7 +291,7 @@ describe('renderResult single', () => {
     expect(text).toContain('Explore');
     expect(text).toContain('9 turns');
     expect(text).toContain('grok-4.5');
-    expect(text).toContain('└');
+    expect(text).toContain('└─');
     expect(text).toContain('ls -la');
     expect(text).not.toContain('.gitignore'); // only latest activity
     expect(text).toContain('(Ctrl+O to expand)');
@@ -320,7 +320,7 @@ describe('renderResult single', () => {
       )
     );
     expect(text.startsWith('✔')).toBe(true);
-    expect(text).not.toContain('└');
+    expect(text).not.toContain('└─');
     expect(text).not.toContain('final answer body');
     expect(text).toContain('(Ctrl+O to expand)');
   });
@@ -475,7 +475,7 @@ describe('renderResult single', () => {
       ),
       width
     );
-    const activityLines = text.split('\n').filter((l) => l.includes('└'));
+    const activityLines = text.split('\n').filter((l) => l.includes('└─'));
     expect(activityLines).toHaveLength(1);
     const line = activityLines[0]!;
     // Whole line, prefix included, must not exceed the available width (ANSI-safe truncation).
@@ -544,13 +544,13 @@ describe('renderResult parallel', () => {
     expect(text).toContain('Explore');
     expect(text).toContain('Reviewer');
     expect(text).toContain('Worker');
-    expect(text).toContain('└');
+    expect(text).toContain('└─');
     expect(text).toContain('read');
     expect(text).toContain('Total:');
     expect(text).toContain('1/3 completed');
     expect(text).toContain('(Ctrl+O to expand)');
     // completed and queued should not show activity lines with tool names beyond the one running
-    const activityLines = text.split('\n').filter((l) => l.includes('└'));
+    const activityLines = text.split('\n').filter((l) => l.includes('└─'));
     expect(activityLines).toHaveLength(1);
   });
 
@@ -665,11 +665,11 @@ describe('renderResult chain', () => {
     expect(text).toContain('1. Explore');
     expect(text).toContain('2. Planner');
     expect(text).not.toContain('3. Worker'); // queued omitted
-    expect(text).toContain('└');
+    expect(text).toContain('└─');
     expect(text).toContain('read');
     expect(text).toContain('Chain: step 2/3');
     expect(text).toContain('1 completed');
-    const activityLines = text.split('\n').filter((l) => l.includes('└'));
+    const activityLines = text.split('\n').filter((l) => l.includes('└─'));
     expect(activityLines).toHaveLength(1);
   });
 
