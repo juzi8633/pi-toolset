@@ -235,12 +235,17 @@ Zero/unknown fields are never printed as misleading zeros.
 ## Output display
 
 Collapsed output is intentionally a compact live summary: status glyph
-(⧗ running, ✔ completed, ✗ failed, ⊘ cancelled, · queued), agent name,
-truncated task preview, usage, and at most one latest activity line while
-running. Completed Single results hide activity and final output until
-expanded. Use Ctrl+O for the full task, ordered transcript, final output
-(once), and error/worktree/structured-output details. Tool-call formatting
-mimics Pi's built-in tools (`$ command` for bash, `read ~/path:1-10` for read,
+(outline-fill spinner ▫▪□■ while a live partial result is collapsed and
+running; static ⧗ for expanded running views, background launch notices, and
+history/final renders; ✔ completed, ✗ failed, ⊘ cancelled, · queued), agent
+name, truncated task preview, usage, and at most one latest activity line
+while running. Animation advances every 100ms through a single shared ticker
+that invalidates all armed tool rows; it never starts from restored or
+non-partial renders even if details still say running. Completed Single
+results hide activity and final output until expanded. Use Ctrl+O for the
+full task, ordered transcript, final output (once), and
+error/worktree/structured-output details. Tool-call formatting mimics Pi's
+built-in tools (`$ command` for bash, `read ~/path:1-10` for read,
 `grep /pattern/ in ~/path` for grep, etc.).
 
 Parallel mode shows one summary line per task in input order, latest activity

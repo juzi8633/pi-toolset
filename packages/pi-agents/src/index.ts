@@ -11,7 +11,13 @@ import {
 } from './background.ts';
 import { renderAgentCatalogue, shouldInjectAgentCatalogue } from './catalogue.ts';
 import { registerAgentCommand } from './command.ts';
-import { type AgentRenderState, renderCall, renderResult } from './render.ts';
+import {
+  type AgentRenderState,
+  renderCall,
+  renderResult,
+  stopAllSpinners,
+  stopSpinner,
+} from './render.ts';
 import { SubagentParams } from './schema.ts';
 import { setDiscoveredSkillsFromOptions } from './skills.ts';
 import { executeAgentTool } from './tool.ts';
@@ -32,8 +38,27 @@ export function normalizeAgentArgs(args: unknown): unknown {
   return args;
 }
 
+/**
+ * Register lifecycle hooks so the shared spinner ticker cannot leak past tool or
+ * session teardown. Event names match Pi 0.80.1 ExtensionAPI (including /tree).
+ * Handlers are additive with other extension listeners on the same event.
+ */
+export function registerSpinnerLifecycle(pi: ExtensionAPI): void {
+  pi.on('tool_execution_end', (event) => {
+    if (event.toolName === 'agent') stopSpinner(event.toolCallId);
+  });
+  pi.on('agent_end', stopAllSpinners);
+  pi.on('session_before_compact', stopAllSpinners);
+  pi.on('session_before_switch', stopAllSpinners);
+  pi.on('session_before_tree', stopAllSpinners);
+  pi.on('session_tree', stopAllSpinners);
+  pi.on('session_start', stopAllSpinners);
+  pi.on('session_shutdown', stopAllSpinners);
+}
+
 export default function (pi: ExtensionAPI) {
   const backgroundManager = createBackgroundManager(pi);
+  registerSpinnerLifecycle(pi);
 
   pi.registerMessageRenderer(BACKGROUND_MESSAGE_TYPE, renderBackgroundMessage);
 

@@ -39,7 +39,12 @@ import type {
 
 type ThemeFg = (color: ThemeColor, text: string) => string;
 
-/** Static glyph for foreground agent runs; avoids status-line thrash on stream updates. */
+/** Outline-fill spinner frames('▫', '▪', '◻', '◼') for collapsed running status. */
+export const SPINNER_FRAMES = ['▫', '▪', '◻', '◼'] as const;
+/** Frame step for spinner invalidation and elapsed-time frame selection. */
+export const SPINNER_INTERVAL_MS = 100;
+
+/** Static running glyph: background launches and non-animated fallbacks. */
 export const RUNNING_STATUS_GLYPH = '⧗';
 
 const QUEUED_GLYPH = '·';
@@ -48,7 +53,10 @@ const CANCELLED_GLYPH = '⊘';
 const EXPAND_HINT = '(Ctrl+O to expand)';
 
 /** Row-local renderer state for `registerTool<..., AgentRenderState>`. */
-export interface AgentRenderState {}
+export interface AgentRenderState {
+  /** Wall-clock start of the current collapsed running phase; cleared when idle. */
+  spinnerStartedAt?: number;
+}
 
 /**
  * Official tool-renderer context for this tool, recovered from ToolDefinition
@@ -59,6 +67,143 @@ export type AgentToolRenderContext = Parameters<
     ToolDefinition<typeof SubagentParams, SubagentDetails, AgentRenderState>['renderResult']
   >
 >[3];
+
+/** Minimal context surface used by frame calculation helpers. */
+export type AgentRenderContext = Pick<AgentToolRenderContext, 'state'>;
+
+/** Injectable timer surface so tests can drive the shared ticker without wall-clock waits. */
+export type SpinnerScheduler = {
+  setInterval: (handler: () => void, ms: number) => unknown;
+  clearInterval: (id: unknown) => void;
+};
+
+const defaultSpinnerScheduler: SpinnerScheduler = {
+  setInterval(handler, ms) {
+    const id = globalThis.setInterval(handler, ms);
+    id.unref?.();
+    return id;
+  },
+  clearInterval(id) {
+    globalThis.clearInterval(id as ReturnType<typeof setInterval>);
+  },
+};
+
+let spinnerScheduler: SpinnerScheduler = defaultSpinnerScheduler;
+
+/** Active collapsed-partial tool rows keyed by toolCallId. One shared interval drives all. */
+const activeSpinners = new Map<string, AgentToolRenderContext>();
+let sharedTickerId: unknown | undefined;
+
+/** Clear spinner bookkeeping. Safe on missing/partial state. */
+export function clearSpinnerState(state: AgentRenderState | undefined): void {
+  if (!state) return;
+  state.spinnerStartedAt = undefined;
+}
+
+/** Replace the shared ticker scheduler (tests). Pass undefined to restore defaults. */
+export function installSpinnerScheduler(scheduler: SpinnerScheduler | undefined): void {
+  stopAllSpinners();
+  spinnerScheduler = scheduler ?? defaultSpinnerScheduler;
+}
+
+function stopSharedTicker(): void {
+  if (sharedTickerId === undefined) return;
+  spinnerScheduler.clearInterval(sharedTickerId);
+  sharedTickerId = undefined;
+}
+
+function ensureSharedTicker(): void {
+  if (sharedTickerId !== undefined || activeSpinners.size === 0) return;
+  sharedTickerId = spinnerScheduler.setInterval(() => {
+    for (const [toolCallId, context] of [...activeSpinners.entries()]) {
+      try {
+        context.invalidate();
+      } catch {
+        stopSpinner(toolCallId);
+      }
+    }
+  }, SPINNER_INTERVAL_MS);
+}
+
+/**
+ * Arm continuous invalidation for a collapsed partial tool row.
+ * Frame origin is set once per armed phase; re-renders refresh the context ref only.
+ */
+export function startSpinner(
+  context: AgentToolRenderContext | undefined,
+  now: () => number = Date.now
+): void {
+  if (!context) return;
+  if (typeof context.state.spinnerStartedAt !== 'number') {
+    context.state.spinnerStartedAt = now();
+  }
+  activeSpinners.set(context.toolCallId, context);
+  ensureSharedTicker();
+}
+
+export function stopSpinner(context: AgentToolRenderContext | string | undefined): void {
+  if (!context) return;
+  const toolCallId = typeof context === 'string' ? context : context.toolCallId;
+  const active = activeSpinners.get(toolCallId);
+  if (!active) {
+    if (typeof context !== 'string') clearSpinnerState(context.state);
+    return;
+  }
+  clearSpinnerState(active.state);
+  if (typeof context !== 'string' && context !== active) clearSpinnerState(context.state);
+  activeSpinners.delete(toolCallId);
+  if (activeSpinners.size === 0) stopSharedTicker();
+}
+
+export function stopAllSpinners(): void {
+  for (const toolCallId of [...activeSpinners.keys()]) stopSpinner(toolCallId);
+  stopSharedTicker();
+}
+
+/** Number of tool rows currently armed for continuous spinner invalidation. */
+export function activeSpinnerCount(): number {
+  return activeSpinners.size;
+}
+
+/** Whether the single shared interval is running (0 or 1 intervals total). */
+export function isSharedSpinnerTickerActive(): boolean {
+  return sharedTickerId !== undefined;
+}
+
+/**
+ * Start/stop the shared ticker only for live collapsed partial results that are
+ * still running. History restore, final results (isPartial=false), expanded view,
+ * and terminal/error paths never arm an interval — even if details still say running.
+ */
+function syncCollapsedPartialSpinner(
+  context: AgentToolRenderContext | undefined,
+  options: { expanded: boolean; isPartial: boolean },
+  detailsRunning: boolean
+): void {
+  const shouldAnimate = options.isPartial && !options.expanded && detailsRunning;
+  if (shouldAnimate) startSpinner(context);
+  else stopSpinner(context);
+}
+
+/**
+ * Collapsed running-status glyph. Animates only when startSpinner armed the row
+ * (spinnerStartedAt set); otherwise returns the static running glyph.
+ */
+export function runningStatusGlyph(
+  isRunning: boolean,
+  context: AgentRenderContext | undefined,
+  now: () => number = Date.now
+): string {
+  if (!isRunning) {
+    clearSpinnerState(context?.state);
+    return RUNNING_STATUS_GLYPH;
+  }
+  const startedAt = context?.state.spinnerStartedAt;
+  if (typeof startedAt !== 'number') return RUNNING_STATUS_GLYPH;
+  const elapsed = Math.max(0, now() - startedAt);
+  const frame = Math.floor(elapsed / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[frame]!;
+}
 
 /** Component that builds text at render time using the available terminal width. */
 class WidthText implements Component {
@@ -178,12 +323,12 @@ function clampTitle(title: string | undefined, maxColumns: number): string | und
   return clamped || undefined;
 }
 
-function statusGlyph(status: ExecutionStatus, theme: Theme): string {
+function statusGlyph(status: ExecutionStatus, theme: Theme, context?: AgentRenderContext): string {
   switch (status) {
     case 'queued':
       return theme.fg('muted', QUEUED_GLYPH);
     case 'running':
-      return theme.fg('accent', RUNNING_STATUS_GLYPH);
+      return theme.fg('accent', runningStatusGlyph(true, context));
     case 'completed':
       return theme.fg('success', '✔');
     case 'failed':
@@ -193,6 +338,23 @@ function statusGlyph(status: ExecutionStatus, theme: Theme): string {
     case 'skipped':
       return theme.fg('muted', SKIPPED_GLYPH);
   }
+}
+
+function hasRunningResults(results: SingleResult[]): boolean {
+  return results.some((r) => resolveExecutionStatus(r) === 'running');
+}
+
+function hasRunningChain(chain: ChainExecutionDetails): boolean {
+  return chain.steps.some((s) => s.status === 'running');
+}
+
+function detailsNeedsCollapsedSpinner(details: SubagentDetails): boolean {
+  if (details.mode === 'background') return false;
+  if (details.mode === 'chain') {
+    const chain = details.chain ?? fallbackChainFromResults(details.results);
+    return hasRunningChain(chain);
+  }
+  return hasRunningResults(details.results);
 }
 
 function aggregateUsage(results: SingleResult[]): UsageStats {
@@ -290,12 +452,18 @@ function formatSummaryLine(parts: SummaryParts, width: number, theme: Theme): st
 function resultSummaryParts(
   r: SingleResult,
   theme: Theme,
-  options?: { labelPrefix?: string; agentSuffix?: string; progress?: string }
+  options?: {
+    labelPrefix?: string;
+    agentSuffix?: string;
+    progress?: string;
+    /** When set, running glyphs animate with the outline-fill spinner. */
+    animateContext?: AgentRenderContext;
+  }
 ): SummaryParts {
   const status = resolveExecutionStatus(r);
   const agentLabel = (options?.labelPrefix ?? '') + r.agent + (options?.agentSuffix ?? '');
   return {
-    glyph: statusGlyph(status, theme),
+    glyph: statusGlyph(status, theme, options?.animateContext),
     label: theme.fg('accent', agentLabel),
     task: r.task,
     titlePreview: clampTitle(r.title, TITLE_MAX_COLUMNS),
@@ -401,10 +569,19 @@ function appendExpandedResultSections(
   }
 }
 
-function renderSingleCollapsed(r: SingleResult, theme: Theme, themeFg: ThemeFg): Component {
+function renderSingleCollapsed(
+  r: SingleResult,
+  theme: Theme,
+  themeFg: ThemeFg,
+  context?: AgentRenderContext
+): Component {
   return new WidthText((width) => {
     const status = resolveExecutionStatus(r);
-    let text = formatSummaryLine(resultSummaryParts(r, theme), width, theme);
+    let text = formatSummaryLine(
+      resultSummaryParts(r, theme, { animateContext: context }),
+      width,
+      theme
+    );
 
     if (status === 'running') {
       const latest = getLatestActivity(r.messages);
@@ -432,13 +609,16 @@ function renderSingleExpanded(
 function renderParallelCollapsed(
   results: SingleResult[],
   theme: Theme,
-  themeFg: ThemeFg
+  themeFg: ThemeFg,
+  context?: AgentRenderContext
 ): Component {
   return new WidthText((width) => {
     const lines: string[] = [];
     for (const r of results) {
       const status = resolveExecutionStatus(r);
-      lines.push(formatSummaryLine(resultSummaryParts(r, theme), width, theme));
+      lines.push(
+        formatSummaryLine(resultSummaryParts(r, theme, { animateContext: context }), width, theme)
+      );
       if (status === 'running') {
         const latest = getLatestActivity(r.messages);
         if (latest) lines.push(formatActivityLine(latest, theme, themeFg));
@@ -566,7 +746,12 @@ function chainFooter(chain: ChainExecutionDetails, results: SingleResult[], them
   return theme.fg('dim', `Chain: ${parts.join(' · ')}`);
 }
 
-function renderChainCollapsed(details: SubagentDetails, theme: Theme, themeFg: ThemeFg): Component {
+function renderChainCollapsed(
+  details: SubagentDetails,
+  theme: Theme,
+  themeFg: ThemeFg,
+  context?: AgentRenderContext
+): Component {
   return new WidthText((width) => {
     const chain = details.chain ?? fallbackChainFromResults(details.results);
     const lines: string[] = [];
@@ -590,9 +775,10 @@ function renderChainCollapsed(details: SubagentDetails, theme: Theme, themeFg: T
         };
         const parts = resultSummaryParts(synthetic, theme, {
           labelPrefix: `${step.step}. `,
+          animateContext: context,
         });
         // Prefer logical status for glyph
-        parts.glyph = statusGlyph(step.status, theme);
+        parts.glyph = statusGlyph(step.status, theme, context);
         lines.push(formatSummaryLine(parts, width, theme));
         if (step.status === 'running' && r) {
           const latest = getLatestActivity(r.messages);
@@ -602,7 +788,7 @@ function renderChainCollapsed(details: SubagentDetails, theme: Theme, themeFg: T
         const items = fanoutResultsForStep(details.results, step.step);
         const usage = aggregateUsage(items.length > 0 ? items : []);
         const parts: SummaryParts = {
-          glyph: statusGlyph(step.status, theme),
+          glyph: statusGlyph(step.status, theme, context),
           label: theme.fg('accent', `${step.step}. ${step.agent} fanout`),
           task: step.taskTemplate,
           titlePreview: clampTitle(step.title, TITLE_MAX_COLUMNS),
@@ -698,20 +884,25 @@ function renderChainExpanded(
 
 export function renderResult(
   result: RenderResultInput,
-  { expanded, isPartial: _isPartial = false }: RenderResultOptions,
+  { expanded, isPartial = false }: RenderResultOptions,
   theme: Theme,
-  _context?: AgentToolRenderContext
+  context?: AgentToolRenderContext
 ): Component {
   const details = result.details;
   const mdTheme = getMarkdownTheme();
   const themeFg: ThemeFg = theme.fg.bind(theme);
+  // Gate continuous invalidation on ToolRenderResultOptions (isPartial + expanded).
+  // History/final renders use isPartial=false, so orphan tickers cannot arm from restored running status.
+  const view = { expanded, isPartial };
 
   if (details && details.mode === 'background') {
+    // One-shot launch notice — static hourglass, no continuous spinner.
+    stopSpinner(context);
     const launches = details.background ?? [];
     if (launches.length > 0) {
       const launch = launches[0];
       let text =
-        theme.fg('warning', '⧗ ') +
+        theme.fg('warning', `${RUNNING_STATUS_GLYPH} `) +
         theme.fg('toolTitle', theme.bold('background ')) +
         theme.fg('accent', launch.jobId) +
         theme.fg('muted', ` [${launch.mode}]`);
@@ -728,33 +919,39 @@ export function renderResult(
   if (!details || details.results.length === 0) {
     // Empty results may still carry Chain logical state (e.g. early validation).
     if (details?.mode === 'chain' && details.chain) {
+      syncCollapsedPartialSpinner(context, view, hasRunningChain(details.chain));
       return expanded
         ? renderChainExpanded(details, theme, themeFg, mdTheme)
-        : renderChainCollapsed(details, theme, themeFg);
+        : renderChainCollapsed(details, theme, themeFg, context);
     }
+    stopSpinner(context);
     const text = result.content[0];
     return new Text(text?.type === 'text' ? (text.text ?? '(no output)') : '(no output)', 0, 0);
   }
 
   if (details.mode === 'single' && details.results.length === 1) {
     const r = details.results[0];
+    syncCollapsedPartialSpinner(context, view, resolveExecutionStatus(r) === 'running');
     return expanded
       ? renderSingleExpanded(r, theme, themeFg, mdTheme)
-      : renderSingleCollapsed(r, theme, themeFg);
+      : renderSingleCollapsed(r, theme, themeFg, context);
   }
 
   if (details.mode === 'chain') {
+    syncCollapsedPartialSpinner(context, view, detailsNeedsCollapsedSpinner(details));
     return expanded
       ? renderChainExpanded(details, theme, themeFg, mdTheme)
-      : renderChainCollapsed(details, theme, themeFg);
+      : renderChainCollapsed(details, theme, themeFg, context);
   }
 
   if (details.mode === 'parallel') {
+    syncCollapsedPartialSpinner(context, view, hasRunningResults(details.results));
     return expanded
       ? renderParallelExpanded(details.results, theme, themeFg, mdTheme)
-      : renderParallelCollapsed(details.results, theme, themeFg);
+      : renderParallelCollapsed(details.results, theme, themeFg, context);
   }
 
+  stopSpinner(context);
   const text = result.content[0];
   return new Text(text?.type === 'text' ? (text.text ?? '(no output)') : '(no output)', 0, 0);
 }

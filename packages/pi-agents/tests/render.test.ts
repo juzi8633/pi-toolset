@@ -1,18 +1,57 @@
-// ABOUTME: Tests agent tool TUI rendering for compact collapse and complete expanded layouts.
-// ABOUTME: Uses fake renderer contexts without agent subprocesses.
+// ABOUTME: Tests agent tool TUI rendering for compact collapse, expanded layouts, and spinner animation.
+// ABOUTME: Uses fake renderer contexts and an injectable spinner scheduler (no wall-clock waits).
 
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { Theme } from '@earendil-works/pi-coding-agent';
 import type { Component } from '@earendil-works/pi-tui';
 import {
+  activeSpinnerCount,
   type AgentRenderState,
   type AgentToolRenderContext,
+  installSpinnerScheduler,
+  isSharedSpinnerTickerActive,
   renderCall,
   renderResult,
   RUNNING_STATUS_GLYPH,
+  runningStatusGlyph,
+  type SpinnerScheduler,
+  SPINNER_FRAMES,
+  SPINNER_INTERVAL_MS,
+  startSpinner,
+  stopAllSpinners,
+  stopSpinner,
 } from '../src/render.ts';
 import type { ChainExecutionDetails, SingleResult, SubagentDetails } from '../src/types.ts';
 import { emptyUsage } from '../src/types.ts';
+
+/** Manual scheduler: records the shared tick handler so tests advance time deterministically. */
+function createManualScheduler(): {
+  scheduler: SpinnerScheduler;
+  tick: () => void;
+  intervalMs: () => number | undefined;
+  isActive: () => boolean;
+} {
+  let handler: (() => void) | undefined;
+  let intervalMs: number | undefined;
+  return {
+    scheduler: {
+      setInterval(h, ms) {
+        handler = h;
+        intervalMs = ms;
+        return 1;
+      },
+      clearInterval() {
+        handler = undefined;
+        intervalMs = undefined;
+      },
+    },
+    tick() {
+      handler?.();
+    },
+    intervalMs: () => intervalMs,
+    isActive: () => handler !== undefined,
+  };
+}
 
 function fakeTheme(): Theme {
   return {
@@ -131,9 +170,72 @@ function renderText(component: Component, width = 120): string {
   return component.render(width).join('\n');
 }
 
+function startsWithSpinnerFrame(text: string): boolean {
+  return SPINNER_FRAMES.some((frame) => text.startsWith(frame));
+}
+
+function containsSpinnerFrame(text: string): boolean {
+  return SPINNER_FRAMES.some((frame) => text.includes(frame));
+}
+
+beforeEach(() => {
+  stopAllSpinners();
+  installSpinnerScheduler(undefined);
+});
+afterEach(() => {
+  stopAllSpinners();
+  installSpinnerScheduler(undefined);
+});
+
 describe('RUNNING_STATUS_GLYPH', () => {
-  it('is the static hourglass-with-bars glyph', () => {
+  it('is the static hourglass-with-bars glyph for non-animated fallbacks', () => {
     expect(RUNNING_STATUS_GLYPH).toBe('⧗');
+  });
+});
+
+describe('runningStatusGlyph', () => {
+  it('falls back to the static glyph without context or when not armed', () => {
+    expect(runningStatusGlyph(true, undefined)).toBe(RUNNING_STATUS_GLYPH);
+    expect(runningStatusGlyph(false, undefined)).toBe(RUNNING_STATUS_GLYPH);
+    const { context, state } = makeContext();
+    expect(runningStatusGlyph(true, context)).toBe(RUNNING_STATUS_GLYPH);
+    expect(state.spinnerStartedAt).toBeUndefined();
+  });
+
+  it('cycles outline-fill frames from elapsed time when armed', () => {
+    const { context, state } = makeContext();
+    let now = 1_000_000;
+    const clock = () => now;
+    startSpinner(context, clock);
+
+    expect(runningStatusGlyph(true, context, clock)).toBe(SPINNER_FRAMES[0]);
+    expect(state.spinnerStartedAt).toBe(1_000_000);
+    expect(runningStatusGlyph(true, context, clock)).toBe(SPINNER_FRAMES[0]);
+
+    now += SPINNER_INTERVAL_MS;
+    expect(runningStatusGlyph(true, context, clock)).toBe(SPINNER_FRAMES[1]);
+
+    now += SPINNER_INTERVAL_MS * 2;
+    expect(runningStatusGlyph(true, context, clock)).toBe(SPINNER_FRAMES[3]);
+
+    expect(runningStatusGlyph(false, context, clock)).toBe(RUNNING_STATUS_GLYPH);
+    expect(state.spinnerStartedAt).toBeUndefined();
+  });
+
+  it('restarting after stop begins a new frame sequence', () => {
+    const { context, state } = makeContext();
+    let now = 5_000;
+    const clock = () => now;
+
+    startSpinner(context, clock);
+    now += SPINNER_INTERVAL_MS * 3;
+    stopSpinner(context);
+    expect(state.spinnerStartedAt).toBeUndefined();
+
+    now = 50_000;
+    startSpinner(context, clock);
+    expect(runningStatusGlyph(true, context, clock)).toBe(SPINNER_FRAMES[0]);
+    expect(state.spinnerStartedAt).toBe(50_000);
   });
 });
 
@@ -184,7 +286,8 @@ describe('renderResult single', () => {
         context
       )
     );
-    expect(text).toContain(RUNNING_STATUS_GLYPH);
+    expect(startsWithSpinnerFrame(text)).toBe(true);
+    expect(text).not.toContain(RUNNING_STATUS_GLYPH);
     expect(text).toContain('explore');
     expect(text).toContain('9 turns');
     expect(text).toContain('grok-4.5');
@@ -349,7 +452,7 @@ describe('renderResult single', () => {
     const firstLine = text.split('\n')[0] ?? '';
     expect(visibleWidth(firstLine)).toBeLessThanOrEqual(width);
     expect(firstLine).toContain('explore');
-    expect(firstLine).toContain(RUNNING_STATUS_GLYPH);
+    expect(startsWithSpinnerFrame(firstLine)).toBe(true);
   });
 });
 
@@ -704,7 +807,7 @@ describe('renderResult misc', () => {
   });
 
   it('uses the static running glyph for background launches', () => {
-    const { context } = makeContext();
+    const { context, state } = makeContext();
     const text = renderText(
       renderResult(
         {
@@ -716,13 +819,121 @@ describe('renderResult misc', () => {
         context
       )
     );
-    expect(text).toContain('⧗');
+    expect(text).toContain(RUNNING_STATUS_GLYPH);
     expect(text).toContain('background');
     expect(text).toContain('agent-bg-1');
     expect(text).toContain('You will be notified when it completes.');
+    expect(state.spinnerStartedAt).toBeUndefined();
+    expect(activeSpinnerCount()).toBe(0);
+    for (const frame of SPINNER_FRAMES) {
+      expect(text.includes(frame)).toBe(false);
+    }
   });
 
-  it('does not invalidate the TUI between host updates', async () => {
+  it('animates collapsed single running results and clears on completion', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context, state } = makeContext();
+    let now = 10_000;
+    const realNow = Date.now;
+    Date.now = () => now;
+    try {
+      const partial = {
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+      };
+
+      const first = renderText(
+        renderResult(partial, { expanded: false, isPartial: true }, theme, context)
+      );
+      expect(first.startsWith(SPINNER_FRAMES[0]!)).toBe(true);
+      expect(first).toContain('explore');
+      expect(state.spinnerStartedAt).toBe(10_000);
+      expect(activeSpinnerCount()).toBe(1);
+      expect(isSharedSpinnerTickerActive()).toBe(true);
+      expect(manual.intervalMs()).toBe(SPINNER_INTERVAL_MS);
+
+      now += SPINNER_INTERVAL_MS * 2;
+      const second = renderText(
+        renderResult(partial, { expanded: false, isPartial: true }, theme, context)
+      );
+      expect(second.startsWith(SPINNER_FRAMES[2]!)).toBe(true);
+      expect(state.spinnerStartedAt).toBe(10_000);
+
+      const done = renderText(
+        renderResult(
+          {
+            content: [{ type: 'text', text: 'done' }],
+            details: singleDetails(singleResult({ status: 'completed', exitCode: 0 })),
+          },
+          { expanded: false, isPartial: false },
+          theme,
+          context
+        )
+      );
+      expect(done.startsWith('✔')).toBe(true);
+      expect(state.spinnerStartedAt).toBeUndefined();
+      expect(activeSpinnerCount()).toBe(0);
+      expect(isSharedSpinnerTickerActive()).toBe(false);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('does not arm a ticker for final or history renders that still say running', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context, state } = makeContext();
+    const text = renderText(
+      renderResult(
+        {
+          content: [{ type: 'text', text: 'stuck' }],
+          details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        context
+      )
+    );
+    expect(text).toContain(RUNNING_STATUS_GLYPH);
+    expect(containsSpinnerFrame(text)).toBe(false);
+    expect(state.spinnerStartedAt).toBeUndefined();
+    expect(activeSpinnerCount()).toBe(0);
+    expect(isSharedSpinnerTickerActive()).toBe(false);
+  });
+
+  it('uses a static running glyph when expanded while still running', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context, state } = makeContext();
+    const text = renderText(
+      renderResult(
+        {
+          content: [{ type: 'text', text: 'running' }],
+          details: singleDetails(
+            singleResult({
+              status: 'running',
+              exitCode: -1,
+              usage: { ...emptyUsage(), turns: 1 },
+            })
+          ),
+        },
+        { expanded: true, isPartial: true },
+        theme,
+        context
+      )
+    );
+    expect(text).toContain('(running...)');
+    expect(text).toContain(RUNNING_STATUS_GLYPH);
+    expect(containsSpinnerFrame(text)).toBe(false);
+    expect(state.spinnerStartedAt).toBeUndefined();
+    expect(activeSpinnerCount()).toBe(0);
+    expect(isSharedSpinnerTickerActive()).toBe(false);
+  });
+
+  it('invalidates on shared ticks while collapsed-running and stops on completion', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
     let invalidations = 0;
     const { context } = makeContext({}, () => invalidations++);
     const partial = {
@@ -730,8 +941,224 @@ describe('renderResult misc', () => {
       details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
     };
     renderResult(partial, { expanded: false, isPartial: true }, theme, context);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(activeSpinnerCount()).toBe(1);
+
+    manual.tick();
+    manual.tick();
+    expect(invalidations).toBe(2);
+
+    invalidations = 0;
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'done' }],
+        details: singleDetails(singleResult({ status: 'completed', exitCode: 0 })),
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      context
+    );
+    manual.tick();
+    manual.tick();
     expect(invalidations).toBe(0);
+    expect(activeSpinnerCount()).toBe(0);
+    expect(isSharedSpinnerTickerActive()).toBe(false);
+  });
+
+  it('uses one shared ticker for concurrent toolCalls; completing one leaves the other', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    let aTicks = 0;
+    let bTicks = 0;
+    const a = makeContext({}, () => aTicks++);
+    const b = makeContext({}, () => bTicks++);
+    const partial = {
+      content: [{ type: 'text', text: 'running' }],
+      details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+    };
+
+    renderResult(partial, { expanded: false, isPartial: true }, theme, a.context);
+    renderResult(partial, { expanded: false, isPartial: true }, theme, b.context);
+    expect(activeSpinnerCount()).toBe(2);
+    expect(isSharedSpinnerTickerActive()).toBe(true);
+    expect(manual.isActive()).toBe(true);
+
+    manual.tick();
+    expect(aTicks).toBe(1);
+    expect(bTicks).toBe(1);
+
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'done' }],
+        details: singleDetails(singleResult({ status: 'completed', exitCode: 0 })),
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      a.context
+    );
+    expect(activeSpinnerCount()).toBe(1);
+    expect(isSharedSpinnerTickerActive()).toBe(true);
+    expect(a.state.spinnerStartedAt).toBeUndefined();
+    expect(b.state.spinnerStartedAt).toBeDefined();
+
+    aTicks = 0;
+    bTicks = 0;
+    manual.tick();
+    expect(aTicks).toBe(0);
+    expect(bTicks).toBe(1);
+
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'done' }],
+        details: singleDetails(singleResult({ status: 'completed', exitCode: 0 })),
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      b.context
+    );
+    expect(activeSpinnerCount()).toBe(0);
+    expect(isSharedSpinnerTickerActive()).toBe(false);
+  });
+
+  it('stops on expand and re-arms when collapsed again while still partial', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    let invalidations = 0;
+    const { context, state } = makeContext({}, () => invalidations++);
+    const partial = {
+      content: [{ type: 'text', text: 'running' }],
+      details: singleDetails(
+        singleResult({
+          status: 'running',
+          exitCode: -1,
+          usage: { ...emptyUsage(), turns: 1 },
+        })
+      ),
+    };
+
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    expect(activeSpinnerCount()).toBe(1);
+    expect(state.spinnerStartedAt).toBeDefined();
+    manual.tick();
+    expect(invalidations).toBe(1);
+
+    invalidations = 0;
+    const expanded = renderText(
+      renderResult(partial, { expanded: true, isPartial: true }, theme, context)
+    );
+    expect(expanded).toContain('(running...)');
+    expect(expanded).toContain(RUNNING_STATUS_GLYPH);
+    expect(activeSpinnerCount()).toBe(0);
+    expect(state.spinnerStartedAt).toBeUndefined();
+    manual.tick();
+    expect(invalidations).toBe(0);
+
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    expect(activeSpinnerCount()).toBe(1);
+    expect(state.spinnerStartedAt).toBeDefined();
+    manual.tick();
+    expect(invalidations).toBe(1);
+  });
+
+  it('does not create duplicate arms for repeated collapsed partial renders', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context } = makeContext();
+    const partial = {
+      content: [{ type: 'text', text: 'running' }],
+      details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+    };
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    renderResult(partial, { expanded: false, isPartial: true }, theme, context);
+    expect(activeSpinnerCount()).toBe(1);
+    expect(isSharedSpinnerTickerActive()).toBe(true);
+  });
+
+  it('self-stops when invalidate throws for a stale runtime', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context, state } = makeContext({}, () => {
+      throw new Error('stale');
+    });
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+      },
+      { expanded: false, isPartial: true },
+      theme,
+      context
+    );
+    expect(activeSpinnerCount()).toBe(1);
+    manual.tick();
+    expect(activeSpinnerCount()).toBe(0);
+    expect(state.spinnerStartedAt).toBeUndefined();
+    expect(isSharedSpinnerTickerActive()).toBe(false);
+  });
+
+  it('stops prior arms on background and empty paths', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context } = makeContext();
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+      },
+      { expanded: false, isPartial: true },
+      theme,
+      context
+    );
+    expect(activeSpinnerCount()).toBe(1);
+
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'launched' }],
+        details: backgroundDetails(),
+      },
+      { expanded: false, isPartial: false },
+      theme,
+      context
+    );
+    expect(activeSpinnerCount()).toBe(0);
+
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+      },
+      { expanded: false, isPartial: true },
+      theme,
+      context
+    );
+    expect(activeSpinnerCount()).toBe(1);
+    renderResult(
+      { content: [{ type: 'text', text: 'none' }], details: undefined },
+      { expanded: false, isPartial: false },
+      theme,
+      context
+    );
+    expect(activeSpinnerCount()).toBe(0);
+    expect(isSharedSpinnerTickerActive()).toBe(false);
+  });
+
+  it('stopSpinner releases an explicit toolCallId arm', () => {
+    const manual = createManualScheduler();
+    installSpinnerScheduler(manual.scheduler);
+    const { context } = makeContext();
+    renderResult(
+      {
+        content: [{ type: 'text', text: 'running' }],
+        details: singleDetails(singleResult({ status: 'running', exitCode: -1 })),
+      },
+      { expanded: false, isPartial: true },
+      theme,
+      context
+    );
+    expect(activeSpinnerCount()).toBe(1);
+    stopSpinner(context.toolCallId);
+    expect(activeSpinnerCount()).toBe(0);
+    expect(isSharedSpinnerTickerActive()).toBe(false);
   });
 });
 

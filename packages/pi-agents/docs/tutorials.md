@@ -45,14 +45,18 @@ a single call, parallel task, chain step, or fanout step to label it in the
 collapsed summary; see
 [How-to: collapse titles](./how-to.md#give-a-step-a-short-collapse-title).
 
-- **Collapsed view** (default): one status line (`✔`/`✗`/`⧗`/`⊘`/`·`), agent,
-  truncated task or a short `title`, usage (fields appear as they become known -
-  for `grok-acp`, ctx can stream mid-turn), and a single latest tool/text line
-  while running. Completed runs hide activity and final output until you
-  expand.
+- **Collapsed view** (default): one status line (`✔`/`✗`/outline-fill spinner
+  `▫▪□■` while a live partial run is collapsed/`⧗` static fallback/`⊘`/`·`),
+  agent, truncated task or a short `title`, usage (fields appear as they become
+  known - for `grok-acp`, ctx can stream mid-turn), and a single latest tool/text
+  line while running. The spinner is driven by one shared 100ms ticker across
+  concurrent agent tool calls and stops when the result is final, expanded, or
+  the session/tree tears down. Completed runs hide activity and final output
+  until you expand.
 - **Expanded view** (Ctrl+O): full task text, complete tool/transcript output,
   final response once, error/worktree/structured-output details when present,
-  and usage.
+  and usage. Running expanded rows use the static `⧗` glyph (no continuous
+  invalidate).
 
 When the agent finishes, its final output is returned to the parent model so it
 can act on the findings.
