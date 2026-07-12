@@ -78,14 +78,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool<typeof SubagentParams, SubagentDetails, AgentRenderState>({
     name: 'agent',
     label: 'Agent',
-    description: `Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.
-When using the Agent tool, specify a \`agent\` parameter to select which agent type to use. If omitted, the general-purpose agent is used.
+    description: `Launch a new agent to handle complex, multi-step tasks. Available agent types are listed in the system prompt.
+Provide exactly one execution mode:
+- \`agent\` + \`task\`: run a single agent.
+- \`tasks\`: run multiple {agent, task} items in parallel.
+- \`chain\`: run sequential steps with output passing between them, optionally fanning out one step's structured output across parallel workers.
 ## When to use
-Reach for this when the task matches an available agent type, when you have independent work to run in parallel, or when answering would mean reading across several files — delegate it and you keep the conclusion, not the file dumps. For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you've delegated a search, don't also run it yourself — wait for the result.
-- The agent's final message is returned to you as the tool result; it is not shown to the user — relay what matters.`,
+Use when the task matches an agent type, for parallel independent work, or when answering requires reading several files - delegate and keep the conclusion, not the file dumps. For a single-fact lookup, search directly. Once delegated, don't redo the work yourself - wait for the result.
+- The agent's final message is returned as the tool result (not shown to the user) - relay what matters.`,
     promptGuidelines: [
       '!! Use the `explore` agent when you need to search across multiple files or do broad code analysis exploration.',
-      '!! Do not repeat the task after delegating it to the agent',
     ],
     parameters: SubagentParams,
     prepareArguments: (args) => normalizeAgentArgs(args) as Static<typeof SubagentParams>,

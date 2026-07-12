@@ -11,12 +11,12 @@ export const IsolationSchema = StringEnum(['none', 'worktree'] as const, {
 export const TitleSchema = Type.String({
   maxLength: 30,
   description:
-    'Short label (max 30 characters) shown in the collapsed summary instead of the task preview. Generate it before the call and keep it concise (e.g. "探索结构", "fix lint"). When omitted or blank, the task preview is used.',
+    'Short label (max 30 chars) shown in the collapsed summary instead of the task preview (e.g. "fix lint"). Omit to use the task preview.',
 });
 
 export const RuntimeSchema = StringEnum(['pi', 'grok', 'grok-acp'] as const, {
   description:
-    "Temporarily override the agent config `runtime` for every agent invoked in this call (single/parallel/chain/fanout). `pi` (default) spawns the pi CLI; `grok` spawns Grok streaming-json; `grok-acp` spawns Grok ACP over stdio. Defaults to each agent's configured runtime.",
+    "Override the agent config `runtime` for every agent in this call. `pi` (default) spawns the pi CLI; `grok` spawns Grok streaming-json; `grok-acp` spawns Grok ACP over stdio. Defaults to each agent's configured runtime.",
 });
 
 export const TaskItem = Type.Object({
@@ -45,7 +45,7 @@ export const SequentialChainItem = Type.Object({
   outputSchema: Type.Optional(
     Type.Any({
       description:
-        'JSON Schema subset describing the required structured final output for this step. When set, the step task is augmented with a JSON-only contract and the result is parsed and validated. Supports type/properties/required/items/enum/additionalProperties/minItems/maxItems.',
+        'JSON Schema subset for the required structured output of this step. When set, the result is parsed and validated against it. Supports type/properties/required/items/enum/additionalProperties/minItems/maxItems.',
     })
   ),
 });
@@ -53,8 +53,14 @@ export const SequentialChainItem = Type.Object({
 export const FanoutChainItem = Type.Object({
   expand: Type.Object({
     from: Type.Object({
-      output: Type.String({ description: 'Name of a previous structured chain output' }),
-      path: Type.String({ description: 'JSON Pointer path to an array inside the output' }),
+      output: Type.String({
+        description:
+          'Name of a previous chain output that produced structured output (a step with `outputSchema` set and validated). Fanout fails if the referenced output has no structured data.',
+      }),
+      path: Type.String({
+        description:
+          'JSON Pointer path (RFC 6901, e.g. "/items" or "/results/0/data") to an array inside the structured output.',
+      }),
     }),
     maxItems: Type.Optional(Type.Number({ description: 'Maximum items to expand' })),
   }),
@@ -69,7 +75,10 @@ export const FanoutChainItem = Type.Object({
     ),
   }),
   collect: Type.Object({
-    name: Type.String({ description: 'Name used to reference collected fanout results' }),
+    name: Type.String({
+      description:
+        "Name used to reference collected fanout results as `{outputs.<name>}` from later chain steps. The value is a JSON array of all items' outputs (or each item's structured output when `outputSchema` is set).",
+    }),
   }),
   concurrency: Type.Optional(Type.Number({ description: 'Maximum concurrent fanout workers' })),
 });
@@ -80,7 +89,7 @@ export const ChainItem = Type.Union([SequentialChainItem, FanoutChainItem], {
 
 export const AgentScopeSchema = StringEnum(['user', 'project', 'both'] as const, {
   description:
-    'Which agent directories to use. Default: "both". "user" loads ~/.pi/agent/agents plus packages installed via `pi install` in user settings (~/.pi/agent/settings.json). "project" loads .pi/agents plus packages installed in project settings (.pi/settings.json). "both" merges them with project overriding user.',
+    'Which agent directories to load. "both" (default) merges user and project agents with project overriding user; "user" or "project" limits to that scope.',
   default: 'both',
 });
 
@@ -112,13 +121,13 @@ export const SubagentParams = Type.Object({
   model: Type.Optional(
     Type.String({
       description:
-        "Temporarily override the agent config `model` for every agent invoked in this call (single/parallel/chain/fanout). Defaults to each agent's configured model; set only when you need to force a specific model for this run.",
+        "Override the agent config `model` for every agent in this call. Defaults to each agent's configured model; set only to force a specific model.",
     })
   ),
   thinking: Type.Optional(
     Type.String({
       description:
-        "Temporarily override the agent config `thinking` for every agent invoked in this call (single/parallel/chain/fanout). Defaults to each agent's configured thinking; set only when you need a specific thinking level for this run.",
+        "Override the agent config `thinking` for every agent in this call. Defaults to each agent's configured thinking; set only to force a specific thinking level.",
     })
   ),
   runtime: Type.Optional(RuntimeSchema),
