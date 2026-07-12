@@ -39,10 +39,10 @@ import type {
 
 type ThemeFg = (color: ThemeColor, text: string) => string;
 
-/** Outline-fill spinner frames('▫', '▪', '◻', '◼') for collapsed running status. */
-export const SPINNER_FRAMES = ['▫', '▪', '◻', '◼'] as const;
+/** Outline-fill spinner frames('▫▪◻◼□■Explore') for collapsed running status. */
+export const SPINNER_FRAMES = ['▫', '▪', '□', '■', '□', '▪', '▫'] as const;
 /** Frame step for spinner invalidation and elapsed-time frame selection. */
-export const SPINNER_INTERVAL_MS = 100;
+export const SPINNER_INTERVAL_MS = 150;
 
 /** Static running glyph: background launches and non-animated fallbacks. */
 export const RUNNING_STATUS_GLYPH = '⧗';
