@@ -97,7 +97,12 @@ export const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({ description: 'Name of the agent to invoke (for single mode)' })
   ),
-  task: Type.Optional(Type.String({ description: 'Task to delegate (for single mode)' })),
+  task: Type.Optional(
+    Type.String({
+      description:
+        'Task to delegate (single mode), or an additional continuation instruction when resuming via runId.',
+    })
+  ),
   title: Type.Optional(TitleSchema),
   tasks: Type.Optional(
     Type.Array(TaskItem, { description: 'Array of {agent, task} for parallel execution' })
@@ -131,4 +136,16 @@ export const SubagentParams = Type.Object({
     })
   ),
   runtime: Type.Optional(RuntimeSchema),
+  runId: Type.Optional(
+    Type.String({
+      description:
+        'Resume an existing durable run by ID. Restores the stored workflow, sessions, and settings. Mutually exclusive with fresh launch fields (agent, tasks, chain, agentScope, cwd, isolation, runInBackground, model, thinking, runtime, title). Optional task appends a continuation instruction; allowReplay acknowledges replay risk for Grok units.',
+    })
+  ),
+  allowReplay: Type.Optional(
+    Type.Boolean({
+      description:
+        'For resume only: allow replay-capable units to re-run from the beginning. Only set after accepting duplicate-side-effect risk.',
+    })
+  ),
 });

@@ -21,6 +21,8 @@ import {
   setDiscoveredSkills,
   type SkillResolution,
 } from '../src/skills.ts';
+import { createRunStore } from '../src/run-store.ts';
+import type { RunUnitRecord } from '../src/run-types.ts';
 import type { SubagentDetails } from '../src/types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
@@ -226,6 +228,91 @@ function cacheProbingExec(
   };
   return { execute, probe: () => probed };
 }
+
+describe('registerAgentCommand durable resume guidance', () => {
+  it('/agent resume prints agent({ runId }) guidance without starting a run', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const storeRoot = mkdtempSync(path.join(tmpRoot, 'runs-'));
+    const store = createRunStore({ rootDir: storeRoot });
+    const created = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'myagent', task: 't' },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'myagent',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: cwd,
+        } as RunUnitRecord,
+      },
+    });
+    const { pi, commands } = fakePi();
+    const exec = fakeExec(okResult('should not run'));
+    registerAgentCommand(pi, { cwd, execute: exec.execute, runStore: store });
+    const { ctx, notifications } = fakeCtx(cwd);
+
+    await commands.get('agent')!.handler(`resume ${created.runId}`, ctx);
+
+    expect(exec.calls).toHaveLength(0);
+    expect(notifications[0]?.type).toBe('info');
+    expect(notifications[0]?.message).toContain(`agent({ runId: "${created.runId}" })`);
+    expect(notifications[0]?.message).not.toContain('allowReplay');
+  });
+
+  it('/agent resume mentions allowReplay when units are replay-capable', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const storeRoot = mkdtempSync(path.join(tmpRoot, 'runs-replay-'));
+    const store = createRunStore({ rootDir: storeRoot });
+    const created = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'myagent', task: 't' },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'myagent',
+          agentFingerprint: 'fp',
+          runtime: 'grok',
+          capability: 'replay',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: cwd,
+        } as RunUnitRecord,
+      },
+    });
+    const { pi, commands } = fakePi();
+    registerAgentCommand(pi, { cwd, execute: fakeExec(okResult('x')).execute, runStore: store });
+    const { ctx, notifications } = fakeCtx(cwd);
+
+    await commands.get('agent')!.handler(`resume ${created.runId}`, ctx);
+
+    expect(notifications[0]?.message).toContain(`agent({ runId: "${created.runId}" })`);
+    expect(notifications[0]?.message).toContain('allowReplay: true');
+  });
+});
 
 describe('registerAgentCommand', () => {
   it('registers /agent and /agent:<name> for discovered agents', () => {

@@ -93,6 +93,147 @@ function makeFakeTimers() {
   };
 }
 
+describe('runSingleAgentPiRpc resume prompts', () => {
+  async function runWithCapturedPrompt(
+    task: string,
+    options: {
+      sessionFile?: string;
+      resumeHadStoredSession?: boolean;
+      resumePrompt?: {
+        continuationTasks: string[];
+        undeliveredContinuationTasks?: string[];
+        currentContinuationTask?: string;
+      };
+    }
+  ): Promise<{ prompt: string; result: SingleResult }> {
+    const listeners = new Set<(e: InteractiveRegistryEvent) => void>();
+    const snap = baseSnap({
+      status: 'registered',
+      sessionFile: options.sessionFile ?? '/tmp/s.jsonl',
+      messages: [],
+    });
+    let capturedPrompt = '';
+    const registry = {
+      get: () => ({ ...snap, messages: [...snap.messages] }),
+      subscribe: (fn: (e: InteractiveRegistryEvent) => void) => {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      },
+      activate: async (_key: string, prompt: string) => {
+        capturedPrompt = prompt;
+        snap.status = 'running';
+        snap.activation = {
+          id: 'act-resume',
+          endpointKey: snap.key,
+          mode: 'prompt',
+          baselineMessageCount: 0,
+          sequence: 1,
+          origin: 'tool_call',
+          settled: false,
+          createdAt: Date.now(),
+        };
+        setTimeout(() => {
+          snap.messages = [
+            { role: 'user', content: prompt },
+            {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'done' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          ] as never;
+          snap.status = 'idle';
+          const id = snap.activation!.id;
+          snap.activation = undefined;
+          for (const l of listeners) {
+            l({
+              type: 'endpoint_updated',
+              key: snap.key,
+              snapshot: { ...snap, messages: [...snap.messages] },
+              kind: 'full',
+            });
+            l({
+              type: 'activation_settled',
+              key: snap.key,
+              activationId: id,
+              snapshot: { ...snap, messages: [...snap.messages] },
+            });
+          }
+        }, 5);
+        return { activationId: 'act-resume', snapshot: { ...snap, messages: [...snap.messages] } };
+      },
+      abort: async () => snap,
+      detach: async () => undefined,
+    } as unknown as InteractiveAgentRegistry;
+
+    const result = await runSingleAgentPiRpc(
+      '/tmp',
+      [makeAgent()],
+      'worker',
+      task,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      {
+        interactiveRegistry: registry,
+        endpointKey: 'run1:single',
+        hostMode: 'tui',
+        sessionFile: options.sessionFile,
+        resumePrompt: options.resumePrompt,
+        ...(options.resumeHadStoredSession !== undefined
+          ? { resumeHadStoredSession: options.resumeHadStoredSession }
+          : {}),
+      }
+    );
+    return { prompt: capturedPrompt, result };
+  }
+
+  it('delivers the shared session-continuation prompt with undelivered tasks', async () => {
+    const { prompt, result } = await runWithCapturedPrompt('Original task', {
+      sessionFile: '/tmp/existing.jsonl',
+      resumeHadStoredSession: true,
+      resumePrompt: {
+        continuationTasks: ['Earlier', 'Also finish validation.'],
+        undeliveredContinuationTasks: ['Also finish validation.'],
+        currentContinuationTask: 'Also finish validation.',
+      },
+    });
+    expect(prompt).not.toContain('Task: Original task');
+    expect(prompt).not.toContain('Earlier');
+    expect(prompt).toContain('resuming');
+    expect(prompt).toContain(
+      'Additional instruction for this resumed run:\nAlso finish validation.'
+    );
+    expect(result.task).toBe('Original task');
+  });
+
+  it('sends original task plus all continuations when resumeHadStoredSession is false', async () => {
+    const { prompt } = await runWithCapturedPrompt('Original task', {
+      sessionFile: '/tmp/just-created.jsonl',
+      resumeHadStoredSession: false,
+      resumePrompt: {
+        continuationTasks: ['Cont A', 'Cont B'],
+      },
+    });
+    expect(prompt).toContain('Task: Original task');
+    expect(prompt).toContain('Additional instruction for this resumed run:\nCont A');
+    expect(prompt).toContain('Additional instruction for this resumed run:\nCont B');
+  });
+
+  it('sends original task plus all continuations when no session file is present', async () => {
+    const { prompt } = await runWithCapturedPrompt('Original task', {
+      resumeHadStoredSession: false,
+      resumePrompt: {
+        continuationTasks: ['Cont A', 'Cont B'],
+      },
+    });
+    expect(prompt).toContain('Task: Original task');
+    expect(prompt).toContain('Additional instruction for this resumed run:\nCont A');
+    expect(prompt).toContain('Additional instruction for this resumed run:\nCont B');
+  });
+});
+
 describe('runSingleAgentPiRpc', () => {
   it('excludes baseline history and waits for activation settle', async () => {
     const listeners = new Set<(e: InteractiveRegistryEvent) => void>();

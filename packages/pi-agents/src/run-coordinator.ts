@@ -421,6 +421,13 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
           if (live.workflowState !== undefined) {
             record.workflowState = live.workflowState;
           }
+          // Preserve continuation delivery progress written during resume.
+          if (live.continuationTasks !== undefined) {
+            record.continuationTasks = live.continuationTasks;
+          }
+          if (live.continuationDelivery !== undefined) {
+            record.continuationDelivery = live.continuationDelivery;
+          }
           record.updatedAt = now();
         }
       })

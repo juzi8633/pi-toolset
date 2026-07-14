@@ -140,10 +140,16 @@ async function runAgentFallbackCommand(
 
   if (lower.startsWith('resume ') && options.runStore) {
     const runId = trimmed.slice(7).trim();
-    ctx.ui.notify(
-      `To resume run ${runId}, use: agent_job({ action: "resume", runId: "${runId}" })`,
-      'info'
-    );
+    const loaded = options.runStore.getRun(runId);
+    const hasReplay =
+      loaded.ok && Object.values(loaded.loaded.record.units).some((u) => u.capability === 'replay');
+    const lines = [`To resume run ${runId}, use: agent({ runId: "${runId}" })`];
+    if (hasReplay) {
+      lines.push(
+        'This run includes replay-capable units; set allowReplay: true only after accepting duplicate-side-effect risk.'
+      );
+    }
+    ctx.ui.notify(lines.join('\n'), 'info');
     return;
   }
 

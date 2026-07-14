@@ -11,7 +11,6 @@ import {
   installSpinnerScheduler,
   isSharedSpinnerTickerActive,
   renderCall,
-  renderJobCall,
   renderResult,
   RUNNING_STATUS_GLYPH,
   runningStatusGlyph,
@@ -534,9 +533,9 @@ describe('renderResult single', () => {
         context
       )
     );
-    // Expanded detail view still exposes the run id and resume hint.
+    // Expanded detail view still exposes the run id and consolidated resume hint.
     expect(expanded).toContain(`runId: ${r.runId}`);
-    expect(expanded).toContain('To resume:');
+    expect(expanded).toContain(`To resume: agent({ runId: "${r.runId}" })`);
   });
 });
 
@@ -1559,42 +1558,12 @@ describe('renderResult title', () => {
   });
 });
 
-describe('agent_job rendering', () => {
+describe('renderResult empty-details fallback', () => {
   function renderText(comp: Component): string {
     return comp.render(80).join('\n');
   }
 
-  it('renderJobCall shows the action and runId', () => {
-    const comp = renderJobCall({ action: 'resume', runId: 'run-abcdef123456' }, fakeTheme());
-    expect(renderText(comp)).toContain('agent_job');
-    expect(renderText(comp)).toContain('resume');
-    expect(renderText(comp)).toContain('run-abcdef12');
-  });
-
-  it('renderJobCall shows list action without runId', () => {
-    const comp = renderJobCall({ action: 'list' }, fakeTheme());
-    expect(renderText(comp)).toContain('agent_job');
-    expect(renderText(comp)).toContain('list');
-  });
-
-  it('renderResult renders a resume result with single agent output style', () => {
-    const { context } = makeContext();
-    const r = singleResult({ status: 'completed', agent: 'explore', task: 'look around' });
-    const comp = renderResult(
-      {
-        content: [{ type: 'text', text: '(no output)' }],
-        details: singleDetails(r),
-      },
-      { expanded: false },
-      fakeTheme(),
-      context
-    );
-    const text = renderText(comp);
-    expect(text).toContain('Explore');
-    expect(text).toContain('look around');
-  });
-
-  it('renderResult falls back to text for a list/get result with empty details', () => {
+  it('falls back to content text when details have no results', () => {
     const comp = renderResult(
       {
         content: [{ type: 'text', text: 'Run ID | Mode | Status\nr1 | single | interrupted' }],
@@ -1614,7 +1583,7 @@ describe('agent_job rendering', () => {
     expect(text).toContain('interrupted');
   });
 
-  it('renderResult does not crash with undefined render context', () => {
+  it('does not crash with undefined render context', () => {
     const r = singleResult({ status: 'completed' });
     const comp = renderResult(
       { content: [{ type: 'text', text: 'done' }], details: singleDetails(r) },

@@ -168,33 +168,36 @@ not re-read the source step's current output.
 When a chain with a dynamic fanout is aborted or interrupted mid-step, completed
 items stay completed and only incomplete items run again.
 
-1. List runs and find the interrupted run:
+1. List runs and find the interrupted run (or read `runId` from a prior
+   `agent` result):
 
    ```
    /agent runs
-   agent_job({ action: "list" })
    ```
 
 2. Inspect status and incomplete units:
 
    ```
    /agent status <run-id>
-   agent_job({ action: "get", runId: "<run-id>" })
    ```
 
    Expect one unit per scheduled fanout item (for example
    `chain-0002-fanout-0001` …), not a single shared fanout placeholder.
 
-3. Resume:
+3. Resume through the `agent` tool (stored workflow is authoritative):
 
    ```
-   agent_job({ action: "resume", runId: "<run-id>" })
+   agent({ runId: "<run-id>" })
+   agent({ runId: "<run-id>", task: "Also verify the remaining items." })
+   agent({ runId: "<run-id>", allowReplay: true })
    ```
 
-   Completed item results and original indexes are retained. Interrupted items
-   continue (Pi session) or replay when allowed (Grok). Never-started items keep
-   attempt `1` and start for the first time. Collection order remains the original
-   expansion order.
+   Optional `task` appends a continuation instruction to every incomplete unit
+   after placeholder/`{item}` resolution. Completed item results and original
+   indexes are retained. Interrupted Pi items continue their stored session;
+   never-started Pi items and Grok replay units receive the original resolved
+   task plus all durable continuation instructions. Never-started items keep
+   attempt `1`. Collection order remains the original expansion order.
 
 ### Blocking errors
 
@@ -206,7 +209,7 @@ If resume is refused, the blocking reason explains what to do:
 | `stored_output_invalid`           | A completed child unit is missing a valid terminal result               | Start a fresh chain; completed output is unsafe |
 | `fanout_state_conflict`           | A concurrent or conflicting expansion write tried to change the mapping | Rare; inspect the run and retry or re-invoke    |
 | fingerprint / session / worktree  | Agent definition or artifacts changed or went missing                   | Restore the agent/session/worktree, then resume |
-| requires replay (`allowReplay`)   | Grok/replay units need explicit acknowledgement                         | Resume with `allowReplay: true` if safe         |
+| requires replay (`allowReplay`)   | Grok/replay units need explicit acknowledgement                         | `agent({ runId, allowReplay: true })` if safe   |
 
 Unsafe legacy partial fanouts (item results or unit fragments without a stored
 `workflowState.fanouts` mapping) are never reconstructed automatically. Re-run

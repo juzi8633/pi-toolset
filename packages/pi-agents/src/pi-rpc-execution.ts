@@ -16,6 +16,7 @@ import type {
   InteractiveEndpointUpdateKind,
   InteractiveRegistryEvent,
 } from './interactive-agent.ts';
+import { appendContinuationTasks, buildSessionContinuationPrompt } from './invocation.ts';
 import { applyTerminalStatus, getFinalOutput } from './output.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
 import type { RunAbortOrigin } from './run-types.ts';
@@ -328,9 +329,19 @@ export async function runSingleAgentPiRpc(
     clearTimeout: (id: unknown) => clearTimeout(id as ReturnType<typeof setTimeout>),
   };
   const settleTimeoutMs = options.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS;
-  const prompt =
-    options.unitContext && options.unitContext.attempt > 1
-      ? 'You are resuming an interrupted task. Inspect the filesystem and git state to understand what was already completed. Treat any unfinished tool call as unconfirmed. Continue the original task to completion, and run validation before finishing.'
+  // Prefer explicit resumeHadStoredSession so a just-created session is not
+  // treated as a prior stored session for never-started units.
+  const resumePrompt = options.resumePrompt;
+  const useSessionContinuation = Boolean(
+    resumePrompt && (options.resumeHadStoredSession ?? Boolean(options.sessionFile))
+  );
+  const prompt = useSessionContinuation
+    ? buildSessionContinuationPrompt(
+        resumePrompt?.undeliveredContinuationTasks ??
+          (resumePrompt?.currentContinuationTask ? [resumePrompt.currentContinuationTask] : [])
+      )
+    : resumePrompt
+      ? `Task: ${appendContinuationTasks(task, resumePrompt.continuationTasks)}`
       : `Task: ${task}`;
 
   let baseline = 0;
@@ -572,6 +583,8 @@ export async function runSingleAgentPiRpc(
       }
       throw err;
     }
+    // RPC activate accepted the resume/fresh prompt for this unit.
+    options.onResumePromptAccepted?.();
     activationId = activated.activationId;
     baseline = activated.snapshot.activation?.baselineMessageCount ?? baseline;
     // Bind to this activation only: drop any sticky terminal state that could not

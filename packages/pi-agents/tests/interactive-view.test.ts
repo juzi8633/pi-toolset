@@ -531,13 +531,7 @@ describe('interactive-view helpers', () => {
       'worker',
       'review',
     ];
-    const statuses = [
-      'detached',
-      'detached',
-      'running',
-      'idle',
-      'detached · 2 queued',
-    ];
+    const statuses = ['detached', 'detached', 'running', 'idle', 'detached · 2 queued'];
     const nameCol = __test.maxVisibleWidth(names);
     for (let i = 0; i < names.length; i++) {
       expect(items[i + 1]?.label).toBe(

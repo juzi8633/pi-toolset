@@ -21,7 +21,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Usage tracking** - turns, tokens, and context per execution unit; aggregates sum tokens/turns and use `ctx:max` (no aggregate model/thinking); partial stats stream live for `grok-acp`
 - **Abort support** - Ctrl+C propagates and kills active subprocesses
 - **Durable runs** - every invocation persists a run record, unit state, and native Pi sessions under `~/.pi/agent/@balaenis/pi-agents/runs/`; interrupted runs can be inspected and resumed without re-running completed work
-- **Resume** - the `agent_job` tool lists, inspects, and resumes interrupted runs; Pi-runtime units reopen their stored session, Grok-runtime units replay from the beginning with explicit acknowledgement
+- **Resume** - `agent({ runId })` resumes an interrupted durable run from its stored workflow and sessions; optional `task` appends a continuation instruction; Pi-runtime units reopen their stored session, Grok-runtime units replay from the beginning with explicit `allowReplay` acknowledgement
 - **Reconciliation** - on session start, runs left running by a dead process are automatically marked interrupted
 
 ## Local development
@@ -63,26 +63,30 @@ Every validated invocation creates a durable run record under `~/.pi/agent/@bala
 
 ### Inspecting and resuming runs
 
-Use the `agent_job` tool to list, inspect, and resume runs:
-
-```
-agent_job({ action: "list" })                              # list recent runs
-agent_job({ action: "get", runId: "run-abc123..." })       # get detailed status
-agent_job({ action: "resume", runId: "run-abc123..." })    # resume an interrupted run
-```
-
-Or use slash commands:
+Every successful `agent` result exposes its durable run ID on `details.run.runId`. List and inspect runs with slash commands (model-facing list/get actions are not provided):
 
 ```
 /agent runs                    # list durable runs
 /agent status <run-id>         # get detailed status
-/agent resume <run-id>         # resume guidance
+/agent resume <run-id>         # print resume guidance (does not start a run)
 ```
+
+Resume through the same `agent` tool. Stored workflow configuration (mode, agents, tasks, scope, cwd, isolation, model, thinking, runtime, titles, background) is authoritative; conflicting fresh-launch fields are rejected.
+
+```
+agent({ runId: "run-abc123..." })
+agent({ runId: "run-abc123...", task: "Also verify the migration path." })
+agent({ runId: "run-abc123...", task: "Retry safely.", allowReplay: true })
+```
+
+Optional `task` is a continuation instruction appended for incomplete units only. Completed units and their stored results remain immutable. Continuation prompts are durable run data and may contain sensitive information.
 
 ### Pi vs Grok resume
 
-- **Pi-runtime units** (`resumeCapability: "session"`) resume by reopening the stored native Pi session with a continuation instruction. Completed work is not repeated.
-- **Grok-runtime units** (`resumeCapability: "replay"`) must re-run from the beginning because Grok sessions are not persisted. Set `allowReplay: true` only after accepting that side effects (edits, commands, network writes) may be duplicated.
+- **Pi-runtime units with a stored session** (`resumeCapability: "session"`) reopen the native Pi session with a safety-oriented continuation prompt plus every **undelivered** continuation instruction for that unit. Already-delivered continuations are not resent. The original task is not resent.
+- **Pi-runtime units that never started** receive their resolved original task plus every continuation instruction recorded on the run (even after `prepareAgentContext` creates a new session file).
+- **Grok-runtime units** (`resumeCapability: "replay"`) re-run from a fresh process with the original task plus all durable continuation instructions. Set `allowReplay: true` only after accepting that side effects (edits, commands, network writes) may be duplicated.
+- Continuation delivery is tracked per unit (`continuationDelivery`). A continuation is marked delivered only after the child accepts the prompt (spawn / RPC activate). Crash after claim, background-mode rejection, or partial dispatch leaves undelivered instructions for the next resume.
 
 ### Chain fanout resume
 

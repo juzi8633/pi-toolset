@@ -1,12 +1,7 @@
 // ABOUTME: Subagent tool entrypoint — registers the `agent` tool and the `before_agent_start` hook.
 // ABOUTME: Delegates discovery, orchestration, and rendering to focused modules.
 
-import {
-  type ExtensionAPI,
-  type ExtensionContext,
-  type Theme,
-} from '@earendil-works/pi-coding-agent';
-import type { Component } from '@earendil-works/pi-tui';
+import { type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { Static } from '@earendil-works/pi-ai';
 import { discoverAgents } from './agents.ts';
 import {
@@ -25,10 +20,10 @@ import {
 import { createInteractiveViewController } from './interactive-view.ts';
 import { createRunStore } from './run-store.ts';
 import { createRunCoordinator } from './run-coordinator.ts';
+import { reconcileDeadOwnerUnits } from './resume.ts';
 import {
   type AgentRenderState,
   renderCall,
-  renderJobCall,
   renderResult,
   stopAllSpinners,
   stopSpinner,
@@ -36,8 +31,6 @@ import {
 import { SubagentParams } from './schema.ts';
 import { setDiscoveredSkillsFromOptions } from './skills.ts';
 import { executeAgentTool } from './tool.ts';
-import { JobParams } from './job-schema.ts';
-import { executeJobTool } from './job-tool.ts';
 import type { SubagentDetails } from './types.ts';
 
 type RawArgs = Record<string, unknown> & { run_in_background?: unknown };
@@ -169,11 +162,7 @@ export default function (pi: ExtensionAPI) {
             await runStore.updateRun(record.runId, (r) => {
               r.status = 'interrupted';
               r.updatedAt = Date.now();
-              for (const unit of Object.values(r.units)) {
-                if (unit.status === 'running' || unit.status === 'queued') {
-                  unit.status = 'interrupted';
-                }
-              }
+              reconcileDeadOwnerUnits(r.units);
             });
             await runStore.appendEvent(record.runId, {
               version: 1,
@@ -239,14 +228,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool<typeof SubagentParams, SubagentDetails, AgentRenderState>({
     name: 'agent',
     label: 'Agent',
-    description: `Launch a new agent to handle complex, multi-step tasks. Available agent types are listed in the system prompt.
-Provide exactly one execution mode:
+    description: `Launch a new agent to handle complex, multi-step tasks, or resume an interrupted durable run. Available agent types are listed in the system prompt.
+Provide exactly one entry form:
 - \`agent\` + \`task\`: run a single agent.
 - \`tasks\`: run multiple {agent, task} items in parallel.
 - \`chain\`: run sequential steps with output passing between them, optionally fanning out one step's structured output across parallel workers.
+- \`runId\`: resume a durable run from its stored workflow and sessions. Optional \`task\` appends a continuation instruction; set \`allowReplay: true\` only for replay-capable (Grok) units after accepting duplicate-side-effect risk. Do not supply fresh launch fields with \`runId\`.
 ## When to use
 Use when the task matches an agent type, for parallel independent work, or when answering requires reading several files - delegate and keep the conclusion, not the file dumps. For a single-fact lookup, search directly. Once delegated, don't redo the work yourself - wait for the result.
-- The agent's final message is returned as the tool result (not shown to the user) - relay what matters.`,
+- The agent's final message is returned as the tool result (not shown to the user) - relay what matters.
+- Durable run IDs appear on tool results; use \`agent({ runId })\` to resume. List/inspect runs with \`/agent runs\` and \`/agent status <run-id>\`.`,
     promptGuidelines: [
       '!! Use the `explore` agent when you need to search across multiple files or do broad code analysis exploration.',
     ],
@@ -263,82 +254,6 @@ Use when the task matches an agent type, for parallel independent work, or when 
     },
     renderCall,
     renderResult,
-  });
-
-  pi.registerTool<typeof JobParams, SubagentDetails, AgentRenderState>({
-    name: 'agent_job',
-    label: 'Agent Job',
-    description: `Inspect and resume durable agent runs. Actions:
-- \`list\`: List recent runs with status, unit counts, and capability.
-- \`get\`: Get detailed status for a specific run including per-unit state and blocking reasons.
-- \`resume\`: Resume an interrupted run. Inspect the run first; set \`allowReplay\` only after accepting that replay-capable units restart from the beginning and may repeat external side effects.`,
-    parameters: JobParams,
-    renderCall: renderJobCall as (args: unknown, theme: Theme) => Component,
-    renderResult: renderResult as (
-      result: { content: Array<{ type: string; text?: string }>; details?: SubagentDetails },
-      options: { expanded: boolean; isPartial?: boolean },
-      theme: Theme,
-      context?: { toolCallId: string; invalidate: () => void; state: AgentRenderState }
-    ) => Component,
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      latestUiCtx = ctx;
-      const agents = discoverAgents(ctx.cwd, 'both').agents;
-      return executeJobTool(params, {
-        runStore,
-        runCoordinator,
-        agents,
-        executeResume: async (allowReplay) => {
-          const loaded = runStore.getRun((params as { runId: string }).runId);
-          if (!loaded.ok) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `resume_error: run not found: ${loaded.error.message}`,
-                },
-              ],
-              isError: true,
-              details: {
-                mode: 'single',
-                agentScope: 'both',
-                projectAgentsDir: null,
-                builtinAgentsDir: '',
-                results: [],
-              },
-            };
-          }
-          const req = loaded.loaded.record.request;
-          return executeAgentTool(
-            {
-              agent: req.agent,
-              task: req.task,
-              title: req.title,
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              tasks: req.tasks as any,
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              chain: req.chain as any,
-              agentScope: req.agentScope,
-              cwd: req.cwd,
-              isolation: req.isolation,
-              model: req.model,
-              thinking: req.thinking,
-              runtime: req.runtime,
-            },
-            signal,
-            onUpdate,
-            ctx,
-            {
-              backgroundManager,
-              runStore,
-              runCoordinator,
-              interactiveRegistry,
-              resumeRunId: (params as { runId: string }).runId,
-              allowReplay,
-            }
-          );
-        },
-      });
-    },
   });
 
   registerAgentCommand(pi, {

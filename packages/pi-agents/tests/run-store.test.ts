@@ -265,6 +265,123 @@ describe('listRuns', () => {
     expect(loaded.ok).toBe(false);
     if (!loaded.ok) expect(loaded.error.code).toBe('corrupt_run');
   });
+
+  it('loads Version 1 records when continuationTasks is absent', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationTasks).toBeUndefined();
+  });
+
+  it('round-trips a string array for continuationTasks', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    await store.updateRun(runId, (r) => {
+      r.continuationTasks = ['First follow-up', 'Second follow-up'];
+    });
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationTasks).toEqual(['First follow-up', 'Second follow-up']);
+  });
+
+  it('returns corrupt_run when continuationTasks is not an array', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    writeFileSync(file, JSON.stringify({ ...record, continuationTasks: 'not-an-array' }));
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(false);
+    if (!loaded.ok) {
+      expect(loaded.error.code).toBe('corrupt_run');
+      expect(loaded.error.message).toContain('continuationTasks');
+    }
+  });
+
+  it('returns corrupt_run when continuationTasks contains a non-string entry', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    writeFileSync(file, JSON.stringify({ ...record, continuationTasks: ['ok', 42] }));
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(false);
+    if (!loaded.ok) {
+      expect(loaded.error.code).toBe('corrupt_run');
+      expect(loaded.error.message).toContain('continuationTasks[1]');
+    }
+  });
+
+  it('round-trips continuationDelivery and rejects malformed entries', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    await store.updateRun(runId, (r) => {
+      r.continuationTasks = ['a', 'b'];
+      r.continuationDelivery = { single: { deliveredCount: 1 } };
+    });
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationDelivery).toEqual({
+      single: { deliveredCount: 1 },
+    });
+
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        continuationDelivery: { single: { deliveredCount: -1 } },
+      })
+    );
+    const bad = store.getRun(runId);
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) {
+      expect(bad.error.code).toBe('corrupt_run');
+      expect(bad.error.message).toContain('continuationDelivery');
+    }
+  });
+
+  it('returns corrupt_run for request mode/topology mismatches without throwing', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'parallel',
+        request: { mode: 'single', agentScope: 'user', agent: 'a', task: 't' },
+      })
+    );
+    const mismatch = store.getRun(runId);
+    expect(mismatch.ok).toBe(false);
+    if (!mismatch.ok) {
+      expect(mismatch.error.code).toBe('corrupt_run');
+      expect(mismatch.error.message).toContain('request.mode');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'chain',
+        request: { mode: 'chain', agentScope: 'user', chain: 'not-array' },
+      })
+    );
+    const badChain = store.getRun(runId);
+    expect(badChain.ok).toBe(false);
+    if (!badChain.ok) {
+      expect(badChain.error.code).toBe('corrupt_run');
+      expect(badChain.error.message).toContain('chain');
+    }
+  });
 });
 
 describe('ticket claim locks', () => {

@@ -25,7 +25,12 @@ import {
 } from './grok-acp-parser.ts';
 import { buildGrokArgs, getGrokInvocation } from './grok-invocation.ts';
 import { createGrokParserState, parseGrokEvent } from './grok-parser.ts';
-import { buildPiArgs, getPiInvocation, writePromptToTempFile } from './invocation.ts';
+import {
+  appendContinuationTasks,
+  buildPiArgs,
+  getPiInvocation,
+  writePromptToTempFile,
+} from './invocation.ts';
 import { applyTerminalStatus, getFinalOutput } from './output.ts';
 import type { UnitExecutionContext } from './run-coordinator.ts';
 import { buildChildAgentEnv, isAgentDelegationAllowed } from './security.ts';
@@ -37,6 +42,20 @@ export interface SpawnedChild extends ChildProcess {
 }
 
 export type SpawnFn = (command: string, args: string[], options: object) => SpawnedChild;
+
+/** Resume prompt metadata threaded from a durable resume into child invocation. */
+export interface ResumePromptContext {
+  /** Full durable continuation history (including the current call when already claimed). */
+  continuationTasks: string[];
+  /**
+   * Continuations not yet confirmed delivered for this unit. Existing Pi sessions
+   * receive only these (plus the fixed safety prompt). Prefer this over
+   * `currentContinuationTask` when delivery tracking is active.
+   */
+  undeliveredContinuationTasks?: string[];
+  /** Current call's continuation; used when undelivered list is not provided. */
+  currentContinuationTask?: string;
+}
 
 export interface RunSingleAgentOptions {
   spawnFn?: SpawnFn;
@@ -57,6 +76,21 @@ export interface RunSingleAgentOptions {
   interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
   /** Endpoint key (`runId:unitId`) registered before spawn. */
   endpointKey?: string;
+  /**
+   * When set, this invocation is part of a durable resume. Existing Pi sessions
+   * receive a session-continuation prompt; never-started/replay units receive
+   * original task + accumulated continuation tasks.
+   */
+  resumePrompt?: ResumePromptContext;
+  /**
+   * Explicit prompt-kind flag for resume. When true, send session-continuation
+   * (unit already owned a stored session before this invocation). When false,
+   * send original task + continuations even if a session file was just created.
+   * Required for correct never-started unit resume after prepareAgentContext.
+   */
+  resumeHadStoredSession?: boolean;
+  /** Called once the child has accepted the resume/fresh prompt (spawn or RPC activate). */
+  onResumePromptAccepted?: () => void;
 }
 
 export const ABORT_MESSAGE = 'Subagent was aborted';
@@ -388,6 +422,19 @@ export async function runSingleAgent(
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
+  // Resolve the prompt text for this invocation. Result metadata keeps the
+  // original resolved task; only the argv / child prompt is rewritten.
+  // Prefer the explicit resumeHadStoredSession flag so a session file created
+  // for a never-started unit is not mistaken for a prior stored session.
+  const resumePrompt = options.resumePrompt;
+  const useSessionContinuation = Boolean(
+    resumePrompt && (options.resumeHadStoredSession ?? Boolean(options.sessionFile))
+  );
+  const invocationTask =
+    resumePrompt && !useSessionContinuation
+      ? appendContinuationTasks(task, resumePrompt.continuationTasks)
+      : task;
+
   try {
     if (agent.systemPrompt.trim()) {
       const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
@@ -397,17 +444,30 @@ export async function runSingleAgent(
 
     const childEnv = buildChildAgentEnv(process.env, { agent: effectiveAgent });
     const disableAgentTool = !isAgentDelegationAllowed(childEnv);
-    const args = buildPiArgs(effectiveAgent, task, {
+    const args = buildPiArgs(effectiveAgent, invocationTask, {
       tmpPromptPath: tmpPromptPath ?? undefined,
       sessionFile: options.sessionFile,
       disableAgentTool,
       resolvedSkillPaths: options.resolvedSkillPaths,
-      ...(options.unitContext && options.unitContext.attempt > 1
-        ? { promptKind: 'resume' as const }
-        : {}),
+      ...(useSessionContinuation
+        ? {
+            prompt: {
+              kind: 'session_continuation' as const,
+              ...(resumePrompt?.undeliveredContinuationTasks !== undefined
+                ? {
+                    undeliveredContinuationTasks: resumePrompt.undeliveredContinuationTasks,
+                  }
+                : {}),
+              ...(resumePrompt?.currentContinuationTask !== undefined
+                ? { currentContinuationTask: resumePrompt.currentContinuationTask }
+                : {}),
+            },
+          }
+        : { prompt: { kind: 'task' as const } }),
     });
     let wasAborted = false;
     let maxTurnsExceeded = false;
+    let promptAccepted = false;
 
     const exitCode = await new Promise<number>((resolve) => {
       const invocation = getPiInvocation(args);
@@ -418,6 +478,11 @@ export async function runSingleAgent(
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      // Child accepted the argv prompt once spawn returns a process handle.
+      if (!promptAccepted) {
+        promptAccepted = true;
+        options.onResumePromptAccepted?.();
+      }
       let buffer = '';
       let killTimer: ReturnType<typeof setTimeout> | null = null;
       let hasClosed = false;
@@ -614,8 +679,13 @@ async function runSingleAgentGrok(
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
+  // Replay-capable units always start fresh; append all durable continuations.
+  const invocationTask = options.resumePrompt
+    ? appendContinuationTasks(task, options.resumePrompt.continuationTasks)
+    : task;
+
   const childEnv = buildChildAgentEnv(process.env, { agent: effectiveAgent });
-  const args = buildGrokArgs(effectiveAgent, task, {
+  const args = buildGrokArgs(effectiveAgent, invocationTask, {
     resolvedSkillPaths: options.resolvedSkillPaths,
   });
 
@@ -630,6 +700,7 @@ async function runSingleAgentGrok(
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    options.onResumePromptAccepted?.();
     let buffer = '';
     let hasClosed = false;
     let settled = false;
@@ -746,6 +817,11 @@ async function runSingleAgentGrokAcp(
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
+  // Replay-capable units always start fresh; append all durable continuations.
+  const invocationTask = options.resumePrompt
+    ? appendContinuationTasks(task, options.resumePrompt.continuationTasks)
+    : task;
+
   const parserState = createGrokAcpParserState(effectiveModel);
   const workCwd = cwd ?? defaultCwd;
   const childEnv = buildGrokAcpEnv(buildChildAgentEnv(process.env, { agent: effectiveAgent }));
@@ -762,11 +838,13 @@ async function runSingleAgentGrokAcp(
       signal,
       initializeParams: buildGrokAcpInitializeParams(),
       sessionNewParams: buildGrokAcpSessionNewParams(workCwd, effectiveAgent),
-      task,
+      task: invocationTask,
       onSessionUpdate: (notification) => {
         handleGrokAcpSessionUpdate(notification, currentResult, parserState, emitUpdate);
       },
     });
+    // ACP accepted the prompt once the client completed a session interaction.
+    options.onResumePromptAccepted?.();
 
     currentResult.stderr = acpResult.stderr;
     finalizeGrokAcpPrompt(

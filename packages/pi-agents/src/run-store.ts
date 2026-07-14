@@ -246,6 +246,13 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         error: { code: 'corrupt_run', runId: expectedRunId, message: 'invalid units' },
       };
     }
+    const requestError = validateStoredRequest(r.request, r.mode);
+    if (requestError) {
+      return {
+        ok: false,
+        error: { code: 'corrupt_run', runId: expectedRunId, message: requestError },
+      };
+    }
     for (const [unitId, unit] of Object.entries(r.units)) {
       if (!isUnitIdValid(unitId)) {
         return {
@@ -285,8 +292,179 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         };
       }
     }
+    if (r.continuationTasks !== undefined) {
+      if (!Array.isArray(r.continuationTasks)) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: 'continuationTasks is not an array',
+          },
+        };
+      }
+      for (let i = 0; i < r.continuationTasks.length; i++) {
+        if (typeof r.continuationTasks[i] !== 'string') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `continuationTasks[${i}] is not a string`,
+            },
+          };
+        }
+      }
+    }
+    if (r.continuationDelivery !== undefined) {
+      if (typeof r.continuationDelivery !== 'object' || r.continuationDelivery === null) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: 'continuationDelivery is not an object',
+          },
+        };
+      }
+      for (const [unitId, entry] of Object.entries(r.continuationDelivery)) {
+        if (!entry || typeof entry !== 'object') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `continuationDelivery[${unitId}] is not an object`,
+            },
+          };
+        }
+        const deliveredCount = (entry as { deliveredCount?: unknown }).deliveredCount;
+        if (
+          typeof deliveredCount !== 'number' ||
+          !Number.isInteger(deliveredCount) ||
+          deliveredCount < 0
+        ) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `continuationDelivery[${unitId}].deliveredCount is invalid`,
+            },
+          };
+        }
+      }
+    }
     void expectedDir;
     return { ok: true, record: r as AgentRunRecordV1 };
+  }
+
+  /**
+   * Validate StoredRunRequest shape and mode/topology consistency.
+   * Returns an error message or undefined when valid. Never throws.
+   */
+  function validateStoredRequest(request: unknown, mode: string): string | undefined {
+    if (!request || typeof request !== 'object') {
+      return 'request is not an object';
+    }
+    const req = request as Record<string, unknown>;
+    if (req.mode !== mode) {
+      return `request.mode (${String(req.mode)}) does not match record.mode (${mode})`;
+    }
+    if (typeof req.agentScope !== 'string') {
+      return 'request.agentScope is not a string';
+    }
+    for (const key of [
+      'model',
+      'thinking',
+      'runtime',
+      'isolation',
+      'agent',
+      'task',
+      'title',
+      'cwd',
+    ] as const) {
+      if (req[key] !== undefined && typeof req[key] !== 'string') {
+        return `request.${key} is not a string`;
+      }
+    }
+    if (mode === 'single') {
+      if (typeof req.agent !== 'string' || typeof req.task !== 'string') {
+        return 'request single mode requires agent and task strings';
+      }
+      if (req.tasks !== undefined || req.chain !== undefined) {
+        return 'request single mode must not include tasks or chain';
+      }
+    } else if (mode === 'parallel') {
+      if (!Array.isArray(req.tasks) || req.tasks.length === 0) {
+        return 'request parallel mode requires a non-empty tasks array';
+      }
+      for (let i = 0; i < req.tasks.length; i++) {
+        const item = req.tasks[i];
+        if (!item || typeof item !== 'object') {
+          return `request.tasks[${i}] is not an object`;
+        }
+        const t = item as Record<string, unknown>;
+        if (typeof t.agent !== 'string' || typeof t.task !== 'string') {
+          return `request.tasks[${i}] requires agent and task strings`;
+        }
+        for (const key of ['title', 'cwd', 'isolation'] as const) {
+          if (t[key] !== undefined && typeof t[key] !== 'string') {
+            return `request.tasks[${i}].${key} is not a string`;
+          }
+        }
+      }
+      if (req.chain !== undefined) {
+        return 'request parallel mode must not include chain';
+      }
+    } else if (mode === 'chain') {
+      if (!Array.isArray(req.chain) || req.chain.length === 0) {
+        return 'request chain mode requires a non-empty chain array';
+      }
+      for (let i = 0; i < req.chain.length; i++) {
+        const item = req.chain[i];
+        if (!item || typeof item !== 'object') {
+          return `request.chain[${i}] is not an object`;
+        }
+        const step = item as Record<string, unknown>;
+        const isFanout = 'expand' in step && !('agent' in step);
+        if (isFanout) {
+          if (!step.expand || typeof step.expand !== 'object') {
+            return `request.chain[${i}].expand is invalid`;
+          }
+          if (!step.parallel || typeof step.parallel !== 'object') {
+            return `request.chain[${i}].parallel is invalid`;
+          }
+          if (!step.collect || typeof step.collect !== 'object') {
+            return `request.chain[${i}].collect is invalid`;
+          }
+          const parallel = step.parallel as Record<string, unknown>;
+          if (typeof parallel.agent !== 'string' || typeof parallel.task !== 'string') {
+            return `request.chain[${i}].parallel requires agent and task strings`;
+          }
+          const collect = step.collect as Record<string, unknown>;
+          if (typeof collect.name !== 'string') {
+            return `request.chain[${i}].collect.name is not a string`;
+          }
+          const expand = step.expand as Record<string, unknown>;
+          if (!expand.from || typeof expand.from !== 'object') {
+            return `request.chain[${i}].expand.from is invalid`;
+          }
+          const from = expand.from as Record<string, unknown>;
+          if (typeof from.output !== 'string' || typeof from.path !== 'string') {
+            return `request.chain[${i}].expand.from requires output and path strings`;
+          }
+        } else {
+          if (typeof step.agent !== 'string' || typeof step.task !== 'string') {
+            return `request.chain[${i}] requires agent and task strings`;
+          }
+        }
+      }
+      if (req.tasks !== undefined) {
+        return 'request chain mode must not include tasks';
+      }
+    }
+    return undefined;
   }
 
   function loadRunJson(

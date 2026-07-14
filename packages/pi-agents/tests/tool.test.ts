@@ -6,12 +6,13 @@ import type { AgentToolResult, ExtensionContext } from '@earendil-works/pi-codin
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { discoverAgents } from '../src/agents.ts';
 import { executeAgentTool, type ExecuteAgentToolOptions } from '../src/tool.ts';
 import type { BackgroundManager } from '../src/background.ts';
 import { clearDiscoveredSkills, setDiscoveredSkills } from '../src/skills.ts';
 import { createRunStore } from '../src/run-store.ts';
-import { createRunCoordinator } from '../src/run-coordinator.ts';
-import type { ListRunsResult, AgentRunRecordV1 } from '../src/run-types.ts';
+import { agentFingerprint, createRunCoordinator } from '../src/run-coordinator.ts';
+import type { ListRunsResult, AgentRunRecordV1, RunUnitRecord } from '../src/run-types.ts';
 import type { SubagentDetails } from '../src/types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
@@ -737,7 +738,11 @@ describe('durable chain fanout item lifecycle', () => {
       mode: 'chain',
       agentScope: 'user',
       background: false,
-      request: { mode: 'chain', agentScope: 'user', chain: [] },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
       details: {
         mode: 'chain',
         agentScope: 'user',
@@ -855,7 +860,11 @@ describe('durable chain fanout item lifecycle', () => {
       mode: 'chain',
       agentScope: 'user',
       background: false,
-      request: { mode: 'chain', agentScope: 'user', chain: [] },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
       details: {
         mode: 'chain',
         agentScope: 'user',
@@ -918,7 +927,11 @@ describe('durable chain fanout item lifecycle', () => {
       mode: 'chain',
       agentScope: 'user',
       background: false,
-      request: { mode: 'chain', agentScope: 'user', chain: [] },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
       details: {
         mode: 'chain',
         agentScope: 'user',
@@ -945,10 +958,9 @@ describe('durable chain fanout item lifecycle', () => {
     live.status = 'running';
     coordinator.registerRun(created.runId, live);
 
-    const origUpdate = store.updateRun.bind(store);
     store.updateRun = (async () => {
       throw new Error('disk full');
-    }) as typeof origUpdate;
+    }) as typeof store.updateRun;
 
     await expect(
       coordinator.expandFanout(created.runId, {
@@ -977,7 +989,11 @@ describe('durable chain fanout item lifecycle', () => {
       mode: 'chain',
       agentScope: 'user',
       background: false,
-      request: { mode: 'chain', agentScope: 'user', chain: [] },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
       details: {
         mode: 'chain',
         agentScope: 'user',
@@ -1062,7 +1078,11 @@ describe('durable chain fanout item lifecycle', () => {
       mode: 'chain',
       agentScope: 'user',
       background: false,
-      request: { mode: 'chain', agentScope: 'user', chain: [] },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
       details: {
         mode: 'chain',
         agentScope: 'user',
@@ -1207,7 +1227,11 @@ describe('durable chain fanout item lifecycle', () => {
       mode: 'chain',
       agentScope: 'user',
       background: false,
-      request: { mode: 'chain', agentScope: 'user', chain: [] },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
       details: {
         mode: 'chain',
         agentScope: 'user',
@@ -1322,5 +1346,959 @@ describe('durable chain fanout item lifecycle', () => {
       expect(unit.agentFingerprint.length).toBeGreaterThan(0);
       expect(unit.runtime === undefined || unit.runtime === 'pi').toBe(true);
     }
+  });
+});
+
+describe('executeAgentTool public runId resume', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-runid-'));
+  });
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function makeStore() {
+    const store = createRunStore({ rootDir: tmpRoot });
+    const coordinator = createRunCoordinator({ store });
+    return { store, coordinator };
+  }
+
+  function exploreAgent() {
+    const agents = discoverAgents(process.cwd(), 'both').agents;
+    const explore = agents.find((a) => a.name === 'explore');
+    if (!explore) throw new Error('builtin explore agent not found');
+    return explore;
+  }
+
+  async function seedInterruptedRun(options: {
+    store: ReturnType<typeof createRunStore>;
+    mode?: 'single' | 'parallel' | 'chain';
+    background?: boolean;
+    capability?: 'session' | 'replay';
+    unitStatus?: RunUnitRecord['status'];
+    sessionFile?: string | null;
+    continuationTasks?: string[];
+    request?: Partial<AgentRunRecordV1['request']>;
+  }): Promise<string> {
+    const agent = exploreAgent();
+    const mode = options.mode ?? 'single';
+    const capability = options.capability ?? 'session';
+    const unitStatus = options.unitStatus ?? 'interrupted';
+    const sessionFile =
+      options.sessionFile === null
+        ? undefined
+        : (options.sessionFile ?? path.join(tmpRoot, 'seed-session.jsonl'));
+    if (sessionFile) writeFileSync(sessionFile, '{}\n');
+
+    const request: AgentRunRecordV1['request'] = {
+      mode,
+      agentScope: 'both',
+      agent: 'explore',
+      task: 'Original stored task',
+      ...options.request,
+    };
+    if (mode === 'parallel' && !request.tasks) {
+      request.tasks = [{ agent: 'explore', task: 'Parallel original' }];
+      delete request.agent;
+      delete request.task;
+    }
+    if (mode === 'chain' && !request.chain) {
+      request.chain = [{ agent: 'explore', task: 'Chain original' }];
+      delete request.agent;
+      delete request.task;
+    }
+
+    const unitId =
+      mode === 'single' ? 'single' : mode === 'parallel' ? 'parallel-0001' : 'chain-0001';
+    const units: Record<string, RunUnitRecord> = {
+      [unitId]: {
+        unitId,
+        agent: agent.name,
+        agentFingerprint: agentFingerprint(agent),
+        runtime: capability === 'replay' ? 'grok' : undefined,
+        capability,
+        status: unitStatus,
+        attempt: 1,
+        attempts:
+          unitStatus === 'queued'
+            ? []
+            : [
+                {
+                  attempt: 1,
+                  status: unitStatus === 'completed' ? 'completed' : 'interrupted',
+                  startedAt: Date.now() - 1000,
+                },
+              ],
+        effectiveCwd: tmpRoot,
+        ...(sessionFile ? { sessionFile } : {}),
+      },
+    };
+
+    const created = await options.store.createRun({
+      mode,
+      agentScope: 'both',
+      background: options.background ?? false,
+      request,
+      details: {
+        mode,
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units,
+    });
+    await options.store.updateRun(created.runId, (r) => {
+      r.status = unitStatus === 'completed' ? 'completed' : 'interrupted';
+      if (options.continuationTasks) r.continuationTasks = [...options.continuationTasks];
+    });
+    return created.runId;
+  }
+
+  it('resumes by runId alone and reuses the same durable run record', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    let seenParams: Record<string, unknown> | undefined;
+    const result = await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async (params) => {
+        seenParams = params as Record<string, unknown>;
+        return okResult('resumed');
+      },
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(result.isError).toBeUndefined();
+    expect(seenParams?.agent).toBe('explore');
+    expect(seenParams?.task).toBe('Original stored task');
+    expect(seenParams?.runId).toBeUndefined();
+    const runs = await store.listRuns();
+    expect(runs.filter((r) => 'record' in r)).toHaveLength(1);
+    expect(loadedRecordOf(runs[0]!).runId).toBe(runId);
+  });
+
+  it('appends a trimmed continuation task after a successful claim', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    await executeAgentTool(
+      { runId, task: '  Also verify migration.  ' },
+      undefined,
+      undefined,
+      makeCtx(),
+      {
+        runWorkflow: async () => okResult('resumed'),
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationTasks).toEqual(['Also verify migration.']);
+  });
+
+  it('does not persist a continuation task when preflight fails', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({
+      store,
+      capability: 'replay',
+      sessionFile: null,
+    });
+    const result = await executeAgentTool(
+      { runId, task: 'Should not persist' },
+      undefined,
+      undefined,
+      makeCtx(),
+      {
+        runWorkflow: async () => okResult('should not run'),
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('preflight_failed');
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationTasks).toBeUndefined();
+    expect(loaded.loaded.record.status).toBe('interrupted');
+  });
+
+  it('does not persist a continuation task when another owner holds the claim', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    const claim = await store.claimRun(runId);
+    expect(claim.ok).toBe(true);
+    const result = await executeAgentTool(
+      { runId, task: 'Blocked by claim' },
+      undefined,
+      undefined,
+      makeCtx(),
+      {
+        runWorkflow: async () => okResult('should not run'),
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(/claim_failed|run_active/);
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationTasks).toBeUndefined();
+    if (claim.ok) await store.releaseRun(runId, claim.claimId);
+  });
+
+  it('rejects conflicting fresh-launch fields with a sorted field list', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    const result = await executeAgentTool(
+      { runId, agent: 'explore', model: 'gpt-5', cwd: '/tmp' },
+      undefined,
+      undefined,
+      makeCtx(),
+      { runStore: store, runCoordinator: coordinator }
+    );
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain('resume_error: conflicting parameters for runId:');
+    expect(text).toContain('agent');
+    expect(text).toContain('cwd');
+    expect(text).toContain('model');
+    // Sorted: agent, cwd, model
+    expect(text.indexOf('agent')).toBeLessThan(text.indexOf('cwd'));
+    expect(text.indexOf('cwd')).toBeLessThan(text.indexOf('model'));
+  });
+
+  it('returns run_not_found for an unknown runId', async () => {
+    const { store, coordinator } = makeStore();
+    const result = await executeAgentTool(
+      { runId: 'run-does-not-exist' },
+      undefined,
+      undefined,
+      makeCtx(),
+      { runStore: store, runCoordinator: coordinator }
+    );
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('run_not_found');
+  });
+
+  it('rejects resume of a completed run without mutating it', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store, unitStatus: 'completed' });
+    const result = await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async () => okResult('should not run'),
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('run_already_completed');
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.status).toBe('completed');
+  });
+
+  it('restores parallel mode and original background delivery from the stored run', async () => {
+    const { store, coordinator } = makeStore();
+    const { manager, launches, runs } = fakeManager();
+    const runId = await seedInterruptedRun({
+      store,
+      mode: 'parallel',
+      background: true,
+      request: {
+        mode: 'parallel',
+        agentScope: 'both',
+        tasks: [{ agent: 'explore', task: 'Inspect parallel' }],
+      },
+    });
+    await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      backgroundManager: manager,
+      runWorkflow: async (params) => {
+        expect(params.tasks?.[0]?.task).toBe('Inspect parallel');
+        expect(params.runInBackground).toBe(true);
+        return okResult('bg resumed');
+      },
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    await Promise.allSettled(runs);
+    expect(launches).toHaveLength(1);
+    expect(launches[0]?.mode).toBe('parallel');
+    const list = await store.listRuns();
+    expect(list.filter((r) => 'record' in r)).toHaveLength(1);
+  });
+
+  it('restores chain mode from the stored request', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({
+      store,
+      mode: 'chain',
+      request: {
+        mode: 'chain',
+        agentScope: 'both',
+        chain: [{ agent: 'explore', task: 'Chain step one' }],
+      },
+    });
+    let modeSeen: string | undefined;
+    await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async (params, _s, _u, _c, _a, makeDetails) => {
+        modeSeen = params.chain ? 'chain' : 'other';
+        return {
+          content: [{ type: 'text', text: 'chain resumed' }],
+          details: makeDetails('chain')([]),
+        };
+      },
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(modeSeen).toBe('chain');
+  });
+
+  it('requires allowReplay for replay-capable units and resumes when acknowledged', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({
+      store,
+      capability: 'replay',
+      sessionFile: null,
+    });
+    const blocked = await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async () => okResult('should not run'),
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(blocked.isError).toBe(true);
+    expect((blocked.content[0] as { text: string }).text).toContain('replay');
+
+    let invoked = false;
+    const allowed = await executeAgentTool(
+      { runId, allowReplay: true, task: 'Retry safely' },
+      undefined,
+      undefined,
+      makeCtx(),
+      {
+        runWorkflow: async () => {
+          invoked = true;
+          return okResult('replayed');
+        },
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(allowed.isError).toBeUndefined();
+    expect(invoked).toBe(true);
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.continuationTasks).toEqual(['Retry safely']);
+  });
+
+  it('treats an absent continuationTasks history as empty on resume', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    const loadedBefore = store.getRun(runId);
+    expect(loadedBefore.ok).toBe(true);
+    if (loadedBefore.ok) expect(loadedBefore.loaded.record.continuationTasks).toBeUndefined();
+
+    await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async () => okResult('resumed'),
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    // No new task appended; field stays absent or empty.
+    expect(loaded.loaded.record.continuationTasks ?? []).toEqual([]);
+  });
+
+  it('rejects blank runId and allowReplay without runId', async () => {
+    const { store, coordinator } = makeStore();
+    const blank = await executeAgentTool({ runId: '   ' }, undefined, undefined, makeCtx(), {
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(blank.isError).toBe(true);
+    expect((blank.content[0] as { text: string }).text).toContain('runId must be a non-empty');
+
+    const orphanReplay = await executeAgentTool(
+      { agent: 'explore', task: 'x', allowReplay: true } as never,
+      undefined,
+      undefined,
+      makeCtx(),
+      { runStore: store, runCoordinator: coordinator }
+    );
+    expect(orphanReplay.isError).toBe(true);
+    expect((orphanReplay.content[0] as { text: string }).text).toContain(
+      'allowReplay requires runId'
+    );
+  });
+
+  it('marks continuation delivery after spawn and redelivers only undelivered on next resume', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+
+    let lastPrompt = '';
+    const spawnFn = ((_cmd: string, args: string[]) => {
+      lastPrompt = args[args.length - 1] ?? '';
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'done' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    // First resume with a continuation: orchestration path (no runWorkflow seam).
+    await executeAgentTool(
+      { runId, task: 'First continuation' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    expect(lastPrompt).toContain('resuming');
+    expect(lastPrompt).toContain('First continuation');
+    expect(lastPrompt).not.toContain('Task: Original stored task');
+
+    const afterFirst = store.getRun(runId);
+    expect(afterFirst.ok).toBe(true);
+    if (!afterFirst.ok) return;
+    expect(afterFirst.loaded.record.continuationTasks).toEqual(['First continuation']);
+    const unitId = Object.keys(afterFirst.loaded.record.units)[0]!;
+    expect(afterFirst.loaded.record.continuationDelivery?.[unitId]?.deliveredCount).toBe(1);
+
+    // Re-interrupt for a second resume.
+    await store.updateRun(runId, (r) => {
+      r.status = 'interrupted';
+      for (const u of Object.values(r.units)) {
+        u.status = 'interrupted';
+      }
+    });
+
+    await executeAgentTool(
+      { runId, task: 'Second continuation' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    // Existing session already delivered the first; only second is new.
+    expect(lastPrompt).toContain('Second continuation');
+    expect(lastPrompt).not.toContain('First continuation');
+    expect(lastPrompt).not.toContain('Task: Original stored task');
+
+    const afterSecond = store.getRun(runId);
+    expect(afterSecond.ok).toBe(true);
+    if (!afterSecond.ok) return;
+    expect(afterSecond.loaded.record.continuationTasks).toEqual([
+      'First continuation',
+      'Second continuation',
+    ]);
+    expect(afterSecond.loaded.record.continuationDelivery?.[unitId]?.deliveredCount).toBe(2);
+  });
+
+  it('never-started queued unit receives original task plus all continuations via orchestration', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({
+      store,
+      unitStatus: 'queued',
+      sessionFile: null,
+      continuationTasks: ['Prior undelivered'],
+    });
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+    let lastPrompt = '';
+    const spawnFn = ((_cmd: string, args: string[]) => {
+      lastPrompt = args[args.length - 1] ?? '';
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    await executeAgentTool(
+      { runId, task: 'New continuation' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    expect(lastPrompt).toContain('Task: Original stored task');
+    expect(lastPrompt).toContain('Prior undelivered');
+    expect(lastPrompt).toContain('New continuation');
+  });
+
+  it('skips completed parallel units by unit.status even when details.results lag', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const sessionA = path.join(tmpRoot, 'a.jsonl');
+    const sessionB = path.join(tmpRoot, 'b.jsonl');
+    writeFileSync(sessionA, '{}\n');
+    writeFileSync(sessionB, '{}\n');
+    const created = await store.createRun({
+      mode: 'parallel',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'parallel',
+        agentScope: 'both',
+        tasks: [
+          { agent: 'explore', task: 'Task A' },
+          { agent: 'explore', task: 'Task B' },
+        ],
+      },
+      details: {
+        mode: 'parallel',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        // Lagging/inconsistent: both slots look incomplete in details.
+        results: [],
+      },
+      units: {
+        'parallel-0001': {
+          unitId: 'parallel-0001',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'completed',
+          fanoutIndex: 0,
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'completed', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: tmpRoot,
+          sessionFile: sessionA,
+          result: {
+            agent: 'explore',
+            agentSource: 'builtin',
+            task: 'Task A',
+            exitCode: 0,
+            status: 'completed',
+            messages: [],
+            stderr: '',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+          },
+        },
+        'parallel-0002': {
+          unitId: 'parallel-0002',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'interrupted',
+          fanoutIndex: 1,
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: tmpRoot,
+          sessionFile: sessionB,
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    const dispatched: string[] = [];
+    await executeAgentTool(
+      { runId: created.runId },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        // Real orchestration path (no runWorkflow seam) so parallel skip runs.
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: ((_cmd: string, args: string[]) => {
+          const prompt = args[args.length - 1] ?? '';
+          dispatched.push(prompt);
+          const EventEmitter = require('node:events').EventEmitter;
+          const { Readable } = require('node:stream');
+          const fake = new (class extends EventEmitter {
+            stdout = new Readable({ read() {} });
+            stderr = new Readable({ read() {} });
+            kill() {
+              this.stdout.push(null);
+              this.stderr.push(null);
+              setImmediate(() => this.emit('close', 0));
+              return true;
+            }
+          })();
+          setImmediate(() => {
+            fake.stdout.push(
+              JSON.stringify({
+                type: 'message_end',
+                message: {
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'b done' }],
+                  usage: { input: 1, output: 1, totalTokens: 2 },
+                },
+              }) + '\n'
+            );
+            fake.kill();
+          });
+          return fake;
+        }) as unknown as import('../src/execution.ts').SpawnFn,
+      }
+    );
+    // Only incomplete unit B should spawn (one prompt).
+    expect(dispatched.length).toBe(1);
+    expect(dispatched[0]).toContain('resuming');
+  });
+
+  it('uses persisted effectiveCwd for discovery and child cwd across different ctx.cwd', async () => {
+    const { store, coordinator } = makeStore();
+    const projectDir = path.join(tmpRoot, 'original-project');
+    mkdirSync(projectDir, { recursive: true });
+    const runId = await seedInterruptedRun({
+      store,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'Original stored task',
+        cwd: projectDir,
+      },
+    });
+    // Point unit effectiveCwd at the original project.
+    await store.updateRun(runId, (r) => {
+      for (const u of Object.values(r.units)) {
+        u.effectiveCwd = projectDir;
+      }
+    });
+
+    let childCwd: string | undefined;
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+    const spawnFn = ((_cmd: string, _args: string[], opts: { cwd?: string }) => {
+      childCwd = opts.cwd;
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    await executeAgentTool(
+      { runId },
+      undefined,
+      undefined,
+      makeCtx({ cwd: '/tmp/different-session-cwd' }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn,
+      }
+    );
+    expect(childCwd).toBe(projectDir);
+  });
+
+  it('releases claim without mutating completed run when post-claim eligibility fails (cross-store race)', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    // Second store instance over the same root simulates a concurrent writer.
+    const store2 = createRunStore({ rootDir: tmpRoot });
+    const originalClaim = store.claimRun.bind(store);
+    store.claimRun = async (id: string) => {
+      const claim = await originalClaim(id);
+      if (claim.ok) {
+        // Another process completes the run after we hold the claim.
+        await store2.updateRun(id, (r) => {
+          r.status = 'completed';
+          for (const u of Object.values(r.units)) {
+            u.status = 'completed';
+          }
+        });
+      }
+      return claim;
+    };
+
+    const result = await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async () => okResult('should not run'),
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(
+      /run_already_completed|preflight_failed|no_incomplete/
+    );
+    const loaded = store2.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.status).toBe('completed');
+    // Claim must be released (no live owner).
+    const claims = store.inspectClaims(runId);
+    expect(claims.ok).toBe(true);
+    if (claims.ok) {
+      const live = claims.claims.filter((c) => c.terminal === undefined && c.owner);
+      expect(live).toHaveLength(0);
+    }
+  });
+
+  it('keeps continuation undelivered when background mode rejects after claim', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({
+      store,
+      background: true,
+    });
+    const result = await executeAgentTool(
+      { runId, task: 'Should stay pending' },
+      undefined,
+      undefined,
+      makeCtx({ mode: 'json' }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBe(true);
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    // Continuation was claimed into history...
+    expect(loaded.loaded.record.continuationTasks).toEqual(['Should stay pending']);
+    // ...but no unit marked delivery (spawn never ran).
+    expect(loaded.loaded.record.continuationDelivery ?? {}).toEqual({});
+  });
+
+  it('mixed parallel Pi completed + Grok incomplete respects unit.status skip and allowReplay gate', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const sessionA = path.join(tmpRoot, 'pi.jsonl');
+    writeFileSync(sessionA, '{}\n');
+    const created = await store.createRun({
+      mode: 'parallel',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'parallel',
+        agentScope: 'both',
+        tasks: [
+          { agent: 'explore', task: 'Pi task' },
+          { agent: 'explore', task: 'Grok task' },
+        ],
+      },
+      details: {
+        mode: 'parallel',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        // Inconsistent: details says both completed, units disagree for grok.
+        results: [
+          {
+            agent: 'explore',
+            agentSource: 'builtin',
+            task: 'Pi task',
+            exitCode: 0,
+            status: 'completed',
+            messages: [],
+            stderr: '',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+          },
+          {
+            agent: 'explore',
+            agentSource: 'builtin',
+            task: 'Grok task',
+            exitCode: 0,
+            status: 'completed',
+            messages: [],
+            stderr: '',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+          },
+        ],
+      },
+      units: {
+        'parallel-0001': {
+          unitId: 'parallel-0001',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'completed',
+          fanoutIndex: 0,
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'completed', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: tmpRoot,
+          sessionFile: sessionA,
+          result: {
+            agent: 'explore',
+            agentSource: 'builtin',
+            task: 'Pi task',
+            exitCode: 0,
+            status: 'completed',
+            messages: [],
+            stderr: '',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+          },
+        },
+        'parallel-0002': {
+          unitId: 'parallel-0002',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok',
+          capability: 'replay',
+          status: 'interrupted',
+          fanoutIndex: 1,
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: tmpRoot,
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    const blocked = await executeAgentTool(
+      { runId: created.runId },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator }
+    );
+    expect(blocked.isError).toBe(true);
+    expect((blocked.content[0] as { text: string }).text).toContain('replay');
+
+    let grokDispatched = false;
+    const allowed = await executeAgentTool(
+      { runId: created.runId, allowReplay: true },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: ((_cmd: string, args: string[]) => {
+          grokDispatched = true;
+          const joined = args.join(' ');
+          expect(joined).toContain('Grok task');
+          const EventEmitter = require('node:events').EventEmitter;
+          const { Readable } = require('node:stream');
+          const fake = new (class extends EventEmitter {
+            stdout = new Readable({ read() {} });
+            stderr = new Readable({ read() {} });
+            kill() {
+              this.stdout.push(null);
+              this.stderr.push(null);
+              setImmediate(() => this.emit('close', 0));
+              return true;
+            }
+          })();
+          setImmediate(() => {
+            fake.stdout.push(
+              JSON.stringify({
+                type: 'message_end',
+                message: {
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'grok done' }],
+                  usage: { input: 1, output: 1, totalTokens: 2 },
+                },
+              }) + '\n'
+            );
+            // Grok streaming may differ; close anyway.
+            fake.kill();
+          });
+          return fake;
+        }) as unknown as import('../src/execution.ts').SpawnFn,
+      }
+    );
+    expect(allowed.isError).toBeUndefined();
+    expect(grokDispatched).toBe(true);
   });
 });

@@ -54,13 +54,50 @@ dropped with the same rules as frontmatter parsing.
 
 ## Tool modes
 
-| Mode     | Parameter          | Description                                          |
-| -------- | ------------------ | ---------------------------------------------------- |
-| Single   | `{ agent, task }`  | One agent, one task.                                 |
-| Parallel | `{ tasks: [...] }` | Multiple agents concurrently (max 8, 4 at a time).   |
-| Chain    | `{ chain: [...] }` | Sequential with `{previous}` and `{outputs.<name>}`. |
+| Mode     | Parameter                        | Description                                             |
+| -------- | -------------------------------- | ------------------------------------------------------- |
+| Single   | `{ agent, task }`                | One agent, one task.                                    |
+| Parallel | `{ tasks: [...] }`               | Multiple agents concurrently (max 8, 4 at a time).      |
+| Chain    | `{ chain: [...] }`               | Sequential with `{previous}` and `{outputs.<name>}`.    |
+| Resume   | `{ runId, task?, allowReplay? }` | Resume a durable run from stored workflow and sessions. |
 
-Any mode can be wrapped with `runInBackground: true` to run asynchronously.
+Any fresh mode can be wrapped with `runInBackground: true` to run asynchronously.
+On resume, background delivery is restored from the stored run and cannot be overridden.
+
+### Resume parameters
+
+| Parameter     | Required | Description                                                                                                                               |
+| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `runId`       | yes      | Public durable run id (from a prior `agent` result or `/agent runs`).                                                                     |
+| `task`        | no       | Continuation instruction appended to incomplete units only. Trimmed; blank values are ignored.                                            |
+| `allowReplay` | no       | When `true`, allows replay-capable (Grok / Grok ACP) units to re-run. Required when any incomplete unit has `resumeCapability: "replay"`. |
+
+When `runId` is present, reject these fresh-launch fields (error
+`resume_error: conflicting parameters for runId: <sorted fields>`):
+`agent`, `tasks`, `chain`, `agentScope`, `cwd`, `isolation`, `runInBackground`,
+`model`, `thinking`, `runtime`, `title`. Stored values remain authoritative.
+
+### Continuation prompt delivery
+
+| Unit situation                | Prompt sent                                                                                                     |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Pi with stored session        | Fixed safety continuation + **undelivered** `continuationTasks` for that unit. Original task not resent.        |
+| Pi never started (no session) | Resolved original task + **all** durable `continuationTasks` (even if a new session file is created this call). |
+| Grok / Grok ACP (replay)      | Resolved original task + **all** durable `continuationTasks`, from a fresh process.                             |
+
+Per-unit delivery progress is stored in `continuationDelivery[unitId].deliveredCount`
+(how many of `continuationTasks[0..n)` have been confirmed accepted by that unit).
+Delivery is marked only after the child accepts the prompt (JSON spawn or RPC
+activate). Crash after claim, background rejection, or partial dispatch leaves
+undelivered entries for the next resume.
+
+Continuation text is applied **after** chain placeholder and fanout `{item}`
+resolution so braces in the new instruction are not treated as templates.
+Appended continuation prompts are durable run data under `continuationTasks`
+and may contain sensitive information.
+
+`runId` must be a non-empty non-whitespace string. `allowReplay` without `runId`
+is rejected with `resume_error`.
 
 ### Collapse titles
 
@@ -105,17 +142,18 @@ frontmatter and config overrides.
 
 ## Background agents
 
-| Property              | Value                                                                      |
-| --------------------- | -------------------------------------------------------------------------- |
-| Job id                | `agent-bg-*`                                                               |
-| Completion message    | `customType: pi-agents-background-result`, `triggerTurn: true`             |
-| Cancelled message     | same `customType`, `triggerTurn: false`                                    |
-| Max in-flight jobs    | 4 (additional launches error with `Too many background agent jobs`)        |
-| Lifetime              | in-memory, per-session; cancelled on `quit`/`reload`/`resume`/`fork`/`new` |
-| Parent abort (Ctrl+C) | does not cancel a launched background job                                  |
-| `json`/`print` modes  | rejected (those host processes exit when the tool returns)                 |
-| Snake_case alias      | `run_in_background` normalized to `runInBackground` before validation      |
-| Foreground detach     | not supported                                                              |
+| Property              | Value                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------- |
+| Job id                | Durable runs use the public `runId`; non-durable launches use `agent-bg-*`                  |
+| Completion message    | `customType: pi-agents-background-result`, `triggerTurn: true`                              |
+| Cancelled message     | same `customType`, `triggerTurn: false`                                                     |
+| Max in-flight jobs    | 4 (additional launches error with `Too many background agent jobs`)                         |
+| Lifetime              | in-memory, per-session; cancelled on `quit`/`reload`/`resume`/`fork`/`new`                  |
+| Parent abort (Ctrl+C) | does not cancel a launched background job                                                   |
+| `json`/`print` modes  | rejected (those host processes exit when the tool returns)                                  |
+| Snake_case alias      | `run_in_background` normalized to `runInBackground` before validation                       |
+| Foreground detach     | not supported                                                                               |
+| Resume + background   | Restored from the stored run; launch result `background[].jobId` equals the durable `runId` |
 
 ## Structured output
 
@@ -199,22 +237,40 @@ fingerprint, runtime capability, and terminal `result`. Unit records are
 authoritative on resume; `details.results` is the ordered presentation
 projection.
 
+### Durable continuation metadata
+
+`AgentRunRecordV1.continuationTasks?: string[]` accumulates trimmed non-empty
+`task` values supplied on successful resume claims. Absent on older Version 1
+records (treated as `[]`). Written only after preflight, claim acquisition, and
+post-claim eligibility re-check succeed, in the same `updateRun` that
+transitions the run to `running`.
+
+`AgentRunRecordV1.continuationDelivery?: Record<unitId, { deliveredCount: number }>`
+tracks how many leading continuation tasks each unit has accepted. Missing
+entry means zero. Updated only after prompt acceptance (spawn / RPC activate).
+
 ### Resume errors
 
-Blocking reasons returned by resume inspection (and related coordinator errors):
+Blocking reasons and tool-level resume errors:
 
-| Prefix / code                     | When                                                            |
-| --------------------------------- | --------------------------------------------------------------- |
-| `stored_fanout_state_unavailable` | Incomplete fanout without a valid, canonical persisted mapping  |
-| `stored_output_invalid`           | Completed child unit missing a completed terminal result        |
-| `fanout_state_conflict`           | Expansion request conflicts with an existing mapping or unit id |
-| `session_unavailable`             | Pi unit that already started is missing its session file        |
-| fingerprint mismatch              | Current agent definition differs from the stored fingerprint    |
-| requires replay                   | Replay-capable unit and `allowReplay` was not set               |
+| Prefix / code                      | When                                                            |
+| ---------------------------------- | --------------------------------------------------------------- |
+| `conflicting parameters for runId` | Fresh-launch fields supplied alongside `runId`                  |
+| `run_not_found`                    | Unknown or unreadable run id                                    |
+| `preflight_failed`                 | Inspection returned one or more blocking reasons                |
+| `run_active`                       | Coordinator already owns the run                                |
+| `resume_setup_failed`              | Post-claim persistence failed (claim released)                  |
+| `stored_fanout_state_unavailable`  | Incomplete fanout without a valid, canonical persisted mapping  |
+| `stored_output_invalid`            | Completed child unit missing a completed terminal result        |
+| `fanout_state_conflict`            | Expansion request conflicts with an existing mapping or unit id |
+| `session_unavailable`              | Pi unit that already started is missing its session file        |
+| fingerprint mismatch               | Current agent definition differs from the stored fingerprint    |
+| requires replay                    | Replay-capable unit and `allowReplay` was not set               |
 
-Completed historical runs remain listable and inspectable even when they predate
-per-item fanout records. Incomplete legacy fanouts without a mapping cannot be
-resumed safely — start a new invocation.
+Completed historical runs remain listable via `/agent runs` and
+`/agent status` even when they predate per-item fanout records. Incomplete
+legacy fanouts without a mapping cannot be resumed safely — start a new
+invocation.
 
 ## Bundled agents
 

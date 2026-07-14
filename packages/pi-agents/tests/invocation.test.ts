@@ -7,9 +7,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentConfig } from '../src/agents.ts';
 import {
+  appendContinuationTasks,
   buildPiArgs,
   buildPiRpcArgs,
+  buildSessionContinuationPrompt,
   getPiInvocation,
+  RESUME_CONTINUATION_PROMPT,
   writePromptToTempFile,
 } from '../src/invocation.ts';
 
@@ -130,15 +133,15 @@ describe('buildPiArgs', () => {
     expect(args).not.toContain('--no-session');
   });
 
-  it('sends Task: <task> once for initial promptKind', () => {
-    const args = buildPiArgs(makeAgent(), 'do work', { promptKind: 'initial' });
+  it('sends Task: <task> once for a fresh task prompt', () => {
+    const args = buildPiArgs(makeAgent(), 'do work', { prompt: { kind: 'task' } });
     expect(args[args.length - 1]).toBe('Task: do work');
     expect(args.filter((a) => a.startsWith('Task:')).length).toBe(1);
   });
 
-  it('sends a fixed continuation instruction for resume promptKind without resending the task', () => {
+  it('sends the fixed session-continuation prompt without resending the original task', () => {
     const args = buildPiArgs(makeAgent(), 'do work', {
-      promptKind: 'resume',
+      prompt: { kind: 'session_continuation' },
       sessionFile: '/tmp/stored.jsonl',
     });
     // Must reuse the stored session, not --no-session.
@@ -147,8 +150,43 @@ describe('buildPiArgs', () => {
     // The last arg is the resume continuation, not Task: <task>.
     const last = args[args.length - 1];
     expect(last).not.toContain('Task: do work');
+    expect(last).toBe(RESUME_CONTINUATION_PROMPT);
     expect(last).toContain('resuming');
     expect(last).toContain('interrupted');
+  });
+
+  it('appends the current continuation task exactly once on session continuation', () => {
+    const args = buildPiArgs(makeAgent(), 'do work', {
+      prompt: { kind: 'session_continuation', currentContinuationTask: 'Also verify migration.' },
+      sessionFile: '/tmp/stored.jsonl',
+    });
+    const last = args[args.length - 1]!;
+    expect(last).not.toContain('Task: do work');
+    expect(last).toContain(RESUME_CONTINUATION_PROMPT);
+    expect(last).toContain('Additional instruction for this resumed run:\nAlso verify migration.');
+    expect(last.split('Additional instruction for this resumed run:').length - 1).toBe(1);
+  });
+
+  it('appends every undelivered continuation on session continuation', () => {
+    const args = buildPiArgs(makeAgent(), 'do work', {
+      prompt: {
+        kind: 'session_continuation',
+        undeliveredContinuationTasks: ['First undelivered', 'Second undelivered'],
+      },
+      sessionFile: '/tmp/stored.jsonl',
+    });
+    const last = args[args.length - 1]!;
+    expect(last).toContain('First undelivered');
+    expect(last).toContain('Second undelivered');
+    expect(last.split('Additional instruction for this resumed run:').length - 1).toBe(2);
+  });
+
+  it('ignores a blank current continuation on session continuation', () => {
+    const args = buildPiArgs(makeAgent(), 'do work', {
+      prompt: { kind: 'session_continuation', currentContinuationTask: '   ' },
+      sessionFile: '/tmp/stored.jsonl',
+    });
+    expect(args[args.length - 1]).toBe(RESUME_CONTINUATION_PROMPT);
   });
 
   it('forwards disableAgentTool to buildToolCliArgs', () => {
@@ -163,6 +201,44 @@ describe('buildPiArgs', () => {
     expect(args).not.toContain('--tools');
     const args2 = buildPiArgs(makeAgent({ tools: undefined }), 'go');
     expect(args2).not.toContain('--tools');
+  });
+});
+
+describe('appendContinuationTasks', () => {
+  it('appends non-blank continuations with the stable delimiter', () => {
+    const result = appendContinuationTasks('Original task', [
+      'First follow-up',
+      '  ',
+      'Second follow-up',
+    ]);
+    expect(result).toBe(
+      [
+        'Original task',
+        '',
+        'Additional instruction for this resumed run:',
+        'First follow-up',
+        '',
+        'Additional instruction for this resumed run:',
+        'Second follow-up',
+      ].join('\n')
+    );
+  });
+
+  it('returns the original task when all continuations are blank', () => {
+    expect(appendContinuationTasks('Original', ['', '  '])).toBe('Original');
+  });
+});
+
+describe('buildSessionContinuationPrompt', () => {
+  it('returns the fixed safety prompt when no current continuation is set', () => {
+    expect(buildSessionContinuationPrompt()).toBe(RESUME_CONTINUATION_PROMPT);
+    expect(buildSessionContinuationPrompt('  ')).toBe(RESUME_CONTINUATION_PROMPT);
+  });
+
+  it('appends a non-empty current continuation once', () => {
+    const prompt = buildSessionContinuationPrompt('Finish validation.');
+    expect(prompt.startsWith(RESUME_CONTINUATION_PROMPT)).toBe(true);
+    expect(prompt).toContain('Additional instruction for this resumed run:\nFinish validation.');
   });
 });
 

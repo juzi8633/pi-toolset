@@ -391,3 +391,18 @@ export function incrementIncompleteAttempts(units: Record<string, RunUnitRecord>
     unit.status = 'queued';
   }
 }
+
+/**
+ * Mark units interrupted when reconciling a dead-owner run. Never-started
+ * queued units (no attempt history) stay queued so resume does not require a
+ * session or inflate attempt counters.
+ */
+export function reconcileDeadOwnerUnits(units: Record<string, RunUnitRecord>): void {
+  for (const unit of Object.values(units)) {
+    if (unit.status === 'running') {
+      unit.status = 'interrupted';
+    } else if (unit.status === 'queued' && unit.attempts.length > 0) {
+      unit.status = 'interrupted';
+    }
+  }
+}

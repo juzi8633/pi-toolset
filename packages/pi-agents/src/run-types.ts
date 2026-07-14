@@ -1,5 +1,5 @@
 // ABOUTME: Versioned persisted run, unit, attempt, lock, event, and resume-capability types.
-// ABOUTME: Shared by the run store, coordinator, resume, and job tool; the durable data contract.
+// ABOUTME: Shared by the run store, coordinator, and resume paths; the durable data contract.
 
 import type { AgentScope, Runtime } from './agents.ts';
 import type { ExecutionStatus, SingleResult, SubagentDetails } from './types.ts';
@@ -136,6 +136,22 @@ export interface AgentRunRecordV1 {
   };
   eventsFile: 'events.jsonl';
   lastError?: string;
+  /**
+   * Accumulated continuation instructions appended on resume via `agent({ runId, task })`.
+   * Optional for backward compatibility; absent means an empty history.
+   */
+  continuationTasks?: string[];
+  /**
+   * Per-unit continuation delivery progress. `deliveredCount` is how many of
+   * `continuationTasks[0..n)` have been confirmed accepted by that unit's prompt.
+   * Missing entry means zero delivered. Optional for backward compatibility.
+   */
+  continuationDelivery?: Record<string, UnitContinuationDelivery>;
+}
+
+/** Per-unit progress for durable continuation-task delivery. */
+export interface UnitContinuationDelivery {
+  deliveredCount: number;
 }
 
 /** Claim owner payload written to `claims/<ticket>/owner.json`. */

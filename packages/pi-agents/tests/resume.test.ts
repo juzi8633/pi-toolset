@@ -11,6 +11,7 @@ import { openAgentWorktree, createAgentWorktree, removeAgentWorktree } from '../
 import {
   incrementIncompleteAttempts,
   inspectResume,
+  reconcileDeadOwnerUnits,
   validateFanoutResumeState,
 } from '../src/resume.ts';
 import { createRunStore } from '../src/run-store.ts';
@@ -47,11 +48,30 @@ async function startDurableRunSync(
   const fp = agentFingerprint(agentConfig);
   const isGrok = agentConfig.runtime === 'grok' || agentConfig.runtime === 'grok-acp';
   const unitId = mode === 'single' ? 'single' : 'parallel-0001';
+  const request =
+    mode === 'single'
+      ? {
+          mode: 'single' as const,
+          agentScope: 'user' as const,
+          agent: agentConfig.name,
+          task: 'stored task',
+        }
+      : mode === 'parallel'
+        ? {
+            mode: 'parallel' as const,
+            agentScope: 'user' as const,
+            tasks: [{ agent: agentConfig.name, task: 'stored task' }],
+          }
+        : {
+            mode: 'chain' as const,
+            agentScope: 'user' as const,
+            chain: [{ agent: agentConfig.name, task: 'stored task' }],
+          };
   const created = await store.createRun({
     mode,
     agentScope: 'user',
     background: false,
-    request: { mode, agentScope: 'user' },
+    request,
     details: {
       mode,
       agentScope: 'user',
@@ -502,6 +522,83 @@ describe('inspectResume', () => {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it('treats an absent continuationTasks field as an empty history (backward compatible)', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'test-agent',
+        description: 'test',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/test.md',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      // Ensure session exists for session-capable preflight.
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+      if (!loaded.ok) return;
+      expect(loaded.loaded.record.continuationTasks).toBeUndefined();
+      const sessionFile = path.join(tmpRoot, 'session.jsonl');
+      writeFileSync(sessionFile, '{}\n');
+      await store.updateRun(runId, (r) => {
+        r.units.single!.sessionFile = sessionFile;
+        r.units.single!.effectiveCwd = tmpRoot;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.blockingReasons).toEqual([]);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mutate continuationTasks when preflight fails', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'grok-agent',
+        description: 'grok',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/grok.md',
+        runtime: 'grok',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      // Preflight blocks on missing allowReplay; inspect is non-mutating.
+      const result = inspectResume(runId, store, {
+        agents: [agent],
+        allowReplay: false,
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.blockingReasons.length).toBeGreaterThan(0);
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+      if (!loaded.ok) return;
+      expect(loaded.loaded.record.continuationTasks).toBeUndefined();
+      expect(loaded.loaded.record.status).toBe('interrupted');
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 // --- Fanout selective resume ---
@@ -590,6 +687,36 @@ describe('incrementIncompleteAttempts', () => {
   });
 });
 
+describe('reconcileDeadOwnerUnits', () => {
+  it('leaves never-started queued units queued and does not inflate attempt', () => {
+    const units: Record<string, RunUnitRecord> = {
+      never: {
+        ...fanoutUnit(2, 0, 'queued'),
+        attempts: [],
+        attempt: 1,
+      },
+      running: {
+        ...fanoutUnit(2, 1, 'running'),
+        attempts: [{ attempt: 1, status: 'running', startedAt: 1 }],
+        attempt: 1,
+      },
+      claimedQueued: {
+        ...fanoutUnit(2, 2, 'queued'),
+        attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+        attempt: 2,
+      },
+    };
+    reconcileDeadOwnerUnits(units);
+    expect(units.never!.status).toBe('queued');
+    expect(units.never!.attempt).toBe(1);
+    expect(units.running!.status).toBe('interrupted');
+    expect(units.claimedQueued!.status).toBe('interrupted');
+    // Attempt counters are not touched by reconciliation.
+    expect(units.running!.attempt).toBe(1);
+    expect(units.claimedQueued!.attempt).toBe(2);
+  });
+});
+
 describe('validateFanoutResumeState', () => {
   function baseRecord(
     units: Record<string, RunUnitRecord>,
@@ -600,7 +727,11 @@ describe('validateFanoutResumeState', () => {
       runId: 'r1',
       mode: 'chain',
       status: 'interrupted',
-      request: { mode: 'chain', agentScope: 'user' },
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed' }],
+      },
       background: false,
       agentScope: 'user',
       createdAt: 0,

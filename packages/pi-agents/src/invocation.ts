@@ -37,13 +37,83 @@ export function getPiInvocation(args: string[]): { command: string; args: string
   return { command: 'pi', args };
 }
 
+/** How the JSON Pi argv prompt is built. Default is a fresh `Task: <task>` invocation. */
+export type PiPromptOption =
+  | { kind: 'task' }
+  | {
+      kind: 'session_continuation';
+      /** Undelivered continuation tasks for this unit (existing Pi session). */
+      undeliveredContinuationTasks?: string[];
+      /**
+       * Single current-call continuation. Used when `undeliveredContinuationTasks`
+       * is absent (simple call sites / tests).
+       */
+      currentContinuationTask?: string;
+    };
+
 export interface BuildPiArgsOptions {
   tmpPromptPath?: string;
   sessionFile?: string;
   disableAgentTool?: boolean;
   resolvedSkillPaths?: string[];
-  /** "initial" sends `Task: <task>`; "resume" sends a fixed continuation instruction. */
-  promptKind?: 'initial' | 'resume';
+  /**
+   * Prompt construction mode. `task` (default) sends `Task: <task>`.
+   * `session_continuation` reuses `--session` and sends the shared resume prompt
+   * without resending the original task.
+   */
+  prompt?: PiPromptOption;
+}
+
+/**
+ * Append durable continuation instructions to an already-resolved original task.
+ * Blank entries are ignored; when none remain, the original task is unchanged.
+ */
+export function appendContinuationTasks(originalTask: string, continuationTasks: string[]): string {
+  let result = originalTask;
+  for (const entry of continuationTasks) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    result = `${result}\n\nAdditional instruction for this resumed run:\n${trimmed}`;
+  }
+  return result;
+}
+
+/**
+ * Normalize undelivered continuations for an existing-session resume prompt.
+ * Prefers an explicit list; falls back to a single current-call task string.
+ */
+export function resolveUndeliveredContinuations(options: {
+  undeliveredContinuationTasks?: string[];
+  currentContinuationTask?: string;
+}): string[] {
+  if (options.undeliveredContinuationTasks !== undefined) {
+    return options.undeliveredContinuationTasks.filter((t) => t.trim().length > 0);
+  }
+  const single = options.currentContinuationTask?.trim();
+  return single ? [single] : [];
+}
+
+/**
+ * Build the Pi session-continuation prompt: the fixed safety instruction plus
+ * every undelivered continuation task. Used by JSON CLI and TUI RPC paths.
+ */
+export function buildSessionContinuationPrompt(
+  undeliveredOrCurrent?: string | string[],
+  currentContinuationTask?: string
+): string {
+  let undelivered: string[];
+  if (Array.isArray(undeliveredOrCurrent)) {
+    undelivered = undeliveredOrCurrent;
+  } else if (typeof undeliveredOrCurrent === 'string' && currentContinuationTask === undefined) {
+    // Legacy single-string form: treat as one current continuation task.
+    undelivered = undeliveredOrCurrent.trim() ? [undeliveredOrCurrent] : [];
+  } else {
+    undelivered = resolveUndeliveredContinuations({
+      undeliveredContinuationTasks: undefined,
+      currentContinuationTask: undeliveredOrCurrent ?? currentContinuationTask,
+    });
+  }
+  return appendContinuationTasks(RESUME_CONTINUATION_PROMPT, undelivered);
 }
 
 export function buildPiArgs(
@@ -58,8 +128,9 @@ export function buildPiArgs(
     args.push('--no-session');
   }
   args.push(...buildSharedPiFlags(agent, options));
-  if (options.promptKind === 'resume') {
-    args.push(RESUME_CONTINUATION_PROMPT);
+  if (options.prompt?.kind === 'session_continuation') {
+    const undelivered = resolveUndeliveredContinuations(options.prompt);
+    args.push(buildSessionContinuationPrompt(undelivered));
   } else {
     args.push(`Task: ${task}`);
   }

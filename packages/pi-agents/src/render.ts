@@ -70,9 +70,8 @@ export type AgentToolRenderContext = Parameters<
 >[3];
 
 /**
- * Minimal renderer context surface used by renderResult and helpers. Relaxes the
- * args type so the same renderer can serve tools with different parameter schemas
- * (e.g. `agent` and `agent_job`) while sharing state/spinner wiring.
+ * Minimal renderer context surface used by renderResult and helpers.
+ * Shares state/spinner wiring for the agent tool renderer.
  */
 export type RenderContext = {
   toolCallId: string;
@@ -301,17 +300,6 @@ export function formatToolCall(
 /** Call title is hidden; result view is the visible tool block. */
 export function renderCall(_args: Static<typeof SubagentParams>, _theme: Theme): Component {
   return new Text('', 0, 0);
-}
-
-/** `agent_job` call preview: shows the action (and runId when present). */
-export function renderJobCall(
-  args: { action?: string; runId?: string; status?: string },
-  theme: Theme
-): Component {
-  const action = args.action ?? 'job';
-  const label = theme.fg('muted', 'agent_job ') + theme.fg('accent', action);
-  const tail = args.runId ? theme.fg('dim', ` ${args.runId.slice(0, 12)}`) : '';
-  return new Text(`${label}${tail}`, 0, 0);
 }
 
 interface RenderResultOptions {
@@ -615,11 +603,7 @@ function appendExpandedResultSections(
     }
     container.addChild(new Spacer(1));
     container.addChild(
-      new Text(
-        theme.fg('dim', `To resume: agent_job({ action: "resume", runId: "${r.runId}" })`),
-        0,
-        0
-      )
+      new Text(theme.fg('dim', `To resume: agent({ runId: "${r.runId}" })`), 0, 0)
     );
   }
 

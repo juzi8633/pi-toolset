@@ -79,11 +79,35 @@ import {
   runWorktreeSetupHook,
 } from './worktree.ts';
 import { inspectResume, incrementIncompleteAttempts } from './resume.ts';
+import type { ResumePromptContext } from './execution.ts';
+import type { StoredRunRequest } from './run-types.ts';
 
 type Params = Static<typeof SubagentParams>;
 type Mode = 'single' | 'parallel' | 'chain';
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 type DetailsFactory = (mode: Mode) => (results: SingleResult[]) => SubagentDetails;
+
+/** Public resume inputs resolved at the start of executeAgentTool. */
+interface ResumeDescriptor {
+  runId: string;
+  allowReplay: boolean;
+  currentContinuationTask?: string;
+}
+
+/** Fresh-run fields that conflict with resume via runId. */
+const RESUME_CONFLICT_FIELDS = [
+  'agent',
+  'tasks',
+  'chain',
+  'agentScope',
+  'cwd',
+  'isolation',
+  'runInBackground',
+  'model',
+  'thinking',
+  'runtime',
+  'title',
+] as const;
 
 export interface ExecuteAgentToolOptions {
   backgroundManager?: BackgroundManager;
@@ -92,12 +116,51 @@ export interface ExecuteAgentToolOptions {
   /** Durable run persistence; injected by the extension entrypoint. */
   runStore?: RunStore;
   runCoordinator?: RunCoordinator;
-  /** When set, resume the stored run instead of creating a new one. */
-  resumeRunId?: string;
-  /** Allow replay-capable units to re-run from the beginning during resume. */
-  allowReplay?: boolean;
   /** Interactive TUI registry; when present, eligible Pi units register before spawn. */
   interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
+  /** Test seam: inject child process spawn for orchestration-path tests. */
+  spawnFn?: import('./execution.ts').SpawnFn;
+}
+
+/** Detect fresh-run configuration supplied alongside runId. */
+function collectResumeConflicts(params: Params): string[] {
+  const found: string[] = [];
+  for (const field of RESUME_CONFLICT_FIELDS) {
+    if (params[field] !== undefined) found.push(field);
+  }
+  return found.sort();
+}
+
+/** Hydrate workflow params from a stored run request (source of truth on resume). */
+function paramsFromStoredRequest(request: StoredRunRequest, background: boolean): Params {
+  const params: Params = {
+    agentScope: request.agentScope,
+  };
+  if (request.agent !== undefined) params.agent = request.agent;
+  if (request.task !== undefined) params.task = request.task;
+  if (request.title !== undefined) params.title = request.title;
+  if (request.cwd !== undefined) params.cwd = request.cwd;
+  if (request.isolation !== undefined) params.isolation = request.isolation;
+  if (request.model !== undefined) params.model = request.model;
+  if (request.thinking !== undefined) params.thinking = request.thinking;
+  if (request.runtime !== undefined) params.runtime = request.runtime;
+  if (background) params.runInBackground = true;
+  if (request.tasks) {
+    params.tasks = request.tasks.map((t) => {
+      const item: NonNullable<Params['tasks']>[number] = {
+        agent: t.agent,
+        task: t.task,
+      };
+      if (t.title !== undefined) item.title = t.title;
+      if (t.cwd !== undefined) item.cwd = t.cwd;
+      if (t.isolation !== undefined) item.isolation = t.isolation;
+      return item;
+    });
+  }
+  if (request.chain) {
+    params.chain = request.chain as NonNullable<Params['chain']>;
+  }
+  return params;
 }
 
 type WorkflowRunner = (
@@ -176,6 +239,15 @@ interface DurableRunContext {
   started: StartedRun;
   lifecycle: RunLifecycle;
   coordinator: RunCoordinator;
+  /** Resume prompt metadata when this durable context was restored via runId. */
+  resume?: ResumePromptContext;
+  /** Whether the caller acknowledged replay side effects. */
+  allowReplay?: boolean;
+  /**
+   * Project/workspace cwd restored from the durable run (request.cwd or unit
+   * effectiveCwd). Used for agent discovery and git root resolution on resume.
+   */
+  projectCwd?: string;
   /** Resolve the UnitExecutionContext for a workflow position. */
   unitFor(
     step: number | undefined,
@@ -193,6 +265,10 @@ interface DurableRunContext {
    * Resolves the requested agent by exact name (synthetic fallback; never agents[0]).
    */
   expandFanout(req: FanoutExpandRequest): Promise<WorkflowFanoutState>;
+  /** Build per-unit resume prompt context with undelivered continuation slice. */
+  resumePromptForUnit?(unitId: string): ResumePromptContext | undefined;
+  /** Mark all current continuation tasks as delivered for a unit (after prompt accept). */
+  markContinuationDelivered?(unitId: string): void;
 }
 
 /**
@@ -314,12 +390,28 @@ async function maybeStartDurableRun(
 }
 
 /**
+ * Project/workspace cwd for a stored run: prefer request.cwd, else the first
+ * unit's effectiveCwd (non-worktree original location).
+ */
+function projectCwdFromRecord(
+  record: import('./run-types.ts').AgentRunRecordV1,
+  fallback: string
+): string {
+  if (record.request.cwd && record.request.cwd.trim()) return record.request.cwd;
+  for (const unit of Object.values(record.units)) {
+    if (unit.effectiveCwd && unit.effectiveCwd.trim()) return unit.effectiveCwd;
+  }
+  return fallback;
+}
+
+/**
  * Build a DurableRunContext from a stored run for resume. Loads the record,
- * runs preflight, claims the run, increments incomplete unit attempts, and
- * registers with the coordinator. Returns undefined when preflight fails.
+ * runs preflight, claims the run, re-validates eligibility on the claimed
+ * record, increments incomplete unit attempts, and registers with the
+ * coordinator. Returns an error when preflight fails.
  */
 async function maybeResumeDurableRun(
-  resumeRunId: string,
+  resume: ResumeDescriptor,
   mode: Mode,
   options: ExecuteAgentToolOptions,
   ctx: ExtensionContext,
@@ -332,9 +424,10 @@ async function maybeResumeDurableRun(
   const coordinator = options.runCoordinator;
   if (!store || !coordinator) return { error: 'persistence_not_configured' };
 
+  const resumeRunId = resume.runId;
   const inspection = inspectResume(resumeRunId, store, {
     agents,
-    allowReplay: options.allowReplay,
+    allowReplay: resume.allowReplay,
   });
   if (!inspection.ok) return { error: inspection.reason };
   if (inspection.blockingReasons.length > 0) {
@@ -345,19 +438,48 @@ async function maybeResumeDurableRun(
   const claim = await store.claimRun(resumeRunId);
   if (!claim.ok) return { error: `claim_failed: ${claim.error.message}` };
 
+  // Re-validate eligibility on the post-claim record so a race that completed
+  // or corrupted the run between preflight and claim fails safely without
+  // mutating a completed run.
   const loaded = store.getRun(resumeRunId);
   if (!loaded.ok) {
     await store.releaseRun(resumeRunId, claim.claimId);
     return { error: 'run_not_found_after_claim' };
   }
-  const record = loaded.loaded.record;
-  const units = { ...record.units };
+  const postClaim = inspectResume(resumeRunId, store, {
+    agents,
+    allowReplay: resume.allowReplay,
+  });
+  if (!postClaim.ok) {
+    await store.releaseRun(resumeRunId, claim.claimId);
+    return { error: postClaim.reason };
+  }
+  if (postClaim.blockingReasons.length > 0) {
+    await store.releaseRun(resumeRunId, claim.claimId);
+    return { error: `preflight_failed: ${postClaim.blockingReasons.join('; ')}` };
+  }
+  if (loaded.loaded.record.status === 'completed') {
+    await store.releaseRun(resumeRunId, claim.claimId);
+    return { error: 'run_already_completed' };
+  }
 
-  // Increment attempts for incomplete units.
+  const record = loaded.loaded.record;
+  // Shallow-copy units so we can stage attempt increments before write.
+  const units: typeof record.units = {};
+  for (const [id, unit] of Object.entries(record.units)) {
+    units[id] = { ...unit, attempts: [...unit.attempts] };
+  }
+
+  // Increment attempts only after post-claim eligibility succeeds.
   incrementIncompleteAttempts(units);
 
-  // Transition to running. Guard the post-claim persistence so a write failure
-  // releases the claim instead of leaving it orphaned.
+  // Transition to running and append the current continuation task atomically.
+  // Guard the post-claim persistence so a write failure releases the claim.
+  const priorContinuations = record.continuationTasks ?? [];
+  const accumulatedContinuations = resume.currentContinuationTask
+    ? [...priorContinuations, resume.currentContinuationTask]
+    : [...priorContinuations];
+  const priorDelivery = { ...(record.continuationDelivery ?? {}) };
   try {
     await store.appendEvent(resumeRunId, {
       version: 1,
@@ -372,6 +494,13 @@ async function maybeResumeDurableRun(
       r.units = units;
       r.updatedAt = Date.now();
       r.startedAt = r.startedAt ?? Date.now();
+      if (resume.currentContinuationTask) {
+        r.continuationTasks = [...(r.continuationTasks ?? []), resume.currentContinuationTask];
+      }
+      // Preserve existing per-unit delivery progress across the resume claim.
+      if (Object.keys(priorDelivery).length > 0) {
+        r.continuationDelivery = { ...priorDelivery };
+      }
     });
   } catch (err) {
     await store.releaseRun(resumeRunId, claim.claimId);
@@ -385,6 +514,8 @@ async function maybeResumeDurableRun(
   // the workflow mutates via beginUnit/endUnit/stampUnitSessionFile.
   record.status = 'running';
   record.units = units;
+  record.continuationTasks = accumulatedContinuations;
+  record.continuationDelivery = { ...priorDelivery };
   if (record.startedAt === undefined) record.startedAt = Date.now();
   record.updatedAt = Date.now();
   coordinator.registerRun(resumeRunId, record);
@@ -392,6 +523,7 @@ async function maybeResumeDurableRun(
   const lifecycle = createRunLifecycle(resumeRunId);
   const sessionsDir = path.join(store.getRunDir(resumeRunId), 'sessions');
   const unitIds = Object.keys(units);
+  const projectCwd = projectCwdFromRecord(record, ctx.cwd);
 
   const unitFor = (
     step: number | undefined,
@@ -406,7 +538,7 @@ async function maybeResumeDurableRun(
       agent: agentName,
       runtime: base?.runtime,
       resumeCapability: base?.capability ?? 'session',
-      effectiveCwd: base?.effectiveCwd ?? ctx.cwd,
+      effectiveCwd: base?.effectiveCwd ?? projectCwd,
       attempt: base?.attempt ?? 1,
       sessionsDir,
       ...(base?.sessionFile !== undefined ? { sessionFile: base.sessionFile } : {}),
@@ -445,7 +577,34 @@ async function maybeResumeDurableRun(
       items: req.items,
       agent,
       runtime,
-      effectiveCwd: req.effectiveCwd ?? ctx.cwd,
+      effectiveCwd: req.effectiveCwd ?? projectCwd,
+    });
+  };
+  const resumePromptForUnit = (unitId: string): ResumePromptContext => {
+    const delivered = record.continuationDelivery?.[unitId]?.deliveredCount ?? 0;
+    const undelivered = accumulatedContinuations.slice(delivered);
+    return {
+      continuationTasks: accumulatedContinuations,
+      undeliveredContinuationTasks: undelivered,
+      ...(resume.currentContinuationTask
+        ? { currentContinuationTask: resume.currentContinuationTask }
+        : {}),
+    };
+  };
+  const markContinuationDelivered = (unitId: string): void => {
+    const deliveredCount = accumulatedContinuations.length;
+    if (!record.continuationDelivery) record.continuationDelivery = {};
+    record.continuationDelivery[unitId] = { deliveredCount };
+    coordinator.persist({
+      runId: resumeRunId,
+      details: record.details,
+      units,
+      flushNow: true,
+      mutate: (r) => {
+        if (!r.continuationDelivery) r.continuationDelivery = {};
+        r.continuationDelivery[unitId] = { deliveredCount };
+        r.continuationTasks = accumulatedContinuations;
+      },
     });
   };
 
@@ -496,16 +655,29 @@ async function maybeResumeDurableRun(
     };
   }
 
+  const resumePrompt: ResumePromptContext = {
+    continuationTasks: accumulatedContinuations,
+    undeliveredContinuationTasks: accumulatedContinuations,
+    ...(resume.currentContinuationTask
+      ? { currentContinuationTask: resume.currentContinuationTask }
+      : {}),
+  };
+
   return {
     durable: {
       started,
       lifecycle,
       coordinator,
+      resume: resumePrompt,
+      allowReplay: resume.allowReplay,
+      projectCwd,
       unitFor,
       beginUnit,
       endUnit,
       stampUnitSessionFile,
       expandFanout,
+      resumePromptForUnit,
+      markContinuationDelivered,
     },
     restoredChain,
   };
@@ -604,6 +776,16 @@ function collectResolvedUnits(
   return resolved;
 }
 
+function emptyErrorDetails(agentScope: AgentScope = 'both'): SubagentDetails {
+  return {
+    mode: 'single',
+    agentScope,
+    projectAgentsDir: null,
+    builtinAgentsDir: getBuiltinAgentsDir(),
+    results: [],
+  };
+}
+
 export async function executeAgentTool(
   params: Params,
   signal: AbortSignal | undefined,
@@ -611,7 +793,94 @@ export async function executeAgentTool(
   ctx: ExtensionContext,
   options: ExecuteAgentToolOptions = {}
 ): Promise<AgentResult> {
-  const agentScope: AgentScope = params.agentScope ?? 'both';
+  // Strict runId shape: present but empty/whitespace is a resume_error, not a fresh launch.
+  if (params.runId !== undefined) {
+    if (typeof params.runId !== 'string' || params.runId.trim().length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'resume_error: runId must be a non-empty string',
+          },
+        ],
+        details: emptyErrorDetails(),
+        isError: true,
+      };
+    }
+  }
+  // allowReplay is resume-only.
+  if (params.allowReplay !== undefined && params.runId === undefined) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'resume_error: allowReplay requires runId',
+        },
+      ],
+      details: emptyErrorDetails(),
+      isError: true,
+    };
+  }
+
+  // Resolve public runId resume before discovery so stored scope is authoritative.
+  const publicRunId =
+    typeof params.runId === 'string' && params.runId.trim().length > 0
+      ? params.runId.trim()
+      : undefined;
+  let resumeDescriptor: ResumeDescriptor | undefined;
+  let effectiveParams: Params = params;
+  let discoveryCwd = ctx.cwd;
+  let restoredProjectCwd: string | undefined;
+
+  if (publicRunId) {
+    const conflicts = collectResumeConflicts(params);
+    if (conflicts.length > 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `resume_error: conflicting parameters for runId: ${conflicts.join(', ')}`,
+          },
+        ],
+        details: emptyErrorDetails(),
+        isError: true,
+      };
+    }
+    if (!options.runStore || !options.runCoordinator) {
+      return {
+        content: [{ type: 'text', text: 'resume_error: persistence_not_configured' }],
+        details: emptyErrorDetails(),
+        isError: true,
+      };
+    }
+    const loaded = options.runStore.getRun(publicRunId);
+    if (!loaded.ok) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `resume_error: run_not_found: ${loaded.error.message}`,
+          },
+        ],
+        details: emptyErrorDetails(),
+        isError: true,
+      };
+    }
+    const trimmedContinuation = params.task?.trim();
+    resumeDescriptor = {
+      runId: publicRunId,
+      allowReplay: params.allowReplay === true,
+      ...(trimmedContinuation ? { currentContinuationTask: trimmedContinuation } : {}),
+    };
+    effectiveParams = paramsFromStoredRequest(
+      loaded.loaded.record.request,
+      loaded.loaded.record.background
+    );
+    restoredProjectCwd = projectCwdFromRecord(loaded.loaded.record, ctx.cwd);
+    discoveryCwd = restoredProjectCwd;
+  }
+
+  const agentScope: AgentScope = effectiveParams.agentScope ?? 'both';
 
   try {
     assertAgentDelegationAllowed(process.env);
@@ -619,23 +888,17 @@ export async function executeAgentTool(
     const message = err instanceof Error ? err.message : String(err);
     return {
       content: [{ type: 'text', text: message }],
-      details: {
-        mode: 'single',
-        agentScope,
-        projectAgentsDir: null,
-        builtinAgentsDir: getBuiltinAgentsDir(),
-        results: [],
-      },
+      details: emptyErrorDetails(agentScope),
       isError: true,
     };
   }
 
-  const discovery = discoverAgents(ctx.cwd, agentScope);
+  const discovery = discoverAgents(discoveryCwd, agentScope);
   const agents = discovery.agents;
 
-  const hasChain = (params.chain?.length ?? 0) > 0;
-  const hasTasks = (params.tasks?.length ?? 0) > 0;
-  const hasSingle = Boolean(params.agent && params.task);
+  const hasChain = (effectiveParams.chain?.length ?? 0) > 0;
+  const hasTasks = (effectiveParams.tasks?.length ?? 0) > 0;
+  const hasSingle = Boolean(effectiveParams.agent && effectiveParams.task);
   const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
   const makeDetails: DetailsFactory =
@@ -648,7 +911,7 @@ export async function executeAgentTool(
       results,
     });
 
-  if (!options.resumeRunId) {
+  if (!resumeDescriptor) {
     if (modeCount !== 1) {
       const available = agents.map((a) => `${a.name} (${a.source})`).join(', ') || 'none';
       return {
@@ -662,12 +925,12 @@ export async function executeAgentTool(
       };
     }
 
-    if (params.tasks && params.tasks.length > MAX_PARALLEL_TASKS) {
+    if (effectiveParams.tasks && effectiveParams.tasks.length > MAX_PARALLEL_TASKS) {
       return {
         content: [
           {
             type: 'text',
-            text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+            text: `Too many parallel tasks (${effectiveParams.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
           },
         ],
         details: makeDetails('parallel')([]),
@@ -677,9 +940,9 @@ export async function executeAgentTool(
   }
 
   let mode: Mode;
-  if (params.chain && params.chain.length > 0) mode = 'chain';
-  else if (params.tasks && params.tasks.length > 0) mode = 'parallel';
-  else if (params.agent && params.task) mode = 'single';
+  if (effectiveParams.chain && effectiveParams.chain.length > 0) mode = 'chain';
+  else if (effectiveParams.tasks && effectiveParams.tasks.length > 0) mode = 'parallel';
+  else if (effectiveParams.agent && effectiveParams.task) mode = 'single';
   else {
     const available = agents.map((a) => `${a.name} (${a.source})`).join(', ') || 'none';
     return {
@@ -689,12 +952,12 @@ export async function executeAgentTool(
   }
 
   // Start a durable run before launching the workflow (persistence optional).
-  // When resumeRunId is set, resume the stored run instead of creating new.
+  // When resumeDescriptor is set, resume the stored run instead of creating new.
   let durable: DurableRunContext | undefined;
   let restoredChain: import('./chain.ts').RestoredChainState | undefined;
   try {
-    if (options.resumeRunId && options.runStore && options.runCoordinator) {
-      const result = await maybeResumeDurableRun(options.resumeRunId, mode, options, ctx, agents);
+    if (resumeDescriptor && options.runStore && options.runCoordinator) {
+      const result = await maybeResumeDurableRun(resumeDescriptor, mode, options, ctx, agents);
       if ('error' in result) {
         return {
           content: [{ type: 'text', text: `resume_error: ${result.error}` }],
@@ -706,7 +969,7 @@ export async function executeAgentTool(
       restoredChain = result.restoredChain;
     } else {
       durable = await maybeStartDurableRun(
-        params,
+        effectiveParams,
         mode,
         agentScope,
         options,
@@ -726,6 +989,8 @@ export async function executeAgentTool(
 
   const interactiveRegistry = options.interactiveRegistry;
 
+  const spawnFn = options.spawnFn;
+
   const selectWorkflow = (
     workflowSignal: AbortSignal | undefined,
     workflowOnUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined
@@ -734,52 +999,55 @@ export async function executeAgentTool(
       return runChain(
         ctx,
         agents,
-        params.chain!,
+        effectiveParams.chain!,
         workflowSignal,
         workflowOnUpdate,
         makeDetails,
-        params.model,
-        params.thinking,
-        params.runtime,
+        effectiveParams.model,
+        effectiveParams.thinking,
+        effectiveParams.runtime,
         durable,
         restoredChain,
-        interactiveRegistry
+        interactiveRegistry,
+        spawnFn
       );
     if (mode === 'parallel')
       return runParallel(
         ctx,
         agents,
-        params.tasks!,
+        effectiveParams.tasks!,
         workflowSignal,
         workflowOnUpdate,
         makeDetails,
-        params.model,
-        params.thinking,
-        params.runtime,
+        effectiveParams.model,
+        effectiveParams.thinking,
+        effectiveParams.runtime,
         durable,
-        interactiveRegistry
+        interactiveRegistry,
+        spawnFn
       );
     return runSingle(
       ctx,
       agents,
-      params.agent!,
-      params.task!,
-      params.cwd,
-      params.isolation,
+      effectiveParams.agent!,
+      effectiveParams.task!,
+      effectiveParams.cwd,
+      effectiveParams.isolation,
       workflowSignal,
       workflowOnUpdate,
       makeDetails,
-      params.model,
-      params.thinking,
-      params.runtime,
-      params.title,
+      effectiveParams.model,
+      effectiveParams.thinking,
+      effectiveParams.runtime,
+      effectiveParams.title,
       durable,
-      interactiveRegistry
+      interactiveRegistry,
+      spawnFn
     );
   };
 
   return await runWithBackgroundOption(
-    params,
+    effectiveParams,
     signal,
     onUpdate,
     ctx,
@@ -888,7 +1156,10 @@ async function runWithBackgroundOption(
   const description = describeWorkflow(params, mode);
   const taskPreview = buildTaskPreview(params, mode);
   const title = extractLaunchTitle(params, mode);
-  const projectAgentsDir = discoverAgents(ctx.cwd, params.agentScope ?? 'user').projectAgentsDir;
+  const projectAgentsDir = discoverAgents(
+    durable?.projectCwd ?? ctx.cwd,
+    params.agentScope ?? 'user'
+  ).projectAgentsDir;
 
   const launchResult = manager.launch({
     mode,
@@ -991,7 +1262,8 @@ async function runChain(
   runtimeOverride?: Runtime,
   durable: DurableRunContext | undefined = undefined,
   restored?: import('./chain.ts').RestoredChainState,
-  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry
+  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry,
+  spawnFn?: import('./execution.ts').SpawnFn
 ): Promise<AgentResult> {
   const chainDetails = (results: SingleResult[], outputs?: Record<string, ChainOutputEntry>) => ({
     ...makeDetails('chain')(results),
@@ -1025,18 +1297,33 @@ async function runChain(
           title: req.title,
           ...(req.postprocessTerminal ? { postprocessTerminal: req.postprocessTerminal } : {}),
           ...(interactiveRegistry ? { interactiveRegistry } : {}),
+          ...(spawnFn ? { spawnFn } : {}),
           ...(durable
-            ? {
-                unitContext: durable.unitFor(req.step, req.fanoutIndex, req.agent),
-                getAbortOrigin: () => durable.lifecycle.origin,
-                beginUnit: durable.beginUnit,
-                endUnit: durable.endUnit,
-                stampUnitSessionFile: (sf) =>
-                  durable.stampUnitSessionFile(
-                    durable.unitFor(req.step, req.fanoutIndex, req.agent).unitId,
-                    sf
-                  ),
-              }
+            ? (() => {
+                const unitContext = durable.unitFor(req.step, req.fanoutIndex, req.agent);
+                return {
+                  unitContext,
+                  getAbortOrigin: () => durable.lifecycle.origin,
+                  beginUnit: durable.beginUnit,
+                  endUnit: durable.endUnit,
+                  stampUnitSessionFile: (sf: string) =>
+                    durable.stampUnitSessionFile(unitContext.unitId, sf),
+                  ...(durable.resumePromptForUnit
+                    ? { resumePrompt: durable.resumePromptForUnit(unitContext.unitId) }
+                    : durable.resume
+                      ? { resumePrompt: durable.resume }
+                      : {}),
+                  ...(durable.markContinuationDelivered
+                    ? {
+                        markContinuationDelivered: durable.markContinuationDelivered,
+                      }
+                    : {}),
+                  ...(durable.allowReplay !== undefined
+                    ? { allowReplay: durable.allowReplay }
+                    : {}),
+                  ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
+                };
+              })()
             : {}),
         }
       ),
@@ -1054,7 +1341,8 @@ async function runParallel(
   thinkingOverride?: string,
   runtimeOverride?: Runtime,
   durable: DurableRunContext | undefined = undefined,
-  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry
+  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry,
+  spawnFn?: import('./execution.ts').SpawnFn
 ): Promise<AgentResult> {
   if (tasks.length > MAX_PARALLEL_TASKS)
     return {
@@ -1068,12 +1356,32 @@ async function runParallel(
       isError: true,
     };
 
-  // When resuming, restore completed results and only retry incomplete tasks.
+  // When resuming, skip by authoritative unit.status (stable unit ID), not lagging
+  // details.results. Prefer unit.result; fall back to details only when consistent.
   const restoredResults = durable?.started.record.details.results ?? [];
   const allResults: SingleResult[] = tasks.map((t, index) => {
-    const existing = restoredResults[index];
-    if (existing && resolveExecutionStatus(existing) === 'completed') {
-      return { ...existing };
+    const unitCtx = durable?.unitFor(undefined, index, t.agent);
+    const unit = unitCtx ? durable?.started.units[unitCtx.unitId] : undefined;
+    if (unit?.status === 'completed') {
+      if (unit.result) return { ...unit.result };
+      const existing = restoredResults[index];
+      if (existing && resolveExecutionStatus(existing) === 'completed') {
+        return { ...existing };
+      }
+      // Completed unit without a usable result: keep a completed slot so we do
+      // not re-dispatch (replay gate still applies to incomplete units only).
+      return {
+        agent: t.agent,
+        agentSource: 'unknown' as const,
+        task: t.task,
+        title: t.title,
+        exitCode: 0,
+        status: 'completed' as const,
+        messages: [],
+        stderr: '',
+        usage: emptyUsage(),
+        ...(unitCtx ? { unitId: unitCtx.unitId, runId: unitCtx.runId } : {}),
+      };
     }
     return {
       agent: t.agent,
@@ -1128,10 +1436,26 @@ async function runParallel(
     tasks,
     MAX_CONCURRENCY,
     async (t, index) => {
-      // Skip already-completed tasks from restored state.
+      // Skip by unit.status / restored completed slot (not lagging details alone).
       if (resolveExecutionStatus(allResults[index]) === 'completed') {
         emitParallelUpdate();
         return allResults[index];
+      }
+      const unitCtx = durable?.unitFor(undefined, index, t.agent);
+      // Replay gate at dispatch: refuse incomplete replay units without allowReplay.
+      if (unitCtx && durable && unitCtx.resumeCapability === 'replay' && !durable.allowReplay) {
+        const blocked: SingleResult = {
+          ...allResults[index],
+          agent: t.agent,
+          task: t.task,
+          exitCode: 1,
+          status: 'failed',
+          stopReason: 'error',
+          errorMessage: `unit ${unitCtx.unitId}: requires replay (allowReplay not set)`,
+        };
+        allResults[index] = blocked;
+        emitParallelUpdate();
+        return blocked;
       }
       allResults[index] = {
         ...allResults[index],
@@ -1146,7 +1470,7 @@ async function runParallel(
           agents,
           t.agent,
           t.task,
-          t.cwd,
+          t.cwd ?? unitCtx?.effectiveCwd,
           t.isolation,
           index,
           undefined,
@@ -1166,17 +1490,29 @@ async function runParallel(
             runtimeOverride,
             title: t.title,
             ...(interactiveRegistry ? { interactiveRegistry } : {}),
-            ...(durable
+            ...(spawnFn ? { spawnFn } : {}),
+            ...(durable && unitCtx
               ? {
-                  unitContext: durable.unitFor(undefined, index, t.agent),
+                  unitContext: unitCtx,
                   getAbortOrigin: () => durable.lifecycle.origin,
-                  stampUnitSessionFile: (sf) =>
-                    durable.stampUnitSessionFile(
-                      durable.unitFor(undefined, index, t.agent).unitId,
-                      sf
-                    ),
+                  stampUnitSessionFile: (sf: string) =>
+                    durable.stampUnitSessionFile(unitCtx.unitId, sf),
                   beginUnit: durable.beginUnit,
                   endUnit: durable.endUnit,
+                  ...(durable.resumePromptForUnit
+                    ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
+                    : durable.resume
+                      ? { resumePrompt: durable.resume }
+                      : {}),
+                  ...(durable.markContinuationDelivered
+                    ? {
+                        markContinuationDelivered: durable.markContinuationDelivered,
+                      }
+                    : {}),
+                  ...(durable.allowReplay !== undefined
+                    ? { allowReplay: durable.allowReplay }
+                    : {}),
+                  ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
                 }
               : {}),
           }
@@ -1257,31 +1593,53 @@ async function runSingle(
   runtimeOverride?: Runtime,
   title?: string,
   durable: DurableRunContext | undefined = undefined,
-  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry
+  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry,
+  spawnFn?: import('./execution.ts').SpawnFn
 ): Promise<AgentResult> {
-  // Reject resume when the sole unit is already completed.
+  // Reject resume when the sole unit is already completed (unit.status is
+  // authoritative; details.results alone must not skip incomplete units).
   if (durable) {
-    const restoredResults = durable.started.record.details.results ?? [];
-    const existing = restoredResults[0];
-    if (existing && resolveExecutionStatus(existing) === 'completed') {
+    const unitCtx = durable.unitFor(undefined, undefined, agentName);
+    const unit = durable.started.units[unitCtx.unitId];
+    if (unit?.status === 'completed') {
+      const existing =
+        unit.result ??
+        (durable.started.record.details.results ?? []).find(
+          (r) => resolveExecutionStatus(r) === 'completed'
+        );
+      if (existing) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'Run already completed; nothing to resume.',
+            },
+          ],
+          details: makeDetails('single')([existing]),
+        };
+      }
+    }
+    if (unitCtx.resumeCapability === 'replay' && !durable.allowReplay) {
       return {
         content: [
           {
             type: 'text',
-            text: 'Run already completed; nothing to resume.',
+            text: `resume_error: preflight_failed: unit ${unitCtx.unitId}: requires replay (allowReplay not set)`,
           },
         ],
-        details: makeDetails('single')([existing]),
+        details: makeDetails('single')([]),
+        isError: true,
       };
     }
   }
   try {
+    const unitCtx = durable?.unitFor(undefined, undefined, agentName);
     const result = await runStepWithContext(
       ctx,
       agents,
       agentName,
       task,
-      cwd,
+      cwd ?? unitCtx?.effectiveCwd,
       isolation,
       0,
       undefined,
@@ -1294,12 +1652,25 @@ async function runSingle(
         runtimeOverride,
         title,
         ...(interactiveRegistry ? { interactiveRegistry } : {}),
-        ...(durable
+        ...(spawnFn ? { spawnFn } : {}),
+        ...(durable && unitCtx
           ? {
-              unitContext: durable.unitFor(undefined, undefined, agentName),
+              unitContext: unitCtx,
               getAbortOrigin: () => durable.lifecycle.origin,
               beginUnit: durable.beginUnit,
               endUnit: durable.endUnit,
+              stampUnitSessionFile: (sf: string) =>
+                durable.stampUnitSessionFile(unitCtx.unitId, sf),
+              ...(durable.resumePromptForUnit
+                ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
+                : durable.resume
+                  ? { resumePrompt: durable.resume }
+                  : {}),
+              ...(durable.markContinuationDelivered
+                ? { markContinuationDelivered: durable.markContinuationDelivered }
+                : {}),
+              ...(durable.allowReplay !== undefined ? { allowReplay: durable.allowReplay } : {}),
+              ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
             }
           : {}),
       }
@@ -1381,9 +1752,21 @@ async function runStepWithContext(
     /** Runs before worktree cleanup and durable endUnit (schema validation, metadata). */
     postprocessTerminal?: (result: SingleResult) => void;
     interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
+    /** Durable resume prompt context (session continuation vs fresh/replay). */
+    resumePrompt?: ResumePromptContext;
+    /** Mark continuation delivery after the child accepts the prompt. */
+    markContinuationDelivered?: (unitId: string) => void;
+    allowReplay?: boolean;
+    /** Restored project/workspace cwd for resume (overrides ctx.cwd for git/cwd fallbacks). */
+    projectCwd?: string;
+    spawnFn?: import('./execution.ts').SpawnFn;
   } = {}
 ): Promise<SingleResult> {
   const agent = agents.find((a) => a.name === agentName);
+  // Capture before prepareAgentContext may create a new session for never-started units.
+  const hadStoredSession = Boolean(options.unitContext?.sessionFile);
+  // Prefer explicit task cwd, then persisted unit effectiveCwd, then project cwd.
+  const fallbackCwd = cwd ?? options.unitContext?.effectiveCwd ?? options.projectCwd ?? ctx.cwd;
   const applyPostprocess = (result: SingleResult): void => {
     if (options.postprocessTerminal) options.postprocessTerminal(result);
   };
@@ -1394,7 +1777,7 @@ async function runStepWithContext(
   };
   if (!agent) {
     const failed = await runSingleAgent(
-      ctx.cwd,
+      fallbackCwd,
       agents,
       agentName,
       task,
@@ -1408,8 +1791,15 @@ async function runStepWithContext(
         thinkingOverride: options.thinkingOverride,
         runtimeOverride: options.runtimeOverride,
         title: options.title,
+        ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
         ...(options.unitContext ? { unitContext: options.unitContext } : {}),
         ...(options.getAbortOrigin ? { getAbortOrigin: options.getAbortOrigin } : {}),
+        ...(options.resumePrompt
+          ? {
+              resumePrompt: options.resumePrompt,
+              resumeHadStoredSession: hadStoredSession,
+            }
+          : {}),
       }
     );
     markEnd(failed, 'failed');
@@ -1459,12 +1849,15 @@ async function runStepWithContext(
   // worktree instead of creating a new one.
   const isolation = resolveIsolation(agent, taskIsolation);
   let worktree: AgentWorktree | undefined;
-  let effectiveCwd = cwd;
+  let effectiveCwd: string | undefined = cwd ?? options.unitContext?.effectiveCwd;
   const storedWorktreePath = options.unitContext?.worktreePath;
+  const gitLookupCwd = options.unitContext?.effectiveCwd ?? options.projectCwd ?? cwd ?? ctx.cwd;
   if (isolation === 'worktree') {
     if (storedWorktreePath) {
       // Resume: reopen the stored worktree without recreating or re-running hooks.
-      const repoRoot = getGitRoot(cwd ?? ctx.cwd);
+      // Prefer deriving repo root from the stored worktree path, then unit cwd.
+      const repoRoot =
+        getGitRoot(path.resolve(storedWorktreePath, '..', '..')) ?? getGitRoot(gitLookupCwd);
       if (!repoRoot) {
         const failure1 = synthesizeFailure(
           agentName,
@@ -1495,7 +1888,7 @@ async function runStepWithContext(
       worktree = opened.worktree;
       effectiveCwd = worktree.path;
     } else {
-      const repoRoot = getGitRoot(cwd ?? ctx.cwd);
+      const repoRoot = getGitRoot(gitLookupCwd);
       if (!repoRoot) {
         const failure3 = synthesizeFailure(
           agentName,
@@ -1561,7 +1954,7 @@ async function runStepWithContext(
       };
     } else {
       agentContext = prepareAgentContext(agent, ctx, {
-        effectiveCwd: effectiveCwd ?? ctx.cwd,
+        effectiveCwd: effectiveCwd ?? fallbackCwd,
         ...(options.unitContext?.runId !== undefined ? { runId: options.unitContext.runId } : {}),
         ...(options.unitContext?.unitId !== undefined
           ? { unitId: options.unitContext.unitId }
@@ -1569,7 +1962,10 @@ async function runStepWithContext(
         ...(options.unitContext?.sessionsDir !== undefined
           ? { sessionsDir: options.unitContext.sessionsDir }
           : {}),
-        ...(options.unitContext?.sessionFile !== undefined
+        // Only pass storedSessionFile when the unit already owned a session
+        // before this invocation (hadStoredSession). A just-created path is
+        // stamped after prepare so result metadata stays correct.
+        ...(hadStoredSession && options.unitContext?.sessionFile !== undefined
           ? { storedSessionFile: options.unitContext.sessionFile }
           : {}),
       });
@@ -1592,6 +1988,7 @@ async function runStepWithContext(
 
   // Persist the newly created session file onto the unit record and mutate the
   // unit context so stampUnitContext() stamps the correct path onto the result.
+  // Do not flip hadStoredSession: prompt kind was decided from the pre-prepare state.
   if (options.unitContext && agentContext.sessionFile) {
     options.unitContext.sessionFile = agentContext.sessionFile;
     options.stampUnitSessionFile?.(agentContext.sessionFile);
@@ -1637,11 +2034,11 @@ async function runStepWithContext(
             agent: agentName,
             task,
             title: options.title,
-            cwd: effectiveCwd ?? ctx.cwd,
+            cwd: effectiveCwd ?? fallbackCwd,
           },
           resolvedSkillPaths,
           sessionFile: agentContext.sessionFile!,
-          effectiveCwd: effectiveCwd ?? ctx.cwd,
+          effectiveCwd: effectiveCwd ?? fallbackCwd,
           worktreePath: worktree?.path,
           title: options.title,
           modelOverride: options.modelOverride,
@@ -1689,11 +2086,11 @@ async function runStepWithContext(
 
   try {
     const result = await runSingleAgent(
-      ctx.cwd,
+      fallbackCwd,
       agents,
       agentName,
       task,
-      effectiveCwd,
+      effectiveCwd ?? fallbackCwd,
       step,
       signal,
       onUpdate,
@@ -1706,8 +2103,21 @@ async function runStepWithContext(
         runtimeOverride: options.runtimeOverride,
         title: options.title,
         hostMode: ctx.mode,
+        ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
         ...(options.unitContext ? { unitContext: options.unitContext } : {}),
         ...(options.getAbortOrigin ? { getAbortOrigin: options.getAbortOrigin } : {}),
+        ...(options.resumePrompt
+          ? {
+              resumePrompt: options.resumePrompt,
+              resumeHadStoredSession: hadStoredSession,
+              ...(options.markContinuationDelivered && options.unitContext
+                ? {
+                    onResumePromptAccepted: () =>
+                      options.markContinuationDelivered!(options.unitContext!.unitId),
+                  }
+                : {}),
+            }
+          : {}),
         ...(options.interactiveRegistry && endpointKey
           ? {
               interactiveRegistry: options.interactiveRegistry,

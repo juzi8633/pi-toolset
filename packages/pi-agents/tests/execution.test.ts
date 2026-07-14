@@ -1251,6 +1251,170 @@ describe('runSingleAgent execution status', () => {
   });
 });
 
+describe('runSingleAgent resume prompt selection', () => {
+  function captureSpawn(): {
+    fake: FakeChild;
+    spawnFn: SpawnFn;
+    captured: { args: string[] };
+  } {
+    const fake = new FakeChild();
+    const captured = { args: [] as string[] };
+    const spawnFn: SpawnFn = ((_command: string, args: string[]) => {
+      captured.args = args;
+      return fake as unknown as SpawnedChild;
+    }) as SpawnFn;
+    return { fake, spawnFn, captured };
+  }
+
+  async function runAndClose(
+    task: string,
+    options: Parameters<typeof runSingleAgent>[9],
+    captured: ReturnType<typeof captureSpawn>
+  ) {
+    const promise = runSingleAgent(
+      process.cwd(),
+      [makeAgent()],
+      'maxie',
+      task,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      { spawnFn: captured.spawnFn, ...options }
+    );
+    setImmediate(() => {
+      captured.fake.emitAssistant('ok');
+      setImmediate(() => {
+        captured.fake.stdout.push(null);
+        captured.fake.stderr.push(null);
+        captured.fake.emit('close', 0);
+      });
+    });
+    return promise;
+  }
+
+  it('sends session-continuation prompt with only undelivered tasks for an existing Pi session', async () => {
+    const ctx = captureSpawn();
+    const result = await runAndClose(
+      'Original resolved task',
+      {
+        sessionFile: '/tmp/existing-session.jsonl',
+        resumeHadStoredSession: true,
+        resumePrompt: {
+          continuationTasks: ['Earlier instruction', 'Current instruction'],
+          undeliveredContinuationTasks: ['Current instruction'],
+          currentContinuationTask: 'Current instruction',
+        },
+      },
+      ctx
+    );
+    const last = ctx.captured.args[ctx.captured.args.length - 1]!;
+    expect(ctx.captured.args).toContain('--session');
+    expect(last).not.toContain('Task: Original resolved task');
+    expect(last).not.toContain('Earlier instruction');
+    expect(last).toContain('resuming');
+    expect(last).toContain('Additional instruction for this resumed run:\nCurrent instruction');
+    // Result metadata keeps the original task.
+    expect(result.task).toBe('Original resolved task');
+  });
+
+  it('redelivers all undelivered continuations to an existing session after a crash window', async () => {
+    const ctx = captureSpawn();
+    await runAndClose(
+      'Original resolved task',
+      {
+        sessionFile: '/tmp/existing-session.jsonl',
+        resumeHadStoredSession: true,
+        resumePrompt: {
+          continuationTasks: ['First cont', 'Second cont'],
+          undeliveredContinuationTasks: ['First cont', 'Second cont'],
+        },
+      },
+      ctx
+    );
+    const last = ctx.captured.args[ctx.captured.args.length - 1]!;
+    expect(last).toContain('First cont');
+    expect(last).toContain('Second cont');
+    expect(last).not.toContain('Task: Original resolved task');
+  });
+
+  it('sends original task plus continuations when resumeHadStoredSession is false even if sessionFile is set', async () => {
+    // Never-started unit: prepareAgentContext creates a new session file, but
+    // the unit never owned a prior session — must not use session-continuation only.
+    const ctx = captureSpawn();
+    await runAndClose(
+      'Original resolved task',
+      {
+        sessionFile: '/tmp/just-created-session.jsonl',
+        resumeHadStoredSession: false,
+        resumePrompt: {
+          continuationTasks: ['Cont A', 'Cont B'],
+        },
+      },
+      ctx
+    );
+    const last = ctx.captured.args[ctx.captured.args.length - 1]!;
+    expect(last).toContain('Task: Original resolved task');
+    expect(last).toContain('Additional instruction for this resumed run:\nCont A');
+    expect(last).toContain('Additional instruction for this resumed run:\nCont B');
+  });
+
+  it('appends all durable continuations for a never-started Pi unit without a session', async () => {
+    const ctx = captureSpawn();
+    await runAndClose(
+      'Original resolved task',
+      {
+        resumeHadStoredSession: false,
+        resumePrompt: {
+          continuationTasks: ['First cont', 'Second cont'],
+        },
+      },
+      ctx
+    );
+    const last = ctx.captured.args[ctx.captured.args.length - 1]!;
+    expect(ctx.captured.args).toContain('--no-session');
+    expect(last).toContain('Task: Original resolved task');
+    expect(last).toContain('Additional instruction for this resumed run:\nFirst cont');
+    expect(last).toContain('Additional instruction for this resumed run:\nSecond cont');
+  });
+
+  it('appends all durable continuations for Grok replay from a fresh process', async () => {
+    const ctx = captureSpawn();
+    await runAndClose(
+      'Original resolved task',
+      {
+        runtimeOverride: 'grok',
+        resumePrompt: {
+          continuationTasks: ['Replay cont'],
+        },
+      },
+      ctx
+    );
+    // Grok argv ends with the prompt text.
+    const joined = ctx.captured.args.join('\n');
+    expect(joined).toContain('Original resolved task');
+    expect(joined).toContain('Additional instruction for this resumed run:\nReplay cont');
+  });
+
+  it('keeps earlier persisted continuations available on a second resume of a never-started unit', async () => {
+    const ctx = captureSpawn();
+    await runAndClose(
+      'Original',
+      {
+        resumePrompt: {
+          continuationTasks: ['From first interruption', 'From second interruption'],
+          currentContinuationTask: 'From second interruption',
+        },
+      },
+      ctx
+    );
+    const last = ctx.captured.args[ctx.captured.args.length - 1]!;
+    expect(last).toContain('From first interruption');
+    expect(last).toContain('From second interruption');
+  });
+});
+
 describe('runSingleAgent durable metadata stamping', () => {
   it('stamps runId/unitId/attempt/session/resumeCapability on partials and the final result', async () => {
     const fake = new FakeChild();
