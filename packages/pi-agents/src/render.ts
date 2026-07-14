@@ -471,7 +471,7 @@ function formatSummaryLine(parts: SummaryParts, width: number, theme: Theme): st
       : 40;
 
   let taskPreview = buildPreview(availableForTask);
-  let line = `${parts.glyph} ${parts.label} (${theme.fg('dim', taskPreview)})${progressPart}${usagePart}`;
+  let line = `${parts.glyph} ${parts.label} ${theme.fg('dim', `(${taskPreview})${progressPart}${usagePart}`)}`;
 
   if (width > 0 && visibleWidth(line) > width && parts.usage) {
     // Drop usage onto a continuation line
@@ -481,7 +481,7 @@ function formatSummaryLine(parts: SummaryParts, width: number, theme: Theme): st
       width - visibleWidth(withoutUsage) - visibleWidth(progressPart) - parenOverhead
     );
     taskPreview = buildPreview(avail);
-    line = `${parts.glyph} ${parts.label} (${theme.fg('dim', taskPreview)})${progressPart}\n  ${theme.fg('dim', parts.usage)}`;
+    line = `${parts.glyph} ${parts.label} ${theme.fg('dim', `(${taskPreview})${progressPart}`)}\n  ${theme.fg('dim', parts.usage)}`;
   }
   return line;
 }
