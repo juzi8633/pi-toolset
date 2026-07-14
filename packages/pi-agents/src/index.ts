@@ -1,7 +1,12 @@
 // ABOUTME: Subagent tool entrypoint — registers the `agent` tool and the `before_agent_start` hook.
 // ABOUTME: Delegates discovery, orchestration, and rendering to focused modules.
 
-import { type ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  type Theme,
+} from '@earendil-works/pi-coding-agent';
+import type { Component } from '@earendil-works/pi-tui';
 import type { Static } from '@earendil-works/pi-ai';
 import { discoverAgents } from './agents.ts';
 import {
@@ -11,9 +16,19 @@ import {
 } from './background.ts';
 import { renderAgentCatalogue, shouldInjectAgentCatalogue } from './catalogue.ts';
 import { registerAgentCommand } from './command.ts';
+import { createInteractiveAgentRegistry, INTERACTIVE_LINK_TYPE } from './interactive-agent.ts';
+import {
+  CONTINUATION_MESSAGE_TYPE,
+  createInteractiveRelayCoordinator,
+  renderContinuationMessage,
+} from './interactive-relay.ts';
+import { createInteractiveViewController } from './interactive-view.ts';
+import { createRunStore } from './run-store.ts';
+import { createRunCoordinator } from './run-coordinator.ts';
 import {
   type AgentRenderState,
   renderCall,
+  renderJobCall,
   renderResult,
   stopAllSpinners,
   stopSpinner,
@@ -21,6 +36,8 @@ import {
 import { SubagentParams } from './schema.ts';
 import { setDiscoveredSkillsFromOptions } from './skills.ts';
 import { executeAgentTool } from './tool.ts';
+import { JobParams } from './job-schema.ts';
+import { executeJobTool } from './job-tool.ts';
 import type { SubagentDetails } from './types.ts';
 
 type RawArgs = Record<string, unknown> & { run_in_background?: unknown };
@@ -40,7 +57,7 @@ export function normalizeAgentArgs(args: unknown): unknown {
 
 /**
  * Register lifecycle hooks so the shared spinner ticker cannot leak past tool or
- * session teardown. Event names match Pi 0.80.1 ExtensionAPI (including /tree).
+ * session teardown. Event names match Pi 0.80.6 ExtensionAPI (including /tree).
  * Handlers are additive with other extension listeners on the same event.
  */
 export function registerSpinnerLifecycle(pi: ExtensionAPI): void {
@@ -61,18 +78,162 @@ export default function (pi: ExtensionAPI) {
   registerSpinnerLifecycle(pi);
 
   pi.registerMessageRenderer(BACKGROUND_MESSAGE_TYPE, renderBackgroundMessage);
+  // Interactive links are custom entries (not model messages). Renderer returns
+  // undefined so any accidental custom_message of this type stays invisible.
+  pi.registerMessageRenderer(INTERACTIVE_LINK_TYPE, () => undefined);
+  // Continuation relays are real custom messages injected into host context.
+  pi.registerMessageRenderer(CONTINUATION_MESSAGE_TYPE, renderContinuationMessage);
 
-  pi.on('session_shutdown', () => {
+  const runStore = createRunStore();
+  const runCoordinator = createRunCoordinator({ store: runStore });
+
+  // Latest UI context and per-session interactive runtime (recreated on session_start).
+  let latestUiCtx: ExtensionContext | undefined;
+  let interactiveRegistry = createInteractiveAgentRegistry({ runStore, runCoordinator });
+  let viewController = createInteractiveViewController({
+    registry: interactiveRegistry,
+    isTui: () => latestUiCtx?.mode === 'tui',
+    getUi: () => latestUiCtx?.ui,
+  });
+  // Relay coordinator forwards interrupted/cancelled view continuations to the
+  // bound host model. Rebuilt with the registry on every session start/tree swap.
+  let relayCoordinator: ReturnType<typeof createInteractiveRelayCoordinator> | undefined;
+
+  function bindHostLinkAppender(): void {
+    interactiveRegistry.setHostLinkAppender((link) => {
+      pi.appendEntry(INTERACTIVE_LINK_TYPE, link);
+    });
+  }
+  bindHostLinkAppender();
+
+  function bindRelayCoordinator(): void {
+    relayCoordinator?.dispose();
+    relayCoordinator = createInteractiveRelayCoordinator({
+      registry: interactiveRegistry,
+      pi,
+      getCtx: () => latestUiCtx,
+    });
+  }
+  bindRelayCoordinator();
+
+  function recreateInteractiveRuntime(): void {
+    relayCoordinator?.dispose();
+    relayCoordinator = undefined;
+    interactiveRegistry = createInteractiveAgentRegistry({ runStore, runCoordinator });
+    bindHostLinkAppender();
+    viewController = createInteractiveViewController({
+      registry: interactiveRegistry,
+      isTui: () => latestUiCtx?.mode === 'tui',
+      getUi: () => latestUiCtx?.ui,
+    });
+    bindRelayCoordinator();
+  }
+
+  // Shutdown order: spinners → background cancel → await idle → dispose relay → dispose registry.
+  pi.on('session_shutdown', async () => {
+    stopAllSpinners();
     backgroundManager.cancelAll('session_shutdown');
+    await backgroundManager.waitForIdle();
+    viewController.clearWidget();
+    relayCoordinator?.dispose();
+    relayCoordinator = undefined;
+    await interactiveRegistry.shutdown();
+    latestUiCtx = undefined;
+  });
+
+  // On session start, recreate interactive state, reconcile dead-owner runs, restore links.
+  pi.on('session_start', async (_event, ctx) => {
+    latestUiCtx = ctx;
+    recreateInteractiveRuntime();
+
+    try {
+      const runs = await runStore.listRuns();
+      for (const entry of runs) {
+        if (!('record' in entry)) continue;
+        const record = entry.record;
+        if (record.status !== 'running' && record.status !== 'queued') continue;
+        if (runCoordinator.isActive(record.runId)) continue;
+        const claims = runStore.inspectClaims(record.runId);
+        if (!claims.ok) continue;
+        const unterminated = claims.claims
+          .filter((c) => c.terminal === undefined)
+          .sort((a, b) => a.ticket - b.ticket);
+        if (unterminated.length === 0) continue;
+        const lowest = unterminated[0];
+        if (!lowest.owner) continue;
+        if (runStore.isPidAlive(lowest.owner.pid)) continue;
+        try {
+          const claim = await runStore.claimRun(record.runId);
+          if (!claim.ok) continue;
+          try {
+            await runStore.updateRun(record.runId, (r) => {
+              r.status = 'interrupted';
+              r.updatedAt = Date.now();
+              for (const unit of Object.values(r.units)) {
+                if (unit.status === 'running' || unit.status === 'queued') {
+                  unit.status = 'interrupted';
+                }
+              }
+            });
+            await runStore.appendEvent(record.runId, {
+              version: 1,
+              event: 'run_interrupted',
+              runId: record.runId,
+              timestamp: Date.now(),
+              origin: 'owner_process_missing',
+            });
+          } finally {
+            await runStore.releaseRun(record.runId, claim.claimId);
+          }
+        } catch {
+          // continue
+        }
+      }
+    } catch {
+      // Best-effort reconciliation.
+    }
+
+    try {
+      interactiveRegistry.restoreActiveBranch(ctx);
+      if (ctx.mode === 'tui') {
+        viewController.installWidget();
+      }
+    } catch {
+      // Best-effort restore.
+    }
+  });
+
+  pi.on('session_tree', async (_event, ctx) => {
+    latestUiCtx = ctx;
+    try {
+      interactiveRegistry.restoreActiveBranch(ctx);
+      if (ctx.mode === 'tui') {
+        viewController.installWidget();
+      } else {
+        viewController.clearWidget();
+      }
+    } catch {
+      // Best-effort.
+    }
   });
 
   pi.on('before_agent_start', async (event, ctx) => {
+    latestUiCtx = ctx;
     setDiscoveredSkillsFromOptions(event.systemPromptOptions);
     const discovery = discoverAgents(ctx.cwd, 'both');
     const safeAgents = discovery.agents.filter((a) => a.source !== 'package');
     if (!shouldInjectAgentCatalogue(process.env, safeAgents)) return;
     const block = renderAgentCatalogue(safeAgents);
     return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
+  });
+
+  pi.registerShortcut('ctrl+alt+down', {
+    description: 'Open interactive agent navigator',
+    handler: async (ctx) => {
+      latestUiCtx = ctx;
+      if (ctx.mode !== 'tui') return;
+      await viewController.openView();
+    },
   });
 
   pi.registerTool<typeof SubagentParams, SubagentDetails, AgentRenderState>({
@@ -92,11 +253,104 @@ Use when the task matches an agent type, for parallel independent work, or when 
     parameters: SubagentParams,
     prepareArguments: (args) => normalizeAgentArgs(args) as Static<typeof SubagentParams>,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      return executeAgentTool(params, signal, onUpdate, ctx, { backgroundManager });
+      latestUiCtx = ctx;
+      return executeAgentTool(params, signal, onUpdate, ctx, {
+        backgroundManager,
+        runStore,
+        runCoordinator,
+        interactiveRegistry,
+      });
     },
     renderCall,
     renderResult,
   });
 
-  registerAgentCommand(pi, { backgroundManager });
+  pi.registerTool<typeof JobParams, SubagentDetails, AgentRenderState>({
+    name: 'agent_job',
+    label: 'Agent Job',
+    description: `Inspect and resume durable agent runs. Actions:
+- \`list\`: List recent runs with status, unit counts, and capability.
+- \`get\`: Get detailed status for a specific run including per-unit state and blocking reasons.
+- \`resume\`: Resume an interrupted run. Inspect the run first; set \`allowReplay\` only after accepting that replay-capable units restart from the beginning and may repeat external side effects.`,
+    parameters: JobParams,
+    renderCall: renderJobCall as (args: unknown, theme: Theme) => Component,
+    renderResult: renderResult as (
+      result: { content: Array<{ type: string; text?: string }>; details?: SubagentDetails },
+      options: { expanded: boolean; isPartial?: boolean },
+      theme: Theme,
+      context?: { toolCallId: string; invalidate: () => void; state: AgentRenderState }
+    ) => Component,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      latestUiCtx = ctx;
+      const agents = discoverAgents(ctx.cwd, 'both').agents;
+      return executeJobTool(params, {
+        runStore,
+        runCoordinator,
+        agents,
+        executeResume: async (allowReplay) => {
+          const loaded = runStore.getRun((params as { runId: string }).runId);
+          if (!loaded.ok) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `resume_error: run not found: ${loaded.error.message}`,
+                },
+              ],
+              isError: true,
+              details: {
+                mode: 'single',
+                agentScope: 'both',
+                projectAgentsDir: null,
+                builtinAgentsDir: '',
+                results: [],
+              },
+            };
+          }
+          const req = loaded.loaded.record.request;
+          return executeAgentTool(
+            {
+              agent: req.agent,
+              task: req.task,
+              title: req.title,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              tasks: req.tasks as any,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              chain: req.chain as any,
+              agentScope: req.agentScope,
+              cwd: req.cwd,
+              isolation: req.isolation,
+              model: req.model,
+              thinking: req.thinking,
+              runtime: req.runtime,
+            },
+            signal,
+            onUpdate,
+            ctx,
+            {
+              backgroundManager,
+              runStore,
+              runCoordinator,
+              interactiveRegistry,
+              resumeRunId: (params as { runId: string }).runId,
+              allowReplay,
+            }
+          );
+        },
+      });
+    },
+  });
+
+  registerAgentCommand(pi, {
+    backgroundManager,
+    runStore,
+    runCoordinator,
+    // Always resolve the current session registry (recreated on session_start).
+    get interactiveRegistry() {
+      return interactiveRegistry;
+    },
+    interactiveView: {
+      openView: () => viewController.openView(),
+    },
+  });
 }

@@ -3,6 +3,7 @@
 
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentScope, AgentSource } from './agents.ts';
+import type { ResumeCapability } from './run-types.ts';
 
 export type SystemPromptMode = 'append' | 'replace';
 export type DefaultContext = 'fresh' | 'fork';
@@ -15,7 +16,8 @@ export type ExecutionStatus =
   | 'completed'
   | 'failed'
   | 'cancelled'
-  | 'skipped';
+  | 'skipped'
+  | 'interrupted';
 
 export interface UsageStats {
   input: number;
@@ -64,6 +66,16 @@ export interface SingleResult {
   finalOutput?: string;
   structuredOutput?: unknown;
   structuredOutputError?: string;
+  /** Durable run this unit belongs to; additive for older sessions. */
+  runId?: string;
+  /** Stable execution-unit id within the run. */
+  unitId?: string;
+  /** Current attempt number (1-based) for this unit. */
+  attempt?: number;
+  /** Persisted Pi session file backing this unit, when any. */
+  sessionFile?: string;
+  /** Resume capability this unit advertises (`session` or `replay`). */
+  resumeCapability?: ResumeCapability;
 }
 
 export interface ChainOutputEntry {
@@ -155,6 +167,14 @@ export interface SubagentDetails {
   /** Logical Chain workflow state; additive for older sessions without it. */
   chain?: ChainExecutionDetails;
   background?: BackgroundLaunchDetails[];
+  /** Durable run metadata; additive for older sessions without a run. */
+  run?: {
+    runId: string;
+    status: import('./run-types.ts').RunStatus;
+    resumable: boolean;
+    /** Aggregate resume capability across units: `session`, `replay`, or `mixed`. */
+    capability: 'session' | 'replay' | 'mixed';
+  };
 }
 
 export type DisplayItem =

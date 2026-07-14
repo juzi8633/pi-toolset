@@ -35,7 +35,7 @@ When there are no critical items, write the section as exactly:
 - None.
 ```
 
-This lets downstream consumers (e.g. the `/implement-and-review` worker) tell “no critical items” apart from real findings.
+This lets downstream consumers (e.g. the `/implement-and-review` general agent) tell “no critical items” apart from real findings.
 
 Otherwise, list each finding on its own line:
 

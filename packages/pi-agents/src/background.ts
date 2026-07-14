@@ -11,6 +11,7 @@ import { getMarkdownTheme } from '@earendil-works/pi-coding-agent';
 import { Container, Markdown, Spacer, Text, type Component } from '@earendil-works/pi-tui';
 import { getBuiltinAgentsDir, type AgentScope } from './agents.ts';
 import { truncateParallelOutput } from './output.ts';
+import type { RunAbortOrigin } from './run-types.ts';
 import type {
   BackgroundJobStatus,
   BackgroundLaunchDetails,
@@ -31,6 +32,24 @@ export interface BackgroundLaunchRequest {
   title?: string;
   projectAgentsDir: string | null;
   run: (signal: AbortSignal) => Promise<AgentToolResult<SubagentDetails> & { isError?: boolean }>;
+  /** Durable run context; when present, the job's id equals the run id and shutdown interrupts. */
+  durable?: DurableRunContextRef;
+}
+
+/**
+ * Minimal durable-run handle carried into the background manager. Mirrors the
+ * fields the manager needs to interrupt and finalize without coupling to tool.ts internals.
+ */
+export interface DurableRunContextRef {
+  runId: string;
+  abort(origin: RunAbortOrigin): void;
+  finalize(input: {
+    success?: boolean;
+    cancelled?: boolean;
+    interrupted?: boolean;
+    lastError?: string;
+  }): Promise<void>;
+  lifecycle: { signal: AbortSignal };
 }
 
 export interface BackgroundManager {
@@ -60,6 +79,20 @@ interface BackgroundJob {
    * exits before `request.run()` settles.
    */
   emitCancellation: () => void;
+  /** Durable run context attached when launched with persistence. */
+  durable?: DurableJobState;
+}
+
+interface DurableJobState {
+  runId: string;
+  abort: (origin: RunAbortOrigin) => void;
+  finalize: (input: {
+    success?: boolean;
+    cancelled?: boolean;
+    interrupted?: boolean;
+    lastError?: string;
+  }) => Promise<void>;
+  lifecycle: { signal: AbortSignal };
 }
 
 interface BackgroundNotificationMessage {
@@ -113,8 +146,9 @@ export function createBackgroundManager(
       };
     }
 
-    const jobId = makeJobId();
+    const jobId = request.durable ? request.durable.runId : makeJobId();
     const startedAt = now();
+    const durable = request.durable;
     const launchDetails: BackgroundLaunchDetails = {
       jobId,
       mode: request.mode,
@@ -126,6 +160,10 @@ export function createBackgroundManager(
       ...(request.title ? { title: request.title } : {}),
     };
     const controller = new AbortController();
+    // When a durable lifecycle is attached, the run observes the coordinator-
+    // owned signal so shutdown surfaces as `interrupted` rather than a bare
+    // job-local cancellation. Otherwise the job-local controller is the source.
+    const runSignal = durable ? durable.lifecycle.signal : controller.signal;
     let settled = false;
 
     const finish = (status: BackgroundJobStatus, result?: string, error?: string): void => {
@@ -169,41 +207,96 @@ export function createBackgroundManager(
       } catch {
         // Best-effort: completion notification is informational. Continue.
       }
-      jobs.delete(jobId);
     };
 
     // Register the job before invoking request.run() so that synchronous
     // failures and concurrent launches account for it correctly.
     let runPromise: Promise<void> = Promise.resolve();
+    /**
+     * Send only the terminal notification without settling or removing the
+     * job. Used by cancelAll() so the notification is recorded synchronously
+     * (surviving process exit) while the runPromise still drives finalize,
+     * flush, and the eventual finish()/delete. The per-job `settled` latch
+     * deduplicates the later run-side finish().
+     */
+    const emitCancellation = (): void => {
+      const job = jobs.get(jobId);
+      if (!job) return;
+      if (settled) return;
+      settled = true;
+      job.details.status = 'cancelled';
+      const finishedAt = now();
+      const notification: BackgroundNotificationDetails = {
+        jobId,
+        mode: request.mode,
+        status: 'cancelled',
+        description: request.description,
+        startedAt,
+        finishedAt,
+        durationMs: finishedAt - startedAt,
+      };
+      try {
+        pi.sendMessage(
+          {
+            customType: BACKGROUND_MESSAGE_TYPE,
+            content: `<pi-agents-background jobId="${jobId}" status="cancelled">\n<summary>${escapeXml(request.description)}</summary>\n</pi-agents-background>`,
+            display: true,
+            details: notification,
+          },
+          { triggerTurn: false, deliverAs: 'followUp' }
+        );
+      } catch {
+        // Best-effort.
+      }
+    };
     jobs.set(jobId, {
       details: launchDetails,
       controller,
       promise: runPromise,
-      emitCancellation: () => finish('cancelled'),
+      durable: durable
+        ? {
+            runId: durable.runId,
+            abort: durable.abort,
+            finalize: durable.finalize,
+            lifecycle: durable.lifecycle,
+          }
+        : undefined,
+      emitCancellation: () => emitCancellation(),
     });
 
     runPromise = (async () => {
       let runResult: (AgentToolResult<SubagentDetails> & { isError?: boolean }) | undefined;
       let runError: unknown;
       try {
-        runResult = await request.run(controller.signal);
+        runResult = await request.run(runSignal);
       } catch (err) {
         runError = err;
       }
-      if (controller.signal.aborted) {
-        finish('cancelled');
-        return;
-      }
-      if (runError !== undefined) {
-        const message = runError instanceof Error ? runError.message : String(runError);
-        finish('failed', undefined, message);
-        return;
-      }
-      const text = extractText(runResult!);
-      if (runResult!.isError) {
-        finish('failed', undefined, text);
-      } else {
-        finish('completed', text);
+      try {
+        const aborted = durable ? durable.lifecycle.signal.aborted : controller.signal.aborted;
+        if (aborted) {
+          if (durable) await durable.finalize({ interrupted: true });
+          finish('cancelled');
+          return;
+        }
+        if (runError !== undefined) {
+          const message = runError instanceof Error ? runError.message : String(runError);
+          if (durable) await durable.finalize({ success: false, lastError: message });
+          finish('failed', undefined, message);
+          return;
+        }
+        const text = extractText(runResult!);
+        if (runResult!.isError) {
+          if (durable) await durable.finalize({ success: false, lastError: text });
+          finish('failed', undefined, text);
+        } else {
+          if (durable) await durable.finalize({ success: true });
+          finish('completed', text);
+        }
+      } finally {
+        // finish() may have been a no-op if emitCancellation() already settled
+        // (cancelAll). Ensure the job is removed so waitForIdle() can drain.
+        jobs.delete(jobId);
       }
     })();
     runPromise.catch(() => {});
@@ -233,8 +326,13 @@ export function createBackgroundManager(
     for (const job of jobs.values()) {
       if (job.details.status === 'running') {
         job.details.status = 'cancelled';
+        // When a durable run is attached, interrupt via the coordinator-owned
+        // lifecycle as `session_shutdown` so the terminal snapshot classifies
+        // as interrupted rather than user-cancelled. Otherwise abort the
+        // job-local controller.
         try {
-          job.controller.abort();
+          if (job.durable) job.durable.abort('session_shutdown');
+          else job.controller.abort();
         } catch {
           // ignore
         }

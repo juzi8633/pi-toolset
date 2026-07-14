@@ -1003,6 +1003,232 @@ describe('runChainWorkflow', () => {
       expect(fanoutStep.skippedCount).toBe(2);
     }
   });
+
+  it('awaits onFanoutExpand before any fanout runStep and passes fanoutIndex', async () => {
+    const events: string[] = [];
+    const indexes: number[] = [];
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'find items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+        concurrency: 3,
+      },
+    ];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      onFanoutExpand: async (req) => {
+        events.push(`expand:${req.items.length}`);
+        expect(req.step).toBe(2);
+        expect(req.agent).toBe('worker');
+        expect(req.items).toEqual(['a', 'b', 'c']);
+      },
+      runStep: async (req) => {
+        if (req.agent === 'explore') {
+          events.push('seed');
+          return makeAssistantResult(req.agent, '{"items":["a","b","c"]}', req.step);
+        }
+        events.push(`step:${req.fanoutIndex}`);
+        indexes.push(req.fanoutIndex!);
+        return makeAssistantResult(req.agent, `ok-${req.fanoutIndex}`, req.step);
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(events[0]).toBe('seed');
+    expect(events[1]).toBe('expand:3');
+    expect(events.slice(2).sort()).toEqual(['step:0', 'step:1', 'step:2']);
+    expect(indexes.sort()).toEqual([0, 1, 2]);
+  });
+
+  it('invokes onFanoutExpand for empty scheduled items before returning 0/0', async () => {
+    let expandCalled = false;
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'find items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+      },
+    ];
+    let workerCalls = 0;
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      onFanoutExpand: async (req) => {
+        expandCalled = true;
+        expect(req.items).toEqual([]);
+      },
+      runStep: async (req) => {
+        if (req.agent === 'explore')
+          return makeAssistantResult(req.agent, '{"items":[]}', req.step);
+        workerCalls++;
+        return makeAssistantResult(req.agent, 'nope', req.step);
+      },
+    });
+    expect(expandCalled).toBe(true);
+    expect(workerCalls).toBe(0);
+    expect(res.isError).toBeUndefined();
+  });
+
+  it('creates expansion items only for maxItems-scheduled subset', async () => {
+    let expanded: unknown[] | undefined;
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'find items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' }, maxItems: 2 },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+      },
+    ];
+    await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      onFanoutExpand: async (req) => {
+        expanded = req.items;
+      },
+      runStep: async (req) => {
+        if (req.agent === 'explore')
+          return makeAssistantResult(req.agent, '{"items":["a","b","c","d"]}', req.step);
+        return makeAssistantResult(req.agent, 'ok', req.step);
+      },
+    });
+    expect(expanded).toEqual(['a', 'b']);
+  });
+
+  it('fails the fanout when onFanoutExpand rejects without scheduling workers', async () => {
+    let workerCalls = 0;
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'find items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+      },
+    ];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      onFanoutExpand: async () => {
+        throw new Error('disk full');
+      },
+      runStep: async (req) => {
+        if (req.agent === 'explore')
+          return makeAssistantResult(req.agent, '{"items":["a"]}', req.step);
+        workerCalls++;
+        return makeAssistantResult(req.agent, 'ok', req.step);
+      },
+    });
+    expect(workerCalls).toBe(0);
+    expect(res.isError).toBe(true);
+    expect((res.content[0] as { text: string }).text).toContain('expansion persistence failed');
+  });
+
+  it('cancel with concurrency < item count leaves unstarted presentation slots skipped', async () => {
+    const controller = new AbortController();
+    let started = 0;
+    let resolveFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      resolveFirstStarted = resolve;
+    });
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      resolveGate = resolve;
+    });
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'find',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+        concurrency: 1,
+      },
+    ];
+    const runPromise = runChainWorkflow({
+      chain,
+      signal: controller.signal,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'explore') {
+          return makeAssistantResult(req.agent, '{"items":["a","b","c","d"]}', req.step);
+        }
+        started++;
+        if (started === 1) resolveFirstStarted();
+        await gate;
+        if (controller.signal.aborted) {
+          throw new Error('Subagent was aborted');
+        }
+        return makeAssistantResult(req.agent, 'late', req.step);
+      },
+    });
+    await firstStarted;
+    controller.abort();
+    resolveGate();
+    const res = await runPromise;
+    expect(res.isError).toBe(true);
+    // Concurrency 1: only the in-flight worker started; others stay unscheduled.
+    expect(started).toBe(1);
+    const fanoutResults = res.details.results.filter((r) => r.fanout);
+    expect(fanoutResults).toHaveLength(4);
+    const statuses = fanoutResults.map((r) => r.status);
+    expect(statuses.filter((s) => s === 'cancelled').length).toBeGreaterThanOrEqual(1);
+    expect(statuses.filter((s) => s === 'skipped').length).toBeGreaterThanOrEqual(1);
+  });
 });
 
 describe('runChainWorkflow title propagation', () => {

@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'bun:test';
 import type { AgentConfig } from '../src/agents.ts';
 import { enforceCompletionCheck, validateCompletionOutput } from '../src/completion-check.ts';
+import { getResultOutput } from '../src/output.ts';
 import { emptyUsage, type SingleResult } from '../src/types.ts';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -120,6 +121,39 @@ describe('enforceCompletionCheck', () => {
     expect(result.errorMessage).toContain('## Completed');
   });
 
+  it('relays unchecked final output after a completion-check warning', () => {
+    const agent = makeAgent({
+      completionCheck: ['## Completed', '## Validation'],
+    });
+    const original = '## Completed\n\nDid partial work without Validation.';
+    const result = completedResult(original);
+    enforceCompletionCheck(agent, result);
+
+    expect(result.status).toBe('failed');
+    expect(result.stopReason).toBe('completion_check');
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toBe('Completion check failed: missing ## Validation');
+
+    const formatted = getResultOutput(result);
+    expect(formatted.startsWith('Completion check failed: missing ## Validation')).toBe(true);
+    expect(formatted).toContain('Unchecked agent output:');
+    const warningEnd = formatted.indexOf('Unchecked agent output:');
+    const outputStart = formatted.indexOf(original);
+    expect(warningEnd).toBeGreaterThanOrEqual(0);
+    expect(outputStart).toBeGreaterThan(warningEnd);
+    expect(formatted.slice(outputStart)).toBe(original);
+  });
+
+  it('uses the no-output fallback when completion check fails without assistant text', () => {
+    const agent = makeAgent({ completionCheck: ['## Completed'] });
+    const result = completedResult('');
+    result.messages = [];
+    enforceCompletionCheck(agent, result);
+    const formatted = getResultOutput(result);
+    expect(formatted).toContain('Completion check failed: missing ## Completed');
+    expect(formatted).toContain('Unchecked agent output:\n(no output)');
+  });
+
   it('leaves successful results with matching headings unchanged', () => {
     const agent = makeAgent({ completionCheck: ['## Completed'] });
     const result = completedResult('## Completed\n\nok');
@@ -139,5 +173,21 @@ describe('enforceCompletionCheck', () => {
     enforceCompletionCheck(agent, result);
     expect(result.stopReason).toBe('error');
     expect(result.errorMessage).toBe('prior');
+  });
+
+  it('keeps generic error-message precedence for non-completion failures', () => {
+    const result = completedResult('agent said this');
+    result.status = 'failed';
+    result.exitCode = 1;
+    result.stopReason = 'error';
+    result.errorMessage = 'boom';
+    result.stderr = 'stderr noise';
+    expect(getResultOutput(result)).toBe('boom');
+
+    delete result.errorMessage;
+    expect(getResultOutput(result)).toBe('stderr noise');
+
+    result.stderr = '';
+    expect(getResultOutput(result)).toBe('agent said this');
   });
 });

@@ -11,6 +11,7 @@ import {
   installSpinnerScheduler,
   isSharedSpinnerTickerActive,
   renderCall,
+  renderJobCall,
   renderResult,
   RUNNING_STATUS_GLYPH,
   runningStatusGlyph,
@@ -294,7 +295,7 @@ describe('renderResult single', () => {
     expect(text).toContain('└─');
     expect(text).toContain('ls -la');
     expect(text).not.toContain('.gitignore'); // only latest activity
-    expect(text).toContain('(Ctrl+O to expand)');
+    expect(text).toContain('(ctrl+o to expand)');
     expect(text).not.toContain('subagent');
   });
 
@@ -322,7 +323,7 @@ describe('renderResult single', () => {
     expect(text.startsWith('✔')).toBe(true);
     expect(text).not.toContain('└─');
     expect(text).not.toContain('final answer body');
-    expect(text).toContain('(Ctrl+O to expand)');
+    expect(text).toContain('(ctrl+o to expand)');
   });
 
   it('shows error icon and message on failed results', () => {
@@ -504,6 +505,39 @@ describe('renderResult single', () => {
     expect(text).toContain(longPath);
     expect(text).not.toContain('…');
   });
+
+  it('hides the durable runId from collapsed status but keeps it in expanded view', () => {
+    const { context } = makeContext();
+    const r = singleResult({
+      status: 'completed',
+      runId: 'run-abcdef1234567890',
+      unitId: 'unit-1',
+      attempt: 1,
+    });
+    const collapsed = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(r) },
+        { expanded: false, isPartial: false },
+        theme,
+        context
+      )
+    );
+    // Collapsed status line must not surface the durable run id.
+    expect(collapsed).not.toContain('run:');
+    expect(collapsed).not.toContain(r.runId!);
+
+    const expanded = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(r) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    // Expanded detail view still exposes the run id and resume hint.
+    expect(expanded).toContain(`runId: ${r.runId}`);
+    expect(expanded).toContain('To resume:');
+  });
 });
 
 describe('renderResult parallel', () => {
@@ -548,7 +582,7 @@ describe('renderResult parallel', () => {
     expect(text).toContain('read');
     expect(text).toContain('Total:');
     expect(text).toContain('1/3 completed');
-    expect(text).toContain('(Ctrl+O to expand)');
+    expect(text).toContain('(ctrl+o to expand)');
     // completed and queued should not show activity lines with tool names beyond the one running
     const activityLines = text.split('\n').filter((l) => l.includes('└─'));
     expect(activityLines).toHaveLength(1);
@@ -1522,5 +1556,72 @@ describe('renderResult title', () => {
     );
     expect(text).toContain('─── Task ───');
     expect(text).toContain('full task text here');
+  });
+});
+
+describe('agent_job rendering', () => {
+  function renderText(comp: Component): string {
+    return comp.render(80).join('\n');
+  }
+
+  it('renderJobCall shows the action and runId', () => {
+    const comp = renderJobCall({ action: 'resume', runId: 'run-abcdef123456' }, fakeTheme());
+    expect(renderText(comp)).toContain('agent_job');
+    expect(renderText(comp)).toContain('resume');
+    expect(renderText(comp)).toContain('run-abcdef12');
+  });
+
+  it('renderJobCall shows list action without runId', () => {
+    const comp = renderJobCall({ action: 'list' }, fakeTheme());
+    expect(renderText(comp)).toContain('agent_job');
+    expect(renderText(comp)).toContain('list');
+  });
+
+  it('renderResult renders a resume result with single agent output style', () => {
+    const { context } = makeContext();
+    const r = singleResult({ status: 'completed', agent: 'explore', task: 'look around' });
+    const comp = renderResult(
+      {
+        content: [{ type: 'text', text: '(no output)' }],
+        details: singleDetails(r),
+      },
+      { expanded: false },
+      fakeTheme(),
+      context
+    );
+    const text = renderText(comp);
+    expect(text).toContain('Explore');
+    expect(text).toContain('look around');
+  });
+
+  it('renderResult falls back to text for a list/get result with empty details', () => {
+    const comp = renderResult(
+      {
+        content: [{ type: 'text', text: 'Run ID | Mode | Status\nr1 | single | interrupted' }],
+        details: {
+          mode: 'single',
+          agentScope: 'user',
+          projectAgentsDir: null,
+          builtinAgentsDir: '/builtin',
+          results: [],
+        },
+      },
+      { expanded: false },
+      fakeTheme()
+    );
+    const text = renderText(comp);
+    expect(text).toContain('Run ID | Mode | Status');
+    expect(text).toContain('interrupted');
+  });
+
+  it('renderResult does not crash with undefined render context', () => {
+    const r = singleResult({ status: 'completed' });
+    const comp = renderResult(
+      { content: [{ type: 'text', text: 'done' }], details: singleDetails(r) },
+      { expanded: false },
+      fakeTheme(),
+      undefined
+    );
+    expect(renderText(comp)).toContain('Explore');
   });
 });

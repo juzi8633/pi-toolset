@@ -84,12 +84,16 @@ a comma-separated list of required headings (e.g.
 inspects the final assistant message for each heading as an exact line
 (case-insensitive, line-anchored). On failure it sets
 `stopReason: "completion_check"`, fills `errorMessage` with the missing
-headings, and forces exit code `1`. The check does not infer behavior from
-`tools`/`excludeTools`/`edit`/`write`/`bash`; agents opt in explicitly.
+headings, forces exit code `1`, and marks the unit `status: "failed"`.
+Validation failure is not output suppression: parent-visible text still includes
+the child's final message after an explicit warning that the output did not pass
+`completionCheck` (labeled as unchecked agent output). The check does not infer
+behavior from `tools`/`excludeTools`/`edit`/`write`/`bash`; agents opt in
+explicitly.
 
 Among the bundled agents, `planner` and `reviewer` declare `completionCheck`.
-The `worker` agent does not; the bundled workflow prompts (`/implement`,
-`/implement-and-review`) instead ask the worker to include the `## Completed`,
+The `general` agent does not; the bundled workflow prompts (`/implement`,
+`/implement-and-review`) instead ask the general agent to include the `## Completed`,
 `## Files Changed`, `## Validation` headings via their task text.
 
 When a chain step declares `outputSchema`, `completionCheck` is bypassed for
@@ -259,3 +263,56 @@ done/running/queued/failed counts and a single latest activity prefixed
 `[item/total]`. Collect names are fanout metadata, not extra Chain steps.
 The footer reports current step, completed logical-step count, and aggregate
 usage.
+
+## Durable fanout expansion
+
+A chain fanout expands a prior structured array into parallel workers. The
+durability boundary is the expansion write, not the first worker start.
+
+1. Resolve the source array, apply `maxItems`, and render item tasks.
+2. Atomically persist `workflowState.fanouts[chain-NNNN-fanout]` (ordered items +
+   unit ids) together with one queued `RunUnitRecord` per scheduled item.
+3. Only after that write succeeds may workers be scheduled.
+
+If the expansion write fails, the run fails without launching any item. Once it
+succeeds, crash recovery can distinguish completed items, started-but-incomplete
+items, and never-started items without re-reading mutable upstream output.
+
+Resume treats per-item unit records as authoritative: completed results are
+reused in original order; only non-completed units dispatch. Attempt numbers
+increment only for units that already executed; never-started units stay at
+attempt `1`. Presentation fields such as `details.results` remain a projection
+for display and completed historical runs, not the selective-resume authority.
+
+### Why legacy partial fanouts are not reconstructed
+
+Older incomplete runs may have fanout presentation results or a single shared
+identity without a stored expansion mapping. Reconstructing item identity,
+attempt history, session paths, and side effects from that evidence would be
+guesswork. The package therefore refuses such runs with
+`stored_fanout_state_unavailable` (or `stored_output_invalid` when a completed
+child lacks a terminal result) and requires a fresh chain invocation. Completed
+V1 records remain readable for listing and inspection.
+
+## Interactive view vs host session switching
+
+The interactive navigator routes its own UI and input. It never replaces Pi's main transcript, footer navigation, or host `SessionManager`. `/agent view` opens a non-overlay `ui.custom` surface that temporarily replaces the host editor (same placement as `/settings`), with a SelectList styled like prompt autocomplete; Escape returns to the host editor with the same main session leaf.
+
+### Why dual binding exists
+
+A main-session link only claims that this extension wrote a pointer on this host session. The durable unit binding (random `bindingId` + `hostSessionId` + `createdAt`) is flushed first. A crash between those writes can leave an unreachable durable binding, never a trusted link without a durable peer. Forged or copied links fail closed when:
+
+- the host session id does not match the current session
+- the durable binding is missing or mismatched
+- the session path escapes the run's `sessions/` directory (including symlink escapes)
+- the current raw agent fingerprint no longer matches the stored unit fingerprint
+
+Request-level overrides (model, thinking, isolation) are applied only after the raw definition fingerprint matches.
+
+### Durable result vs interactive continuation
+
+Messages sent before the original activation settles contribute to the unit's durable `SingleResult`. After that activation settles, further interactive messages extend the child JSONL session only. They do not rewrite attempt history or the completed run result. For a normally completed agent, post-completion chat stays in the child session and never enters the parent model's context. The one exception is an interrupted or cancelled tool-call activation: the next view continuation that settles is relayed back to the bound host model once (per activation) as a clearly-marked interactive continuation, so the parent can act on what the continuation produced. The relay is scoped to the same host session and active branch; if the host session or branch changes first, no content is injected. Resume of durable runs remains a separate path via `agent_job`.
+
+### Why worktrees are retained
+
+Interactive reattach needs a stable effective cwd. Automatic cleanup of a clean worktree after a successful unit would break later interactive prompts and lazy reopen. Version 1 prioritizes continuity and documents manual cleanup and disk growth instead of silent pruning.

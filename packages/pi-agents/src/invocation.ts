@@ -42,6 +42,8 @@ export interface BuildPiArgsOptions {
   sessionFile?: string;
   disableAgentTool?: boolean;
   resolvedSkillPaths?: string[];
+  /** "initial" sends `Task: <task>`; "resume" sends a fixed continuation instruction. */
+  promptKind?: 'initial' | 'resume';
 }
 
 export function buildPiArgs(
@@ -55,6 +57,47 @@ export function buildPiArgs(
   } else {
     args.push('--no-session');
   }
+  args.push(...buildSharedPiFlags(agent, options));
+  if (options.promptKind === 'resume') {
+    args.push(RESUME_CONTINUATION_PROMPT);
+  } else {
+    args.push(`Task: ${task}`);
+  }
+  return args;
+}
+
+export interface BuildPiRpcArgsOptions {
+  tmpPromptPath?: string;
+  sessionFile?: string;
+  disableAgentTool?: boolean;
+  resolvedSkillPaths?: string[];
+}
+
+/**
+ * Build argv for an interactive Pi child in RPC mode.
+ * Same session/model/thinking/tool/skill/system-prompt flags as JSON mode,
+ * but without `-p`, an argv prompt, or `--no-session`.
+ */
+export function buildPiRpcArgs(agent: AgentConfig, options: BuildPiRpcArgsOptions = {}): string[] {
+  const args: string[] = ['--mode', 'rpc'];
+  if (options.sessionFile) {
+    args.push('--session', options.sessionFile);
+  }
+  // Interactive children always keep discovery off so host extensions do not load twice.
+  args.push('-ne', '-ns', '-np', '--offline');
+  args.push(...buildSharedPiFlags(agent, options));
+  return args;
+}
+
+function buildSharedPiFlags(
+  agent: AgentConfig,
+  options: {
+    tmpPromptPath?: string;
+    disableAgentTool?: boolean;
+    resolvedSkillPaths?: string[];
+  }
+): string[] {
+  const args: string[] = [];
   if (agent.model) args.push('--model', agent.model);
   if (agent.thinking) args.push('--thinking', agent.thinking);
   args.push(...buildToolCliArgs(agent, { disableAgentTool: options.disableAgentTool }));
@@ -72,6 +115,9 @@ export function buildPiArgs(
       agent.systemPromptMode === 'replace' ? '--system-prompt' : '--append-system-prompt';
     args.push(promptFlag, options.tmpPromptPath);
   }
-  args.push(`Task: ${task}`);
   return args;
 }
+
+/** Fixed continuation instruction for resumed Pi sessions. */
+export const RESUME_CONTINUATION_PROMPT =
+  'You are resuming an interrupted task. Inspect the filesystem and git state to understand what was already completed. Treat any unfinished tool call as unconfirmed. Continue the original task to completion, and run validation before finishing.';

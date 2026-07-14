@@ -164,6 +164,53 @@ function isUnderWorktreesDir(repoRoot: string, candidate: string): boolean {
   return target !== root && target.startsWith(expectedBase);
 }
 
+export type OpenWorktreeResult =
+  | { ok: true; worktree: AgentWorktree }
+  | { ok: false; error: string; code: 'worktree_unavailable' };
+
+/** Reopen a stored worktree for resume without creating a replacement. */
+export function openAgentWorktree(repoRoot: string, storedPath: string): OpenWorktreeResult {
+  const root = path.resolve(repoRoot);
+  const candidate = path.resolve(storedPath);
+  if (!isUnderWorktreesDir(root, candidate)) {
+    return {
+      ok: false,
+      error: `Stored worktree path is outside <repo>/.worktrees: ${storedPath}`,
+      code: 'worktree_unavailable',
+    };
+  }
+  if (!fs.existsSync(candidate)) {
+    return {
+      ok: false,
+      error: `Stored worktree path no longer exists: ${storedPath}`,
+      code: 'worktree_unavailable',
+    };
+  }
+  // Verify it is a registered worktree.
+  const list = spawnSync('git', ['-C', root, 'worktree', 'list', '--porcelain'], {
+    encoding: 'utf-8',
+  });
+  if (list.status !== 0) {
+    return {
+      ok: false,
+      error: `Cannot list worktrees: ${(list.stderr || '').trim()}`,
+      code: 'worktree_unavailable',
+    };
+  }
+  const registered = list.stdout
+    .split('\n')
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => path.resolve(line.slice('worktree '.length).trim()));
+  if (!registered.includes(candidate)) {
+    return {
+      ok: false,
+      error: `Stored worktree is no longer registered: ${storedPath}`,
+      code: 'worktree_unavailable',
+    };
+  }
+  return { ok: true, worktree: { path: candidate, repoRoot: root } };
+}
+
 export interface RemoveWorktreeResult {
   removed: boolean;
   error?: string;

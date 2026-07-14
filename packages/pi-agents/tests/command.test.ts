@@ -25,7 +25,8 @@ import type { SubagentDetails } from '../src/types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 type Params = Parameters<typeof executeAgentTool>[0];
-type ExecCall = { params: Params };
+type ExecOptions = Parameters<typeof executeAgentTool>[4];
+type ExecCall = { params: Params; options?: ExecOptions };
 type WidgetComponent = Component & { dispose?(): void };
 type WidgetFactory = (tui: TUI, theme: Theme) => WidgetComponent;
 type WidgetValue = string[] | WidgetFactory | undefined;
@@ -86,16 +87,16 @@ function fakePi(): { pi: ExtensionAPI; commands: Map<string, CapturedCommand> } 
 
 function fakeCtx(
   cwd: string,
-  options: { skills?: Skill[] } = {}
+  options: { skills?: Skill[]; mode?: 'tui' | 'json' | 'print' | 'rpc'; hasUI?: boolean } = {}
 ): {
   ctx: ExtensionCommandContext;
   notifications: Array<{ message: string; type: string }>;
   widgets: WidgetUpdate[];
-  state: { idleCalls: number };
+  state: { idleCalls: number; customCalls: number };
 } {
   const notifications: Array<{ message: string; type: string }> = [];
   const widgets: WidgetUpdate[] = [];
-  const state = { idleCalls: 0 };
+  const state = { idleCalls: 0, customCalls: 0 };
   const fakeTui = { requestRender: () => undefined } as TUI;
   const fakeTheme = {
     bold: (text: string) => text,
@@ -104,6 +105,8 @@ function fakeCtx(
   let currentWidget: WidgetComponent | undefined;
   const ctx = {
     cwd,
+    mode: options.mode ?? 'tui',
+    hasUI: options.hasUI ?? true,
     signal: undefined,
     waitForIdle: async () => {
       state.idleCalls++;
@@ -116,6 +119,10 @@ function fakeCtx(
         currentWidget?.dispose?.();
         currentWidget = typeof value === 'function' ? value(fakeTui, fakeTheme) : undefined;
         widgets.push({ key, value, component: currentWidget });
+      },
+      custom: async () => {
+        state.customCalls++;
+        return null;
       },
     },
   } as unknown as ExtensionCommandContext;
@@ -176,8 +183,8 @@ function progressResult(text: string, turns: number): AgentResult {
 
 function fakeExec(result: AgentResult): { execute: typeof executeAgentTool; calls: ExecCall[] } {
   const calls: ExecCall[] = [];
-  const execute: typeof executeAgentTool = async (params) => {
-    calls.push({ params: params as Params });
+  const execute: typeof executeAgentTool = async (params, _signal, _onUpdate, _ctx, options) => {
+    calls.push({ params: params as Params, options });
     return result;
   };
   return { execute, calls };
@@ -188,8 +195,8 @@ function streamingExec(
   partialResult: AgentResult
 ): { execute: typeof executeAgentTool; calls: ExecCall[] } {
   const calls: ExecCall[] = [];
-  const execute: typeof executeAgentTool = async (params, _signal, onUpdate) => {
-    calls.push({ params: params as Params });
+  const execute: typeof executeAgentTool = async (params, _signal, onUpdate, _ctx, options) => {
+    calls.push({ params: params as Params, options });
     onUpdate?.(partialResult);
     return finalResult;
   };
@@ -246,6 +253,57 @@ describe('registerAgentCommand', () => {
     expect(notifications[0].type).toBe('info');
     expect(notifications[0].message).toContain('myagent');
     expect(notifications[0].message).toContain('[project]');
+  });
+
+  it('opens /agent view immediately without waitForIdle while host is busy', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    let openCalls = 0;
+    registerAgentCommand(pi, {
+      cwd,
+      execute: fakeExec(okResult('done')).execute,
+      interactiveView: {
+        openView: async () => {
+          openCalls++;
+        },
+      },
+    });
+    const { ctx, state } = fakeCtx(cwd, { mode: 'tui' });
+
+    await commands.get('agent')!.handler('view', ctx);
+
+    expect(state.idleCalls).toBe(0);
+    expect(openCalls).toBe(1);
+  });
+
+  it('does not open custom UI for /agent view outside TUI', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    let openCalls = 0;
+    registerAgentCommand(pi, {
+      cwd,
+      execute: fakeExec(okResult('done')).execute,
+      interactiveView: {
+        openView: async () => {
+          openCalls++;
+        },
+      },
+    });
+    const { ctx, notifications, state } = fakeCtx(cwd, { mode: 'json', hasUI: false });
+
+    await commands.get('agent')!.handler('view', ctx);
+
+    expect(state.idleCalls).toBe(0);
+    expect(openCalls).toBe(0);
+    expect(notifications).toHaveLength(0);
+  });
+
+  it('offers view in argument completions', () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    registerAgentCommand(pi, { cwd, execute: fakeExec(okResult('done')).execute });
+    const items = commands.get('agent')!.getArgumentCompletions?.('v') as Array<{ value: string }>;
+    expect(items?.some((i) => i.value === 'view')).toBe(true);
   });
 
   it('shows usage when called with no args', async () => {
@@ -414,7 +472,9 @@ describe('registerAgentCommand', () => {
       value: string;
     }>;
     const values = completions.map((c) => c.value);
-    expect(values).toEqual(['list']);
+    expect(values).toContain('list');
+    expect(values).toContain('view');
+    expect(values).toContain('runs');
   });
 
   it('filters completions by prefix', () => {
@@ -493,5 +553,45 @@ describe('registerAgentCommand', () => {
     const probed = exec.probe();
     expect(probed.resolved).toEqual([]);
     expect(probed.missing).toEqual(['hidden']);
+  });
+
+  it('forwards interactiveRegistry on TUI /agent:<name> so RPC/link path is used', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    const exec = fakeExec(okResult('done'));
+    const interactiveRegistry = {
+      registerInitial: async () => {
+        throw new Error('not used by fake executor');
+      },
+    } as never;
+    registerAgentCommand(pi, {
+      cwd,
+      execute: exec.execute,
+      interactiveRegistry,
+    });
+    const { ctx } = fakeCtx(cwd, { mode: 'tui' });
+
+    await commands.get('agent:myagent')!.handler('inspect things', ctx);
+
+    expect(exec.calls).toHaveLength(1);
+    expect(exec.calls[0]!.options?.interactiveRegistry).toBe(interactiveRegistry);
+    expect(exec.calls[0]!.params).toMatchObject({ agent: 'myagent', task: 'inspect things' });
+  });
+
+  it('still forwards interactiveRegistry outside TUI (dispatch decides RPC vs JSON)', async () => {
+    const cwd = makeProjectCwd('myagent', 'does a thing');
+    const { pi, commands } = fakePi();
+    const exec = fakeExec(okResult('done'));
+    const interactiveRegistry = { id: 'reg-print' } as never;
+    registerAgentCommand(pi, {
+      cwd,
+      execute: exec.execute,
+      interactiveRegistry,
+    });
+    const { ctx } = fakeCtx(cwd, { mode: 'print' });
+
+    await commands.get('agent:myagent')!.handler('task', ctx);
+
+    expect(exec.calls[0]!.options?.interactiveRegistry).toBe(interactiveRegistry);
   });
 });

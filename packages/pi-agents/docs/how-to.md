@@ -9,19 +9,19 @@ You don't have to write JSON - describe the delegation in plain language and Pi
 calls the `agent` tool for you. Name the agent (and optionally inline per-call
 overrides); the rest of the sentence becomes the task.
 
-**Implement a plan with the worker agent:**
+**Implement a plan with the general agent:**
 
-> Use the worker agent to implement the plan.
+> Use the general agent to implement the plan.
 
-Pi invokes `worker` in single mode with your task.
+Pi invokes `general` in single mode with your task.
 
-**Implement a plan with the worker agent on the Grok ACP runtime:**
+**Implement a plan with the general agent on the Grok ACP runtime:**
 
-> Use the worker agent (runtime: grok-acp, model: grok-4.5, thinking: high) to
+> Use the general agent (runtime: grok-acp, model: grok-4.5, thinking: high) to
 > implement the plan.
 
 Pi passes `runtime`, `model`, and `thinking` as per-call overrides, so the
-worker runs on Grok ACP with the `grok-4.5` model and `high` thinking for this
+general agent runs on Grok ACP with the `grok-4.5` model and `high` thinking for this
 call only - the agent's own config is untouched. See
 [Per-invocation overrides](./reference.md#per-invocation-overrides).
 
@@ -67,7 +67,7 @@ view still shows the complete task.
     { "agent": "planner", "name": "plan", "task": "Plan changes for {previous}.", "title": "计划" },
     {
       "expand": { "from": { "output": "plan", "path": "/items" } },
-      "parallel": { "agent": "worker", "task": "Process {item}", "title": "处理项" },
+      "parallel": { "agent": "general", "task": "Process {item}", "title": "处理项" },
       "collect": { "name": "results" }
     }
   ]
@@ -85,7 +85,7 @@ the launch summary.
   "chain": [
     { "agent": "explore", "name": "context", "task": "Find auth-related code." },
     { "agent": "planner", "name": "plan", "task": "Plan changes for {previous}." },
-    { "agent": "worker", "task": "Implement {outputs.plan}." }
+    { "agent": "general", "task": "Implement {outputs.plan}." }
   ]
 }
 ```
@@ -145,7 +145,7 @@ Expand an array from a prior structured output into one parallel task per item:
     },
     {
       "expand": { "from": { "output": "context", "path": "/items" } },
-      "parallel": { "agent": "worker", "task": "Process {item}" },
+      "parallel": { "agent": "general", "task": "Process {item}" },
       "collect": { "name": "results" }
     }
   ]
@@ -159,13 +159,66 @@ worker is parsed and validated; the collected `structured` is an array of each
 worker's `structuredOutput` (or its final text when absent). Fanout is capped by
 `MAX_FANOUT_ITEMS` (8) and concurrency by `MAX_CONCURRENCY` (4).
 
+Before any fanout worker starts, the scheduled item list (after `maxItems`) is
+persisted as a durable expansion. Resume always uses that stored list; it does
+not re-read the source step's current output.
+
+## Resume an interrupted fanout
+
+When a chain with a dynamic fanout is aborted or interrupted mid-step, completed
+items stay completed and only incomplete items run again.
+
+1. List runs and find the interrupted run:
+
+   ```
+   /agent runs
+   agent_job({ action: "list" })
+   ```
+
+2. Inspect status and incomplete units:
+
+   ```
+   /agent status <run-id>
+   agent_job({ action: "get", runId: "<run-id>" })
+   ```
+
+   Expect one unit per scheduled fanout item (for example
+   `chain-0002-fanout-0001` …), not a single shared fanout placeholder.
+
+3. Resume:
+
+   ```
+   agent_job({ action: "resume", runId: "<run-id>" })
+   ```
+
+   Completed item results and original indexes are retained. Interrupted items
+   continue (Pi session) or replay when allowed (Grok). Never-started items keep
+   attempt `1` and start for the first time. Collection order remains the original
+   expansion order.
+
+### Blocking errors
+
+If resume is refused, the blocking reason explains what to do:
+
+| Reason prefix                     | Meaning                                                                 | What to do                                      |
+| --------------------------------- | ----------------------------------------------------------------------- | ----------------------------------------------- |
+| `stored_fanout_state_unavailable` | Incomplete fanout work without a valid persisted expansion mapping      | Start a fresh chain; do not force-replay legacy |
+| `stored_output_invalid`           | A completed child unit is missing a valid terminal result               | Start a fresh chain; completed output is unsafe |
+| `fanout_state_conflict`           | A concurrent or conflicting expansion write tried to change the mapping | Rare; inspect the run and retry or re-invoke    |
+| fingerprint / session / worktree  | Agent definition or artifacts changed or went missing                   | Restore the agent/session/worktree, then resume |
+| requires replay (`allowReplay`)   | Grok/replay units need explicit acknowledgement                         | Resume with `allowReplay: true` if safe         |
+
+Unsafe legacy partial fanouts (item results or unit fragments without a stored
+`workflowState.fanouts` mapping) are never reconstructed automatically. Re-run
+the chain from a new invocation.
+
 ## Isolate an agent in a git worktree
 
 Set `isolation: "worktree"` so the child runs in a throw-away worktree under
 `<repo>/.worktrees/`:
 
 ```json
-{ "agent": "worker", "task": "Refactor the session store.", "isolation": "worktree" }
+{ "agent": "general", "task": "Refactor the session store.", "isolation": "worktree" }
 ```
 
 The tool runs `git worktree add --detach <path> HEAD`, executes the child with
@@ -261,7 +314,7 @@ parent does not need immediately:
 
 ```json
 {
-  "agent": "worker",
+  "agent": "general",
   "task": "Run the full test suite and report failures.",
   "runInBackground": true
 }
@@ -304,7 +357,7 @@ over stdio (`grok agent … stdio`), which gives structured tool calls, usage, a
 ACP cancellation:
 
 ```json
-{ "agent": "worker", "task": "Read package.json and summarize scripts.", "runtime": "grok-acp" }
+{ "agent": "general", "task": "Read package.json and summarize scripts.", "runtime": "grok-acp" }
 ```
 
 `maxTurns` is accepted at the config layer but ignored by `grok-acp`. See
@@ -312,21 +365,68 @@ ACP cancellation:
 for the field mapping.
 
 The bundled `/work-with-grok <task>` prompt is a shortcut for this: it
-delegates the task to the `worker` agent with `runtime: "grok-acp"`,
+delegates the task to the `general` agent with `runtime: "grok-acp"`,
 `model: "grok-4.5"`, `thinking: "high"`.
 
 ## Use the bundled workflow prompts
 
 The package ships three workflow prompts, available as slash commands:
 
-| Prompt                          | Flow                         |
-| ------------------------------- | ---------------------------- |
-| `/implement <query>`            | explore -> planner -> worker |
-| `/explore-and-plan <query>`     | explore -> planner           |
-| `/implement-and-review <query>` | worker -> reviewer -> worker |
+| Prompt                          | Flow                           |
+| ------------------------------- | ------------------------------ |
+| `/implement <query>`            | explore -> planner -> general  |
+| `/explore-and-plan <query>`     | explore -> planner             |
+| `/implement-and-review <query>` | general -> reviewer -> general |
 
-Each prompt instructs Pi to run a chain with named steps. The worker steps
+Each prompt instructs Pi to run a chain with named steps. The general agent steps
 require the final output to include `## Completed`, `## Files Changed`, and
 `## Validation`. The reviewer step classifies findings under `## Critical (must
 fix)`, `## Warnings (should fix)`, and `## Suggestions (consider)`, writing
 `- None.` under Critical when empty.
+
+## Interactive agent view
+
+In TUI mode, Pi-runtime subagents can be inspected and messaged without switching the host session.
+
+### Open the navigator
+
+While any host turn is running (or idle):
+
+```
+/agent view
+```
+
+or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC hosts may show a warning.
+
+### Select and inspect
+
+1. The list shows `main` first, then linked Pi endpoints ordered by link creation time.
+2. Enter on `main` closes the view; Enter on a child opens its detail transcript (last 15 lines by default).
+3. In detail, Ctrl+O expands the full transcript; Ctrl+O again collapses to the last 15 lines at the tail.
+4. Escape returns from detail to the list, or closes the list.
+
+### Steer, follow-up, and reopen
+
+| Child state             | Enter                                                       | Alt+Enter                               |
+| ----------------------- | ----------------------------------------------------------- | --------------------------------------- |
+| Running / starting      | Steer (delivered after current tools, before next LLM call) | Queue follow-up after the child settles |
+| Idle / detached / error | New prompt on the same native session                       | Same as Enter (prompt)                  |
+
+- Ctrl+X aborts only the selected child's current turn.
+- Ctrl+O toggles between the last-15-line preview and the full transcript.
+- After idle, a new message continues the child session without replaying the original task prompt.
+- Detached idle children reopen lazily on the next prompt (same session file, cwd/worktree, and fingerprint).
+
+### Detach and retention
+
+- Up to four idle RPC children stay attached; excess idle endpoints detach but keep their sessions on disk.
+- Linked clean worktrees are retained in Version 1 so reattach keeps a valid cwd. Clean them up manually when finished.
+- `/tree` away from a link hides it from the navigator; navigating back restores the summary without auto-spawning.
+- `/reload` and session switch dispose live transports, then restore links on the next session start.
+
+### What does not happen
+
+- The host `SessionManager` is never switched to the child.
+- Post-completion interactive messages do not rewrite the completed durable unit result. After a normal completion they stay in the child session only. When the original tool-call activation was interrupted/cancelled, the next view continuation that settles is relayed back to the bound host model as a clearly-marked interactive continuation (once per activation); normal completed agents never relay.
+- Grok / Grok ACP units are not shown.
+- Child slash commands are rejected; child extension UI dialogs are cancelled.

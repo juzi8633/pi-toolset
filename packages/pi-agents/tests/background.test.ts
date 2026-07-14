@@ -6,9 +6,11 @@ import {
   BACKGROUND_MESSAGE_TYPE,
   createBackgroundManager,
   type BackgroundLaunchRequest,
+  type DurableRunContextRef,
 } from '../src/background.ts';
 import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
 import type { BackgroundNotificationDetails, SubagentDetails } from '../src/types.ts';
+import type { RunAbortOrigin } from '../src/run-types.ts';
 
 type SentMessage = {
   customType: string;
@@ -245,5 +247,122 @@ describe('createBackgroundManager.launch', () => {
     release();
     await mgr.waitForIdle();
     expect(pi.messages.length).toBe(1);
+  });
+});
+
+describe('createBackgroundManager durable interruption', () => {
+  it('uses the run id as the job id when a durable context is attached', async () => {
+    const pi = makePi();
+    const mgr = createBackgroundManager(pi);
+    const lifecycle = new AbortController();
+    let finalized:
+      | { interrupted?: boolean; cancelled?: boolean; success?: boolean; lastError?: string }
+      | undefined;
+    const durable: DurableRunContextRef = {
+      runId: 'run-test-jobid',
+      abort: () => {},
+      finalize: async (input) => {
+        finalized = input;
+      },
+      lifecycle: { signal: lifecycle.signal },
+    };
+    let proceed!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      proceed = resolve;
+    });
+    const launchResult = mgr.launch(
+      baseRequest({
+        durable,
+        run: async () => {
+          proceed();
+          await gate.then(() => {});
+          // never resolves until gate; but we proceed immediately to complete
+          return okResult('done');
+        },
+      })
+    );
+    // The job id should equal the durable run id.
+    const bg = launchResult.details?.background;
+    expect(bg?.[0]?.jobId).toBe('run-test-jobid');
+    proceed();
+    await mgr.waitForIdle();
+    expect(finalized).toEqual({ success: true }); // success path finalizes the run
+  });
+
+  it('interrupts via the durable lifecycle and finalizes as interrupted on session_shutdown', async () => {
+    const pi = makePi();
+    const mgr = createBackgroundManager(pi);
+    const lifecycle = new AbortController();
+    let finalized: { interrupted?: boolean; cancelled?: boolean } | undefined;
+    let abortOrigin: RunAbortOrigin | undefined;
+    const durable: DurableRunContextRef = {
+      runId: 'run-test-interrupt',
+      abort: (origin) => {
+        abortOrigin = origin;
+        lifecycle.abort();
+      },
+      finalize: async (input) => {
+        finalized = input;
+      },
+      lifecycle: { signal: lifecycle.signal },
+    };
+    let runObservedAbort = false;
+    let proceed!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      proceed = resolve;
+    });
+    mgr.launch(
+      baseRequest({
+        durable,
+        run: async (signal) => {
+          proceed();
+          await new Promise<void>((resolve) => {
+            signal.addEventListener('abort', () => resolve(), { once: true });
+            gate.then(() => resolve());
+          });
+          runObservedAbort = signal.aborted;
+          if (signal.aborted) throw new Error('aborted');
+          return okResult('done');
+        },
+      })
+    );
+    // Trigger shutdown; cancelAll should interrupt via durable.abort('session_shutdown').
+    mgr.cancelAll('session_shutdown');
+    expect(abortOrigin).toBe('session_shutdown');
+    await mgr.waitForIdle();
+    expect(runObservedAbort).toBe(true);
+    expect(finalized).toEqual({ interrupted: true });
+    // A cancelled notification was emitted.
+    const statuses = pi.messages.map((m) => m.details?.status);
+    expect(statuses).toContain('cancelled');
+  });
+
+  it('falls back to the job-local controller when no durable context is attached', async () => {
+    const pi = makePi();
+    const mgr = createBackgroundManager(pi);
+    let runObservedAbort = false;
+    let proceed!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      proceed = resolve;
+    });
+    mgr.launch(
+      baseRequest({
+        run: async (signal) => {
+          proceed();
+          await new Promise<void>((resolve) => {
+            signal.addEventListener('abort', () => resolve(), { once: true });
+            gate.then(() => resolve());
+          });
+          runObservedAbort = signal.aborted;
+          if (signal.aborted) throw new Error('aborted');
+          return okResult('done');
+        },
+      })
+    );
+    mgr.cancelAll('session_shutdown');
+    await mgr.waitForIdle();
+    expect(runObservedAbort).toBe(true);
+    const statuses = pi.messages.map((m) => m.details?.status);
+    expect(statuses).toContain('cancelled');
   });
 });

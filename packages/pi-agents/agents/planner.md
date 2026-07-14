@@ -42,4 +42,4 @@ Numbered steps, each small and actionable:
 
 Anything to watch out for.
 
-Keep the plan concrete. The worker agent will execute it verbatim.
+Keep the plan concrete. The general agent will execute it verbatim.

@@ -10,6 +10,8 @@ import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig, Runtime } from './agents.ts';
 import { GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
 import { GrokAcpClientError, runGrokAcpClient } from './grok-acp-client.ts';
+import type { RunAbortOrigin } from './run-types.ts';
+import { originToUnitStatus } from './run-lifecycle.ts';
 import {
   buildGrokAcpArgs,
   buildGrokAcpEnv,
@@ -25,6 +27,7 @@ import { buildGrokArgs, getGrokInvocation } from './grok-invocation.ts';
 import { createGrokParserState, parseGrokEvent } from './grok-parser.ts';
 import { buildPiArgs, getPiInvocation, writePromptToTempFile } from './invocation.ts';
 import { applyTerminalStatus, getFinalOutput } from './output.ts';
+import type { UnitExecutionContext } from './run-coordinator.ts';
 import { buildChildAgentEnv, isAgentDelegationAllowed } from './security.ts';
 import { cloneSingleResult, emptyUsage, type SingleResult, type SubagentDetails } from './types.ts';
 
@@ -44,18 +47,40 @@ export interface RunSingleAgentOptions {
   runtimeOverride?: Runtime;
   /** Short collapsed-summary label stamped onto every emitted result snapshot. */
   title?: string;
+  /** Durable run/unit/attempt identity stamped onto every emitted snapshot. */
+  unitContext?: UnitExecutionContext;
+  /** Supplies the carried abort origin so terminal snapshots classify as cancelled/interrupted. */
+  getAbortOrigin?: () => RunAbortOrigin;
+  /** Host extension mode; TUI Pi units with a registry endpoint use RPC execution. */
+  hostMode?: 'tui' | 'rpc' | 'json' | 'print';
+  /** Interactive registry handle for TUI Pi RPC execution. */
+  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
+  /** Endpoint key (`runId:unitId`) registered before spawn. */
+  endpointKey?: string;
 }
 
 export const ABORT_MESSAGE = 'Subagent was aborted';
 
-/** Abort error that carries a deep-cloned terminal SingleResult snapshot. */
+function stampUnitContext(result: SingleResult, options: RunSingleAgentOptions): void {
+  const ctx = options.unitContext;
+  if (!ctx) return;
+  result.runId = ctx.runId;
+  result.unitId = ctx.unitId;
+  result.attempt = ctx.attempt;
+  result.sessionFile = ctx.sessionFile;
+  result.resumeCapability = ctx.resumeCapability;
+}
+
+/** Abort error that carries a deep-cloned terminal SingleResult snapshot and the abort origin. */
 export class AgentAbortError extends Error {
   readonly result: SingleResult;
+  readonly origin: RunAbortOrigin;
 
-  constructor(result: SingleResult) {
+  constructor(result: SingleResult, origin: RunAbortOrigin = 'unknown') {
     super(ABORT_MESSAGE);
     this.name = 'AgentAbortError';
     this.result = cloneSingleResult(result);
+    this.origin = origin;
   }
 }
 
@@ -180,9 +205,22 @@ function emitTerminalSnapshot(
   });
 }
 
-function finalizeCancelled(currentResult: SingleResult): void {
-  currentResult.stopReason = currentResult.stopReason ?? 'aborted';
-  currentResult.status = 'cancelled';
+function resolveAbortOrigin(
+  signal: AbortSignal | undefined,
+  options: RunSingleAgentOptions
+): RunAbortOrigin {
+  const injected = options.getAbortOrigin?.();
+  if (injected) return injected;
+  // When Pi's incoming tool signal aborts with no coordinator-owned origin,
+  // treat it as user-initiated; otherwise unknown (interrupted with diagnostic).
+  return signal && signal.aborted ? 'user' : 'unknown';
+}
+
+function finalizeAborted(currentResult: SingleResult, origin: RunAbortOrigin): void {
+  const status = originToUnitStatus(origin);
+  currentResult.stopReason =
+    currentResult.stopReason ?? (status === 'interrupted' ? 'interrupted' : 'aborted');
+  currentResult.status = status;
   if (currentResult.exitCode === 0 || currentResult.exitCode === -1) {
     currentResult.exitCode = 1;
   }
@@ -300,6 +338,34 @@ export async function runSingleAgent(
     );
   }
 
+  // TUI Pi units with a registered interactive endpoint run through RPC so they
+  // remain steerable; JSON/print/RPC host modes keep the one-shot JSON path.
+  if (
+    options.hostMode === 'tui' &&
+    options.interactiveRegistry &&
+    options.endpointKey &&
+    (options.sessionFile || options.unitContext?.sessionFile)
+  ) {
+    const { runSingleAgentPiRpc } = await import('./pi-rpc-execution.ts');
+    return runSingleAgentPiRpc(
+      defaultCwd,
+      agents,
+      agentName,
+      task,
+      cwd,
+      step,
+      signal,
+      onUpdate,
+      makeDetails,
+      {
+        ...options,
+        interactiveRegistry: options.interactiveRegistry,
+        endpointKey: options.endpointKey,
+        hostMode: 'tui',
+      }
+    );
+  }
+
   let tmpPromptDir: string | null = null;
   let tmpPromptPath: string | null = null;
 
@@ -317,6 +383,8 @@ export async function runSingleAgent(
     thinking: effectiveThinking,
     step,
   };
+  stampUnitContext(currentResult, options);
+  if (options.unitContext) options.sessionFile = options.unitContext.sessionFile;
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
@@ -334,6 +402,9 @@ export async function runSingleAgent(
       sessionFile: options.sessionFile,
       disableAgentTool,
       resolvedSkillPaths: options.resolvedSkillPaths,
+      ...(options.unitContext && options.unitContext.attempt > 1
+        ? { promptKind: 'resume' as const }
+        : {}),
     });
     let wasAborted = false;
     let maxTurnsExceeded = false;
@@ -478,9 +549,10 @@ export async function runSingleAgent(
       currentResult.exitCode = exitCode;
     }
     if (wasAborted) {
-      finalizeCancelled(currentResult);
+      const origin = resolveAbortOrigin(signal, options);
+      finalizeAborted(currentResult, origin);
       emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
-      throw new AgentAbortError(currentResult);
+      throw new AgentAbortError(currentResult, origin);
     }
     applyTerminalStatus(currentResult);
     return currentResult;
@@ -538,6 +610,7 @@ async function runSingleAgentGrok(
     thinking: effectiveThinking,
     step,
   };
+  stampUnitContext(currentResult, options);
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
@@ -622,9 +695,10 @@ async function runSingleAgentGrok(
       : 'Agent exceeded max turns';
   }
   if (wasAborted) {
-    finalizeCancelled(currentResult);
+    const origin = resolveAbortOrigin(signal, options);
+    finalizeAborted(currentResult, origin);
     emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
-    throw new AgentAbortError(currentResult);
+    throw new AgentAbortError(currentResult, origin);
   }
   applyTerminalStatus(currentResult);
   return currentResult;
@@ -668,6 +742,7 @@ async function runSingleAgentGrokAcp(
     thinking: effectiveThinking,
     step,
   };
+  stampUnitContext(currentResult, options);
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
@@ -712,18 +787,20 @@ async function runSingleAgentGrokAcp(
     }
 
     if (acpResult.wasAborted) {
-      finalizeCancelled(currentResult);
+      const origin = resolveAbortOrigin(signal, options);
+      finalizeAborted(currentResult, origin);
       emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
-      throw new AgentAbortError(currentResult);
+      throw new AgentAbortError(currentResult, origin);
     }
     applyTerminalStatus(currentResult);
     return currentResult;
   } catch (err) {
     if (isAbortError(err)) {
       if (!(err instanceof AgentAbortError)) {
-        finalizeCancelled(currentResult);
+        const origin = resolveAbortOrigin(signal, options);
+        finalizeAborted(currentResult, origin);
         emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
-        throw new AgentAbortError(currentResult);
+        throw new AgentAbortError(currentResult, origin);
       }
       throw err;
     }

@@ -151,7 +151,7 @@ describe('spinner lifecycle cleanup', () => {
     expect(handlers.get('session_shutdown')?.length).toBe(2);
   });
 
-  it('tree navigation events match Pi 0.80.1 ExtensionAPI names', () => {
+  it('tree navigation events match Pi 0.80.6 ExtensionAPI names', () => {
     const { handlers } = setupLifecycle();
     const registered = [...handlers.keys()].sort();
     expect(registered).toContain('session_before_tree');

@@ -41,6 +41,7 @@ import {
   type SingleResult,
   type SubagentDetails,
 } from './types.ts';
+import type { RunUnitRecord, WorkflowFanoutState } from './run-types.ts';
 
 export type ChainItemInput = Static<typeof ChainItem>;
 
@@ -61,12 +62,36 @@ export interface ChainStepRequest {
   isolation: IsolationMode | undefined;
   taskIndex: number;
   step: number;
+  /** Zero-based fanout item index when this request is a fanout child. */
+  fanoutIndex?: number;
   signal: AbortSignal | undefined;
   onUpdate: OnUpdateCallback | undefined;
   skipCompletionCheck?: boolean;
+  /**
+   * Optional terminal postprocessor. Production adapters run this before worktree
+   * cleanup and durable endUnit so schema-validated results are persisted.
+   * Callers that ignore it still get the same result via the chain-side call.
+   */
+  postprocessTerminal?: (result: SingleResult) => void;
 }
 
 export type ChainRunStep = (req: ChainStepRequest) => Promise<SingleResult>;
+
+export interface RestoredChainState {
+  results: SingleResult[];
+  outputs: Record<string, ChainOutputEntry>;
+  logicalSteps: ChainLogicalStep[];
+  units: Record<string, RunUnitRecord>;
+  fanouts?: Record<string, WorkflowFanoutState>;
+}
+
+/** Storage-agnostic fanout expansion request passed to the durability hook. */
+export interface FanoutExpandRequest {
+  step: number;
+  items: unknown[];
+  agent: string;
+  effectiveCwd?: string;
+}
 
 export interface RunChainWorkflowOptions {
   chain: ChainItemInput[];
@@ -74,6 +99,13 @@ export interface RunChainWorkflowOptions {
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined;
   makeDetails: DetailsFactory;
   runStep: ChainRunStep;
+  /** Restored state from a previous interrupted run; when present, completed steps are skipped. */
+  restored?: RestoredChainState;
+  /**
+   * Optional awaited expansion hook. Called after items are known and before
+   * any worker is scheduled. Must not receive RunStore/RunCoordinator.
+   */
+  onFanoutExpand?: (req: FanoutExpandRequest) => Promise<WorkflowFanoutState | void>;
 }
 
 export type ChainResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
@@ -161,11 +193,33 @@ function cloneLogicalSteps(steps: ChainLogicalStep[]): ChainLogicalStep[] {
 }
 
 export async function runChainWorkflow(options: RunChainWorkflowOptions): Promise<ChainResult> {
-  const { chain, signal, onUpdate, makeDetails, runStep } = options;
-  const results: SingleResult[] = [];
+  const { chain, signal, onUpdate, makeDetails, runStep, restored, onFanoutExpand } = options;
+  let results: SingleResult[];
   let previousOutput = '';
   const outputs = new Map<string, ChainOutputEntry>();
-  const logicalSteps = initLogicalSteps(chain);
+  let logicalSteps: ChainLogicalStep[];
+
+  if (restored) {
+    results = cloneResults(restored.results);
+    for (const [name, entry] of Object.entries(restored.outputs)) {
+      outputs.set(name, entry);
+    }
+    logicalSteps = cloneLogicalSteps(restored.logicalSteps);
+    // Recompute previousOutput from the last completed sequential/fanout step.
+    for (let i = logicalSteps.length - 1; i >= 0; i--) {
+      if (logicalSteps[i].status === 'completed') {
+        const stepResults = results.filter((r) => r.step === i + 1);
+        const last = stepResults[stepResults.length - 1];
+        if (last) {
+          previousOutput = last.finalOutput ?? getFinalOutput(last.messages);
+        }
+        break;
+      }
+    }
+  } else {
+    results = [];
+    logicalSteps = initLogicalSteps(chain);
+  }
 
   const outputsRecord = (): Record<string, ChainOutputEntry> => Object.fromEntries(outputs);
 
@@ -202,6 +256,20 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
       const step = chain[i];
       const stepNumber = i + 1;
 
+      // Skip completed steps from restored state; their outputs are already in `outputs`.
+      if (logicalSteps[i].status === 'completed') {
+        const stepResults = results.filter((r) => r.step === stepNumber);
+        const last = stepResults[stepResults.length - 1];
+        if (last) {
+          previousOutput = last.finalOutput ?? getFinalOutput(last.messages);
+        }
+        continue;
+      }
+      // Reset non-completed steps to queued for retry.
+      if (logicalSteps[i].status !== 'queued') {
+        logicalSteps[i].status = 'queued';
+      }
+
       if (isFanoutChainStep(step)) {
         const fanout = await runFanoutStep({
           step,
@@ -218,6 +286,8 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
           logicalSteps,
           buildDetails,
           emit,
+          restored,
+          onFanoutExpand,
         });
         if (fanout.done) return fanout.result;
         previousOutput = fanout.previousOutput;
@@ -261,6 +331,7 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
         logicalSteps,
         buildDetails,
         emit,
+        restored,
       });
       if (sequential.done) return sequential.result;
       previousOutput = sequential.previousOutput;
@@ -376,6 +447,8 @@ interface StepShared {
   logicalSteps: ChainLogicalStep[];
   buildDetails: () => SubagentDetails;
   emit: (content: string) => void;
+  restored?: RestoredChainState;
+  onFanoutExpand?: (req: FanoutExpandRequest) => Promise<WorkflowFanoutState | void>;
 }
 
 async function runSequentialStep(
@@ -586,22 +659,53 @@ async function runFanoutStep(
   fanoutMeta.status = 'running';
   emit(`Chain step ${stepNumber}/${logicalSteps.length} fanout running...`);
 
-  const outputName = step.expand.from.output;
-  const outputEntry = outputs.get(outputName);
-  if (!outputEntry || outputEntry.structured === undefined) {
-    return fanoutFailure(
-      opts,
-      `Fanout source output "${outputName}" is missing structured output.`
-    );
-  }
+  // Use restored items when available; otherwise expand from the source output.
+  const fanoutUnitId = `chain-${String(stepNumber).padStart(4, '0')}-fanout`;
+  const restoredFanout = opts.restored?.fanouts?.[fanoutUnitId];
+  const isRestoredExpansion = restoredFanout !== undefined;
 
-  const pointer = readJsonPointer(outputEntry.structured as JsonValue, step.expand.from.path);
-  if (!pointer.ok) return fanoutFailure(opts, pointer.error);
-  if (!Array.isArray(pointer.value)) {
-    return fanoutFailure(
-      opts,
-      `Fanout source ${outputName}${step.expand.from.path} is not an array.`
-    );
+  let items: unknown[];
+  let skipped: number;
+
+  if (isRestoredExpansion) {
+    // Authoritative stored expansion: do not re-read source or reapply maxItems.
+    items = restoredFanout.items;
+    // Preserve the logical step's original skipped count when present.
+    skipped = fanoutMeta.skippedCount ?? 0;
+  } else {
+    const outputName = step.expand.from.output;
+    const outputEntry = outputs.get(outputName);
+    if (!outputEntry || outputEntry.structured === undefined) {
+      return fanoutFailure(
+        opts,
+        `Fanout source output "${outputName}" is missing structured output.`
+      );
+    }
+    const pointer = readJsonPointer(outputEntry.structured as JsonValue, step.expand.from.path);
+    if (!pointer.ok) return fanoutFailure(opts, pointer.error);
+    if (!Array.isArray(pointer.value)) {
+      return fanoutFailure(
+        opts,
+        `Fanout source ${outputName}${step.expand.from.path} is not an array.`
+      );
+    }
+    const allSourceItems = pointer.value;
+
+    const rawMaxItems = step.expand.maxItems;
+    if (rawMaxItems !== undefined) {
+      if (typeof rawMaxItems !== 'number' || !Number.isFinite(rawMaxItems) || rawMaxItems < 1) {
+        return fanoutFailure(
+          opts,
+          `Invalid expand.maxItems: expected positive integer, got ${String(rawMaxItems)}`
+        );
+      }
+    }
+    const requestedMax =
+      typeof rawMaxItems === 'number' ? Math.floor(rawMaxItems) : MAX_FANOUT_ITEMS;
+    const maxItems = Math.min(requestedMax, MAX_FANOUT_ITEMS);
+    items = allSourceItems.slice(0, maxItems);
+    skipped = allSourceItems.length - items.length;
+    fanoutMeta.skippedCount = skipped;
   }
 
   const parsedSchema = parseOutputSchema(
@@ -626,41 +730,7 @@ async function runFanoutStep(
   }
   const outputSchema = parsedSchema.schema;
 
-  const rawMaxItems = step.expand.maxItems;
-  if (rawMaxItems !== undefined) {
-    if (typeof rawMaxItems !== 'number' || !Number.isFinite(rawMaxItems) || rawMaxItems < 1) {
-      return fanoutFailure(
-        opts,
-        `Invalid expand.maxItems: expected positive integer, got ${String(rawMaxItems)}`
-      );
-    }
-  }
-  const requestedMax = typeof rawMaxItems === 'number' ? Math.floor(rawMaxItems) : MAX_FANOUT_ITEMS;
-  const maxItems = Math.min(requestedMax, MAX_FANOUT_ITEMS);
-  const allSourceItems = pointer.value;
-  const items = allSourceItems.slice(0, maxItems);
-  const skipped = allSourceItems.length - items.length;
-  fanoutMeta.skippedCount = skipped;
-
-  // Empty source: successful 0/0 fanout
-  if (items.length === 0) {
-    fanoutMeta.executedCount = 0;
-    fanoutMeta.completedCount = 0;
-    fanoutMeta.failedCount = 0;
-    fanoutMeta.runningCount = 0;
-    fanoutMeta.queuedCount = 0;
-    fanoutMeta.status = 'completed';
-    const text = '[]';
-    outputs.set(step.collect.name, {
-      text,
-      structured: [],
-      agent: step.parallel.agent,
-      step: stepNumber,
-    });
-    emit(`Fanout: 0/0 done`);
-    return { done: false, previousOutput: text };
-  }
-
+  // Render tasks for every scheduled item before expansion persistence / dispatch.
   const renderedTasks: string[] = [];
   for (const item of items) {
     const rendered = renderTaskTemplate(step.parallel.task, {
@@ -678,6 +748,41 @@ async function runFanoutStep(
     );
   }
 
+  // Await expansion persistence before creating running slots or scheduling workers.
+  if (opts.onFanoutExpand) {
+    try {
+      await opts.onFanoutExpand({
+        step: stepNumber,
+        items,
+        agent: step.parallel.agent,
+        ...(step.parallel.cwd !== undefined ? { effectiveCwd: step.parallel.cwd } : {}),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return fanoutFailure(opts, `Fanout expansion persistence failed: ${message}`);
+    }
+  }
+
+  // Empty source: successful 0/0 fanout (expansion already persisted above).
+  if (items.length === 0) {
+    fanoutMeta.executedCount = 0;
+    fanoutMeta.completedCount = 0;
+    fanoutMeta.failedCount = 0;
+    fanoutMeta.runningCount = 0;
+    fanoutMeta.queuedCount = 0;
+    fanoutMeta.skippedCount = skipped;
+    fanoutMeta.status = 'completed';
+    const text = '[]';
+    outputs.set(step.collect.name, {
+      text,
+      structured: [],
+      agent: step.parallel.agent,
+      step: stepNumber,
+    });
+    emit(`Fanout: 0/0 done`);
+    return { done: false, previousOutput: text };
+  }
+
   const concurrency = Math.max(
     1,
     Math.min(
@@ -687,20 +792,46 @@ async function runFanoutStep(
   );
   fanoutMeta.concurrency = concurrency;
 
-  // Ordered slots for every item that will actually run
-  const slots: SingleResult[] = renderedTasks.map((task, index) => ({
-    agent: step.parallel.agent,
-    agentSource: 'unknown' as const,
-    task,
-    title: step.parallel.title,
-    exitCode: -1,
-    status: 'queued' as const,
-    messages: [],
-    stderr: '',
-    usage: emptyUsage(),
-    step: stepNumber,
-    fanout: { index, count: renderedTasks.length, itemTask: task },
-  }));
+  // Ordered slots for every item that will actually run.
+  // When restoring, remove old fanout results for this step so we can merge
+  // completed items with freshly retried incomplete ones.
+  if (opts.restored) {
+    for (let i = results.length - 1; i >= 0; i--) {
+      if (results[i].step === stepNumber && results[i].fanout !== undefined) {
+        results.splice(i, 1);
+      }
+    }
+  }
+
+  const slots: SingleResult[] = renderedTasks.map((task, index) => {
+    // Prefer durable unit result; fall back to presentation results for restore.
+    if (opts.restored) {
+      const unitId = restoredFanout?.unitIds[index];
+      const unit = unitId ? opts.restored.units[unitId] : undefined;
+      if (unit?.status === 'completed' && unit.result) {
+        return { ...unit.result };
+      }
+      const existing = opts.restored.results.find(
+        (r) => r.step === stepNumber && r.fanout?.index === index
+      );
+      if (existing && resolveExecutionStatus(existing) === 'completed') {
+        return { ...existing };
+      }
+    }
+    return {
+      agent: step.parallel.agent,
+      agentSource: 'unknown' as const,
+      task,
+      title: step.parallel.title,
+      exitCode: -1,
+      status: 'queued' as const,
+      messages: [],
+      stderr: '',
+      usage: emptyUsage(),
+      step: stepNumber,
+      fanout: { index, count: renderedTasks.length, itemTask: task },
+    };
+  });
 
   const baseLength = results.length;
   results.push(...slots);
@@ -763,11 +894,36 @@ async function runFanoutStep(
     return existing;
   };
 
+  const makeTerminalPostprocess = (index: number, task: string) => {
+    return (result: SingleResult): void => {
+      applyStructuredOutputValidation(result, outputSchema, stepNumber);
+      if (!result.status || result.status === 'running') applyTerminalStatus(result);
+      result.step = stepNumber;
+      result.fanout = {
+        index,
+        count: renderedTasks.length,
+        itemTask: task,
+      };
+    };
+  };
+
   try {
     await mapWithConcurrencyLimit(
       renderedTasks,
       concurrency,
       async (task, index) => {
+        // Skip already-completed slots from restored state.
+        if (resolveExecutionStatus(slots[index]) === 'completed') {
+          return slots[index];
+        }
+        // Skip units already completed in durable state even if presentation was missing.
+        if (opts.restored) {
+          const unitId = restoredFanout?.unitIds[index];
+          const unit = unitId ? opts.restored.units[unitId] : undefined;
+          if (unit?.status === 'completed') {
+            return slots[index];
+          }
+        }
         slots[index] = {
           ...slots[index],
           status: 'running',
@@ -795,6 +951,8 @@ async function runFanoutStep(
             }
           : undefined;
 
+        const postprocessTerminal = makeTerminalPostprocess(index, task);
+
         try {
           const result = await opts.runStep({
             agent: step.parallel.agent,
@@ -804,22 +962,18 @@ async function runFanoutStep(
             isolation: step.parallel.isolation,
             taskIndex: stepNumber * (MAX_FANOUT_ITEMS + 1) + index,
             step: stepNumber,
+            fanoutIndex: index,
             signal,
             onUpdate: itemUpdate,
             skipCompletionCheck: outputSchema !== undefined,
+            postprocessTerminal,
           });
           if (fanoutTerminal || signal?.aborted) {
             // Worker finished after cancel: keep cancelled if we already marked it.
             if (resolveExecutionStatus(slots[index]) === 'cancelled') return slots[index];
           }
-          applyStructuredOutputValidation(result, outputSchema, stepNumber);
-          if (!result.status || result.status === 'running') applyTerminalStatus(result);
-          result.step = stepNumber;
-          result.fanout = {
-            index,
-            count: renderedTasks.length,
-            itemTask: task,
-          };
+          // Idempotent: re-apply so stubs that ignore postprocessTerminal still match.
+          postprocessTerminal(result);
           slots[index] = result;
           fanoutMeta.latestIndex = index;
           if (!fanoutTerminal && !signal?.aborted) emitFanout();
@@ -836,12 +990,13 @@ async function runFanoutStep(
       {
         signal,
         onUnstarted: (_task, index) => {
-          const skipped = slots[index];
-          skipped.status = 'skipped';
-          skipped.exitCode = 1;
-          skipped.stopReason = skipped.stopReason ?? 'aborted';
-          slots[index] = skipped;
-          return skipped;
+          // Presentation may mark skipped; durable state keeps the unit queued.
+          const skippedSlot = slots[index];
+          skippedSlot.status = 'skipped';
+          skippedSlot.exitCode = 1;
+          skippedSlot.stopReason = skippedSlot.stopReason ?? 'aborted';
+          slots[index] = skippedSlot;
+          return skippedSlot;
         },
       }
     );
@@ -913,9 +1068,13 @@ async function runFanoutStep(
         result.finalOutput ??
         getFinalOutput(result.messages)) as JsonValue
   );
+  const maxItemsNote =
+    typeof step.expand.maxItems === 'number' ? Math.floor(step.expand.maxItems) : undefined;
   const text = `${JSON.stringify(collected, null, 2)}${
     skipped > 0
-      ? `\n\n[Fanout skipped ${skipped} item${skipped === 1 ? '' : 's'} due to maxItems=${maxItems}]`
+      ? `\n\n[Fanout skipped ${skipped} item${skipped === 1 ? '' : 's'}${
+          maxItemsNote !== undefined ? ` due to maxItems=${maxItemsNote}` : ''
+        }]`
       : ''
   }`;
   outputs.set(step.collect.name, {

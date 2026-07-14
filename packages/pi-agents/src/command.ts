@@ -32,12 +32,22 @@ export interface RegisterAgentCommandOptions {
   execute?: AgentExecutor;
   /** Directory used to discover per-agent /agent:<name> commands at registration time. */
   cwd?: string;
+  /** Durable run store for /agent runs, /agent status, /agent resume. */
+  runStore?: import('./run-store.ts').RunStore;
+  runCoordinator?: import('./run-coordinator.ts').RunCoordinator;
+  /** Interactive registry so TUI /agent:<name> creates links and uses RPC. */
+  interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
+  /** Interactive navigator controller; opens immediately without waitForIdle. */
+  interactiveView?: {
+    openView: () => Promise<void>;
+  };
 }
 
 const LIST_KEYWORD = 'list';
+const VIEW_KEYWORD = 'view';
 const AGENT_WIDGET_KEY = 'pi-agents-command';
 const AGENT_COMMAND_DESCRIPTION =
-  'List discovered subagents (/agent list); invoke a specific one via /agent:<name> <task...>';
+  'List discovered subagents (/agent list); invoke via /agent:<name> <task...>; /agent view for interactive navigator; /agent runs|status|resume for durable runs';
 
 export function registerAgentCommand(
   pi: ExtensionAPI,
@@ -50,7 +60,7 @@ export function registerAgentCommand(
     description: AGENT_COMMAND_DESCRIPTION,
     getArgumentCompletions: (prefix) => agentArgumentCompletions(prefix),
     handler: async (args, ctx) => {
-      await runAgentFallbackCommand(args, ctx);
+      await runAgentFallbackCommand(args, ctx, options);
     },
   });
 
@@ -65,12 +75,75 @@ export function registerAgentCommand(
   }
 }
 
-async function runAgentFallbackCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function runAgentFallbackCommand(
+  args: string,
+  ctx: ExtensionCommandContext,
+  options: RegisterAgentCommandOptions
+): Promise<void> {
+  const trimmed = args.trim();
+  const lower = trimmed.toLowerCase();
+
+  // /agent view opens immediately, including while the host agent is busy.
+  if (lower === VIEW_KEYWORD) {
+    if (ctx.mode !== 'tui') {
+      if (ctx.hasUI) {
+        ctx.ui.notify('Interactive agent view is TUI-only.', 'warning');
+      }
+      return;
+    }
+    if (options.interactiveView) {
+      await options.interactiveView.openView();
+    } else {
+      ctx.ui.notify('Interactive agent view is not available.', 'warning');
+    }
+    return;
+  }
+
   await ctx.waitForIdle();
 
-  const trimmed = args.trim();
-  if (trimmed.toLowerCase() === LIST_KEYWORD) {
+  if (lower === LIST_KEYWORD) {
     ctx.ui.notify(renderAgentList(discoverAgents(ctx.cwd, 'both').agents), 'info');
+    return;
+  }
+
+  if (lower === 'runs' && options.runStore) {
+    const runs = await options.runStore.listRuns();
+    const lines = runs
+      .filter((r): r is import('./run-types.ts').LoadedRun => 'record' in r)
+      .map((r) => {
+        const rec = r.record;
+        const total = Object.keys(rec.units).length;
+        const done = Object.values(rec.units).filter((u) => u.status === 'completed').length;
+        return `${rec.runId} | ${rec.mode} | ${rec.status} | ${done}/${total}`;
+      });
+    ctx.ui.notify(lines.length > 0 ? lines.join('\n') : '(no runs found)', 'info');
+    return;
+  }
+
+  if (lower.startsWith('status ') && options.runStore) {
+    const runId = trimmed.slice(7).trim();
+    const loaded = options.runStore.getRun(runId);
+    if (!loaded.ok) {
+      ctx.ui.notify(`Run not found: ${runId}`, 'error');
+      return;
+    }
+    const rec = loaded.loaded.record;
+    const unitLines = Object.values(rec.units).map(
+      (u) => `  ${u.unitId}: ${u.status} (agent=${u.agent}, attempt=${u.attempt})`
+    );
+    ctx.ui.notify(
+      `Run: ${rec.runId}\nMode: ${rec.mode}\nStatus: ${rec.status}\nUnits:\n${unitLines.join('\n')}`,
+      'info'
+    );
+    return;
+  }
+
+  if (lower.startsWith('resume ') && options.runStore) {
+    const runId = trimmed.slice(7).trim();
+    ctx.ui.notify(
+      `To resume run ${runId}, use: agent_job({ action: "resume", runId: "${runId}" })`,
+      'info'
+    );
     return;
   }
 
@@ -120,6 +193,11 @@ async function invokeAgent(
   try {
     result = await execute({ agent: agentName, task }, ctx.signal, updateWidget, ctx, {
       backgroundManager: options.backgroundManager,
+      runStore: options.runStore,
+      runCoordinator: options.runCoordinator,
+      // TUI path: pass registry so executeAgentTool registers interactive links and
+      // dispatches Pi units through RPC rather than one-shot JSON.
+      interactiveRegistry: options.interactiveRegistry,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -220,6 +298,14 @@ function truncateWidgetText(value: string, max: number): string {
 function agentArgumentCompletions(prefix: string): AutocompleteItem[] {
   const items: AutocompleteItem[] = [
     { value: LIST_KEYWORD, label: LIST_KEYWORD, description: 'List all discovered agents' },
+    {
+      value: VIEW_KEYWORD,
+      label: VIEW_KEYWORD,
+      description: 'Open interactive agent navigator (TUI)',
+    },
+    { value: 'runs', label: 'runs', description: 'List durable agent runs' },
+    { value: 'status', label: 'status', description: 'Show status for a run id' },
+    { value: 'resume', label: 'resume', description: 'Hint how to resume a run' },
   ];
   const lower = prefix.toLowerCase();
   return lower.length === 0 ? items : items.filter((i) => i.value.toLowerCase().startsWith(lower));
@@ -246,7 +332,9 @@ function usageText(cwd: string): string {
   return [
     'Usage:',
     '  /agent list              List discovered agents',
+    '  /agent view              Open interactive agent navigator (TUI)',
     '  /agent:<name> <task...>  Invoke a specific agent',
+    '  /agent runs              List durable runs',
     `Available agents: ${available}`,
   ].join('\n');
 }

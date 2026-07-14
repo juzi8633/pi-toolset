@@ -12,6 +12,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Dynamic fanout** - chain steps expand a prior step's array output into parallel subtasks with a collected result
 - **Package agents** - install agents from npm packages that declare `pi.agents`
 - **Slash-command invocation** - `/agent:<name> <task>` runs a discovered agent directly; `/agent list` enumerates them
+- **Interactive agent view (TUI)** - `/agent view` or `Ctrl+Alt+Down` opens a navigator for current-session Pi subagents; steer, follow-up, and abort child turns without switching the host session
 - **Worktree isolation + setup hook** - run agents in a throw-away git worktree with an optional shell `worktreeSetupHook` and per-run diff metadata
 - **Completion check** - require final-message headings via frontmatter
 - **Compact live rendering** - collapsed view is a status summary (glyph, agent, truncated task or a short `title`, usage, at most one latest activity); Ctrl+O expands full task/transcript/final output
@@ -19,6 +20,9 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Parallel & Chain progress** - ordered per-task summaries; Chain fanout is one logical step with real item counts and collect metadata
 - **Usage tracking** - turns, tokens, and context per execution unit; aggregates sum tokens/turns and use `ctx:max` (no aggregate model/thinking); partial stats stream live for `grok-acp`
 - **Abort support** - Ctrl+C propagates and kills active subprocesses
+- **Durable runs** - every invocation persists a run record, unit state, and native Pi sessions under `~/.pi/agent/@balaenis/pi-agents/runs/`; interrupted runs can be inspected and resumed without re-running completed work
+- **Resume** - the `agent_job` tool lists, inspects, and resumes interrupted runs; Pi-runtime units reopen their stored session, Grok-runtime units replay from the beginning with explicit acknowledgement
+- **Reconciliation** - on session start, runs left running by a dead process are automatically marked interrupted
 
 ## Local development
 
@@ -29,12 +33,109 @@ mise run build --package packages/pi-agents
 pi -e ./packages/pi-agents/dist/index.js
 ```
 
+## Durable runs and resume
+
+Every validated invocation creates a durable run record under `~/.pi/agent/@balaenis/pi-agents/runs/<run-id>/`. The per-run layout:
+
+```
+<run-id>/
+  run.json         # Versioned authoritative run snapshot
+  events.jsonl     # Append-only event log (run_created, run_claimed, run_resumed, run_terminal, run_interrupted)
+  claims/          # Per-ticket ownership claims
+    <ticket>/
+      owner.json    # Claim owner (instanceId, pid, acquiredAt)
+      terminal.json # Terminal state (released/abandoned)
+  sessions/        # Native Pi JSONL session files
+```
+
+### Statuses
+
+| Status        | Resumable | Description                                      |
+| ------------- | --------- | ------------------------------------------------ |
+| `queued`      | Yes       | Created but not yet started                      |
+| `running`     | Yes       | Actively executing                               |
+| `completed`   | No        | All units finished successfully                  |
+| `failed`      | Yes       | One or more units failed                         |
+| `cancelled`   | Yes       | Aborted by the user (Ctrl+C)                     |
+| `interrupted` | Yes       | Interrupted by session shutdown or process death |
+
+`cancelled` means the user explicitly aborted (Ctrl+C). `interrupted` means the session shut down or the owning process died. Both are resumable.
+
+### Inspecting and resuming runs
+
+Use the `agent_job` tool to list, inspect, and resume runs:
+
+```
+agent_job({ action: "list" })                              # list recent runs
+agent_job({ action: "get", runId: "run-abc123..." })       # get detailed status
+agent_job({ action: "resume", runId: "run-abc123..." })    # resume an interrupted run
+```
+
+Or use slash commands:
+
+```
+/agent runs                    # list durable runs
+/agent status <run-id>         # get detailed status
+/agent resume <run-id>         # resume guidance
+```
+
+### Pi vs Grok resume
+
+- **Pi-runtime units** (`resumeCapability: "session"`) resume by reopening the stored native Pi session with a continuation instruction. Completed work is not repeated.
+- **Grok-runtime units** (`resumeCapability: "replay"`) must re-run from the beginning because Grok sessions are not persisted. Set `allowReplay: true` only after accepting that side effects (edits, commands, network writes) may be duplicated.
+
+### Chain fanout resume
+
+When a chain step expands a structured array into parallel items, the expansion is frozen before any worker is scheduled. The ordered item list and one durable unit record per scheduled item are written to `run.json` under `workflowState.fanouts` and `units`. Resume never recomputes the expansion from mutable upstream output: it reuses the stored mapping, keeps completed item results, and retries only incomplete items in their original order.
+
+Each item has a canonical unit id such as `chain-0002-fanout-0003` (one-based step, one-based display position). Items that never started remain `queued` with attempt `1`; items that already ran advance their attempt on resume. Incomplete fanout runs that lack a valid stored mapping are refused rather than reconstructed — start a fresh chain instead. See [How-to: Resume an interrupted fanout](./docs/how-to.md#resume-an-interrupted-fanout) and [Reference: Durable runs](./docs/reference.md#durable-runs).
+
+### Interactive agent navigator (TUI)
+
+In interactive TUI mode, Pi-runtime units register a branch-scoped link and run over RPC so you can inspect them live:
+
+```
+/agent view              # open navigator (works while the host agent is busy)
+Ctrl+Alt+Down            # same shortcut
+```
+
+`/agent view` opens in the input/editor area (non-overlay `ui.custom`, same surface as `/settings`) with a candidate list styled like the prompt autocomplete list. Pick `main` or Escape to restore the host editor; Enter on a child opens its detail transcript.
+
+The below-editor agent list appears only while at least one visible agent is `starting` or `running`. While the navigator is open, that list (including the open hint) is hidden so it does not duplicate the navigator rows; it is restored after the navigator closes if any agent is still active. Idle, detached, error, and other non-active endpoints remain reachable from `/agent view`.
+
+| Control (detail view) | Behavior                                                |
+| --------------------- | ------------------------------------------------------- |
+| Enter                 | Steer when running; new prompt when idle/detached/error |
+| Alt+Enter             | Queue follow-up when running; prompt otherwise          |
+| Ctrl+X                | Abort only the selected child's current turn            |
+| Ctrl+O                | Toggle last-15-line preview vs full transcript          |
+| Escape                | Return to the navigator list                            |
+| PageUp/PageDown / End | Scroll transcript / resume tail-follow                  |
+
+Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the full content; Ctrl+O again collapses to the last 15 lines and jumps back to the tail.
+
+**Scope and limits (Version 1):**
+
+- Pi-runtime units only; Grok / Grok ACP are not in the navigator
+- Links are host-session and active-branch scoped (forked/imported sessions do not inherit trusted links)
+- Up to four idle RPC children stay attached; others detach and reopen lazily
+- Linked clean worktrees are retained (no automatic pruning) so interactive reattach keeps a valid cwd
+- Child slash commands and extension UI dialogs are cancelled/rejected
+- Post-completion interactive messages stay in the child session only — they do not rewrite the durable unit result or enter main-model context. The one exception is a continuation sent after the original tool-call activation was interrupted/cancelled: once that continuation settles, its final output is relayed back to the bound host model as a clearly-marked interactive continuation. Normal completed agents never relay.
+- Sessions created before this feature have no interactive links
+
+See [How-to: Interactive agent view](./docs/how-to.md#interactive-agent-view) and [Reference: Interactive agent view](./docs/reference.md#interactive-agent-view).
+
+### Privacy and disk growth
+
+Run records contain prompts, transcripts, outputs, cwd paths, and possibly sensitive tool results. Protect and manually remove them according to your retention policy. Version 1 performs no automatic pruning. To delete a run, remove its complete `<run-id>/` directory only when the run is not active. Linked interactive worktrees are also retained until you remove them manually.
+
 ## Documentation
 
 - [Tutorial: Get started with subagents](./docs/tutorials.md) - load the extension and run your first agents
-- [How-to guides](./docs/how-to.md) - parallel runs, chains, structured output, fanout, worktree isolation, slash commands, background agents, Grok runtimes
-- [Reference](./docs/reference.md) - frontmatter fields, config overrides, tool modes, bundled agents, `stopReason` values, environment variables
-- [Explanation](./docs/explanation.md) - security model, nesting control, fork context, package-agent discovery, Grok runtimes
+- [How-to guides](./docs/how-to.md) - parallel runs, chains, structured output, fanout, resume, worktree isolation, slash commands, background agents, Grok runtimes
+- [Reference](./docs/reference.md) - frontmatter fields, config overrides, tool modes, durable runs, bundled agents, `stopReason` values, environment variables
+- [Explanation](./docs/explanation.md) - security model, nesting control, durable fanout expansion, fork context, package-agent discovery, Grok runtimes
 
 ## Bundled agents
 
@@ -43,7 +144,7 @@ pi -e ./packages/pi-agents/dist/index.js
 | `explore`  | Fast codebase recon  | `read, grep, find, ls, bash`  | disabled (`maxSubagentDepth: 0`) |
 | `planner`  | Implementation plans | `read, grep, find, ls, write` | disabled (`maxSubagentDepth: 0`) |
 | `reviewer` | Code review          | `read, grep, find, ls, bash`  | disabled (`maxSubagentDepth: 0`) |
-| `worker`   | General-purpose      | (all default)                 | follows `PI_AGENT_MAX_DEPTH`     |
+| `general`  | General-purpose      | (all default)                 | follows `PI_AGENT_MAX_DEPTH`     |
 
 The package also ships prompt templates: the `/implement`, `/explore-and-plan`, and `/implement-and-review` workflow prompts, plus `/work-with-grok` for delegating a task to the Grok ACP runtime. See [How-to guides](./docs/how-to.md#use-the-bundled-workflow-prompts).
 

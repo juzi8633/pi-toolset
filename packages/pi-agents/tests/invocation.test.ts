@@ -6,7 +6,12 @@ import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AgentConfig } from '../src/agents.ts';
-import { buildPiArgs, getPiInvocation, writePromptToTempFile } from '../src/invocation.ts';
+import {
+  buildPiArgs,
+  buildPiRpcArgs,
+  getPiInvocation,
+  writePromptToTempFile,
+} from '../src/invocation.ts';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -125,6 +130,27 @@ describe('buildPiArgs', () => {
     expect(args).not.toContain('--no-session');
   });
 
+  it('sends Task: <task> once for initial promptKind', () => {
+    const args = buildPiArgs(makeAgent(), 'do work', { promptKind: 'initial' });
+    expect(args[args.length - 1]).toBe('Task: do work');
+    expect(args.filter((a) => a.startsWith('Task:')).length).toBe(1);
+  });
+
+  it('sends a fixed continuation instruction for resume promptKind without resending the task', () => {
+    const args = buildPiArgs(makeAgent(), 'do work', {
+      promptKind: 'resume',
+      sessionFile: '/tmp/stored.jsonl',
+    });
+    // Must reuse the stored session, not --no-session.
+    expect(args).toContain('--session');
+    expect(args).not.toContain('--no-session');
+    // The last arg is the resume continuation, not Task: <task>.
+    const last = args[args.length - 1];
+    expect(last).not.toContain('Task: do work');
+    expect(last).toContain('resuming');
+    expect(last).toContain('interrupted');
+  });
+
   it('forwards disableAgentTool to buildToolCliArgs', () => {
     const args = buildPiArgs(makeAgent({ tools: ['read'] }), 'go', { disableAgentTool: true });
     expect(args).toContain('--exclude-tools');
@@ -137,6 +163,38 @@ describe('buildPiArgs', () => {
     expect(args).not.toContain('--tools');
     const args2 = buildPiArgs(makeAgent({ tools: undefined }), 'go');
     expect(args2).not.toContain('--tools');
+  });
+});
+
+describe('buildPiRpcArgs', () => {
+  it('uses --mode rpc without -p or argv prompt', () => {
+    const args = buildPiRpcArgs(makeAgent({ model: 'gpt-x', thinking: 'high' }), {
+      sessionFile: '/tmp/s.jsonl',
+      tmpPromptPath: '/tmp/p.md',
+    });
+    expect(args[0]).toBe('--mode');
+    expect(args[1]).toBe('rpc');
+    expect(args).not.toContain('-p');
+    expect(args.some((a) => a.startsWith('Task:'))).toBe(false);
+    expect(args).toContain('--session');
+    expect(args).toContain('/tmp/s.jsonl');
+    expect(args).toContain('--model');
+    expect(args).toContain('gpt-x');
+    expect(args).toContain('--thinking');
+    expect(args).toContain('high');
+    expect(args).toContain('--append-system-prompt');
+    expect(args).toContain('/tmp/p.md');
+    expect(args).toContain('-ne');
+  });
+
+  it('includes resolved skill paths and does not use --no-session', () => {
+    const args = buildPiRpcArgs(makeAgent(), {
+      sessionFile: '/tmp/s.jsonl',
+      resolvedSkillPaths: ['/abs/skill/SKILL.md'],
+    });
+    expect(args).not.toContain('--no-session');
+    expect(args).toContain('--skill');
+    expect(args).toContain('/abs/skill/SKILL.md');
   });
 });
 

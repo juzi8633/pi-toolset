@@ -213,7 +213,7 @@ Body.`
     expect(get('explore')?.maxSubagentDepth).toBe(0);
     expect(get('planner')?.maxSubagentDepth).toBe(0);
     expect(get('reviewer')?.maxSubagentDepth).toBe(0);
-    expect(get('worker')?.maxSubagentDepth).toBeUndefined();
+    expect(get('general')?.maxSubagentDepth).toBeUndefined();
   });
 
   it('parses comma lists with trimming and drops empty items', () => {

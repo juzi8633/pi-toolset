@@ -83,7 +83,7 @@ immediately preceding step) or `{outputs.<name>}` (any earlier named step):
 Use a chain:
   - { agent: explore, name: context, task: "find the read tool" }
   - { agent: planner, name: plan, task: "suggest improvements using {previous}" }
-  - { agent: worker,                  task: "implement {outputs.plan}" }
+  - { agent: general,                 task: "implement {outputs.plan}" }
 ```
 
 Each step runs in order. A reference to an unknown name stops the chain before

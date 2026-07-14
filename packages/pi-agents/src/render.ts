@@ -50,7 +50,8 @@ export const RUNNING_STATUS_GLYPH = '▣';
 const QUEUED_GLYPH = '·';
 const SKIPPED_GLYPH = '–';
 const CANCELLED_GLYPH = '⊘';
-const EXPAND_HINT = '(Ctrl+O to expand)';
+const INTERRUPTED_GLYPH = '⧖';
+const EXPAND_HINT = '(ctrl+o to expand)';
 
 /** Row-local renderer state for `registerTool<..., AgentRenderState>`. */
 export interface AgentRenderState {
@@ -68,8 +69,19 @@ export type AgentToolRenderContext = Parameters<
   >
 >[3];
 
+/**
+ * Minimal renderer context surface used by renderResult and helpers. Relaxes the
+ * args type so the same renderer can serve tools with different parameter schemas
+ * (e.g. `agent` and `agent_job`) while sharing state/spinner wiring.
+ */
+export type RenderContext = {
+  toolCallId: string;
+  invalidate: () => void;
+  state: AgentRenderState;
+};
+
 /** Minimal context surface used by frame calculation helpers. */
-export type AgentRenderContext = Pick<AgentToolRenderContext, 'state'>;
+export type AgentRenderContext = Pick<RenderContext, 'state'>;
 
 /** Injectable timer surface so tests can drive the shared ticker without wall-clock waits. */
 export type SpinnerScheduler = {
@@ -91,7 +103,7 @@ const defaultSpinnerScheduler: SpinnerScheduler = {
 let spinnerScheduler: SpinnerScheduler = defaultSpinnerScheduler;
 
 /** Active collapsed-partial tool rows keyed by toolCallId. One shared interval drives all. */
-const activeSpinners = new Map<string, AgentToolRenderContext>();
+const activeSpinners = new Map<string, RenderContext>();
 let sharedTickerId: unknown | undefined;
 
 /** Clear spinner bookkeeping. Safe on missing/partial state. */
@@ -130,7 +142,7 @@ function ensureSharedTicker(): void {
  * Frame origin is set once per armed phase; re-renders refresh the context ref only.
  */
 export function startSpinner(
-  context: AgentToolRenderContext | undefined,
+  context: RenderContext | undefined,
   now: () => number = Date.now
 ): void {
   if (!context) return;
@@ -141,7 +153,7 @@ export function startSpinner(
   ensureSharedTicker();
 }
 
-export function stopSpinner(context: AgentToolRenderContext | string | undefined): void {
+export function stopSpinner(context: RenderContext | string | undefined): void {
   if (!context) return;
   const toolCallId = typeof context === 'string' ? context : context.toolCallId;
   const active = activeSpinners.get(toolCallId);
@@ -176,7 +188,7 @@ export function isSharedSpinnerTickerActive(): boolean {
  * and terminal/error paths never arm an interval — even if details still say running.
  */
 function syncCollapsedPartialSpinner(
-  context: AgentToolRenderContext | undefined,
+  context: RenderContext | undefined,
   options: { expanded: boolean; isPartial: boolean },
   detailsRunning: boolean
 ): void {
@@ -291,6 +303,17 @@ export function renderCall(_args: Static<typeof SubagentParams>, _theme: Theme):
   return new Text('', 0, 0);
 }
 
+/** `agent_job` call preview: shows the action (and runId when present). */
+export function renderJobCall(
+  args: { action?: string; runId?: string; status?: string },
+  theme: Theme
+): Component {
+  const action = args.action ?? 'job';
+  const label = theme.fg('muted', 'agent_job ') + theme.fg('accent', action);
+  const tail = args.runId ? theme.fg('dim', ` ${args.runId.slice(0, 12)}`) : '';
+  return new Text(`${label}${tail}`, 0, 0);
+}
+
 interface RenderResultOptions {
   expanded: boolean;
   isPartial?: boolean;
@@ -341,6 +364,8 @@ function statusGlyph(status: ExecutionStatus, theme: Theme, context?: AgentRende
       return theme.fg('error', '✗');
     case 'cancelled':
       return theme.fg('warning', CANCELLED_GLYPH);
+    case 'interrupted':
+      return theme.fg('warning', INTERRUPTED_GLYPH);
     case 'skipped':
       return theme.fg('muted', SKIPPED_GLYPH);
   }
@@ -567,6 +592,35 @@ function appendExpandedResultSections(
         new Text(theme.fg('dim', JSON.stringify(r.structuredOutput, null, 2)), 0, 0)
       );
     }
+  }
+
+  // Durable run identity and resume info in expanded view.
+  if (r.runId) {
+    container.addChild(new Spacer(1));
+    container.addChild(new Text(theme.fg('muted', '─── Run ───'), 0, 0));
+    container.addChild(new Text(theme.fg('dim', `runId: ${r.runId}`), 0, 0));
+    if (r.unitId) {
+      container.addChild(new Text(theme.fg('dim', `unit: ${r.unitId}`), 0, 0));
+    }
+    container.addChild(new Text(theme.fg('dim', `attempt: ${r.attempt ?? '—'}`), 0, 0));
+    if (r.resumeCapability) {
+      const capLabel =
+        r.resumeCapability === 'replay'
+          ? theme.fg('warning', 'replay (⚠ may repeat side effects)')
+          : 'session';
+      container.addChild(new Text(theme.fg('dim', `capability: ${capLabel}`), 0, 0));
+    }
+    if (r.sessionFile) {
+      container.addChild(new Text(theme.fg('dim', `session: ${r.sessionFile}`), 0, 0));
+    }
+    container.addChild(new Spacer(1));
+    container.addChild(
+      new Text(
+        theme.fg('dim', `To resume: agent_job({ action: "resume", runId: "${r.runId}" })`),
+        0,
+        0
+      )
+    );
   }
 
   const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
@@ -901,7 +955,7 @@ export function renderResult(
   result: RenderResultInput,
   { expanded, isPartial = false }: RenderResultOptions,
   theme: Theme,
-  context?: AgentToolRenderContext
+  context?: RenderContext
 ): Component {
   const details = result.details;
   const mdTheme = getMarkdownTheme();

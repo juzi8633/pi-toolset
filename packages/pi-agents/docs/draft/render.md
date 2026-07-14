@@ -40,7 +40,7 @@ Queued / empty (not yet started):
 
 ```text
 · explore (pending task...) ·
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Running (glyph animates through ▫ ▪ □ ■):
@@ -48,14 +48,14 @@ Running (glyph animates through ▫ ▪ □ ■):
 ```text
 ▪ explore (探索当前项目的整体结构...) · 9 turns ↑20k ↓6.5k R148k ctx:9.4k grok-4.5 • high
   └─ read ~/workspace/my/pi-myagent/.gitignore
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Completed (no latest activity, no final output in collapse):
 
 ```text
 ✔ explore (探索当前项目的整体结构...) · 9 turns ↑20k ↓6.5k R148k ctx:9.4k grok-4.5 • high
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Failed (optional latest activity only when it explains the failure; error summary on its own line when present):
@@ -63,21 +63,21 @@ Failed (optional latest activity only when it explains the failure; error summar
 ```text
 ✗ explore (探索当前项目的整体结构...) · 2 turns ↑1k ↓200 grok-4.5 • high
   Error: Agent exceeded maxTurns=2
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Cancelled:
 
 ```text
 ⊘ explore (探索当前项目的整体结构...) · 1 turn ↑500 ↓100
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Empty output when completed with no messages:
 
 ```text
 ✔ explore (empty task) · 0 turns
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Rules:
@@ -126,9 +126,9 @@ One summary line per task in input order. At most one latest-activity line under
 ✔ explore (探索项目结构...) · 5 turns ↑12k ↓2k grok-4.5 • high
 ▪ reviewer (审查模型服务...) · 4 turns ↑8k ↓1k openai-codex/gpt-5.6 • high
   └─ read src/services/models.rs
-· worker (queued task...) ·
+· general (queued task...) ·
 Total: 1/2 completed · 9 turns ↑20k ↓3k R40k ctx:max 12k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Aggregate footer: completed count over total tasks, aggregate usage (`ctx:max N`, no model/thinking).
@@ -150,7 +150,7 @@ One line per started logical step. Queued future steps are omitted. At most one 
 ▪ 2. planner (制定实施计划...) · 4 turns ↑8k ↓1k openai-codex/gpt-5.6 • high
   └─ read docs/spec.md
 Chain: step 2/3 · 1 completed · 9 turns ↑20k ↓3k R40k ctx:max 12k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Completed:
@@ -158,9 +158,9 @@ Completed:
 ```text
 ✔ 1. explore (分析当前实现...) · 5 turns ↑12k ↓2k grok-4.5 • high
 ✔ 2. planner (制定实施计划...) · 4 turns ↑8k ↓1k openai-codex/gpt-5.6 • high
-✔ 3. worker (implement the plan...) · 6 turns ↑10k ↓3k grok-4.5 • high
+✔ 3. general (implement the plan...) · 6 turns ↑10k ↓3k grok-4.5 • high
 Chain: step 3/3 · 3 completed · 15 turns ↑30k ↓6k R40k ctx:max 14k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 After failure or cancellation, the footer reports the terminal state and any skipped later steps:
@@ -169,7 +169,7 @@ After failure or cancellation, the footer reports the terminal state and any ski
 ✔ 1. explore (分析当前实现...) · 5 turns ↑12k ↓2k grok-4.5 • high
 ✗ 2. planner (制定实施计划...) · 1 turn ↑1k ↓200
 Chain: step 2/3 · 1 completed · failed · 1 skipped · 6 turns ↑13k ↓2.2k R20k ctx:max 10k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Cancelled active step:
@@ -178,7 +178,7 @@ Cancelled active step:
 ✔ 1. explore (分析当前实现...) · 5 turns ↑12k ↓2k grok-4.5 • high
 ⊘ 2. planner (制定实施计划...) · 1 turn ↑1k ↓100
 Chain: step 2/3 · 1 completed · cancelled · 1 skipped · 6 turns ↑13k ↓2.1k R20k ctx:max 10k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Footer fields: current step, completed logical-step count, terminal failure/cancellation when applicable, skipped count when non-zero, aggregate usage.
@@ -198,7 +198,7 @@ A fanout is one logical Chain step in collapse regardless of how many items exec
 ▪ 2. reviewer fanout (审查每个目标...) · 3/8 done, 4 running, 1 queued · 12 turns ↑24k ↓4k
   └─ [5/8] read src/models.ts
 Chain: step 2/3 · 1 completed · 16 turns ↑32k ↓5k R60k ctx:max 14k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 Rules:
@@ -215,7 +215,7 @@ Failed fanout after all items settle:
 ✔ 1. planner (生成审查目标...) · 4 turns ↑8k ↓1k grok-4.5 • high
 ✗ 2. reviewer fanout (审查每个目标...) · 2/3 done, 1 failed · 8 turns ↑16k ↓3k
 Chain: step 2/3 · 1 completed · failed · 1 skipped · 12 turns ↑24k ↓4k R40k ctx:max 12k
-(Ctrl+O to expand)
+(ctrl+o to expand)
 ```
 
 ### Expanded

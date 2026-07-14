@@ -1251,6 +1251,99 @@ describe('runSingleAgent execution status', () => {
   });
 });
 
+describe('runSingleAgent durable metadata stamping', () => {
+  it('stamps runId/unitId/attempt/session/resumeCapability on partials and the final result', async () => {
+    const fake = new FakeChild();
+    const snapshots: SingleResult[] = [];
+    const unitContext = {
+      runId: 'run-stamp',
+      unitId: 'single',
+      agent: 'maxie',
+      runtime: undefined,
+      resumeCapability: 'session' as const,
+      effectiveCwd: '/cwd',
+      sessionFile: '/sessions/run-stamp/s.jsonl',
+      attempt: 1,
+    };
+    const promise = runSingleAgent(
+      process.cwd(),
+      [makeAgent()],
+      'maxie',
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      (partial) => {
+        if (partial.details?.results[0]) snapshots.push(partial.details.results[0]);
+      },
+      makeDetails,
+      {
+        spawnFn: (() => fake as unknown as SpawnedChild) as SpawnFn,
+        unitContext,
+        sessionFile: unitContext.sessionFile,
+      }
+    );
+    setImmediate(() => {
+      fake.emitAssistant('turn');
+      setImmediate(() => {
+        fake.stdout.push(null);
+        fake.stderr.push(null);
+        fake.emit('close', 0);
+      });
+    });
+    const result = await promise;
+    expect(result.runId).toBe('run-stamp');
+    expect(result.unitId).toBe('single');
+    expect(result.attempt).toBe(1);
+    expect(result.sessionFile).toBe('/sessions/run-stamp/s.jsonl');
+    expect(result.resumeCapability).toBe('session');
+    for (const snap of snapshots) {
+      expect(snap.runId).toBe('run-stamp');
+      expect(snap.unitId).toBe('single');
+    }
+  });
+
+  it('an aborted pi run carries a deep-cloned terminal snapshot with durable identity', async () => {
+    const fake = new FakeChild();
+    const controller = new AbortController();
+    const unitContext = {
+      runId: 'run-abort',
+      unitId: 'single',
+      agent: 'maxie',
+      runtime: undefined,
+      resumeCapability: 'session' as const,
+      effectiveCwd: '/cwd',
+      attempt: 1,
+    };
+    const promise = runSingleAgent(
+      process.cwd(),
+      [makeAgent()],
+      'maxie',
+      'do work',
+      undefined,
+      undefined,
+      controller.signal,
+      undefined,
+      makeDetails,
+      {
+        spawnFn: (() => fake as unknown as SpawnedChild) as SpawnFn,
+        unitContext,
+      }
+    );
+    setImmediate(() => {
+      fake.emitAssistant('partial');
+      setImmediate(() => {
+        controller.abort();
+      });
+    });
+    await expect(promise).rejects.toBeInstanceOf(AgentAbortError);
+    const err = (await promise.catch((e: unknown) => e)) as AgentAbortError;
+    expect(err.result.runId).toBe('run-abort');
+    expect(err.result.unitId).toBe('single');
+    expect(err.result.status).toBe('cancelled');
+  });
+});
+
 describe('mapWithConcurrencyLimit cancel-safe scheduling', () => {
   it('stops scheduling, waits for started workers, and fills unstarted slots', async () => {
     const controller = new AbortController();

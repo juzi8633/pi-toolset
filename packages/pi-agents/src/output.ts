@@ -95,6 +95,7 @@ export function isFailedResult(result: SingleResult): boolean {
 export function resolveExecutionStatus(result: SingleResult): ExecutionStatus {
   if (result.status) return result.status;
   if (result.exitCode === -1) return 'running';
+  if (result.stopReason === 'interrupted') return 'interrupted';
   if (result.stopReason === 'aborted') return 'cancelled';
   if (isFailedResult(result)) return 'failed';
   return 'completed';
@@ -113,6 +114,11 @@ export function applyTerminalStatus(result: SingleResult): void {
 
 export function getResultOutput(result: SingleResult): string {
   if (isFailedResult(result)) {
+    if (result.stopReason === 'completion_check') {
+      const reason = result.errorMessage || 'Completion check failed';
+      const agentOutput = (result.finalOutput ?? getFinalOutput(result.messages)) || '(no output)';
+      return `${reason}\n\nUnchecked agent output:\n${agentOutput}`;
+    }
     return result.errorMessage || result.stderr || getFinalOutput(result.messages) || '(no output)';
   }
   return getFinalOutput(result.messages) || '(no output)';

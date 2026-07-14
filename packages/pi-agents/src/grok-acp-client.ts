@@ -46,7 +46,7 @@ export type GrokAcpLifecycleStage =
   | 'shutdown';
 
 const DEFAULT_STAGE_TIMEOUT_MS = 60_000;
-const DEFAULT_PROMPT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_PROMPT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_CANCEL_GRACE_MS = 2_000;
 const HARD_KILL_MS = 5_000;
 const MAX_STDERR_CHARS = 16 * 1024;
