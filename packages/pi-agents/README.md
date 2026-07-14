@@ -33,6 +33,10 @@ mise run build --package packages/pi-agents
 pi -e ./packages/pi-agents/dist/index.js
 ```
 
+## Failure logging
+
+Failed `agent` tool invocations record the complete tool call parameters and failure details in `~/.pi/@balaenis/pi-agents/default.log`. Set `PI_AGENTS_LOG_FILE` to override the path. Because task prompts and continuation instructions may contain sensitive information, protect or remove this log as appropriate.
+
 ## Durable runs and resume
 
 Every validated invocation creates a durable run record under `~/.pi/agent/@balaenis/pi-agents/runs/<run-id>/`. The per-run layout:

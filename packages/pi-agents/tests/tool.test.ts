@@ -3,9 +3,11 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { AgentToolResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import { discoverAgents } from '../src/agents.ts';
 import { executeAgentTool, type ExecuteAgentToolOptions } from '../src/tool.ts';
 import type { BackgroundManager } from '../src/background.ts';
@@ -56,6 +58,42 @@ function errResult(text: string): AgentResult {
 
 function fakeWorkflow(text: string): NonNullable<ExecuteAgentToolOptions['runWorkflow']> {
   return async () => okResult(text);
+}
+
+function fakeGrokSpawn(
+  onSpawn: (args: string[]) => void,
+  emitGrokMessage = true
+): import('../src/execution.ts').SpawnFn {
+  return ((_command: string, args: string[]) => {
+    onSpawn(args);
+    const child = new (class extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      stdin = new Writable({ write: (_chunk, _encoding, callback) => callback() });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    })();
+    setImmediate(() => {
+      if (emitGrokMessage) {
+        child.stdout.push(
+          `${JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'grok done' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          })}\n`
+        );
+      }
+      child.kill();
+    });
+    return child;
+  }) as unknown as import('../src/execution.ts').SpawnFn;
 }
 
 function fakeManager(): {
@@ -487,6 +525,74 @@ describe('executeAgentTool durable run persistence', () => {
     const coordinator = createRunCoordinator({ store });
     return { store, coordinator };
   }
+
+  it('allows a fresh single Grok run without allowReplay', async () => {
+    const { store, coordinator } = makeStore();
+    let spawnCount = 0;
+
+    const result = await executeAgentTool(
+      { agent: 'general', task: 'fresh Grok task', runtime: 'grok' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: fakeGrokSpawn(() => spawnCount++),
+      }
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(spawnCount).toBe(1);
+    expect(result.details.results[0]?.resumeCapability).toBe('replay');
+  });
+
+  it('dispatches a fresh Grok ACP run without allowReplay', async () => {
+    const { store, coordinator } = makeStore();
+    let spawnCount = 0;
+
+    const result = await executeAgentTool(
+      { agent: 'general', task: 'fresh Grok ACP task', runtime: 'grok-acp' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: fakeGrokSpawn(() => spawnCount++, false),
+      }
+    );
+
+    expect(spawnCount).toBe(1);
+    expect(JSON.stringify(result.content)).not.toContain('requires replay');
+  });
+
+  it('allows fresh parallel Grok runs without allowReplay', async () => {
+    const { store, coordinator } = makeStore();
+    let spawnCount = 0;
+
+    const result = await executeAgentTool(
+      {
+        tasks: [
+          { agent: 'general', task: 'fresh Grok task A' },
+          { agent: 'general', task: 'fresh Grok task B' },
+        ],
+        runtime: 'grok',
+      },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: fakeGrokSpawn(() => spawnCount++),
+      }
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(spawnCount).toBe(2);
+    expect(result.details.results.every((entry) => entry.resumeCapability === 'replay')).toBe(true);
+  });
 
   it('creates a durable run before the workflow starts and finalizes completed on success', async () => {
     const { store, coordinator } = makeStore();

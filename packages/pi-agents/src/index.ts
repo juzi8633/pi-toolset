@@ -18,6 +18,7 @@ import {
   renderContinuationMessage,
 } from './interactive-relay.ts';
 import { createInteractiveViewController } from './interactive-view.ts';
+import { withAgentToolFailureLogging } from './log.ts';
 import { createRunStore } from './run-store.ts';
 import { createRunCoordinator } from './run-coordinator.ts';
 import { reconcileDeadOwnerUnits } from './resume.ts';
@@ -245,12 +246,14 @@ Use when the task matches an agent type, for parallel independent work, or when 
     prepareArguments: (args) => normalizeAgentArgs(args) as Static<typeof SubagentParams>,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       latestUiCtx = ctx;
-      return executeAgentTool(params, signal, onUpdate, ctx, {
-        backgroundManager,
-        runStore,
-        runCoordinator,
-        interactiveRegistry,
-      });
+      return withAgentToolFailureLogging(params, () =>
+        executeAgentTool(params, signal, onUpdate, ctx, {
+          backgroundManager,
+          runStore,
+          runCoordinator,
+          interactiveRegistry,
+        })
+      );
     },
     renderCall,
     renderResult,

@@ -239,6 +239,8 @@ interface DurableRunContext {
   started: StartedRun;
   lifecycle: RunLifecycle;
   coordinator: RunCoordinator;
+  /** Whether this context restored an existing run rather than starting a fresh one. */
+  isResume: boolean;
   /** Resume prompt metadata when this durable context was restored via runId. */
   resume?: ResumePromptContext;
   /** Whether the caller acknowledged replay side effects. */
@@ -381,6 +383,7 @@ async function maybeStartDurableRun(
     started,
     lifecycle,
     coordinator,
+    isResume: false,
     unitFor,
     beginUnit,
     endUnit,
@@ -668,6 +671,7 @@ async function maybeResumeDurableRun(
       started,
       lifecycle,
       coordinator,
+      isResume: true,
       resume: resumePrompt,
       allowReplay: resume.allowReplay,
       projectCwd,
@@ -1442,8 +1446,13 @@ async function runParallel(
         return allResults[index];
       }
       const unitCtx = durable?.unitFor(undefined, index, t.agent);
-      // Replay gate at dispatch: refuse incomplete replay units without allowReplay.
-      if (unitCtx && durable && unitCtx.resumeCapability === 'replay' && !durable.allowReplay) {
+      // Replay gate at dispatch: refuse resumed replay units without allowReplay.
+      if (
+        unitCtx &&
+        durable?.isResume &&
+        unitCtx.resumeCapability === 'replay' &&
+        !durable.allowReplay
+      ) {
         const blocked: SingleResult = {
           ...allResults[index],
           agent: t.agent,
@@ -1619,7 +1628,7 @@ async function runSingle(
         };
       }
     }
-    if (unitCtx.resumeCapability === 'replay' && !durable.allowReplay) {
+    if (durable.isResume && unitCtx.resumeCapability === 'replay' && !durable.allowReplay) {
       return {
         content: [
           {
