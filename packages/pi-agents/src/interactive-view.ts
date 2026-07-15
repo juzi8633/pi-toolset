@@ -124,7 +124,7 @@ export function createInteractiveViewController(options: InteractiveViewControll
           }
           lines.push('/agent view or Ctrl+Alt+Down');
           return {
-            render: () => lines,
+            render: () => lines.map((l) => ` ${l}`),
             invalidate: () => undefined,
           };
         },
@@ -681,9 +681,14 @@ export class AgentDetailPanel implements Component, Focusable {
         ]
       : this.input
           .render(width)
-          .map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
+          // pi-tui Input hardcodes "> "; swap to heavy arrow prompt for detail input.
+          .map((l) => {
+            const line = l.startsWith('> ') ? `❱ ${l.slice(2)}` : l;
+            return visibleWidth(line) > width ? truncateToWidth(line, width) : line;
+          });
     const safeView = view.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
-    return [border, header, ...safeView, statusLine, ...inputLines, help, border];
+    const separator = this.opts.theme.fg('accent', '─'.repeat(Math.max(1, width)));
+    return [border, header, ...safeView, separator, statusLine, ...inputLines, help, border];
   }
 
   handleInput(data: string): void {
