@@ -236,6 +236,19 @@ only the other fields that are already known (e.g. `ctx:111 model`). When the
 (`turns`, `↑input`, `↓output`, cache read/write, ctx, model) is shown together.
 Zero/unknown fields are never printed as misleading zeros.
 
+**Session resume and Agent View (grok-acp):** Unlike plain `runtime: "grok"`
+(streaming-json replay), Grok ACP is session-capable. After `session/new`, the
+protocol session ID is flushed to the durable run record before any prompt. On
+resume or Agent View hydrate, the client requires
+`agentCapabilities.loadSession === true`, calls `session/load` with the stored
+ID and original cwd/worktree, and treats only matching `session/update`
+notifications that arrive **before** the load response as historical replay.
+A dedicated transcript projector maps those updates into complete
+user/assistant/thinking/tool-result `AgentMessage` history for Agent View.
+Private Grok files under `~/.grok/sessions` are never opened, copied, or
+parsed — the protocol replay stream is authoritative. Attempted units without a
+persisted ID fail closed rather than replaying the original task.
+
 ## Output display
 
 Collapsed output is intentionally a compact live summary: status glyph

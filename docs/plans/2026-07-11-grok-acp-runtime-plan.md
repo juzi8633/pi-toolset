@@ -425,3 +425,16 @@ The implementation must never mention `agent.maxTurns` in the `grok-acp` path.
 - **SDK API or framing behavior changes across versions** — Pin the compatible range, use only documented `client`, `connectWith`, `ndJsonStream`, and standard method APIs, and cover stream closure plus unknown extensions with focused tests.
 - **Protocol logs include benign Grok stderr noise** — Treat non-empty stderr as diagnostic unless process/protocol failure occurs; do not mark successful prompt completion failed solely because stderr contains warnings.
 - **Historical design documentation contradicts the new runtime** — Add a dated follow-up note while preserving the original decision record.
+
+## Follow-up (2026-07-15)
+
+Native ACP session resume and Agent View restoration for `runtime: "grok-acp"` are
+implemented in
+[`packages/pi-agents/docs/plans/2026-07-15-grok-acp-session-resume-agent-view-plan.md`](../../packages/pi-agents/docs/plans/2026-07-15-grok-acp-session-resume-agent-view-plan.md).
+
+That work is deliberately ACP-only: plain `runtime: "grok"` remains replay-only
+with `allowReplay`. The original out-of-scope statement in this plan — that ACP
+session reuse would be evaluated separately after the one-shot lifecycle was
+stable — is preserved here as historical context. Session identity is the
+protocol session ID only; private Grok storage under `~/.grok/sessions` is never
+parsed.

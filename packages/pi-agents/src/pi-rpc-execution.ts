@@ -10,17 +10,28 @@ import {
   type RunSingleAgentOptions,
   ABORT_MESSAGE,
 } from './execution.ts';
-import type {
-  InteractiveAgentRegistry,
-  InteractiveEndpointSnapshot,
-  InteractiveEndpointUpdateKind,
-  InteractiveRegistryEvent,
+import {
+  InteractiveAgentError,
+  type InteractiveAgentRegistry,
+  type InteractiveEndpointSnapshot,
+  type InteractiveEndpointUpdateKind,
+  type InteractiveRegistryEvent,
 } from './interactive-agent.ts';
 import { appendContinuationTasks, buildSessionContinuationPrompt } from './invocation.ts';
 import { applyTerminalStatus, getFinalOutput } from './output.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { cloneSingleResult, emptyUsage, type SingleResult, type SubagentDetails } from './types.ts';
+
+/** Structured error codes from InteractiveAgentError / GrokAcpClientError / plain {code}. */
+function structuredErrorCode(err: unknown): string | undefined {
+  if (err instanceof InteractiveAgentError && err.code) return err.code;
+  if (err && typeof err === 'object' && 'code' in err) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === 'string' && code.length > 0) return code;
+  }
+  return undefined;
+}
 
 const DEFAULT_SETTLE_TIMEOUT_MS = 10_000;
 
@@ -66,6 +77,9 @@ function stampUnitContext(result: SingleResult, options: RunSingleAgentOptions):
   result.unitId = ctx.unitId;
   result.attempt = ctx.attempt;
   result.sessionFile = ctx.sessionFile;
+  if (ctx.acpSessionId !== undefined) {
+    result.acpSessionId = ctx.acpSessionId;
+  }
   result.resumeCapability = ctx.resumeCapability;
 }
 
@@ -158,7 +172,14 @@ function projectSnapshot(
     contextTokens,
   };
   if (model) currentResult.model = model;
-  if (stopReason) currentResult.stopReason = stopReason;
+  // Prefer formal SingleResult stop reason from endpoint usage (Grok ACP mapped
+  // end/max_turns/error/aborted) over assistant-message vocabulary (stop/length).
+  const formalStop = snap.usage?.stopReason;
+  if (formalStop) {
+    currentResult.stopReason = formalStop === 'stop' ? 'end' : formalStop;
+  } else if (stopReason) {
+    currentResult.stopReason = stopReason === 'stop' ? 'end' : stopReason;
+  }
   if (snap.lastError) {
     currentResult.stderr = snap.lastError;
   }
@@ -172,11 +193,27 @@ function endpointBelongsToActivation(
   return snap.activation?.id === activationId;
 }
 
-function applyMaxTurnsTerminal(currentResult: SingleResult, agent: AgentConfig): void {
+/**
+ * Apply max_turns terminal. Prefer an existing activation/endpoint/ACP message
+ * over Pi client text. Only emit `Agent exceeded maxTurns=N` when agent.maxTurns
+ * is a finite number — never overwrite ACP `max_turn_requests` with
+ * `maxTurns=undefined` (Grok ACP strips maxTurns).
+ */
+function applyMaxTurnsTerminal(
+  currentResult: SingleResult,
+  agent: AgentConfig,
+  preferredMessage?: string
+): void {
   currentResult.stopReason = 'max_turns';
-  currentResult.errorMessage =
-    currentResult.errorMessage ?? `Agent exceeded maxTurns=${agent.maxTurns}`;
   currentResult.exitCode = 1;
+  if (currentResult.errorMessage) return;
+  if (preferredMessage) {
+    currentResult.errorMessage = preferredMessage;
+    return;
+  }
+  if (typeof agent.maxTurns === 'number' && Number.isFinite(agent.maxTurns)) {
+    currentResult.errorMessage = `Agent exceeded maxTurns=${agent.maxTurns}`;
+  }
 }
 
 /**
@@ -197,7 +234,11 @@ function projectTerminalFromSettled(
     errorCode === 'max_turns' ||
     currentResult.stopReason === 'max_turns'
   ) {
-    applyMaxTurnsTerminal(currentResult, agent);
+    // Prefer endpoint/activation error (e.g. ACP max_turn_requests mapping).
+    const preferred =
+      currentResult.errorMessage ?? snap.activation?.error ?? snap.lastError ?? undefined;
+    applyMaxTurnsTerminal(currentResult, agent, preferred);
+    if (errorCode) currentResult.errorCode = errorCode;
     return;
   }
 
@@ -211,24 +252,40 @@ function projectTerminalFromSettled(
     currentResult.errorMessage =
       currentResult.errorMessage ?? snap.activation?.error ?? ABORT_MESSAGE;
     if (!currentResult.stderr) currentResult.stderr = currentResult.errorMessage;
+    if (errorCode) currentResult.errorCode = errorCode;
     return;
   }
 
-  if (
-    override === 'error' ||
-    snap.status === 'error' ||
+  // Structured failure codes (dispose_failed, acp_*, transport_error, …) and
+  // formal non-success stop reasons all project to failed SingleResult.
+  const structuredFail =
     errorCode === 'transport_error' ||
-    errorCode === 'error'
-  ) {
+    errorCode === 'error' ||
+    errorCode === 'dispose_failed' ||
+    errorCode === 'acp_load_error' ||
+    errorCode === 'acp_session_not_found' ||
+    errorCode === 'acp_cwd_mismatch' ||
+    errorCode === 'acp_load_unsupported' ||
+    errorCode === 'acp_session_history_empty' ||
+    errorCode === 'acp_session_unavailable' ||
+    currentResult.stopReason === 'error' ||
+    currentResult.stopReason === 'max_turns';
+
+  if (override === 'error' || snap.status === 'error' || structuredFail) {
     currentResult.exitCode = 1;
     // Force error terminal — never keep a prior assistant stopReason via ??.
-    currentResult.stopReason = 'error';
+    if (currentResult.stopReason !== 'max_turns') {
+      currentResult.stopReason = 'error';
+    }
     currentResult.errorMessage =
       currentResult.errorMessage ??
       snap.activation?.error ??
       snap.lastError ??
       'RPC endpoint error';
     currentResult.stderr = currentResult.stderr || currentResult.errorMessage;
+    if (errorCode) {
+      currentResult.errorCode = errorCode;
+    }
   }
 }
 
@@ -428,6 +485,10 @@ export async function runSingleAgentPiRpc(
     settledSnapshot = snap;
     projectSnapshot(currentResult, snap, baseline);
     projectTerminalFromSettled(currentResult, snap, agent);
+    // Surface real matching prompt completion for Grok ACP delivery gating.
+    // Cancel-grace and prompt_failed leave promptCompleted unset/false.
+    (currentResult as { acpPromptCompleted?: boolean }).acpPromptCompleted =
+      snap.activation?.promptCompleted === true;
     if (waitingForSettle) finishSettleWait();
   };
 
@@ -584,6 +645,8 @@ export async function runSingleAgentPiRpc(
       throw err;
     }
     // RPC activate accepted the resume/fresh prompt for this unit.
+    // Await original-prompt establishment first so write failure fail-closes.
+    await options.onSessionPromptEstablished?.();
     options.onResumePromptAccepted?.();
     activationId = activated.activationId;
     baseline = activated.snapshot.activation?.baselineMessageCount ?? baseline;
@@ -707,6 +770,9 @@ export async function runSingleAgentPiRpc(
     currentResult.errorMessage = err instanceof Error ? err.message : String(err);
     currentResult.stopReason = 'error';
     currentResult.stderr = currentResult.errorMessage;
+    // Preserve structured codes from activation/open/load/dispose/prompt failures.
+    const code = structuredErrorCode(err) ?? registry.get(endpointKey)?.errorCode;
+    if (code) currentResult.errorCode = code;
     applyTerminalStatus(currentResult);
     return currentResult;
   } finally {

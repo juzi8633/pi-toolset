@@ -29,11 +29,26 @@ export interface UnitExecutionContext {
   resumeCapability: ResumeCapability;
   effectiveCwd: string;
   sessionFile?: string;
+  /**
+   * ACP protocol session ID for `runtime: "grok-acp"` units.
+   * Protocol identity only — never a private Grok session-file path.
+   */
+  acpSessionId?: string;
+  /**
+   * Pi original-prompt establishment flag mirrored from the durable unit.
+   * `false` = session path stamped but original prompt not yet accepted.
+   */
+  sessionPromptEstablished?: boolean;
   worktreePath?: string;
   /** Directory for native Pi session files (<runDir>/sessions). Undefined when persistence is inactive. */
   sessionsDir?: string;
   /** 1-based attempt number; the coordinator increments it on resume. */
   attempt: number;
+  /**
+   * True when the durable unit is never-started (`queued`|`skipped` with empty
+   * attempts). Used so a planned session path cannot flip resumeHadStoredSession.
+   */
+  neverStarted?: boolean;
   /** One-based chain step number; immutable once the unit is created. */
   step?: number;
   /** Zero-based fanout item index within a chain fanout step. */
@@ -192,7 +207,24 @@ export function agentFingerprint(agent: AgentConfig): string {
 
 /** Resolve the resume capability for a runtime. */
 export function resumeCapabilityForRuntime(runtime: Runtime | undefined): ResumeCapability {
-  return runtime === GROK_RUNTIME || runtime === GROK_ACP_RUNTIME ? 'replay' : 'session';
+  // Plain Grok streaming-json is replay-only. Grok ACP uses native session/load.
+  return runtime === GROK_RUNTIME ? 'replay' : 'session';
+}
+
+/**
+ * Whether a unit requires allowReplay acknowledgement for resume.
+ * Uses the unit's effective runtime rather than a legacy stored capability label,
+ * so a legacy Grok ACP unit stored as `capability: "replay"` cannot be replayed.
+ */
+export function unitRequiresReplayAcknowledgement(unit: {
+  runtime?: Runtime;
+  capability?: ResumeCapability;
+}): boolean {
+  const runtime = unit.runtime;
+  if (runtime === GROK_RUNTIME) return true;
+  if (runtime === GROK_ACP_RUNTIME) return false;
+  // Unknown/legacy: honor stored capability only for non-ACP runtimes.
+  return unit.capability === 'replay';
 }
 
 /** Aggregate per-unit capabilities into a single run-level capability label. */
@@ -216,6 +248,7 @@ export function createUnitRecord(ctx: UnitExecutionContext, _now: number): RunUn
     attempt: ctx.attempt,
     attempts: [],
     sessionFile: ctx.sessionFile,
+    ...(ctx.acpSessionId !== undefined ? { acpSessionId: ctx.acpSessionId } : {}),
     effectiveCwd: ctx.effectiveCwd,
     worktreePath: ctx.worktreePath,
     ...(ctx.step !== undefined ? { step: ctx.step } : {}),
@@ -237,6 +270,7 @@ function emptyResultForUnit(ctx: UnitExecutionContext): SingleResult {
     unitId: ctx.unitId,
     attempt: ctx.attempt,
     sessionFile: ctx.sessionFile,
+    ...(ctx.acpSessionId !== undefined ? { acpSessionId: ctx.acpSessionId } : {}),
     resumeCapability: ctx.resumeCapability,
   };
 }
@@ -250,6 +284,9 @@ export function stampResultMetadata(result: SingleResult, ctx: UnitExecutionCont
   result.unitId = ctx.unitId;
   result.attempt = ctx.attempt;
   result.sessionFile = ctx.sessionFile;
+  if (ctx.acpSessionId !== undefined) {
+    result.acpSessionId = ctx.acpSessionId;
+  }
   result.resumeCapability = ctx.resumeCapability;
   void emptyResultForUnit;
 }
@@ -338,8 +375,12 @@ export interface RunCoordinator {
    * are idempotent; conflicting expansions throw `fanout_state_conflict`.
    */
   expandFanout(runId: string, input: FanoutExpansionInput): Promise<WorkflowFanoutState>;
-  /** Mark a unit as started for the current attempt. Marks empty results + flushes. */
-  startUnit(runId: string, ctx: UnitExecutionContext, result?: SingleResult): void;
+  /**
+   * Mark a unit as started for the current attempt. Awaits unit_started event +
+   * durable attempt write so stamp/register cannot run before attempted state is
+   * recoverable after a crash.
+   */
+  startUnit(runId: string, ctx: UnitExecutionContext, result?: SingleResult): Promise<void>;
   /** Mark a unit's terminal state for its current attempt. Preserves attempt history. */
   finishUnit(
     runId: string,
@@ -379,6 +420,38 @@ export interface RunCoordinator {
     unitId: string;
     binding: InteractiveAgentBindingV1;
   }): Promise<void>;
+  /**
+   * Strict awaited write of a Grok ACP protocol session ID. Disk-first on the
+   * shared durable queue; does not cancel pending coalesced timers so ordinary
+   * live updates still flush afterward. Same-ID is idempotent; rejects a
+   * conflicting existing ID. On first successful write for a legacy never-started
+   * Grok ACP unit stored as `capability: "replay"`, normalizes capability to `session`.
+   */
+  persistAcpSessionId(input: { runId: string; unitId: string; sessionId: string }): Promise<void>;
+  /**
+   * Strict awaited first-write of a Pi unit sessionFile. Disk-first CAS on the
+   * shared durable queue; does not cancel pending coalesced timers. Same path is
+   * idempotent; a different existing path throws `session_file_conflict`. Full
+   * merge never accepts a live-only sessionFile when disk has none — this is the
+   * only legal establishment path for a first session path.
+   */
+  persistSessionFile(input: { runId: string; unitId: string; sessionFile: string }): Promise<void>;
+  /**
+   * Strict awaited mark that Pi accepted the unit's original prompt.
+   * Disk-first; write failure must fail-close the current execution.
+   */
+  persistSessionPromptEstablished(input: { runId: string; unitId: string }): Promise<void>;
+  /**
+   * Strict awaited write of continuation delivery progress for a unit.
+   * Does not cancel pending coalesced timers. Used by Grok ACP after the matching
+   * prompt response (never from dispatch accept).
+   */
+  persistContinuationDelivery(input: {
+    runId: string;
+    unitId: string;
+    deliveredCount: number;
+    continuationTasks?: string[];
+  }): Promise<void>;
 }
 
 export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordinator {
@@ -389,6 +462,28 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
   const active = new Map<string, AgentRunRecordV1>();
   const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const lastPersist = new Map<string, number>();
+  /**
+   * Per-run serial queue for all durable writes (strict field updates, live
+   * commit, coalesced/full flush). Prevents a full snapshot flush from running
+   * between a strict disk write and its live mirror and wiping bindings/session.
+   */
+  const durableWriteTails = new Map<string, Promise<unknown>>();
+
+  function enqueueDurableWrite<T>(runId: string, work: () => Promise<T>): Promise<T> {
+    const prev = durableWriteTails.get(runId) ?? Promise.resolve();
+    const next = prev.then(
+      () => work(),
+      () => work()
+    );
+    durableWriteTails.set(
+      runId,
+      next.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return next;
+  }
 
   function registerRun(runId: string, record: AgentRunRecordV1): void {
     active.set(runId, record);
@@ -402,42 +497,338 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
       pendingTimers.delete(runId);
     }
     lastPersist.delete(runId);
+    // Keep durableWriteTails so late non-active persist/finalize stay serial
+    // with any in-flight queue work after the run leaves the active map.
   }
 
   function isActive(runId: string): boolean {
     return active.has(runId);
   }
 
-  function writeRun(runId: string): Promise<void> {
-    return store
-      .updateRun(runId, (record) => {
-        const live = active.get(runId);
-        if (live) {
-          // Copy authoritative in-memory fields back over the durable record.
-          record.status = live.status;
-          record.details = live.details;
-          record.units = live.units;
-          // Preserve expansion mappings written by expandFanout.
-          if (live.workflowState !== undefined) {
-            record.workflowState = live.workflowState;
-          }
-          // Preserve continuation delivery progress written during resume.
-          if (live.continuationTasks !== undefined) {
-            record.continuationTasks = live.continuationTasks;
-          }
-          if (live.continuationDelivery !== undefined) {
-            record.continuationDelivery = live.continuationDelivery;
-          }
-          record.updatedAt = now();
+  /**
+   * Disk-first append-only/prefix merge for continuationTasks.
+   * When either side is a prefix of the other, take the longer list without
+   * rewriting existing items. Incompatible content keeps disk and sets
+   * `compatible: false` so callers ignore live continuationDelivery.
+   */
+  function mergeContinuationTasks(
+    disk: string[] | undefined,
+    live: string[] | undefined
+  ): { tasks: string[] | undefined; compatible: boolean } {
+    if (live === undefined) return { tasks: disk, compatible: true };
+    if (disk === undefined) return { tasks: live, compatible: true };
+    const diskIsPrefix = disk.every((t, i) => live[i] === t);
+    const liveIsPrefix = live.every((t, i) => disk[i] === t);
+    if (diskIsPrefix) {
+      return { tasks: live.length >= disk.length ? live : disk, compatible: true };
+    }
+    if (liveIsPrefix) return { tasks: disk, compatible: true };
+    // Incompatible content: disk wins (strict conflict — do not apply live).
+    return { tasks: disk, compatible: false };
+  }
+
+  /**
+   * Full persist/finalize workflowState merge: disk is sole authority.
+   * Live must never introduce fanout keys; only `expandFanout` may add mapping.
+   */
+  function mergeWorkflowState(
+    disk: AgentRunRecordV1['workflowState'],
+    _live: AgentRunRecordV1['workflowState']
+  ): AgentRunRecordV1['workflowState'] {
+    return disk;
+  }
+
+  /** Unit ids that are children of any committed disk fanout expansion. */
+  function diskFanoutChildIds(record: AgentRunRecordV1): Set<string> {
+    const ids = new Set<string>();
+    for (const expansion of Object.values(record.workflowState?.fanouts ?? {})) {
+      for (const id of expansion.unitIds) ids.add(id);
+    }
+    return ids;
+  }
+
+  /**
+   * Mirror disk-authoritative slices (fanout mapping/child identity, unit
+   * identity, nested result identity, continuation) back onto live after a
+   * merge so stale live cannot re-pollute later flushes.
+   * ACP/session/capability/attempt use precise set-or-delete from the
+   * post-merge record (never leave a live-only stale identity field).
+   */
+  function mirrorAuthoritativeToLive(record: AgentRunRecordV1, live: AgentRunRecordV1): void {
+    if (live === record) return;
+    live.workflowState = record.workflowState
+      ? {
+          fanouts: Object.fromEntries(
+            Object.entries(record.workflowState.fanouts).map(([k, v]) => [
+              k,
+              { step: v.step, items: v.items.slice(), unitIds: v.unitIds.slice() },
+            ])
+          ),
         }
-      })
-      .then(
-        () => undefined,
-        () => {
-          // Persistence failure is reported elsewhere; swallow here to avoid
-          // unhandled rejections from coalesced timers.
+      : undefined;
+    const fanoutChildren = diskFanoutChildIds(record);
+    for (const [id, diskUnit] of Object.entries(record.units)) {
+      const liveUnit = live.units[id];
+      if (!liveUnit) {
+        // Only materialize missing fanout children that exist on disk.
+        if (fanoutChildren.has(id)) {
+          live.units[id] = {
+            ...diskUnit,
+            unitId: id,
+            attempts: diskUnit.attempts.map((a) => ({ ...a })),
+          };
         }
+        continue;
+      }
+      // Immutable identity + canonical session/capability/attempt from post-merge.
+      liveUnit.unitId = id;
+      liveUnit.agent = diskUnit.agent;
+      liveUnit.agentFingerprint = diskUnit.agentFingerprint;
+      liveUnit.runtime = diskUnit.runtime;
+      liveUnit.step = diskUnit.step;
+      liveUnit.fanoutIndex = diskUnit.fanoutIndex;
+      liveUnit.effectiveCwd = diskUnit.effectiveCwd;
+      liveUnit.attempt = diskUnit.attempt;
+      liveUnit.capability = diskUnit.capability;
+      if (diskUnit.acpSessionId !== undefined && diskUnit.acpSessionId !== '') {
+        liveUnit.acpSessionId = diskUnit.acpSessionId;
+      } else {
+        delete liveUnit.acpSessionId;
+      }
+      // sessionFile: exact set/delete from disk for every runtime.
+      if (diskUnit.sessionFile !== undefined) {
+        liveUnit.sessionFile = diskUnit.sessionFile;
+      } else {
+        delete liveUnit.sessionFile;
+      }
+      // sessionPromptEstablished: exact set/delete from disk.
+      if (diskUnit.sessionPromptEstablished !== undefined) {
+        liveUnit.sessionPromptEstablished = diskUnit.sessionPromptEstablished;
+      } else {
+        delete liveUnit.sessionPromptEstablished;
+      }
+      if (diskUnit.result) {
+        if (!liveUnit.result) {
+          liveUnit.result = { ...diskUnit.result };
+        } else {
+          liveUnit.result.runId = diskUnit.result.runId;
+          liveUnit.result.unitId = diskUnit.result.unitId;
+          liveUnit.result.attempt = diskUnit.result.attempt;
+          liveUnit.result.sessionFile = diskUnit.sessionFile;
+          if (diskUnit.sessionFile === undefined) {
+            delete liveUnit.result.sessionFile;
+          }
+          if (diskUnit.acpSessionId !== undefined && diskUnit.acpSessionId !== '') {
+            liveUnit.result.acpSessionId = diskUnit.acpSessionId;
+          } else {
+            delete liveUnit.result.acpSessionId;
+          }
+          liveUnit.result.resumeCapability = diskUnit.capability;
+        }
+      }
+    }
+    // Drop mapped-but-missing children and every live-only unit (full merge
+    // never admits new units; only expandFanout may add children).
+    for (const id of fanoutChildren) {
+      if (!record.units[id]) delete live.units[id];
+    }
+    for (const id of Object.keys(live.units)) {
+      if (!record.units[id]) delete live.units[id];
+    }
+    live.continuationTasks = record.continuationTasks ? [...record.continuationTasks] : undefined;
+    if (record.continuationDelivery) {
+      live.continuationDelivery = Object.fromEntries(
+        Object.entries(record.continuationDelivery).map(([uid, d]) => [
+          uid,
+          { deliveredCount: d.deliveredCount },
+        ])
       );
+    } else {
+      live.continuationDelivery = undefined;
+    }
+  }
+
+  /**
+   * Merge live snapshot into the latest disk record without wiping durable
+   * field-level writes (bindings, acpSessionId, continuation delivery, fanout
+   * mapping/child identity) that may still be authoritative on disk if live
+   * lagged — defensive under the shared serial queue.
+   *
+   * Strict fields already present on disk win on conflict; live must never
+   * downgrade them. Nested result identity is re-stamped from the canonical
+   * unit/record after ordinary terminal/output field merge.
+   */
+  function mergeLiveIntoRecord(record: AgentRunRecordV1, live: AgentRunRecordV1): void {
+    // Ordinary run status/details may advance from live.
+    record.status = live.status;
+    record.details = live.details;
+
+    // Fanout mapping: disk is sole authority (never add keys from live).
+    const diskFanoutsBefore = record.workflowState;
+    record.workflowState = mergeWorkflowState(diskFanoutsBefore, live.workflowState);
+
+    const mergedUnits: Record<string, RunUnitRecord> = {};
+    const unitIds = new Set([...Object.keys(live.units), ...Object.keys(record.units)]);
+    for (const id of unitIds) {
+      const liveUnit = live.units[id];
+      const diskUnit = record.units[id];
+      if (liveUnit) {
+        // Full merge never admits new units. Only expandFanout may add children
+        // (including units that happen to use a canonical fanout id without a mapping).
+        if (!diskUnit) {
+          continue;
+        }
+        const unit: RunUnitRecord = { ...liveUnit };
+        // Immutable unit identity is disk/canonical-map-key authoritative.
+        unit.unitId = id;
+        unit.agent = diskUnit.agent;
+        unit.agentFingerprint = diskUnit.agentFingerprint;
+        unit.runtime = diskUnit.runtime;
+        unit.step = diskUnit.step;
+        unit.fanoutIndex = diskUnit.fanoutIndex;
+        unit.effectiveCwd = diskUnit.effectiveCwd;
+        // Attempt + capability: disk is sole authority on full persist/finalize.
+        unit.attempt = diskUnit.attempt;
+        unit.capability = diskUnit.capability;
+        // ACP id: exact set/delete from disk — never write back a live-only stale id.
+        if (diskUnit.acpSessionId !== undefined && diskUnit.acpSessionId !== '') {
+          unit.acpSessionId = diskUnit.acpSessionId;
+        } else {
+          delete unit.acpSessionId;
+        }
+        // sessionFile: exact set/delete from disk for every runtime. Live must
+        // never introduce a first path via full merge — use persistSessionFile.
+        if (diskUnit.sessionFile !== undefined) {
+          unit.sessionFile = diskUnit.sessionFile;
+        } else {
+          delete unit.sessionFile;
+        }
+        // sessionPromptEstablished: disk is sole authority (strict write only).
+        if (diskUnit.sessionPromptEstablished !== undefined) {
+          unit.sessionPromptEstablished = diskUnit.sessionPromptEstablished;
+        } else {
+          delete unit.sessionPromptEstablished;
+        }
+        // interactiveBindings: disk entries win on id conflict; live may only add.
+        if (diskUnit.interactiveBindings || liveUnit.interactiveBindings) {
+          const merged: NonNullable<RunUnitRecord['interactiveBindings']> = {
+            ...(diskUnit.interactiveBindings ?? {}),
+          };
+          for (const [bid, b] of Object.entries(liveUnit.interactiveBindings ?? {})) {
+            const existing = merged[bid];
+            if (existing) {
+              // Conflict: keep disk; live must not overwrite a different binding.
+              if (
+                existing.bindingId !== b.bindingId ||
+                existing.hostSessionId !== b.hostSessionId ||
+                existing.createdAt !== b.createdAt
+              ) {
+                continue;
+              }
+            } else {
+              merged[bid] = b;
+            }
+          }
+          unit.interactiveBindings = merged;
+        }
+        // Result: live missing keeps disk; both present field-merge ordinary
+        // terminal/output fields, then re-stamp durable identity from unit/record.
+        if (!liveUnit.result) {
+          if (diskUnit.result) unit.result = diskUnit.result;
+        } else if (diskUnit.result) {
+          unit.result = { ...diskUnit.result, ...liveUnit.result };
+        } else {
+          unit.result = liveUnit.result;
+        }
+        // Re-stamp durable identity from the canonical unit/map key so stale live
+        // cannot overwrite runId/unitId/attempt/sessionFile/acpSessionId/capability.
+        if (unit.result) {
+          const nextResult = { ...unit.result };
+          nextResult.runId = record.runId;
+          nextResult.unitId = id;
+          nextResult.attempt = unit.attempt;
+          if (unit.sessionFile !== undefined) {
+            nextResult.sessionFile = unit.sessionFile;
+          } else {
+            delete nextResult.sessionFile;
+          }
+          // Canonical unit session id is authoritative: set or clear unconditionally.
+          if (unit.acpSessionId !== undefined && unit.acpSessionId !== '') {
+            nextResult.acpSessionId = unit.acpSessionId;
+          } else {
+            delete nextResult.acpSessionId;
+          }
+          // Canonical unit capability is authoritative for nested resumeCapability.
+          nextResult.resumeCapability = unit.capability;
+          unit.result = nextResult;
+        }
+        mergedUnits[id] = unit;
+      } else if (diskUnit) {
+        // Keep disk-only units (do not wipe peers), including fanout children.
+        // Never fill a disk mapping target from live when the disk unit is absent.
+        mergedUnits[id] = diskUnit;
+      }
+    }
+    record.units = mergedUnits;
+
+    // continuationTasks: disk-first append-only/prefix; take longer compatible list.
+    const tasksMerge = mergeContinuationTasks(record.continuationTasks, live.continuationTasks);
+    record.continuationTasks = tasksMerge.tasks;
+    // continuationDelivery: only merge live when tasks are compatible append-only.
+    // Incompatible → ignore live delivery entirely; keep disk tasks+delivery.
+    if (!tasksMerge.compatible) {
+      const tasksLen = (record.continuationTasks ?? []).length;
+      if (record.continuationDelivery) {
+        const kept: NonNullable<AgentRunRecordV1['continuationDelivery']> = {};
+        for (const [uid, d] of Object.entries(record.continuationDelivery)) {
+          if (!mergedUnits[uid]) continue;
+          kept[uid] = { deliveredCount: Math.min(d.deliveredCount, tasksLen) };
+        }
+        record.continuationDelivery = Object.keys(kept).length > 0 ? kept : undefined;
+      }
+    } else if (live.continuationDelivery || record.continuationDelivery) {
+      const tasksLen = (record.continuationTasks ?? []).length;
+      const merged: NonNullable<AgentRunRecordV1['continuationDelivery']> = {};
+      for (const [uid, d] of Object.entries(record.continuationDelivery ?? {})) {
+        if (!mergedUnits[uid]) continue;
+        merged[uid] = {
+          deliveredCount: Math.min(d.deliveredCount, tasksLen),
+        };
+      }
+      for (const [uid, d] of Object.entries(live.continuationDelivery ?? {})) {
+        if (!mergedUnits[uid]) continue;
+        const existing = merged[uid]?.deliveredCount ?? 0;
+        const next = Math.min(d.deliveredCount, tasksLen);
+        if (next >= existing) merged[uid] = { deliveredCount: next };
+      }
+      record.continuationDelivery = Object.keys(merged).length > 0 ? merged : undefined;
+    }
+    if (live.finishedAt !== undefined) record.finishedAt = live.finishedAt;
+    if (live.lastError !== undefined) record.lastError = live.lastError;
+    // startedAt: disk keeps the first value; live may fill only when disk is missing.
+    if (record.startedAt === undefined && live.startedAt !== undefined) {
+      record.startedAt = live.startedAt;
+    }
+    record.updatedAt = now();
+
+    // Correct stale live so a later flush cannot re-apply rejected fanout/continuation.
+    mirrorAuthoritativeToLive(record, live);
+  }
+
+  function writeRun(runId: string): Promise<void> {
+    return enqueueDurableWrite(runId, async () => {
+      try {
+        await store.updateRun(runId, (record) => {
+          const live = active.get(runId);
+          if (live) {
+            mergeLiveIntoRecord(record, live);
+          }
+        });
+      } catch {
+        // Persistence failure is reported elsewhere; swallow here to avoid
+        // unhandled rejections from coalesced timers.
+      }
+    });
   }
 
   function cancelPendingTimer(runId: string): void {
@@ -462,8 +853,9 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     runId: string,
     input: FanoutExpansionInput
   ): Promise<WorkflowFanoutState> {
-    const live = active.get(runId);
-    if (!live) {
+    // Fast pre-check only: all idempotence/conflict/collision decisions re-run
+    // inside the durable queue against the latest live + disk records.
+    if (!active.has(runId)) {
       throw new Error(`fanout_state_conflict: run ${runId} is not active`);
     }
 
@@ -474,101 +866,346 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
       items: input.items,
       unitIds,
     };
+    const fingerprint = agentFingerprint(input.agent);
+    const expectedRuntime = input.runtime ?? DEFAULT_RUNTIME;
 
-    const existing = live.workflowState?.fanouts?.[fanoutKey];
-    if (existing) {
-      if (!fanoutStateEqual(existing, expansion)) {
-        throw new Error(
-          `fanout_state_conflict: step ${input.step} already expanded with different items`
-        );
+    /**
+     * Compare full worker identity (agent/fingerprint/runtime/cwd + child mapping).
+     * Mapping-only equality is not enough: a different agent/cwd must conflict.
+     */
+    const childIdentityMatches = (unit: RunUnitRecord, fanoutIndex: number): boolean => {
+      return (
+        unit.step === input.step &&
+        unit.fanoutIndex === fanoutIndex &&
+        unit.agent === input.agent.name &&
+        unit.agentFingerprint === fingerprint &&
+        (unit.runtime ?? DEFAULT_RUNTIME) === expectedRuntime &&
+        unit.effectiveCwd === input.effectiveCwd
+      );
+    };
+
+    /**
+     * Re-check idempotence / conflict / child collision on the latest record
+     * (live and disk, both inside the durable queue). Any mutation is refused
+     * when a different expansion or worker identity already committed.
+     */
+    const evaluateExpansion = (
+      record: AgentRunRecordV1
+    ):
+      | { kind: 'idempotent'; existing: WorkflowFanoutState }
+      | { kind: 'conflict'; message: string }
+      | { kind: 'expand' } => {
+      const existing = record.workflowState?.fanouts?.[fanoutKey];
+      if (existing) {
+        if (!fanoutStateEqual(existing, expansion)) {
+          return {
+            kind: 'conflict',
+            message: `fanout_state_conflict: step ${input.step} already expanded with different items`,
+          };
+        }
+        for (let i = 0; i < unitIds.length; i++) {
+          const id = unitIds[i]!;
+          const unit = record.units[id];
+          if (!unit || !childIdentityMatches(unit, i)) {
+            return {
+              kind: 'conflict',
+              message: `fanout_state_conflict: step ${input.step} unit identity mismatch for ${id}`,
+            };
+          }
+        }
+        return { kind: 'idempotent', existing };
       }
-      // Idempotent: verify child units still match.
-      for (let i = 0; i < unitIds.length; i++) {
-        const id = unitIds[i]!;
-        const unit = live.units[id];
-        if (!unit || unit.step !== input.step || unit.fanoutIndex !== i) {
+      for (const id of unitIds) {
+        if (record.units[id] !== undefined) {
+          return {
+            kind: 'conflict',
+            message: `fanout_state_conflict: unit ${id} already exists`,
+          };
+        }
+      }
+      return { kind: 'expand' };
+    };
+
+    // Strict awaited write on the shared durable queue so concurrent expand
+    // calls and full snapshot flushes cannot interleave between decision and
+    // disk+live commit. Do not cancel pending coalesced timers — the durable
+    // queue serializes them after this write so ordinary live updates still land.
+    // All final idempotent/conflict/collision decisions use durable disk via
+    // updateRun; live is only mirrored after success. Stale live conflict must
+    // never fail the call before reading latest disk.
+    return enqueueDurableWrite(runId, async () => {
+      const live = active.get(runId);
+      if (!live) {
+        throw new Error(`fanout_state_conflict: run ${runId} is not active`);
+      }
+
+      const cloneUnit = (u: RunUnitRecord): RunUnitRecord => ({
+        ...u,
+        attempts: u.attempts.map((a) => ({ ...a })),
+      });
+
+      /**
+       * Capture this step's disk-authoritative mapping + existing children so a
+       * conflict path can precisely repair live (including "no mapping" cases).
+       * Attempt unit ids present on disk (collision) are captured even without a mapping.
+       */
+      const captureStepAuthority = (
+        diskRecord: AgentRunRecordV1
+      ): {
+        expansion: WorkflowFanoutState | undefined;
+        units: Record<string, RunUnitRecord>;
+      } => {
+        const existing = diskRecord.workflowState?.fanouts?.[fanoutKey];
+        const units: Record<string, RunUnitRecord> = {};
+        if (existing) {
+          for (const id of existing.unitIds) {
+            const u = diskRecord.units[id];
+            if (u) units[id] = cloneUnit(u);
+          }
+        }
+        // Collision / pre-existing units that share attempt ids must be restored.
+        for (const id of unitIds) {
+          if (!units[id] && diskRecord.units[id]) {
+            units[id] = cloneUnit(diskRecord.units[id]!);
+          }
+        }
+        return {
+          expansion: existing
+            ? {
+                step: existing.step,
+                items: existing.items.slice(),
+                unitIds: existing.unitIds.slice(),
+              }
+            : undefined,
+          units,
+        };
+      };
+
+      /**
+       * Fanout/canonical identity match between live and disk child units.
+       * When matched, preserve timer-unflushed mutable payload on live.
+       */
+      const fanoutChildIdentityMatches = (a: RunUnitRecord, b: RunUnitRecord): boolean => {
+        return (
+          a.agent === b.agent &&
+          a.agentFingerprint === b.agentFingerprint &&
+          (a.runtime ?? DEFAULT_RUNTIME) === (b.runtime ?? DEFAULT_RUNTIME) &&
+          a.effectiveCwd === b.effectiveCwd &&
+          a.step === b.step &&
+          a.fanoutIndex === b.fanoutIndex
+        );
+      };
+
+      /**
+       * Stamp disk canonical/strict/fanout identity onto an existing live child
+       * without replacing ordinary mutable status/result/messages/attempts.
+       */
+      const applyDiskIdentityToLiveChild = (
+        liveUnit: RunUnitRecord,
+        diskUnit: RunUnitRecord,
+        id: string
+      ): void => {
+        liveUnit.unitId = id;
+        liveUnit.agent = diskUnit.agent;
+        liveUnit.agentFingerprint = diskUnit.agentFingerprint;
+        liveUnit.runtime = diskUnit.runtime;
+        liveUnit.step = diskUnit.step;
+        liveUnit.fanoutIndex = diskUnit.fanoutIndex;
+        liveUnit.effectiveCwd = diskUnit.effectiveCwd;
+        liveUnit.attempt = diskUnit.attempt;
+        liveUnit.capability = diskUnit.capability;
+        if (diskUnit.sessionFile !== undefined) {
+          liveUnit.sessionFile = diskUnit.sessionFile;
+        } else {
+          delete liveUnit.sessionFile;
+        }
+        if (diskUnit.acpSessionId !== undefined && diskUnit.acpSessionId !== '') {
+          liveUnit.acpSessionId = diskUnit.acpSessionId;
+        } else {
+          delete liveUnit.acpSessionId;
+        }
+        if (diskUnit.sessionPromptEstablished !== undefined) {
+          liveUnit.sessionPromptEstablished = diskUnit.sessionPromptEstablished;
+        } else {
+          delete liveUnit.sessionPromptEstablished;
+        }
+        if (liveUnit.result) {
+          liveUnit.result.runId = live.runId;
+          liveUnit.result.unitId = id;
+          liveUnit.result.attempt = liveUnit.attempt;
+          if (liveUnit.sessionFile !== undefined) {
+            liveUnit.result.sessionFile = liveUnit.sessionFile;
+          } else {
+            delete liveUnit.result.sessionFile;
+          }
+          if (liveUnit.acpSessionId !== undefined && liveUnit.acpSessionId !== '') {
+            liveUnit.result.acpSessionId = liveUnit.acpSessionId;
+          } else {
+            delete liveUnit.result.acpSessionId;
+          }
+          liveUnit.result.resumeCapability = liveUnit.capability;
+        }
+      };
+
+      /**
+       * Precise step mirror: restore disk mapping/children; delete live-only
+       * mapping for this step and this attempt's live-only children. Never fill
+       * a disk mapping target from live when the disk unit is absent.
+       * Identity-matched live children keep unflushed mutable payload.
+       */
+      const mirrorStepAuthorityToLive = (captured: {
+        expansion: WorkflowFanoutState | undefined;
+        units: Record<string, RunUnitRecord>;
+      }): WorkflowFanoutState | undefined => {
+        if (captured.expansion) {
+          if (!live.workflowState) live.workflowState = { fanouts: {} };
+          live.workflowState.fanouts[fanoutKey] = {
+            step: captured.expansion.step,
+            items: captured.expansion.items.slice(),
+            unitIds: captured.expansion.unitIds.slice(),
+          };
+        } else if (live.workflowState?.fanouts) {
+          delete live.workflowState.fanouts[fanoutKey];
+          if (Object.keys(live.workflowState.fanouts).length === 0) {
+            live.workflowState = undefined;
+          }
+        }
+
+        const diskMappedIds = new Set(captured.expansion?.unitIds ?? []);
+        // Drop this attempt's live-only children (not present on disk capture).
+        for (const id of unitIds) {
+          if (!captured.units[id]) delete live.units[id];
+        }
+        // Drop other live-only fanout children for this step, and mapped-but-missing targets.
+        for (const [id, liveUnit] of Object.entries(live.units)) {
+          if (captured.units[id]) continue;
+          if (diskMappedIds.has(id)) {
+            delete live.units[id];
+            continue;
+          }
+          if (liveUnit.step === input.step && liveUnit.fanoutIndex !== undefined) {
+            delete live.units[id];
+          }
+        }
+
+        for (const [id, diskUnit] of Object.entries(captured.units)) {
+          const existing = live.units[id];
+          if (existing && fanoutChildIdentityMatches(existing, diskUnit)) {
+            applyDiskIdentityToLiveChild(existing, diskUnit, id);
+          } else {
+            live.units[id] = cloneUnit({ ...diskUnit, unitId: id });
+          }
+        }
+
+        live.updatedAt = now();
+        lastPersist.set(runId, now());
+        return captured.expansion;
+      };
+
+      // Optional fast path: live already matches request → recheck disk only.
+      // Stale live (conflict / expand / wrong identity) falls through to disk.
+      const liveDecision = evaluateExpansion(live);
+      if (liveDecision.kind === 'idempotent') {
+        const loaded = store.getRun(runId);
+        if (!loaded.ok) {
           throw new Error(
-            `fanout_state_conflict: step ${input.step} unit mapping mismatch for ${id}`
+            `fanout_state_conflict: cannot revalidate disk for run ${runId}: ${loaded.error.message}`
           );
         }
-      }
-      return existing;
-    }
-
-    // Reject collisions with non-fanout units already registered under a child id.
-    for (const id of unitIds) {
-      if (live.units[id] !== undefined) {
-        throw new Error(`fanout_state_conflict: unit ${id} already exists`);
-      }
-    }
-
-    const fingerprint = agentFingerprint(input.agent);
-    const capability = resumeCapabilityForRuntime(input.runtime);
-    const childUnits: Record<string, RunUnitRecord> = {};
-    for (let i = 0; i < unitIds.length; i++) {
-      const unitId = unitIds[i]!;
-      const ctx: UnitExecutionContext = {
-        runId,
-        unitId,
-        agent: input.agent.name,
-        runtime: input.runtime,
-        resumeCapability: capability,
-        effectiveCwd: input.effectiveCwd,
-        attempt: 1,
-        step: input.step,
-        fanoutIndex: i,
-      };
-      const unit = createUnitRecord(ctx, now());
-      unit.agentFingerprint = fingerprint;
-      childUnits[unitId] = unit;
-    }
-
-    // Strict awaited write: cancel coalesced timers and surface failures.
-    // Mutate the store record inside updateRun; after success, ensure the live
-    // units object (often the same reference) carries the children without
-    // replacing the shared object held by StartedRun / lifecycle hooks.
-    cancelPendingTimer(runId);
-    try {
-      await store.updateRun(runId, (record) => {
-        for (const [id, unit] of Object.entries(childUnits)) {
-          record.units[id] = unit;
+        const diskRecord = loaded.loaded.record;
+        const diskDecision = evaluateExpansion(diskRecord);
+        if (diskDecision.kind === 'conflict') {
+          mirrorStepAuthorityToLive(captureStepAuthority(diskRecord));
+          throw new Error(diskDecision.message);
         }
-        record.workflowState = {
-          fanouts: {
-            ...(record.workflowState?.fanouts ?? {}),
-            [fanoutKey]: expansion,
-          },
+        if (diskDecision.kind === 'idempotent') {
+          const mirrored = mirrorStepAuthorityToLive(captureStepAuthority(diskRecord));
+          return mirrored ?? diskDecision.existing;
+        }
+        // Disk missing expansion while live has it — fall through to durable write.
+      }
+
+      const capability = resumeCapabilityForRuntime(input.runtime);
+      const childUnits: Record<string, RunUnitRecord> = {};
+      for (let i = 0; i < unitIds.length; i++) {
+        const unitId = unitIds[i]!;
+        const ctx: UnitExecutionContext = {
+          runId,
+          unitId,
+          agent: input.agent.name,
+          runtime: input.runtime,
+          resumeCapability: capability,
+          effectiveCwd: input.effectiveCwd,
+          attempt: 1,
+          step: input.step,
+          fanoutIndex: i,
         };
-        record.updatedAt = now();
-      });
-    } catch (err) {
-      // If the store mutated before failing the write and shares our units
-      // object, roll back the child keys so live state stays clean.
-      for (const id of unitIds) {
-        if (live.units[id] !== undefined && childUnits[id] !== undefined) {
-          delete live.units[id];
+        const unit = createUnitRecord(ctx, now());
+        unit.agentFingerprint = fingerprint;
+        childUnits[unitId] = unit;
+      }
+
+      /** When disk is already idempotent, mirror those children onto live — never B's units. */
+      let diskMirror:
+        | { expansion: WorkflowFanoutState | undefined; units: Record<string, RunUnitRecord> }
+        | undefined;
+      /** On conflict, mirror latest disk step authority (including no-mapping collision). */
+      let conflictMirror:
+        | { expansion: WorkflowFanoutState | undefined; units: Record<string, RunUnitRecord> }
+        | undefined;
+
+      try {
+        await store.updateRun(runId, (record) => {
+          // Always decide against the latest disk record before any write.
+          const diskDecision = evaluateExpansion(record);
+          if (diskDecision.kind === 'idempotent') {
+            diskMirror = captureStepAuthority(record);
+            return;
+          }
+          if (diskDecision.kind === 'conflict') {
+            conflictMirror = captureStepAuthority(record);
+            throw new Error(diskDecision.message);
+          }
+          for (const [id, unit] of Object.entries(childUnits)) {
+            record.units[id] = unit;
+          }
+          record.workflowState = {
+            fanouts: {
+              ...(record.workflowState?.fanouts ?? {}),
+              [fanoutKey]: expansion,
+            },
+          };
+          record.updatedAt = now();
+        });
+      } catch (err) {
+        // Conflict: precise mirror of disk step authority before rethrow.
+        if (conflictMirror) {
+          mirrorStepAuthorityToLive(conflictMirror);
+        }
+        throw err;
+      }
+
+      // Disk idempotent path: mirror disk children onto live (do not install B units).
+      if (diskMirror) {
+        const mirrored = mirrorStepAuthorityToLive(diskMirror);
+        return mirrored ?? diskMirror.expansion!;
+      }
+
+      // Persist succeeded: ensure live units/workflowState are populated in place.
+      for (const [id, unit] of Object.entries(childUnits)) {
+        if (live.units[id] !== unit) {
+          live.units[id] = unit;
         }
       }
-      if (live.workflowState?.fanouts?.[fanoutKey] === expansion) {
-        delete live.workflowState.fanouts[fanoutKey];
+      if (!live.workflowState) {
+        live.workflowState = { fanouts: {} };
       }
-      throw err;
-    }
+      live.workflowState.fanouts[fanoutKey] = expansion;
+      live.updatedAt = now();
+      lastPersist.set(runId, now());
 
-    // Persist succeeded: ensure live units/workflowState are populated in place.
-    for (const [id, unit] of Object.entries(childUnits)) {
-      if (live.units[id] !== unit) {
-        live.units[id] = unit;
-      }
-    }
-    if (!live.workflowState) {
-      live.workflowState = { fanouts: {} };
-    }
-    live.workflowState.fanouts[fanoutKey] = expansion;
-    live.updatedAt = now();
-    lastPersist.set(runId, now());
-
-    return expansion;
+      return expansion;
+    });
   }
 
   function persist(input: PersistUpdateInput): void {
@@ -587,17 +1224,28 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
       if (input.mutate) input.mutate(live);
       live.updatedAt = now();
     } else {
-      // No active registration: apply directly through the store as a fallback.
-      store
-        .updateRun(runId, (record) => {
-          record.details = input.details;
-          record.units = input.units;
-          record.updatedAt = now();
-          if (input.mutate) input.mutate(record);
-        })
-        .catch(() => {
+      // No active registration: still enter the shared durable queue and apply
+      // field-level disk-first merge so a late stale snapshot cannot erase
+      // bindings / acpSessionId / continuation delivery written by peers.
+      // Deep-clone the full incoming snapshot before mutate so workflowState /
+      // request / continuationDelivery / details / units never share disk refs.
+      // Mutate then only affects the clone; disk-authoritative merge admits
+      // ordinary/allowed fields (e.g. startedAt) only.
+      void enqueueDurableWrite(runId, async () => {
+        try {
+          await store.updateRun(runId, (record) => {
+            const incoming = structuredClone({
+              ...record,
+              details: input.details,
+              units: input.units,
+            });
+            if (input.mutate) input.mutate(incoming);
+            mergeLiveIntoRecord(record, incoming);
+          });
+        } catch {
           /* best-effort */
-        });
+        }
+      });
       return;
     }
 
@@ -629,43 +1277,52 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     return active.get(runId);
   }
 
-  function startUnit(runId: string, ctx: UnitExecutionContext, result?: SingleResult): void {
+  async function startUnit(
+    runId: string,
+    ctx: UnitExecutionContext,
+    result?: SingleResult
+  ): Promise<void> {
     if (result) {
       stampResultMetadata(result, ctx);
       result.status = 'running';
     }
     const live = ensureLiveRecord(runId);
-    if (live) {
-      const unit = live.units[ctx.unitId];
-      if (unit) {
-        unit.status = 'running';
-        unit.attempt = ctx.attempt;
-        unit.sessionFile = ctx.sessionFile;
-        unit.worktreePath = ctx.worktreePath;
-        // Record a running attempt so finishUnit can finalize it with real timestamps.
-        unit.attempts.push({
-          attempt: ctx.attempt,
-          status: 'running',
-          startedAt: now(),
-        });
-      }
-      void store
-        .appendEvent(runId, {
-          version: 1,
-          event: 'unit_started',
-          runId,
-          timestamp: now(),
-          unitId: ctx.unitId,
-          attempt: ctx.attempt,
-        })
-        .catch(() => {});
-      persist({
-        runId,
-        details: live.details,
-        units: live.units,
-        flushNow: true,
+    if (!live) return;
+    const unit = live.units[ctx.unitId];
+    if (unit) {
+      unit.status = 'running';
+      unit.attempt = ctx.attempt;
+      // sessionFile / acpSessionId identity: never write from ctx. Only strict
+      // persistence (persistSessionFile / persistAcpSessionId) may establish
+      // identity on the unit; full merge is disk-exact.
+      unit.worktreePath = ctx.worktreePath;
+      // Record a running attempt so finishUnit can finalize it with real timestamps.
+      unit.attempts.push({
+        attempt: ctx.attempt,
+        status: 'running',
+        startedAt: now(),
       });
     }
+    // Await durable unit_started + attempt history before callers stamp session
+    // paths or register interactive endpoints (crash-window safety).
+    await store.appendEvent(runId, {
+      version: 1,
+      event: 'unit_started',
+      runId,
+      timestamp: now(),
+      unitId: ctx.unitId,
+      attempt: ctx.attempt,
+    });
+    cancelPendingTimer(runId);
+    await enqueueDurableWrite(runId, async () => {
+      await store.updateRun(runId, (record) => {
+        const liveRec = active.get(runId);
+        if (liveRec) {
+          mergeLiveIntoRecord(record, liveRec);
+        }
+      });
+    });
+    lastPersist.set(runId, now());
   }
 
   function finishUnit(
@@ -694,6 +1351,33 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
           errorMessage: result.errorMessage,
         });
       }
+      // Canonical session identity is unit.sessionFile / unit.acpSessionId after
+      // strict first-write. Exact set-or-delete onto result + ctx so a stale ctx
+      // identity cannot survive when the unit has none or a different value.
+      // Never first-write identity onto the unit from ctx here.
+      const unitSession =
+        unit.sessionFile !== undefined && unit.sessionFile.trim() !== ''
+          ? unit.sessionFile
+          : undefined;
+      if (unitSession !== undefined) {
+        result.sessionFile = unitSession;
+        ctx.sessionFile = unitSession;
+      } else {
+        delete result.sessionFile;
+        delete ctx.sessionFile;
+      }
+      const unitAcp =
+        unit.acpSessionId !== undefined && unit.acpSessionId !== '' ? unit.acpSessionId : undefined;
+      if (unitAcp !== undefined) {
+        result.acpSessionId = unitAcp;
+        ctx.acpSessionId = unitAcp;
+      } else {
+        delete result.acpSessionId;
+        delete ctx.acpSessionId;
+      }
+      // Canonical unit capability is authoritative for nested/live resume labels.
+      result.resumeCapability = unit.capability;
+      ctx.resumeCapability = unit.capability;
       unit.status = finalStatus;
       unit.result = result;
     }
@@ -729,20 +1413,32 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
   ): Promise<void> {
     const live = active.get(runId);
     if (!live) {
-      // Still try to persist against the durable record for runs we didn't register.
-      try {
-        await store.updateRun(runId, (record) => {
-          record.details = details;
-          record.units = units;
-          record.finishedAt = now();
-          record.updatedAt = now();
-          const status = deriveRunStatus(units, details);
-          record.status = status;
-          if (options.lastError !== undefined) record.lastError = options.lastError;
-        });
-      } catch {
-        /* best-effort */
-      }
+      // Same durable queue + field-level disk-first merge as active full flush.
+      // A late finalize snapshot must not wipe bindings/acpSessionId/delivery.
+      // Deep-clone so merge/mirror cannot share workflowState/request refs with disk.
+      await enqueueDurableWrite(runId, async () => {
+        try {
+          await store.updateRun(runId, (record) => {
+            const snapshot = structuredClone({
+              ...record,
+              details,
+              units,
+            });
+            mergeLiveIntoRecord(record, snapshot);
+            record.finishedAt = now();
+            record.updatedAt = now();
+            let status: RunStatus;
+            if (options.cancelled) status = 'cancelled';
+            else if (options.interrupted) status = 'interrupted';
+            else if (options.success === false) status = 'failed';
+            else status = deriveRunStatus(record.units, record.details);
+            record.status = status;
+            if (options.lastError !== undefined) record.lastError = options.lastError;
+          });
+        } catch {
+          /* best-effort */
+        }
+      });
       return;
     }
     live.details = details;
@@ -787,9 +1483,13 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
   }
 
   /**
-   * Idempotently persist one interactive binding on a unit, then flush the run
-   * snapshot. Must succeed before the host-session link is appended. Existing
-   * Version 1 records without `interactiveBindings` remain valid.
+   * Idempotently persist one interactive binding on a unit with disk-first
+   * strict flush. Must succeed before the host-session link is appended.
+   * Field-level merge runs inside RunStore's serial `updateRun` callback on the
+   * latest disk record; live state is mutated only after the atomic disk write
+   * succeeds. On failure neither live nor disk change, and no coalesced flush
+   * may later write a half-applied binding.
+   * Existing Version 1 records without `interactiveBindings` remain valid.
    */
   async function persistInteractiveBinding(input: {
     runId: string;
@@ -797,9 +1497,9 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     binding: InteractiveAgentBindingV1;
   }): Promise<void> {
     const { runId, unitId, binding } = input;
-    const live = active.get(runId);
 
-    const apply = (record: AgentRunRecordV1): void => {
+    /** Field-level merge for one unit only — never replaces `record.units`. */
+    const applyBinding = (record: AgentRunRecordV1): void => {
       const unit = record.units[unitId];
       if (!unit) {
         throw new Error(`persistInteractiveBinding: unit ${unitId} not found in run ${runId}`);
@@ -826,28 +1526,359 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
       record.updatedAt = now();
     };
 
-    cancelPendingTimer(runId);
-    // Apply to the live snapshot first (authoritative while registered), then
-    // flush through updateRun so disk failures surface to the caller. Do not use
-    // writeRun here — it swallows persistence errors.
-    if (live) {
-      apply(live);
-    }
-    await store.updateRun(runId, (record) => {
-      if (live) {
-        // Mirror authoritative live fields onto the durable snapshot.
-        record.status = live.status;
-        record.details = live.details;
-        record.units = live.units;
-        if (live.workflowState !== undefined) {
-          record.workflowState = live.workflowState;
+    // Shared serial queue: conflict decided only against latest disk inside updateRun.
+    // Live is overwrite-synced from the committed binding after success (no re-apply).
+    // Pending coalesced timers are left armed so ordinary live updates still flush.
+    await enqueueDurableWrite(runId, async () => {
+      let committed: InteractiveAgentBindingV1 | undefined;
+
+      await store.updateRun(runId, (record) => {
+        applyBinding(record);
+        const unit = record.units[unitId];
+        const b = unit?.interactiveBindings?.[binding.bindingId];
+        if (b) {
+          committed = {
+            bindingId: b.bindingId,
+            hostSessionId: b.hostSessionId,
+            createdAt: b.createdAt,
+          };
         }
-        record.updatedAt = now();
-      } else {
-        apply(record);
+      });
+
+      const live = active.get(runId);
+      if (live && committed) {
+        const unit = live.units[unitId];
+        if (unit) {
+          if (!unit.interactiveBindings) unit.interactiveBindings = {};
+          unit.interactiveBindings[binding.bindingId] = {
+            bindingId: committed.bindingId,
+            hostSessionId: committed.hostSessionId,
+            createdAt: committed.createdAt,
+          };
+        }
+        live.updatedAt = now();
       }
+      lastPersist.set(runId, now());
     });
-    lastPersist.set(runId, now());
+  }
+
+  /**
+   * Persist a Pi unit sessionFile with disk-first CAS. Same path is idempotent;
+   * a different existing path throws `session_file_conflict`. Empty paths are
+   * rejected. This is the only legal first-write path — full merge never accepts
+   * a live-only sessionFile when disk has none.
+   *
+   * Conflict check runs only inside RunStore's serial `updateRun` on the latest
+   * disk record. After commit, live is overwrite-synced. Pending coalesced timers
+   * are left armed so ordinary live updates still flush.
+   */
+  async function persistSessionFile(input: {
+    runId: string;
+    unitId: string;
+    sessionFile: string;
+  }): Promise<void> {
+    const { runId, unitId } = input;
+    const sessionFile = input.sessionFile.trim();
+    if (!sessionFile) {
+      throw new Error('session_file_unavailable: sessionFile must be a non-empty string');
+    }
+
+    const applyUnit = (record: AgentRunRecordV1): void => {
+      const unit = record.units[unitId];
+      if (!unit) {
+        throw new Error(`persistSessionFile: unit ${unitId} not found in run ${runId}`);
+      }
+      const existing = unit.sessionFile?.trim();
+      if (existing) {
+        if (existing !== sessionFile) {
+          throw new Error(
+            `session_file_conflict: unit ${unitId} already has sessionFile ${existing}, refusing ${sessionFile}`
+          );
+        }
+        // Idempotent same path: still restamp nested result if present.
+        // Do not regress sessionPromptEstablished on restamp.
+      } else {
+        unit.sessionFile = sessionFile;
+        // First path write: original prompt is not yet established. Resume must
+        // fail closed until persistSessionPromptEstablished succeeds.
+        if (unit.sessionPromptEstablished !== true) {
+          unit.sessionPromptEstablished = false;
+        }
+      }
+      if (unit.result) {
+        unit.result.sessionFile = sessionFile;
+      }
+      record.updatedAt = now();
+    };
+
+    await enqueueDurableWrite(runId, async () => {
+      let committed: string | undefined;
+      let committedEstablished: boolean | undefined;
+
+      await store.updateRun(runId, (record) => {
+        applyUnit(record);
+        const unit = record.units[unitId];
+        if (unit?.sessionFile) {
+          committed = unit.sessionFile;
+          committedEstablished = unit.sessionPromptEstablished;
+        }
+      });
+
+      const live = active.get(runId);
+      if (live && committed) {
+        const liveUnit = live.units[unitId];
+        if (liveUnit) {
+          liveUnit.sessionFile = committed;
+          if (committedEstablished !== undefined) {
+            liveUnit.sessionPromptEstablished = committedEstablished;
+          }
+          if (liveUnit.result) {
+            liveUnit.result.sessionFile = committed;
+          }
+        }
+        live.updatedAt = now();
+      }
+      lastPersist.set(runId, now());
+    });
+  }
+
+  /**
+   * Mark that Pi accepted the unit's original prompt. Idempotent once true.
+   * Disk-first; callers must await and fail-close the turn on write error.
+   */
+  async function persistSessionPromptEstablished(input: {
+    runId: string;
+    unitId: string;
+  }): Promise<void> {
+    const { runId, unitId } = input;
+
+    await enqueueDurableWrite(runId, async () => {
+      await store.updateRun(runId, (record) => {
+        const unit = record.units[unitId];
+        if (!unit) {
+          throw new Error(
+            `persistSessionPromptEstablished: unit ${unitId} not found in run ${runId}`
+          );
+        }
+        unit.sessionPromptEstablished = true;
+        record.updatedAt = now();
+      });
+
+      const live = active.get(runId);
+      if (live) {
+        const liveUnit = live.units[unitId];
+        if (liveUnit) {
+          liveUnit.sessionPromptEstablished = true;
+        }
+        live.updatedAt = now();
+      }
+      lastPersist.set(runId, now());
+    });
+  }
+
+  /**
+   * Persist a Grok ACP session ID with disk-first strict flush. Same-ID is
+   * idempotent; a different existing ID throws `acp_session_conflict`.
+   * Legacy never-started Grok ACP units stored as capability `replay` are
+   * normalized to `session` on the first successful ID write.
+   *
+   * Conflict check and field-level unit merge run only inside RunStore's serial
+   * `updateRun` callback on the latest disk record — never from a stale live
+   * precheck. After disk commit, live is overwrite-synced from the committed
+   * unit fields (no re-apply that could throw if live changed mid-write).
+   */
+  async function persistAcpSessionId(input: {
+    runId: string;
+    unitId: string;
+    sessionId: string;
+  }): Promise<void> {
+    const { runId, unitId } = input;
+    const sessionId = input.sessionId.trim();
+    if (!sessionId) {
+      throw new Error('acp_session_unavailable: sessionId must be a non-empty string');
+    }
+
+    /** Field-level merge for one unit only — never replaces `record.units`. */
+    const applyUnit = (record: AgentRunRecordV1): void => {
+      const unit = record.units[unitId];
+      if (!unit) {
+        throw new Error(`persistAcpSessionId: unit ${unitId} not found in run ${runId}`);
+      }
+      const existing = unit.acpSessionId?.trim();
+      if (existing) {
+        if (existing !== sessionId) {
+          throw new Error(
+            `acp_session_conflict: unit ${unitId} already has session ${existing}, refusing ${sessionId}`
+          );
+        }
+        // Idempotent same-ID: still normalize capability when needed.
+      } else {
+        unit.acpSessionId = sessionId;
+      }
+
+      // Legacy never-started Grok ACP units may still store capability "replay".
+      // First successful ID write normalizes them to session-capable.
+      const runtime = unit.runtime;
+      if (
+        runtime === GROK_ACP_RUNTIME &&
+        unit.capability === 'replay' &&
+        unit.acpSessionId === sessionId
+      ) {
+        unit.capability = 'session';
+        if (unit.result && unit.result.resumeCapability === 'replay') {
+          unit.result.resumeCapability = 'session';
+        }
+      }
+
+      // Keep nested result identity aligned when present.
+      if (unit.result) {
+        unit.result.acpSessionId = sessionId;
+        if (unit.capability === 'session') {
+          unit.result.resumeCapability = 'session';
+        }
+      }
+
+      record.updatedAt = now();
+    };
+
+    // Do not cancel pending coalesced timers — ordinary live updates stay scheduled.
+    await enqueueDurableWrite(runId, async () => {
+      let committed:
+        | {
+            acpSessionId: string | undefined;
+            capability: ResumeCapability;
+          }
+        | undefined;
+
+      await store.updateRun(runId, (record) => {
+        applyUnit(record);
+        const unit = record.units[unitId];
+        if (unit) {
+          committed = {
+            acpSessionId: unit.acpSessionId,
+            capability: unit.capability,
+          };
+        }
+      });
+
+      // Disk succeeded: overwrite-sync live from committed fields (never re-apply).
+      const live = active.get(runId);
+      if (live && committed) {
+        const liveUnit = live.units[unitId];
+        if (liveUnit) {
+          liveUnit.acpSessionId = committed.acpSessionId;
+          liveUnit.capability = committed.capability;
+          if (liveUnit.result) {
+            if (committed.acpSessionId !== undefined && committed.acpSessionId !== '') {
+              liveUnit.result.acpSessionId = committed.acpSessionId;
+            } else {
+              delete liveUnit.result.acpSessionId;
+            }
+            liveUnit.result.resumeCapability = committed.capability;
+          }
+        }
+        live.updatedAt = now();
+      }
+      lastPersist.set(runId, now());
+    });
+  }
+
+  /**
+   * Strict awaited continuation-delivery write for Grok ACP (disk-first).
+   * Marks `deliveredCount` only after the atomic run.json write succeeds.
+   * Updates only the target unit's delivery entry inside the serial callback;
+   * rejects regression, counts above the continuationTasks upper bound, and
+   * refuses continuationTasks lists that change or shorten the durable history.
+   * Live is mirrored from the committed disk result (never authoritative alone).
+   * Pending coalesced timers are left armed so ordinary live updates still flush.
+   */
+  async function persistContinuationDelivery(input: {
+    runId: string;
+    unitId: string;
+    deliveredCount: number;
+    continuationTasks?: string[];
+  }): Promise<void> {
+    const { runId, unitId, deliveredCount } = input;
+    if (!Number.isInteger(deliveredCount) || deliveredCount < 0) {
+      throw new Error('persistContinuationDelivery: deliveredCount must be a non-negative integer');
+    }
+
+    /**
+     * Field-level delivery update for one unit only (disk-authoritative).
+     * When `continuationTasks` is supplied, it must be append-only relative to
+     * the record's existing list (existing is a prefix; no item rewrite/shorten).
+     */
+    const applyDelivery = (record: AgentRunRecordV1): void => {
+      if (!record.units[unitId]) {
+        throw new Error(
+          `persistContinuationDelivery: unit ${unitId} does not exist on run ${runId}`
+        );
+      }
+      if (input.continuationTasks !== undefined) {
+        const existingTasks = record.continuationTasks ?? [];
+        const nextTasks = input.continuationTasks;
+        const existingIsPrefix = existingTasks.every((t, i) => nextTasks[i] === t);
+        if (!existingIsPrefix) {
+          throw new Error(
+            `persistContinuationDelivery: continuationTasks would change or regress durable history on run ${runId}`
+          );
+        }
+        record.continuationTasks = nextTasks;
+      }
+      const tasks = record.continuationTasks ?? [];
+      if (deliveredCount > tasks.length) {
+        throw new Error(
+          `persistContinuationDelivery: deliveredCount ${deliveredCount} exceeds continuationTasks length ${tasks.length}`
+        );
+      }
+      const existing = record.continuationDelivery?.[unitId]?.deliveredCount ?? 0;
+      if (deliveredCount < existing) {
+        throw new Error(
+          `persistContinuationDelivery: deliveredCount ${deliveredCount} would regress from ${existing} for unit ${unitId}`
+        );
+      }
+      if (!record.continuationDelivery) record.continuationDelivery = {};
+      record.continuationDelivery[unitId] = { deliveredCount };
+      record.updatedAt = now();
+    };
+
+    await enqueueDurableWrite(runId, async () => {
+      // Monotonic / upper-bound / task checks run only against latest disk inside
+      // updateRun — never reject early from a wrongly-ahead live count.
+      let committedTasks: string[] | undefined;
+      let committedCount: number | undefined;
+      let sawDelivery = false;
+
+      await store.updateRun(runId, (record) => {
+        applyDelivery(record);
+        committedTasks = record.continuationTasks ? [...record.continuationTasks] : undefined;
+        const entry = record.continuationDelivery?.[unitId];
+        if (entry) {
+          sawDelivery = true;
+          committedCount = entry.deliveredCount;
+        } else {
+          sawDelivery = false;
+          committedCount = undefined;
+        }
+      });
+
+      // Unconditionally mirror committed tasks/count onto live (undefined clears stale).
+      const live = active.get(runId);
+      if (live) {
+        live.continuationTasks = committedTasks !== undefined ? [...committedTasks] : undefined;
+        if (sawDelivery && committedCount !== undefined) {
+          if (!live.continuationDelivery) live.continuationDelivery = {};
+          live.continuationDelivery[unitId] = { deliveredCount: committedCount };
+        } else if (live.continuationDelivery) {
+          delete live.continuationDelivery[unitId];
+          if (Object.keys(live.continuationDelivery).length === 0) {
+            live.continuationDelivery = undefined;
+          }
+        }
+        live.updatedAt = now();
+      }
+      lastPersist.set(runId, now());
+    });
   }
 
   return {
@@ -861,6 +1892,10 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     isActive,
     aggregateRun,
     persistInteractiveBinding,
+    persistAcpSessionId,
+    persistSessionFile,
+    persistSessionPromptEstablished,
+    persistContinuationDelivery,
   };
 }
 

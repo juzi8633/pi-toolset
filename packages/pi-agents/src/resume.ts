@@ -6,7 +6,13 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig } from './agents.ts';
-import { agentFingerprint, chainFanoutStepId, chainFanoutUnitId } from './run-coordinator.ts';
+import { GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
+import {
+  agentFingerprint,
+  chainFanoutStepId,
+  chainFanoutUnitId,
+  unitRequiresReplayAcknowledgement,
+} from './run-coordinator.ts';
 import type { RunCoordinator } from './run-coordinator.ts';
 import type { RunStore } from './run-store.ts';
 import { createRunLifecycle } from './run-lifecycle.ts';
@@ -40,6 +46,15 @@ export interface InspectResumeOptions {
   agents: AgentConfig[];
   /** Allow replay-capable units to re-run from the beginning. */
   allowReplay?: boolean;
+}
+
+/**
+ * Never-started means the unit is still `queued` or `skipped` with an empty
+ * attempt history. Queued/skipped units that already have attempt entries are
+ * attempted (e.g. re-queued after a prior run) and must not create first sessions.
+ */
+export function isNeverStartedUnit(unit: Pick<RunUnitRecord, 'status' | 'attempts'>): boolean {
+  return (unit.status === 'queued' || unit.status === 'skipped') && unit.attempts.length === 0;
 }
 
 /**
@@ -202,26 +217,53 @@ export function inspectResume(
       blockingReasons.push(`unit ${unit.unitId}: agent "${unit.agent}" fingerprint mismatch`);
     }
 
-    // Check replay capability.
-    if (unit.capability === 'replay') {
+    // Plain Grok requires allowReplay; Grok ACP never uses replay acknowledgement
+    // even when a legacy record still stores capability "replay".
+    if (unitRequiresReplayAcknowledgement(unit)) {
       requiresReplay = true;
       if (!options.allowReplay) {
         blockingReasons.push(`unit ${unit.unitId}: requires replay (allowReplay not set)`);
       }
     }
 
-    // Verify session file for session-capable Pi units. Units that never
-    // started (queued/skipped) legitimately lack a session; only require the
-    // file when the unit was already running, interrupted, or failed.
-    if (unit.capability === 'session') {
-      const needsSession = unit.status !== 'queued' && unit.status !== 'skipped';
-      if (needsSession) {
+    const runtime = unit.runtime;
+    // Only true never-started units may lack session artifacts. Queued/skipped
+    // with prior attempt history are attempted and must have session identity.
+    const needsSessionArtifact = !isNeverStartedUnit(unit);
+
+    // Grok ACP: attempted units require a stored protocol session ID. Never-started
+    // units may create their first session during resume. Attempted units without
+    // an ID are blocked (never normalize/create a replacement session).
+    if (runtime === GROK_ACP_RUNTIME) {
+      if (needsSessionArtifact) {
+        const acpId = unit.acpSessionId?.trim();
+        if (!acpId) {
+          blockingReasons.push(
+            `unit ${unit.unitId}: ACP session unavailable (acp_session_unavailable)`
+          );
+        }
+      }
+    } else if (runtime !== GROK_RUNTIME && unit.capability === 'session') {
+      // Pi (and other session-capable non-Grok runtimes): require a persisted
+      // session file that exists on disk for attempted units. Planned paths that
+      // were stamped before the native file/history existed fail closed so resume
+      // neither sends continuation-only nor silently replays the original task.
+      // sessionFile existence alone is not enough: original prompt must be
+      // established (`sessionPromptEstablished !== false`). Explicit false means
+      // stamp-before-prompt crash window — fail closed, never continuation-only
+      // and never auto-replay original. Legacy units without the field remain
+      // admissible when the session file exists.
+      if (needsSessionArtifact) {
         if (!unit.sessionFile) {
           blockingReasons.push(
             `unit ${unit.unitId}: session file unavailable (session_unavailable)`
           );
         } else if (!fs.existsSync(unit.sessionFile)) {
           blockingReasons.push(`unit ${unit.unitId}: session file missing: ${unit.sessionFile}`);
+        } else if (unit.sessionPromptEstablished === false) {
+          blockingReasons.push(
+            `unit ${unit.unitId}: original prompt not established (session_prompt_unestablished)`
+          );
         }
       }
     }
@@ -372,9 +414,7 @@ export function incrementIncompleteAttempts(units: Record<string, RunUnitRecord>
   for (const unit of Object.values(units)) {
     if (unit.status === 'completed') continue;
 
-    const neverStarted =
-      (unit.status === 'queued' || unit.status === 'skipped') && unit.attempts.length === 0;
-    if (neverStarted) {
+    if (isNeverStartedUnit(unit)) {
       unit.status = 'queued';
       continue;
     }

@@ -1366,6 +1366,307 @@ describe('InteractiveAgentRegistry reviewer fixes', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it('existing Pi endpoint requires exact six-field link; empty/forged refuse and clear branch trust', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const links: InteractiveAgentLinkV1[] = [];
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'explore', task: 'look' },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionFile = path.join(store.getRunDir(runId), 'sessions', 's.jsonl');
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"test-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+    });
+    registry.setHostLinkAppender((link) => {
+      links.push(link);
+    });
+
+    const first = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-a',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () =>
+        links.map((data) => ({ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data })),
+    });
+    expect(links).toHaveLength(1);
+    expect(registry.isOnActiveBranch(first.key)).toBe(true);
+
+    // Same host, empty branch: fail closed (never trust local desiredLink).
+    await expect(
+      registry.registerInitial({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-a',
+        launchSpec: {
+          agent,
+          request: record.request,
+          sessionFile,
+          effectiveCwd: root,
+          agentScope: 'both',
+          registrationKind: 'initial',
+        },
+        getBranchEntries: () => [],
+      })
+    ).rejects.toThrow(/exact six-field|exact branch link/i);
+    expect(registry.isOnActiveBranch(first.key)).toBe(false);
+
+    // Re-grant with exact branch link present.
+    const again = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-a',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () =>
+        links.map((data) => ({ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data })),
+    });
+    expect(again.bindingId).toBe(first.bindingId);
+    expect(registry.isOnActiveBranch(first.key)).toBe(true);
+
+    // Second host without exact link: refuse (trust for original host remains).
+    await expect(
+      registry.registerInitial({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-b',
+        launchSpec: {
+          agent,
+          request: record.request,
+          sessionFile,
+          effectiveCwd: root,
+          agentScope: 'both',
+          registrationKind: 'initial',
+        },
+        getBranchEntries: () => [],
+      })
+    ).rejects.toThrow(/hostSessionId|exact branch link/i);
+    expect(registry.isOnActiveBranch(first.key)).toBe(true);
+
+    // Forged-only branch: refuse and clear trust (no append-and-trust).
+    await expect(
+      registry.registerInitial({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-a',
+        launchSpec: {
+          agent,
+          request: record.request,
+          sessionFile,
+          effectiveCwd: root,
+          agentScope: 'both',
+          registrationKind: 'initial',
+        },
+        getBranchEntries: () => [
+          {
+            type: 'custom',
+            customType: INTERACTIVE_LINK_TYPE,
+            data: {
+              version: 1,
+              runId,
+              unitId: 'single',
+              bindingId: 'forged-binding',
+              hostSessionId: 'host-a',
+              createdAt: first.linkCreatedAt,
+            },
+          },
+        ],
+      })
+    ).rejects.toThrow(/exact six-field|exact branch link/i);
+    expect(registry.isOnActiveBranch(first.key)).toBe(false);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('existing Grok ACP endpoint requires exact six-field link; empty/forged refuse trust', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const links: InteractiveAgentLinkV1[] = [];
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: 'sess-exact-1',
+        },
+      },
+    });
+    const live0 = store.getRun(runId);
+    if (live0.ok) coordinator.registerRun(runId, live0.loaded.record);
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+    });
+    registry.setHostLinkAppender((link) => {
+      links.push(link);
+    });
+
+    const first = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-g',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile: '',
+        sessionArtifact: { runtime: 'grok-acp', sessionId: 'sess-exact-1' },
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () =>
+        links.map((data) => ({ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data })),
+    });
+    expect(registry.isOnActiveBranch(first.key)).toBe(true);
+
+    await expect(
+      registry.registerInitial({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-g',
+        launchSpec: {
+          agent,
+          request: record.request,
+          sessionFile: '',
+          sessionArtifact: { runtime: 'grok-acp', sessionId: 'sess-exact-1' },
+          effectiveCwd: root,
+          agentScope: 'both',
+          registrationKind: 'initial',
+        },
+        getBranchEntries: () => [],
+      })
+    ).rejects.toThrow(/exact six-field|exact branch link/i);
+    expect(registry.isOnActiveBranch(first.key)).toBe(false);
+
+    // Exact link re-grants.
+    const again = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-g',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile: '',
+        sessionArtifact: { runtime: 'grok-acp', sessionId: 'sess-exact-1' },
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () =>
+        links.map((data) => ({ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data })),
+    });
+    expect(again.bindingId).toBe(first.bindingId);
+    expect(registry.isOnActiveBranch(first.key)).toBe(true);
+
+    await expect(
+      registry.registerInitial({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-g',
+        launchSpec: {
+          agent,
+          request: record.request,
+          sessionFile: '',
+          sessionArtifact: { runtime: 'grok-acp', sessionId: 'sess-exact-1' },
+          effectiveCwd: root,
+          agentScope: 'both',
+          registrationKind: 'initial',
+        },
+        getBranchEntries: () => [
+          {
+            type: 'custom',
+            customType: INTERACTIVE_LINK_TYPE,
+            data: {
+              version: 1,
+              runId,
+              unitId: 'single',
+              bindingId: 'forged-g',
+              hostSessionId: 'host-g',
+              createdAt: first.linkCreatedAt,
+            },
+          },
+        ],
+      })
+    ).rejects.toThrow(/exact six-field|exact branch link/i);
+    expect(registry.isOnActiveBranch(first.key)).toBe(false);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it('revalidates existing endpoint key on restore and hides off-branch endpoints', async () => {
     const { root, store, coordinator } = makeTempStore();
     const agent = makeAgent();
@@ -4479,7 +4780,8 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
     // T2 factory must not have run.
     expect(factoryN).toBe(1);
 
-    await registry.shutdown();
+    // Shutdown must surface sticky dispose_failed (not swallow).
+    await expect(registry.shutdown()).rejects.toThrow(/SIGKILL|dispose/i);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -4674,7 +4976,7 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
     );
     expect(factoryN).toBe(1);
 
-    await registry.shutdown();
+    await expect(registry.shutdown()).rejects.toThrow(/SIGKILL|dispose/i);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -4789,17 +5091,18 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
       getBranchEntries: () => [],
     });
 
-    // Factory returns before deadline but getState hangs — shutdown must still dispose.
+    // Factory returns before deadline but getState hangs — shutdown must still
+    // dispose, surface dispose_failed on budget, and sticky-fail the lease.
     const hangAct = reg1.activate(snap1.key, 'Task: hang', 'prompt').catch(() => undefined);
     await new Promise((r) => setTimeout(r, 20));
     expect(hangGetState).toBe(true);
 
-    await reg1.shutdown();
+    await expect(reg1.shutdown()).rejects.toMatchObject({ code: 'dispose_failed' });
     await hangAct;
     expect(order).toContain('old-dispose-start');
-    // Shutdown returned while dispose still gated (budget elapsed).
 
-    // New registry attempts same session — factory must wait for old dispose.
+    // New registry must not spawn: deadline sticky-failed the same-session lease
+    // even though background dispose is still gated.
     const reg2 = createInteractiveAgentRegistry({
       runStore: store,
       runCoordinator: coordinator,
@@ -4816,33 +5119,29 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
     });
     reg2.setHostLinkAppender(() => undefined);
 
-    // registerInitial hydrates only after the writer lease releases — start it while
-    // dispose is still gated so we observe the barrier (do not await yet).
-    const snap2Promise = reg2.registerInitial({
-      runId,
-      unitId: 'single',
-      hostSessionId: 'host-cross-2',
-      launchSpec: {
-        agent,
-        request: record.request,
-        sessionFile,
-        effectiveCwd: root,
-        agentScope: 'both',
-        registrationKind: 'initial',
-      },
-      getBranchEntries: () => [],
-    });
-    const act2Promise = snap2Promise.then((snap) =>
-      reg2.activate(snap.key, 'Task: after', 'prompt')
-    );
-    await new Promise((r) => setTimeout(r, 40));
-    // Hydrate + factory must both wait for the old dispose lease.
+    await expect(
+      reg2
+        .registerInitial({
+          runId,
+          unitId: 'single',
+          hostSessionId: 'host-cross-2',
+          launchSpec: {
+            agent,
+            request: record.request,
+            sessionFile,
+            effectiveCwd: root,
+            agentScope: 'both',
+            registrationKind: 'initial',
+          },
+          getBranchEntries: () => [],
+        })
+        .then((snap) => reg2.activate(snap.key, 'Task: after', 'prompt'))
+    ).rejects.toMatchObject({ code: 'dispose_failed' });
     expect(factoryNew).toBe(0);
 
     releaseOldDispose();
-    await act2Promise;
-    expect(factoryNew).toBe(1);
-    expect(order.indexOf('new-factory')).toBeGreaterThan(order.indexOf('old-dispose-done'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toContain('old-dispose-done');
 
     await reg2.shutdown();
 
@@ -4981,7 +5280,7 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
     // Detach left endpoint on regFail; regAfterFail is a new registry with empty endpoints.
     // Re-register same run would conflict with regFail if still alive — shutdown regFail first
     // but session barrier remains sticky.
-    await regFail.shutdown();
+    await expect(regFail.shutdown()).rejects.toThrow(/SIGKILL|dispose/i);
     // Sticky dispose failure fail-closes hydrate and spawn (registerInitial waits on lease).
     await expect(
       regAfterFail.registerInitial({
@@ -5272,7 +5571,8 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
     await new Promise((r) => setTimeout(r, 20));
 
     const t0 = Date.now();
-    await registry.shutdown();
+    // Hung dispose past budget: shutdown surfaces dispose_failed and fail-closes leases.
+    await expect(registry.shutdown()).rejects.toThrow(/dispose|deadline/i);
     const elapsed = Date.now() - t0;
     await handshakeP;
 
@@ -5290,7 +5590,7 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
 });
 
 describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hydrate barrier', () => {
-  it('T1 factory hang across shutdown deadline: new registry waits; T2 factory only after T1 close', async () => {
+  it('T1 factory hang across shutdown deadline: sticky-fails lease; late dispose success cannot clear', async () => {
     const { root, store, coordinator } = makeTempStore();
     const agent = makeAgent({ systemPrompt: '' });
     const order: string[] = [];
@@ -5410,8 +5710,12 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
     expect(factoryN).toBe(1);
     expect(order).toContain('factory-1');
 
-    await reg1.shutdown();
-    // Shutdown returned while factory still hung; lease must remain held.
+    // Shutdown deadline exceeded while factory hung: surface dispose_failed, lease sticky.
+    const shutdown1 = reg1.shutdown();
+    await expect(shutdown1).rejects.toMatchObject({ code: 'dispose_failed' });
+    // Cached promise: repeat shutdown rethrows the same dispose_failed.
+    await expect(reg1.shutdown()).rejects.toMatchObject({ code: 'dispose_failed' });
+    await expect(reg1.shutdown()).rejects.toBe(await shutdown1.catch((e) => e));
     expect(factoryN).toBe(1);
 
     let factoryNew = 0;
@@ -5431,41 +5735,75 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
     });
     reg2.setHostLinkAppender(() => undefined);
 
-    // registerInitial + activate both wait on the pre-acquired T1 lease (do not await yet).
-    const act2Promise = reg2
-      .registerInitial({
-        runId,
-        unitId: 'single',
-        hostSessionId: 'host-lease-hang-2',
-        launchSpec: {
-          agent,
-          request: record.request,
-          sessionFile,
-          effectiveCwd: root,
-          agentScope: 'both',
-          registrationKind: 'initial',
-        },
-        getBranchEntries: () => [],
-      })
-      .then((snap) => reg2.activate(snap.key, 'Task: after', 'prompt'));
-    await new Promise((r) => setTimeout(r, 40));
-    // New registry must not call factory while T1 factory is still hung (lease held).
+    // Sticky deadline settle: new registry must fail closed even before late dispose.
+    await expect(
+      reg2
+        .registerInitial({
+          runId,
+          unitId: 'single',
+          hostSessionId: 'host-lease-hang-2',
+          launchSpec: {
+            agent,
+            request: record.request,
+            sessionFile,
+            effectiveCwd: root,
+            agentScope: 'both',
+            registrationKind: 'initial',
+          },
+          getBranchEntries: () => [],
+        })
+        .then((snap) => reg2.activate(snap.key, 'Task: after', 'prompt'))
+    ).rejects.toMatchObject({ code: 'dispose_failed' });
     expect(factoryNew).toBe(0);
 
-    // T1 factory finally returns; generation is stale → dispose then release lease.
+    // T1 factory finally returns; late dispose success must not clear sticky failure.
     releaseT1Factory(makeIdleTransport('t1-late', { disposeGate: true }));
     await hangAct;
     await new Promise((r) => setTimeout(r, 20));
     expect(order).toContain('t1-late-dispose-start');
-    // Still blocked on T1 dispose.
+    releaseT1Dispose();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toContain('t1-late-dispose-done');
+
+    // After late clean dispose, a third registry still fails closed (factory never called).
+    let factoryThird = 0;
+    const reg3 = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      transportFactory: async () => {
+        factoryThird += 1;
+        return makeIdleTransport('third');
+      },
+    });
+    reg3.setHostLinkAppender(() => undefined);
+    await expect(
+      reg3
+        .registerInitial({
+          runId,
+          unitId: 'single',
+          hostSessionId: 'host-lease-hang-3',
+          launchSpec: {
+            agent,
+            request: record.request,
+            sessionFile,
+            effectiveCwd: root,
+            agentScope: 'both',
+            registrationKind: 'initial',
+          },
+          getBranchEntries: () => [],
+        })
+        .then((snap) => reg3.activate(snap.key, 'Task: third', 'prompt'))
+    ).rejects.toMatchObject({ code: 'dispose_failed' });
+    expect(factoryThird).toBe(0);
     expect(factoryNew).toBe(0);
 
-    releaseT1Dispose();
-    await act2Promise;
-    expect(factoryNew).toBe(1);
-    expect(order.indexOf('factory-new')).toBeGreaterThan(order.indexOf('t1-late-dispose-done'));
-
     await reg2.shutdown();
+    await reg3.shutdown();
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -5590,7 +5928,8 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
       getBranchEntries: () => [],
     });
     await reg1.activate(snap1.key, 'Task: old', 'prompt');
-    await reg1.shutdown();
+    // Dispose gated past budget: shutdown fails closed and surfaces dispose_failed.
+    await expect(reg1.shutdown()).rejects.toMatchObject({ code: 'dispose_failed' });
     expect(order).toContain('old-dispose-start');
 
     // New registry uses realpath for the same session file.
@@ -5610,30 +5949,32 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
     });
     reg2.setHostLinkAppender(() => undefined);
 
-    // Alias lease from reg1 must block realpath register/activate until dispose completes.
-    const act2Promise = reg2
-      .registerInitial({
-        runId,
-        unitId: 'single',
-        hostSessionId: 'host-symlink-2',
-        launchSpec: {
-          agent,
-          request: record.request,
-          sessionFile: realSessionFile,
-          effectiveCwd: root,
-          agentScope: 'both',
-          registrationKind: 'initial',
-        },
-        getBranchEntries: () => [],
-      })
-      .then((snap) => reg2.activate(snap.key, 'Task: new', 'prompt'));
-    await new Promise((r) => setTimeout(r, 40));
+    // After shutdown deadline the shared lease is sticky fail-closed: alias and
+    // realpath keys collide, so the new registry must not spawn.
+    await expect(
+      reg2
+        .registerInitial({
+          runId,
+          unitId: 'single',
+          hostSessionId: 'host-symlink-2',
+          launchSpec: {
+            agent,
+            request: record.request,
+            sessionFile: realSessionFile,
+            effectiveCwd: root,
+            agentScope: 'both',
+            registrationKind: 'initial',
+          },
+          getBranchEntries: () => [],
+        })
+        .then((snap) => reg2.activate(snap.key, 'Task: new', 'prompt'))
+    ).rejects.toMatchObject({ code: 'dispose_failed' });
     expect(factoryNew).toBe(0);
 
+    // Background cleanup may still finish after the deadline.
     releaseT1Dispose();
-    await act2Promise;
-    expect(factoryNew).toBe(1);
-    expect(order.indexOf('new-factory')).toBeGreaterThan(order.indexOf('old-dispose-done'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toContain('old-dispose-done');
 
     await reg2.shutdown();
     fs.rmSync(root, { recursive: true, force: true });
@@ -6124,6 +6465,1230 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
     expect(factoryNew).toBe(1);
 
     await reg.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('Grok ACP session resume + Agent View restoration', () => {
+  it('restores Grok ACP endpoint with sessionArtifact and rejects replay capability', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: 'sess-restore-1',
+        },
+      },
+    });
+    const binding = { bindingId: 'bind-1', hostSessionId: 'host-g', createdAt: 100 };
+    await store.updateRun(runId, (r) => {
+      r.units.single.interactiveBindings = { [binding.bindingId]: binding };
+      r.status = 'interrupted';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({ agents: [agent], projectAgentsDir: null, builtinAgentsDir: '/b' }),
+    });
+
+    const link: InteractiveAgentLinkV1 = {
+      version: 1,
+      runId,
+      unitId: 'single',
+      bindingId: binding.bindingId,
+      hostSessionId: binding.hostSessionId,
+      createdAt: binding.createdAt,
+    };
+    const fakeSm = {
+      getSessionId: () => 'host-g',
+      getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: link }],
+    };
+    const restored = registry.restoreActiveBranch({
+      sessionManager: fakeSm as never,
+      cwd: root,
+    });
+    expect(restored.length).toBe(1);
+    expect(restored[0]!.status).toBe('detached');
+    expect(restored[0]!.sessionArtifact).toEqual({
+      runtime: 'grok-acp',
+      sessionId: 'sess-restore-1',
+    });
+    expect(restored[0]!.sessionFile).toBe('');
+    expect(restored[0]!.messages.length).toBe(0);
+
+    // Capability replay must fail closed even with a stored ID.
+    await store.updateRun(runId, (r) => {
+      r.units.single.capability = 'replay';
+    });
+    const live2 = store.getRun(runId);
+    if (live2.ok) {
+      coordinator.unregisterRun(runId);
+      coordinator.registerRun(runId, live2.loaded.record);
+    }
+    const restored2 = registry.restoreActiveBranch({
+      sessionManager: fakeSm as never,
+      cwd: root,
+    });
+    expect(restored2[0]!.status).toBe('unavailable');
+    expect(restored2[0]!.errorCode).toBe('unavailable');
+    // non_session_capability maps to unavailable code
+    expect(restored2[0]!.lastError).toMatch(/non_session_capability|capability/);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('rejects forged link without matching binding and rejects running Grok input', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: 'sess-forge',
+        },
+      },
+    });
+    const binding = { bindingId: 'real-bind', hostSessionId: 'host-g', createdAt: 50 };
+    await store.updateRun(runId, (r) => {
+      r.units.single.interactiveBindings = { [binding.bindingId]: binding };
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({ agents: [agent], projectAgentsDir: null, builtinAgentsDir: '/b' }),
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const forged: InteractiveAgentLinkV1 = {
+      version: 1,
+      runId,
+      unitId: 'single',
+      bindingId: 'forged-bind',
+      hostSessionId: 'host-g',
+      createdAt: 50,
+    };
+    const forgedSnap = registry.restoreActiveBranch({
+      sessionManager: {
+        getSessionId: () => 'host-g',
+        getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
+      } as never,
+      cwd: root,
+    });
+    expect(forgedSnap[0]!.status).toBe('unavailable');
+    expect(forgedSnap[0]!.lastError).toMatch(/binding/);
+
+    // Trusted register then reject running input before activation mutation.
+    // Unavailable forged endpoint is replaced by a RunStore-validated registration.
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-g',
+      launchSpec: {
+        agent,
+        request: {
+          mode: 'single',
+          agentScope: 'both',
+          agent: 'gagent',
+          task: 't',
+          runtime: 'grok-acp',
+        },
+        sessionFile: '',
+        sessionArtifact: { runtime: 'grok-acp', sessionId: 'sess-forge' },
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () => [],
+    });
+
+    // Inject a fake Grok transport that is already "running".
+    const ep = registry.getMutable(snap.key)!;
+    const events: unknown[] = [];
+    let promptCalls = 0;
+    ep.client = {
+      runtime: 'grok-acp',
+      runningInput: 'unsupported',
+      async getState() {
+        return { running: true, idle: false, disposed: false };
+      },
+      async prompt() {
+        promptCalls += 1;
+      },
+      async abort() {},
+      async dispose() {},
+      subscribe() {
+        return () => undefined;
+      },
+      getStderr() {
+        return '';
+      },
+    } as never;
+    ep.status = 'running';
+    ep.activation = {
+      id: 'act_running',
+      endpointKey: snap.key,
+      mode: 'prompt',
+      baselineMessageCount: 0,
+      sequence: 1,
+      origin: 'view',
+      settled: false,
+      createdAt: 1,
+      observedAgentStart: true,
+    };
+
+    await expect(registry.activate(snap.key, 'while running', 'prompt')).rejects.toMatchObject({
+      code: 'running_input_unsupported',
+    });
+    expect(promptCalls).toBe(0);
+    // Activation from the rejected call must not replace the in-flight one.
+    expect(registry.get(snap.key)?.activation?.id).toBe('act_running');
+    void events;
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('hydrate-only pending owner is tracked: shutdown deadline sticky-fails lease; late clean dispose cannot clear', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const sessionId = 'sess-hydrate-pending';
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: sessionId,
+        },
+      },
+    });
+    const binding = { bindingId: 'bind-h', hostSessionId: 'host-h', createdAt: 10 };
+    await store.updateRun(runId, (r) => {
+      r.units.single.interactiveBindings = { [binding.bindingId]: binding };
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    let releaseFactory!: (t: {
+      getFinalizedMessages: () => unknown[];
+      dispose: () => Promise<void>;
+      getState: () => Promise<unknown>;
+      prompt: () => Promise<void>;
+      abort: () => Promise<void>;
+      subscribe: () => () => void;
+      getStderr: () => string;
+    }) => void;
+    const factoryGate = new Promise<typeof releaseFactory extends (t: infer T) => void ? T : never>(
+      (r) => {
+        releaseFactory = r as typeof releaseFactory;
+      }
+    );
+    let disposeCalls = 0;
+    let releaseDispose!: () => void;
+    const disposeGate = new Promise<void>((r) => {
+      releaseDispose = r;
+    });
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+      }),
+      shutdownDisposeBudgetMs: 40,
+      grokAcpTransportFactory: async () => {
+        // Hang past shutdown deadline while lease is already held + pending-tracked.
+        return factoryGate as never;
+      },
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const link: InteractiveAgentLinkV1 = {
+      version: 1,
+      runId,
+      unitId: 'single',
+      bindingId: binding.bindingId,
+      hostSessionId: binding.hostSessionId,
+      createdAt: binding.createdAt,
+    };
+    registry.restoreActiveBranch({
+      sessionManager: {
+        getSessionId: () => 'host-h',
+        getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: link }],
+      } as never,
+      cwd: root,
+    });
+
+    const key = `${runId}:single`;
+    const hydrateP = registry.ensureTranscript(key).catch(() => undefined);
+    // Wait until hydrate has acquired the lease (pending owner registered).
+    for (let i = 0; i < 50; i++) {
+      if (registry._pendingOwnerCount() > 0) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(registry._pendingOwnerCount()).toBeGreaterThan(0);
+
+    await expect(registry.shutdown()).rejects.toMatchObject({ code: 'dispose_failed' });
+
+    // Late factory return + clean dispose must not clear sticky failure.
+    releaseFactory({
+      getFinalizedMessages: () => [],
+      async dispose() {
+        disposeCalls += 1;
+        await disposeGate;
+      },
+      async getState() {
+        return { running: false, idle: true, disposed: false };
+      },
+      async prompt() {},
+      async abort() {},
+      subscribe() {
+        return () => undefined;
+      },
+      getStderr() {
+        return '';
+      },
+    });
+    releaseDispose();
+    await hydrateP;
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Sticky: a new registry cannot acquire the same Grok session lease.
+    const { buildSessionLeaseKey } = await import('../src/session-lease.ts');
+    const leaseKey = buildSessionLeaseKey({
+      runtime: 'grok-acp',
+      cwd: root,
+      sessionIdentity: sessionId,
+    });
+    await expect(acquireSessionLease(leaseKey)).rejects.toThrow(/dispose|deadline/i);
+
+    fs.rmSync(root, { recursive: true, force: true });
+    void disposeCalls;
+  });
+
+  it('registerGrokAcpLive: binding-gate shutdown race fails closed without attaching transport', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const sessionId = 'sess-live-race';
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: sessionId,
+        },
+      },
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    let releaseBinding!: () => void;
+    const bindingGate = new Promise<void>((r) => {
+      releaseBinding = r;
+    });
+    let bindingEntered = false;
+    const origPersist = coordinator.persistInteractiveBinding.bind(coordinator);
+    coordinator.persistInteractiveBinding = (async (input) => {
+      bindingEntered = true;
+      await bindingGate;
+      return origPersist(input);
+    }) as typeof coordinator.persistInteractiveBinding;
+
+    let disposeCalls = 0;
+    const lease = await acquireSessionLease(
+      (await import('../src/session-lease.ts')).buildSessionLeaseKey({
+        runtime: 'grok-acp',
+        cwd: root,
+        sessionIdentity: sessionId,
+      })
+    );
+
+    const transport = {
+      runtime: 'grok-acp' as const,
+      runningInput: 'unsupported' as const,
+      async getState() {
+        return { running: false, idle: true, disposed: false };
+      },
+      async prompt() {},
+      async abort() {},
+      async dispose() {
+        disposeCalls += 1;
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      getStderr() {
+        return '';
+      },
+    };
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+      }),
+      shutdownDisposeBudgetMs: 5_000,
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const regP = registry
+      .registerGrokAcpLive({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-live',
+        transport: transport as never,
+        leaseRelease: lease.release,
+        launchSpec: {
+          agent,
+          request: {
+            mode: 'single',
+            agentScope: 'both',
+            agent: 'gagent',
+            task: 't',
+            runtime: 'grok-acp',
+          },
+          sessionFile: '',
+          sessionArtifact: { runtime: 'grok-acp', sessionId },
+          effectiveCwd: root,
+          agentScope: 'both',
+          registrationKind: 'initial',
+        },
+        getBranchEntries: () => [],
+      })
+      .then(
+        () => 'ok' as const,
+        (e: unknown) => e
+      );
+
+    for (let i = 0; i < 80 && !bindingEntered; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bindingEntered).toBe(true);
+    expect(registry._pendingOwnerCount()).toBeGreaterThan(0);
+
+    // Shutdown while binding is gated: must not attach transport after release.
+    const shutdownP = registry.shutdown();
+    releaseBinding();
+    const regResult = await regP;
+    expect(regResult).toMatchObject({ code: 'shutdown' });
+    await shutdownP;
+
+    // Endpoint must not hold the live transport (no late attach / no zombie grant).
+    const ep = registry.getMutable(`${runId}:single`);
+    expect(ep).toBeUndefined();
+    // Per-transport dispose promise: exactly one dispose() across fail-closed + shutdown.
+    expect(disposeCalls).toBe(1);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('concurrent registerGrokAcpLive: single winner, loser disposes once, no client overwrite', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const sessionId = 'sess-concurrent-live';
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: sessionId,
+        },
+      },
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    let releaseBinding!: () => void;
+    const bindingGate = new Promise<void>((r) => {
+      releaseBinding = r;
+    });
+    let bindingEntered = 0;
+    const origPersist = coordinator.persistInteractiveBinding.bind(coordinator);
+    coordinator.persistInteractiveBinding = (async (input) => {
+      bindingEntered += 1;
+      // Gate only the first binder so the second waits on registration serial.
+      if (bindingEntered === 1) await bindingGate;
+      return origPersist(input);
+    }) as typeof coordinator.persistInteractiveBinding;
+
+    const { buildSessionLeaseKey } = await import('../src/session-lease.ts');
+    const leaseKey = buildSessionLeaseKey({
+      runtime: 'grok-acp',
+      cwd: root,
+      sessionIdentity: sessionId,
+    });
+
+    function makeTransport(label: string) {
+      let disposeCalls = 0;
+      let leaseReleased = false;
+      return {
+        label,
+        disposeCalls: () => disposeCalls,
+        leaseReleased: () => leaseReleased,
+        transport: {
+          runtime: 'grok-acp' as const,
+          runningInput: 'unsupported' as const,
+          async getState() {
+            return { running: false, idle: true, disposed: false };
+          },
+          async prompt() {},
+          async abort() {},
+          async dispose() {
+            disposeCalls += 1;
+          },
+          subscribe() {
+            return () => undefined;
+          },
+          getStderr() {
+            return '';
+          },
+        },
+        leaseRelease: (_err?: Error) => {
+          leaseReleased = true;
+        },
+      };
+    }
+
+    // Two distinct leases/transports for the same session key — only one may win.
+    const a = makeTransport('A');
+    const b = makeTransport('B');
+    // Real leases would conflict on the same session identity; use synthetic releases
+    // so the registry ownership path is under test (dispose + release counts).
+    void leaseKey;
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+      }),
+      shutdownDisposeBudgetMs: 5_000,
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const launchSpec = {
+      agent,
+      request: {
+        mode: 'single' as const,
+        agentScope: 'both' as const,
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp' as const,
+      },
+      sessionFile: '',
+      sessionArtifact: { runtime: 'grok-acp' as const, sessionId },
+      effectiveCwd: root,
+      agentScope: 'both' as const,
+      registrationKind: 'initial' as const,
+    };
+
+    const p1 = registry
+      .registerGrokAcpLive({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-a',
+        transport: a.transport as never,
+        leaseRelease: a.leaseRelease,
+        launchSpec,
+        getBranchEntries: () => [],
+      })
+      .then(
+        (s) => ({ ok: true as const, snap: s, who: 'A' }),
+        (e: unknown) => ({ ok: false as const, err: e, who: 'A' })
+      );
+
+    for (let i = 0; i < 80 && bindingEntered < 1; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(bindingEntered).toBe(1);
+
+    const p2 = registry
+      .registerGrokAcpLive({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-b',
+        transport: b.transport as never,
+        leaseRelease: b.leaseRelease,
+        launchSpec,
+        getBranchEntries: () => [],
+      })
+      .then(
+        (s) => ({ ok: true as const, snap: s, who: 'B' }),
+        (e: unknown) => ({ ok: false as const, err: e, who: 'B' })
+      );
+
+    // Let B reserve a newer generation while A is mid-binding, then release A.
+    await new Promise((r) => setTimeout(r, 20));
+    releaseBinding();
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    const wins = [r1, r2].filter((r) => r.ok);
+    const losses = [r1, r2].filter((r) => !r.ok);
+    expect(wins).toHaveLength(1);
+    expect(losses).toHaveLength(1);
+    expect((losses[0] as { err: { code?: string } }).err).toMatchObject({
+      code: 'session_busy',
+    });
+
+    const ep = registry.getMutable(`${runId}:single`);
+    expect(ep).toBeDefined();
+    expect(ep!.client).toBeDefined();
+    // Winner's transport is attached; loser never overwrites.
+    const winnerWho = (wins[0] as { who: string }).who;
+    if (winnerWho === 'A') {
+      expect(ep!.client).toBe(a.transport);
+      expect(b.disposeCalls()).toBe(1);
+      expect(b.leaseReleased()).toBe(true);
+      expect(a.disposeCalls()).toBe(0);
+    } else {
+      expect(ep!.client).toBe(b.transport);
+      expect(a.disposeCalls()).toBe(1);
+      expect(a.leaseReleased()).toBe(true);
+      expect(b.disposeCalls()).toBe(0);
+    }
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('concurrent registerGrokAcpLive after live owner: second refuses without attach', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const sessionId = 'sess-live-owner';
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: sessionId,
+        },
+      },
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    let disposeB = 0;
+    let leaseBReleased = false;
+    const transportA = {
+      runtime: 'grok-acp' as const,
+      runningInput: 'unsupported' as const,
+      async getState() {
+        return { running: false, idle: true, disposed: false };
+      },
+      async prompt() {},
+      async abort() {},
+      async dispose() {},
+      subscribe() {
+        return () => undefined;
+      },
+      getStderr() {
+        return '';
+      },
+    };
+    const transportB = {
+      runtime: 'grok-acp' as const,
+      runningInput: 'unsupported' as const,
+      async getState() {
+        return { running: false, idle: true, disposed: false };
+      },
+      async prompt() {},
+      async abort() {},
+      async dispose() {
+        disposeB += 1;
+      },
+      subscribe() {
+        return () => undefined;
+      },
+      getStderr() {
+        return '';
+      },
+    };
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+      }),
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const launchSpec = {
+      agent,
+      request: {
+        mode: 'single' as const,
+        agentScope: 'both' as const,
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp' as const,
+      },
+      sessionFile: '',
+      sessionArtifact: { runtime: 'grok-acp' as const, sessionId },
+      effectiveCwd: root,
+      agentScope: 'both' as const,
+      registrationKind: 'initial' as const,
+    };
+
+    const first = await registry.registerGrokAcpLive({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-1',
+      transport: transportA as never,
+      leaseRelease: () => undefined,
+      launchSpec,
+      getBranchEntries: () => [],
+    });
+    expect(first.key).toBe(`${runId}:single`);
+    expect(registry.getMutable(first.key)?.client).toBe(transportA);
+
+    await expect(
+      registry.registerGrokAcpLive({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-2',
+        transport: transportB as never,
+        leaseRelease: () => {
+          leaseBReleased = true;
+        },
+        launchSpec,
+        getBranchEntries: () => [],
+      })
+    ).rejects.toMatchObject({ code: 'session_busy' });
+
+    // Live owner unchanged; loser disposed exactly once and lease released.
+    expect(registry.getMutable(first.key)?.client).toBe(transportA);
+    expect(disposeB).toBe(1);
+    expect(leaseBReleased).toBe(true);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('same-tick concurrent registerGrokAcpLive: acquire-stage loser disposes once and releases lease', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
+    const sessionId = 'sess-same-tick-acquire';
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'gagent',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+          acpSessionId: sessionId,
+        },
+      },
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    function makeTransport(label: string) {
+      let disposeCalls = 0;
+      let leaseReleased = false;
+      return {
+        label,
+        disposeCalls: () => disposeCalls,
+        leaseReleased: () => leaseReleased,
+        transport: {
+          runtime: 'grok-acp' as const,
+          runningInput: 'unsupported' as const,
+          async getState() {
+            return { running: false, idle: true, disposed: false };
+          },
+          async prompt() {},
+          async abort() {},
+          async dispose() {
+            disposeCalls += 1;
+          },
+          subscribe() {
+            return () => undefined;
+          },
+          getStderr() {
+            return '';
+          },
+        },
+        leaseRelease: (_err?: Error) => {
+          leaseReleased = true;
+        },
+      };
+    }
+
+    const a = makeTransport('A');
+    const b = makeTransport('B');
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+      }),
+      shutdownDisposeBudgetMs: 5_000,
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const launchSpec = {
+      agent,
+      request: {
+        mode: 'single' as const,
+        agentScope: 'both' as const,
+        agent: 'gagent',
+        task: 't',
+        runtime: 'grok-acp' as const,
+      },
+      sessionFile: '',
+      sessionArtifact: { runtime: 'grok-acp' as const, sessionId },
+      effectiveCwd: root,
+      agentScope: 'both' as const,
+      registrationKind: 'initial' as const,
+    };
+
+    // Fire both on the same tick so the later reservation supersedes the earlier
+    // generation at acquireRegistration (before binding / attach).
+    const p1 = registry
+      .registerGrokAcpLive({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-a',
+        transport: a.transport as never,
+        leaseRelease: a.leaseRelease,
+        launchSpec,
+        getBranchEntries: () => [],
+      })
+      .then(
+        (s) => ({ ok: true as const, snap: s, who: 'A' as const }),
+        (e: unknown) => ({ ok: false as const, err: e, who: 'A' as const })
+      );
+    const p2 = registry
+      .registerGrokAcpLive({
+        runId,
+        unitId: 'single',
+        hostSessionId: 'host-b',
+        transport: b.transport as never,
+        leaseRelease: b.leaseRelease,
+        launchSpec,
+        getBranchEntries: () => [],
+      })
+      .then(
+        (s) => ({ ok: true as const, snap: s, who: 'B' as const }),
+        (e: unknown) => ({ ok: false as const, err: e, who: 'B' as const })
+      );
+
+    // Pending owners must be visible to shutdown while either registration is in flight.
+    expect(registry._pendingOwnerCount()).toBeGreaterThan(0);
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    const wins = [r1, r2].filter((r) => r.ok);
+    const losses = [r1, r2].filter((r) => !r.ok);
+    expect(wins).toHaveLength(1);
+    expect(losses).toHaveLength(1);
+    // Loser fails at acquire (superseded) or live-owner gate — both session_busy.
+    expect((losses[0] as { err: { code?: string } }).err).toMatchObject({
+      code: 'session_busy',
+    });
+
+    const loser = (losses[0] as { who: 'A' | 'B' }).who === 'A' ? a : b;
+    const winner = (wins[0] as { who: 'A' | 'B' }).who === 'A' ? a : b;
+    expect(loser.disposeCalls()).toBe(1);
+    expect(loser.leaseReleased()).toBe(true);
+    // Winner keeps the attached transport (dispose only on later shutdown).
+    expect(winner.disposeCalls()).toBe(0);
+
+    const ep = registry.getMutable(`${runId}:single`);
+    expect(ep?.client).toBe(winner.transport);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('shutdown with fixed clock + pending no transport still hits real deadline (no hang)', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ systemPrompt: '' });
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'explore', task: 'look' },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionFile = path.join(store.getRunDir(runId), 'sessions', 'fixed-clock.jsonl');
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"s","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+
+    let releaseFactory!: (t: PiRpcTransport) => void;
+    const factoryGate = new Promise<PiRpcTransport>((r) => {
+      releaseFactory = r;
+    });
+    let factoryEntered = false;
+
+    // Fixed clock must not freeze the shutdown deadline (real Date.now used).
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      clock: () => 1_000_000,
+      shutdownDisposeBudgetMs: 80,
+      transportFactory: async () => {
+        factoryEntered = true;
+        // Pending owner holds lease with no transport until factory returns.
+        return factoryGate;
+      },
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-fixed-clock',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () => [],
+    });
+
+    const actP = registry.activate(snap.key, 'Task: hang', 'prompt').catch(() => undefined);
+    for (let i = 0; i < 80 && !factoryEntered; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(factoryEntered).toBe(true);
+    expect(registry._pendingOwnerCount()).toBeGreaterThan(0);
+
+    const t0 = Date.now();
+    await expect(registry.shutdown()).rejects.toMatchObject({ code: 'dispose_failed' });
+    const elapsed = Date.now() - t0;
+    // Real short deadline fires despite fixed clock; must not hang.
+    expect(elapsed).toBeLessThan(2_000);
+    expect(elapsed).toBeGreaterThanOrEqual(50);
+
+    // Late factory resolve must not hang the test; sticky settle already ran.
+    releaseFactory({
+      async getState() {
+        return {
+          sessionId: 's',
+          thinkingLevel: 'off',
+          isStreaming: false,
+          isCompacting: false,
+          steeringMode: 'all',
+          followUpMode: 'one-at-a-time',
+          autoCompactionEnabled: true,
+          messageCount: 0,
+          pendingMessageCount: 0,
+        };
+      },
+      async prompt() {},
+      async steer() {},
+      async followUp() {},
+      async abort() {},
+      subscribe() {
+        return () => undefined;
+      },
+      async dispose() {},
+      getStderr() {
+        return '';
+      },
+    } as unknown as PiRpcTransport);
+    await actP;
+    await new Promise((r) => setTimeout(r, 20));
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('shutdown clears deadline timer when dispose completes first (no residual active timer)', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent({ systemPrompt: '' });
+    const activeTimers = new Set<unknown>();
+    let timerSeq = 0;
+    const timers = {
+      setTimeout: (fn: () => void, ms?: number) => {
+        const id = { id: ++timerSeq, ms };
+        activeTimers.add(id);
+        const handle = setTimeout(() => {
+          activeTimers.delete(id);
+          fn();
+        }, ms);
+        (id as { handle?: ReturnType<typeof setTimeout> }).handle = handle;
+        return id;
+      },
+      clearTimeout: (id: unknown) => {
+        activeTimers.delete(id);
+        const handle = (id as { handle?: ReturnType<typeof setTimeout> })?.handle;
+        if (handle) clearTimeout(handle);
+      },
+    };
+
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'explore', task: 'look' },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionFile = path.join(store.getRunDir(runId), 'sessions', 'timer.jsonl');
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"s","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      shutdownDisposeBudgetMs: 5_500,
+      timers,
+      transportFactory: async () =>
+        ({
+          async getState() {
+            return {
+              sessionId: 's',
+              thinkingLevel: 'off',
+              isStreaming: false,
+              isCompacting: false,
+              steeringMode: 'all',
+              followUpMode: 'one-at-a-time',
+              autoCompactionEnabled: true,
+              messageCount: 0,
+              pendingMessageCount: 0,
+            };
+          },
+          async prompt() {},
+          async steer() {},
+          async followUp() {},
+          async abort() {},
+          subscribe() {
+            return () => undefined;
+          },
+          async dispose() {
+            // Completes immediately — well under the 5.5s budget.
+          },
+          getStderr() {
+            return '';
+          },
+        }) as unknown as PiRpcTransport,
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-timer',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () => [],
+    });
+    await registry.activate(snap.key, 'Task: quick', 'prompt');
+
+    const t0 = Date.now();
+    await registry.shutdown();
+    const elapsed = Date.now() - t0;
+    // Fast dispose path: well under the absolute budget.
+    expect(elapsed).toBeLessThan(500);
+    // No residual deadline timer left active after clean shutdown.
+    expect(activeTimers.size).toBe(0);
+
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

@@ -54,7 +54,12 @@ import {
 import { normalizeStoredRequest, startDurableRun, type StartedRun } from './run-persistence.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import type { RunStore } from './run-store.ts';
-import { chainFanoutUnitId, chainStepUnitId, pad } from './run-coordinator.ts';
+import {
+  chainFanoutUnitId,
+  chainStepUnitId,
+  pad,
+  unitRequiresReplayAcknowledgement,
+} from './run-coordinator.ts';
 import type { RunCoordinator, UnitExecutionContext } from './run-coordinator.ts';
 import type { SubagentParams } from './schema.ts';
 import { assertAgentDelegationAllowed } from './security.ts';
@@ -78,7 +83,7 @@ import {
   removeAgentWorktree,
   runWorktreeSetupHook,
 } from './worktree.ts';
-import { inspectResume, incrementIncompleteAttempts } from './resume.ts';
+import { inspectResume, incrementIncompleteAttempts, isNeverStartedUnit } from './resume.ts';
 import type { ResumePromptContext } from './execution.ts';
 import type { StoredRunRequest } from './run-types.ts';
 
@@ -256,12 +261,25 @@ interface DurableRunContext {
     fanoutIndex: number | undefined,
     agentName: string
   ): UnitExecutionContext;
-  /** Stamp the per-unit start; called before runStepWithContext. */
-  beginUnit(ctx: UnitExecutionContext): void;
+  /** Stamp the per-unit start; awaited before session stamp / interactive register. */
+  beginUnit(ctx: UnitExecutionContext): void | Promise<void>;
   /** Stamp the per-unit terminal. */
   endUnit(ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus): void;
-  /** Update a unit's sessionFile after Pi session creation (persisted on next flush). */
-  stampUnitSessionFile(unitId: string, sessionFile: string): void;
+  /**
+   * Strict awaited first-write of a unit sessionFile after Pi session creation.
+   * Disk-first CAS via the coordinator; same path is idempotent.
+   */
+  stampUnitSessionFile(unitId: string, sessionFile: string): Promise<void>;
+  /**
+   * Strict awaited write of a Grok ACP session ID (disk-first). Must succeed
+   * before the first session/prompt.
+   */
+  persistAcpSessionId?(unitId: string, sessionId: string): Promise<void>;
+  /**
+   * Strict awaited mark that Pi accepted the unit's original prompt.
+   * Write failure must fail-close the current execution.
+   */
+  markSessionPromptEstablished?(unitId: string): Promise<void>;
   /**
    * Persist fanout expansion + child unit records before workers are scheduled.
    * Resolves the requested agent by exact name (synthetic fallback; never agents[0]).
@@ -269,8 +287,12 @@ interface DurableRunContext {
   expandFanout(req: FanoutExpandRequest): Promise<WorkflowFanoutState>;
   /** Build per-unit resume prompt context with undelivered continuation slice. */
   resumePromptForUnit?(unitId: string): ResumePromptContext | undefined;
-  /** Mark all current continuation tasks as delivered for a unit (after prompt accept). */
-  markContinuationDelivered?(unitId: string): void;
+  /**
+   * Mark all current continuation tasks as delivered for a unit.
+   * Pi: after prompt accept (may be fire-and-forget).
+   * Grok ACP: after matching prompt completed; await the returned promise.
+   */
+  markContinuationDelivered?(unitId: string): void | Promise<void>;
 }
 
 /**
@@ -330,6 +352,7 @@ async function maybeStartDurableRun(
   ): UnitExecutionContext => {
     const unitId = resolveUnitId(mode, unitIds, step, fanoutIndex);
     const base = units[unitId];
+    const neverStarted = base ? isNeverStartedUnit(base) : true;
     return {
       runId: started.runId,
       unitId,
@@ -339,14 +362,19 @@ async function maybeStartDurableRun(
       effectiveCwd: base?.effectiveCwd ?? ctx.cwd,
       attempt: base?.attempt ?? 1,
       sessionsDir,
+      neverStarted,
       ...(base?.sessionFile !== undefined ? { sessionFile: base.sessionFile } : {}),
+      ...(base?.acpSessionId !== undefined ? { acpSessionId: base.acpSessionId } : {}),
+      ...(base?.sessionPromptEstablished !== undefined
+        ? { sessionPromptEstablished: base.sessionPromptEstablished }
+        : {}),
       ...(base?.worktreePath !== undefined ? { worktreePath: base.worktreePath } : {}),
       ...(step !== undefined ? { step } : {}),
       ...(fanoutIndex !== undefined ? { fanoutIndex } : {}),
     };
   };
-  const beginUnit = (unitCtx: UnitExecutionContext) => {
-    coordinator.startUnit(started.runId, unitCtx);
+  const beginUnit = async (unitCtx: UnitExecutionContext) => {
+    await coordinator.startUnit(started.runId, unitCtx);
   };
   const endUnit = (
     unitCtx: UnitExecutionContext,
@@ -355,16 +383,44 @@ async function maybeStartDurableRun(
   ) => {
     coordinator.finishUnit(started.runId, unitCtx, result, status);
   };
-  const stampUnitSessionFile = (unitId: string, sessionFile: string) => {
+  const stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
+    const unit = units[unitId];
+    // Only first path write marks unestablished; restamp must not regress legacy/true.
+    const firstWrite = !unit?.sessionFile?.trim();
+    await coordinator.persistSessionFile({
+      runId: started.runId,
+      unitId,
+      sessionFile,
+    });
+    if (unit) {
+      unit.sessionFile = sessionFile.trim();
+      if (firstWrite && unit.sessionPromptEstablished !== true) {
+        unit.sessionPromptEstablished = false;
+      }
+    }
+  };
+  const markSessionPromptEstablished = async (unitId: string): Promise<void> => {
+    await coordinator.persistSessionPromptEstablished({
+      runId: started.runId,
+      unitId,
+    });
     const unit = units[unitId];
     if (unit) {
-      unit.sessionFile = sessionFile;
-      coordinator.persist({
-        runId: started.runId,
-        details: started.record.details,
-        units,
-        flushNow: true,
-      });
+      unit.sessionPromptEstablished = true;
+    }
+  };
+  const persistAcpSessionId = async (unitId: string, sessionId: string): Promise<void> => {
+    await coordinator.persistAcpSessionId({
+      runId: started.runId,
+      unitId,
+      sessionId,
+    });
+    const unit = units[unitId];
+    if (unit) {
+      unit.acpSessionId = sessionId.trim();
+      if (unit.runtime === GROK_ACP_RUNTIME && unit.capability === 'replay') {
+        unit.capability = 'session';
+      }
     }
   };
   const expandFanout = async (req: FanoutExpandRequest): Promise<WorkflowFanoutState> => {
@@ -387,7 +443,9 @@ async function maybeStartDurableRun(
     unitFor,
     beginUnit,
     endUnit,
+    persistAcpSessionId,
     stampUnitSessionFile,
+    markSessionPromptEstablished,
     expandFanout,
   };
 }
@@ -476,6 +534,18 @@ async function maybeResumeDurableRun(
   // Increment attempts only after post-claim eligibility succeeds.
   incrementIncompleteAttempts(units);
 
+  // Drop planned-only session paths from never-started units. A pre-begin stamp
+  // crash window may have left a path without attempt history; those are not
+  // established sessions and must not block a fresh first-write or flip
+  // resumeHadStoredSession.
+  for (const unit of Object.values(units)) {
+    if (isNeverStartedUnit(unit) && unit.sessionFile) {
+      delete unit.sessionFile;
+      delete unit.sessionPromptEstablished;
+      if (unit.result) delete unit.result.sessionFile;
+    }
+  }
+
   // Transition to running and append the current continuation task atomically.
   // Guard the post-claim persistence so a write failure releases the claim.
   const priorContinuations = record.continuationTasks ?? [];
@@ -494,6 +564,20 @@ async function maybeResumeDurableRun(
     });
     await store.updateRun(resumeRunId, (r) => {
       r.status = 'running';
+      // Normalize eligible incomplete Grok ACP units: capability is always session
+      // (including legacy stored "replay"). Attempted units without an ID are kept
+      // unavailable by preflight and never reach this write.
+      for (const unit of Object.values(units)) {
+        if (unit.status === 'completed' || unit.status === 'skipped') continue;
+        if (unit.runtime !== GROK_ACP_RUNTIME) continue;
+        // Only normalize units that preflight already admitted (never-started, or
+        // attempted with a stored acpSessionId).
+        if (!isNeverStartedUnit(unit) && !unit.acpSessionId?.trim()) continue;
+        unit.capability = 'session';
+        if (unit.result) {
+          unit.result.resumeCapability = 'session';
+        }
+      }
       r.units = units;
       r.updatedAt = Date.now();
       r.startedAt = r.startedAt ?? Date.now();
@@ -535,6 +619,7 @@ async function maybeResumeDurableRun(
   ): UnitExecutionContext => {
     const unitId = resolveUnitId(mode, unitIds, step, fanoutIndex);
     const base = units[unitId];
+    const neverStarted = base ? isNeverStartedUnit(base) : true;
     return {
       runId: resumeRunId,
       unitId,
@@ -544,14 +629,19 @@ async function maybeResumeDurableRun(
       effectiveCwd: base?.effectiveCwd ?? projectCwd,
       attempt: base?.attempt ?? 1,
       sessionsDir,
+      neverStarted,
       ...(base?.sessionFile !== undefined ? { sessionFile: base.sessionFile } : {}),
+      ...(base?.acpSessionId !== undefined ? { acpSessionId: base.acpSessionId } : {}),
+      ...(base?.sessionPromptEstablished !== undefined
+        ? { sessionPromptEstablished: base.sessionPromptEstablished }
+        : {}),
       ...(base?.worktreePath !== undefined ? { worktreePath: base.worktreePath } : {}),
       ...(step !== undefined ? { step } : {}),
       ...(fanoutIndex !== undefined ? { fanoutIndex } : {}),
     };
   };
-  const beginUnit = (unitCtx: UnitExecutionContext) => {
-    coordinator.startUnit(resumeRunId, unitCtx);
+  const beginUnit = async (unitCtx: UnitExecutionContext) => {
+    await coordinator.startUnit(resumeRunId, unitCtx);
   };
   const endUnit = (
     unitCtx: UnitExecutionContext,
@@ -560,16 +650,43 @@ async function maybeResumeDurableRun(
   ) => {
     coordinator.finishUnit(resumeRunId, unitCtx, result, status);
   };
-  const stampUnitSessionFile = (unitId: string, sessionFile: string) => {
+  const stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
+    const unit = units[unitId];
+    const firstWrite = !unit?.sessionFile?.trim();
+    await coordinator.persistSessionFile({
+      runId: resumeRunId,
+      unitId,
+      sessionFile,
+    });
+    if (unit) {
+      unit.sessionFile = sessionFile.trim();
+      if (firstWrite && unit.sessionPromptEstablished !== true) {
+        unit.sessionPromptEstablished = false;
+      }
+    }
+  };
+  const markSessionPromptEstablished = async (unitId: string): Promise<void> => {
+    await coordinator.persistSessionPromptEstablished({
+      runId: resumeRunId,
+      unitId,
+    });
     const unit = units[unitId];
     if (unit) {
-      unit.sessionFile = sessionFile;
-      coordinator.persist({
-        runId: resumeRunId,
-        details: record.details,
-        units,
-        flushNow: true,
-      });
+      unit.sessionPromptEstablished = true;
+    }
+  };
+  const persistAcpSessionId = async (unitId: string, sessionId: string): Promise<void> => {
+    await coordinator.persistAcpSessionId({
+      runId: resumeRunId,
+      unitId,
+      sessionId,
+    });
+    const unit = units[unitId];
+    if (unit) {
+      unit.acpSessionId = sessionId.trim();
+      if (unit.runtime === GROK_ACP_RUNTIME && unit.capability === 'replay') {
+        unit.capability = 'session';
+      }
     }
   };
   const expandFanout = async (req: FanoutExpandRequest): Promise<WorkflowFanoutState> => {
@@ -594,21 +711,17 @@ async function maybeResumeDurableRun(
         : {}),
     };
   };
-  const markContinuationDelivered = (unitId: string): void => {
+  const markContinuationDelivered = async (unitId: string): Promise<void> => {
     const deliveredCount = accumulatedContinuations.length;
+    // Disk-first strict write so a crash before confirm leaves instructions undelivered.
+    await coordinator.persistContinuationDelivery({
+      runId: resumeRunId,
+      unitId,
+      deliveredCount,
+      continuationTasks: accumulatedContinuations,
+    });
     if (!record.continuationDelivery) record.continuationDelivery = {};
     record.continuationDelivery[unitId] = { deliveredCount };
-    coordinator.persist({
-      runId: resumeRunId,
-      details: record.details,
-      units,
-      flushNow: true,
-      mutate: (r) => {
-        if (!r.continuationDelivery) r.continuationDelivery = {};
-        r.continuationDelivery[unitId] = { deliveredCount };
-        r.continuationTasks = accumulatedContinuations;
-      },
-    });
   };
 
   const started: StartedRun = {
@@ -679,6 +792,8 @@ async function maybeResumeDurableRun(
       beginUnit,
       endUnit,
       stampUnitSessionFile,
+      markSessionPromptEstablished,
+      persistAcpSessionId,
       expandFanout,
       resumePromptForUnit,
       markContinuationDelivered,
@@ -1312,6 +1427,18 @@ async function runChain(
                   endUnit: durable.endUnit,
                   stampUnitSessionFile: (sf: string) =>
                     durable.stampUnitSessionFile(unitContext.unitId, sf),
+                  ...(durable.markSessionPromptEstablished
+                    ? {
+                        markSessionPromptEstablished: () =>
+                          durable.markSessionPromptEstablished!(unitContext.unitId),
+                      }
+                    : {}),
+                  ...(durable.persistAcpSessionId
+                    ? {
+                        persistAcpSessionId: (id: string) =>
+                          durable.persistAcpSessionId!(unitContext.unitId, id),
+                      }
+                    : {}),
                   ...(durable.resumePromptForUnit
                     ? { resumePrompt: durable.resumePromptForUnit(unitContext.unitId) }
                     : durable.resume
@@ -1446,11 +1573,15 @@ async function runParallel(
         return allResults[index];
       }
       const unitCtx = durable?.unitFor(undefined, index, t.agent);
-      // Replay gate at dispatch: refuse resumed replay units without allowReplay.
+      // Replay gate at dispatch: runtime-aware — plain Grok needs allowReplay;
+      // legacy Grok ACP stored as capability "replay" does not.
       if (
         unitCtx &&
         durable?.isResume &&
-        unitCtx.resumeCapability === 'replay' &&
+        unitRequiresReplayAcknowledgement({
+          runtime: unitCtx.runtime,
+          capability: unitCtx.resumeCapability,
+        }) &&
         !durable.allowReplay
       ) {
         const blocked: SingleResult = {
@@ -1508,6 +1639,18 @@ async function runParallel(
                     durable.stampUnitSessionFile(unitCtx.unitId, sf),
                   beginUnit: durable.beginUnit,
                   endUnit: durable.endUnit,
+                  ...(durable.markSessionPromptEstablished
+                    ? {
+                        markSessionPromptEstablished: () =>
+                          durable.markSessionPromptEstablished!(unitCtx.unitId),
+                      }
+                    : {}),
+                  ...(durable.persistAcpSessionId
+                    ? {
+                        persistAcpSessionId: (id: string) =>
+                          durable.persistAcpSessionId!(unitCtx.unitId, id),
+                      }
+                    : {}),
                   ...(durable.resumePromptForUnit
                     ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
                     : durable.resume
@@ -1628,7 +1771,16 @@ async function runSingle(
         };
       }
     }
-    if (durable.isResume && unitCtx.resumeCapability === 'replay' && !durable.allowReplay) {
+    // Runtime-aware replay gate: plain Grok needs allowReplay; legacy Grok ACP
+    // stored as capability "replay" must still create/load sessions without it.
+    if (
+      durable.isResume &&
+      unitRequiresReplayAcknowledgement({
+        runtime: unitCtx.runtime,
+        capability: unitCtx.resumeCapability,
+      }) &&
+      !durable.allowReplay
+    ) {
       return {
         content: [
           {
@@ -1670,6 +1822,18 @@ async function runSingle(
               endUnit: durable.endUnit,
               stampUnitSessionFile: (sf: string) =>
                 durable.stampUnitSessionFile(unitCtx.unitId, sf),
+              ...(durable.markSessionPromptEstablished
+                ? {
+                    markSessionPromptEstablished: () =>
+                      durable.markSessionPromptEstablished!(unitCtx.unitId),
+                  }
+                : {}),
+              ...(durable.persistAcpSessionId
+                ? {
+                    persistAcpSessionId: (id: string) =>
+                      durable.persistAcpSessionId!(unitCtx.unitId, id),
+                  }
+                : {}),
               ...(durable.resumePromptForUnit
                 ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
                 : durable.resume
@@ -1755,16 +1919,20 @@ async function runStepWithContext(
     title?: string;
     unitContext?: UnitExecutionContext;
     getAbortOrigin?: () => RunAbortOrigin;
-    stampUnitSessionFile?: (sessionFile: string) => void;
-    beginUnit?: (ctx: UnitExecutionContext) => void;
+    stampUnitSessionFile?: (sessionFile: string) => void | Promise<void>;
+    beginUnit?: (ctx: UnitExecutionContext) => void | Promise<void>;
     endUnit?: (ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus) => void;
     /** Runs before worktree cleanup and durable endUnit (schema validation, metadata). */
     postprocessTerminal?: (result: SingleResult) => void;
     interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
     /** Durable resume prompt context (session continuation vs fresh/replay). */
     resumePrompt?: ResumePromptContext;
-    /** Mark continuation delivery after the child accepts the prompt. */
-    markContinuationDelivered?: (unitId: string) => void;
+    /** Mark continuation delivery (Pi: after accept; Grok ACP: after prompt completed). */
+    markContinuationDelivered?: (unitId: string) => void | Promise<void>;
+    /** Strict Pi original-prompt establishment after spawn/RPC activate. */
+    markSessionPromptEstablished?: () => Promise<void>;
+    /** Strict Grok ACP session-ID persistence before the first prompt. */
+    persistAcpSessionId?: (sessionId: string) => Promise<void>;
     allowReplay?: boolean;
     /** Restored project/workspace cwd for resume (overrides ctx.cwd for git/cwd fallbacks). */
     projectCwd?: string;
@@ -1773,7 +1941,16 @@ async function runStepWithContext(
 ): Promise<SingleResult> {
   const agent = agents.find((a) => a.name === agentName);
   // Capture before prepareAgentContext may create a new session for never-started units.
-  const hadStoredSession = Boolean(options.unitContext?.sessionFile);
+  // Pi: only a session whose original prompt was confirmed counts as stored.
+  // Explicit sessionPromptEstablished === false is the stamp-before-prompt crash
+  // window and must not flip resumeHadStoredSession (preflight fail-closes it).
+  // Legacy units without the field still count when a sessionFile is present.
+  // Grok ACP: protocol session ID. Never-started units never count as prior.
+  const hadStoredSession =
+    options.unitContext?.neverStarted !== true &&
+    (Boolean(options.unitContext?.acpSessionId) ||
+      (Boolean(options.unitContext?.sessionFile) &&
+        options.unitContext?.sessionPromptEstablished !== false));
   // Prefer explicit task cwd, then persisted unit effectiveCwd, then project cwd.
   const fallbackCwd = cwd ?? options.unitContext?.effectiveCwd ?? options.projectCwd ?? ctx.cwd;
   const applyPostprocess = (result: SingleResult): void => {
@@ -1980,7 +2157,7 @@ async function runStepWithContext(
       });
     }
   } catch (err) {
-    if (worktree) removeAgentWorktree(worktree);
+    // Pre-execution context failure: only remove owned-new clean worktrees.
     const message = err instanceof Error ? err.message : String(err);
     const failure4 = synthesizeFailure(
       agentName,
@@ -1991,109 +2168,237 @@ async function runStepWithContext(
       message,
       options.title
     );
+    if (worktree && !storedWorktreePath) {
+      const status = getWorktreeDirtyStatus(worktree.path);
+      if (status.ok && status.output.trim().length === 0) {
+        removeAgentWorktree(worktree);
+      } else {
+        failure4.worktreePath = worktree.path;
+        failure4.worktreeDirty = status.ok ? status.output.trim().length > 0 : true;
+      }
+    } else if (storedWorktreePath) {
+      failure4.worktreePath = storedWorktreePath;
+      const dirty = getWorktreeDirtyStatus(storedWorktreePath);
+      failure4.worktreeDirty = dirty.ok ? dirty.output.trim().length > 0 : true;
+    }
     markEnd(failure4, 'failed');
     return failure4;
   }
 
-  // Persist the newly created session file onto the unit record and mutate the
-  // unit context so stampUnitContext() stamps the correct path onto the result.
-  // Do not flip hadStoredSession: prompt kind was decided from the pre-prepare state.
-  if (options.unitContext && agentContext.sessionFile) {
-    options.unitContext.sessionFile = agentContext.sessionFile;
-    options.stampUnitSessionFile?.(agentContext.sessionFile);
-  }
-  // Stamp the worktree path onto the unit context so the coordinator persists it.
-  if (options.unitContext && worktree) {
-    options.unitContext.worktreePath = worktree.path;
-  }
-
-  // Interactive TUI Pi registration: after cwd/session resolution, before begin/spawn.
+  // Interactive TUI registration: Pi (pre-spawn with session file) or Grok ACP
+  // (resume with stored acpSessionId). Fresh Grok ACP registers after session/new.
   let endpointKey: string | undefined;
   let retainCleanWorktree = false;
-  const canRegisterInteractive =
+  const isGrokAcp = effectiveRuntime === GROK_ACP_RUNTIME;
+  const acpSessionId = options.unitContext?.acpSessionId?.trim();
+  const canRegisterInteractivePi =
     ctx.mode === 'tui' &&
     options.interactiveRegistry &&
     options.unitContext &&
     agentContext.sessionFile &&
     !isGrokFamily;
+  const canRegisterInteractiveGrokAcp =
+    ctx.mode === 'tui' &&
+    options.interactiveRegistry &&
+    options.unitContext &&
+    isGrokAcp &&
+    Boolean(acpSessionId);
+  // Whether a worktree was created for this invocation (vs reopened stored path).
+  const createdNewWorktree = Boolean(worktree && !storedWorktreePath);
+  // True once beginUnit has been called (spawn may have side effects).
+  let beganUnit = false;
+  // True once runSingleAgent is entered (child may have modified the worktree).
+  let executionStarted = false;
+  // Crash-window detection must use pre-stamp durable state: a first path write
+  // this turn sets sessionPromptEstablished false and still sends the original
+  // prompt. Only a prior unestablished path fail-closes resume.
+  const priorUnestablishedSession =
+    options.unitContext?.neverStarted !== true &&
+    Boolean(options.unitContext?.sessionFile?.trim()) &&
+    options.unitContext?.sessionPromptEstablished === false;
 
-  if (canRegisterInteractive && options.interactiveRegistry && options.unitContext) {
-    try {
-      const hostSessionId = ctx.sessionManager.getSessionId();
-      const unitCtx = options.unitContext;
-      const launchAgent: AgentConfig = {
-        ...agent,
-        model: options.modelOverride ?? agent.model,
-        thinking: options.thinkingOverride ?? agent.thinking,
-        runtime: options.runtimeOverride ?? agent.runtime,
-      };
-      const snap = await options.interactiveRegistry.registerInitial({
-        runId: unitCtx.runId,
-        unitId: unitCtx.unitId,
-        hostSessionId,
-        launchSpec: {
-          agent: launchAgent,
-          request: {
-            mode: 'single',
-            agentScope: 'both',
-            model: options.modelOverride,
-            thinking: options.thinkingOverride,
-            runtime: options.runtimeOverride,
-            isolation: resolveIsolation(agent, taskIsolation),
-            agent: agentName,
-            task,
+  /** Stamp worktree path + dirty diagnostics onto a failure result. */
+  const stampWorktreeOnFailure = (failure: SingleResult): void => {
+    if (!worktree) return;
+    failure.worktreePath = worktree.path;
+    const status = getWorktreeDirtyStatus(worktree.path);
+    failure.worktreeDirty = status.ok ? status.output.trim().length > 0 : true;
+    if (failure.worktreeDirty) {
+      const diff = getWorktreeDiffSummary(worktree.path);
+      if (diff.ok) {
+        if (diff.stat) failure.worktreeDiffStat = diff.stat;
+        if (diff.changedFiles) failure.worktreeChangedFiles = diff.changedFiles;
+      }
+    }
+  };
+
+  /**
+   * Remove an owned-new worktree only when execution never started and the tree
+   * is confirmed clean. Once execution starts or the tree is dirty/unknown,
+   * retain it and stamp diagnostics on the failure result.
+   */
+  const maybeRemoveOwnedCleanWorktree = (failure?: SingleResult): boolean => {
+    if (!worktree || !createdNewWorktree || executionStarted) {
+      if (worktree && failure) stampWorktreeOnFailure(failure);
+      return false;
+    }
+    const status = getWorktreeDirtyStatus(worktree.path);
+    if (!status.ok || status.output.trim().length > 0) {
+      if (failure) stampWorktreeOnFailure(failure);
+      return false;
+    }
+    removeAgentWorktree(worktree);
+    return true;
+  };
+
+  // Unified cleanup boundary. Durable begin runs first so crash recovery sees an
+  // attempted unit before session stamp/register; only owned-new worktrees are
+  // removed on failure (never stored resume paths, dirty or clean).
+  try {
+    // Stamp the worktree path onto the unit context before begin so durable
+    // attempt history records the reopen path.
+    if (options.unitContext && worktree) {
+      options.unitContext.worktreePath = worktree.path;
+    }
+
+    // Await durable unit_started + attempt write before stamp/register so a crash
+    // never leaves a stamped session path on a still never-started unit.
+    if (options.unitContext && options.beginUnit) {
+      await options.beginUnit(options.unitContext);
+      beganUnit = true;
+    }
+
+    // Strict first-write of a newly prepared Pi session path (or idempotent
+    // restamp of an existing path). Do not mutate unitContext until success so
+    // a conflict/disk failure cannot leave a live-only uncommitted path.
+    // First path write records sessionPromptEstablished: false; restamp of an
+    // existing path must not regress legacy (undefined) or true.
+    if (options.unitContext && agentContext.sessionFile) {
+      const priorPath = Boolean(options.unitContext.sessionFile?.trim());
+      const priorEstablished = options.unitContext.sessionPromptEstablished;
+      await options.stampUnitSessionFile?.(agentContext.sessionFile);
+      options.unitContext.sessionFile = agentContext.sessionFile;
+      if (priorEstablished === true) {
+        options.unitContext.sessionPromptEstablished = true;
+      } else if (!priorPath) {
+        options.unitContext.sessionPromptEstablished = false;
+      } else if (priorEstablished === false) {
+        options.unitContext.sessionPromptEstablished = false;
+      }
+      // else: legacy resume (path already present, field absent) — leave undefined
+    }
+
+    if (
+      (canRegisterInteractivePi || canRegisterInteractiveGrokAcp) &&
+      options.interactiveRegistry &&
+      options.unitContext
+    ) {
+      try {
+        const hostSessionId = ctx.sessionManager.getSessionId();
+        const unitCtx = options.unitContext;
+        const launchAgent: AgentConfig = {
+          ...agent,
+          model: options.modelOverride ?? agent.model,
+          thinking: options.thinkingOverride ?? agent.thinking,
+          runtime: options.runtimeOverride ?? agent.runtime,
+        };
+        const sessionArtifact = isGrokAcp
+          ? ({ runtime: 'grok-acp' as const, sessionId: acpSessionId! } as const)
+          : ({ runtime: 'pi' as const, sessionFile: agentContext.sessionFile! } as const);
+        const snap = await options.interactiveRegistry.registerInitial({
+          runId: unitCtx.runId,
+          unitId: unitCtx.unitId,
+          hostSessionId,
+          launchSpec: {
+            agent: launchAgent,
+            request: {
+              mode: 'single',
+              agentScope: 'both',
+              model: options.modelOverride,
+              thinking: options.thinkingOverride,
+              runtime: options.runtimeOverride,
+              isolation: resolveIsolation(agent, taskIsolation),
+              agent: agentName,
+              task,
+              title: options.title,
+              cwd: effectiveCwd ?? fallbackCwd,
+            },
+            resolvedSkillPaths,
+            sessionFile: agentContext.sessionFile ?? '',
+            sessionArtifact,
+            effectiveCwd: effectiveCwd ?? fallbackCwd,
+            worktreePath: worktree?.path,
             title: options.title,
-            cwd: effectiveCwd ?? fallbackCwd,
+            modelOverride: options.modelOverride,
+            thinkingOverride: options.thinkingOverride,
+            runtimeOverride: options.runtimeOverride,
+            isolation: resolveIsolation(agent, taskIsolation),
+            agentScope: 'both',
+            registrationKind: 'initial',
           },
-          resolvedSkillPaths,
-          sessionFile: agentContext.sessionFile!,
-          effectiveCwd: effectiveCwd ?? fallbackCwd,
-          worktreePath: worktree?.path,
-          title: options.title,
-          modelOverride: options.modelOverride,
-          thinkingOverride: options.thinkingOverride,
-          runtimeOverride: options.runtimeOverride,
-          isolation: resolveIsolation(agent, taskIsolation),
-          agentScope: 'both',
-          registrationKind: 'initial',
-        },
-        getBranchEntries: () =>
-          ctx.sessionManager.getBranch().map((e) => {
-            if (e.type === 'custom') {
-              return {
-                type: 'custom',
-                customType: (e as { customType?: string }).customType,
-                data: (e as { data?: unknown }).data,
-              };
-            }
-            return { type: e.type };
-          }),
-      });
-      endpointKey = snap.key;
-      retainCleanWorktree = true;
-    } catch (err) {
-      if (worktree) removeAgentWorktree(worktree);
-      const message = err instanceof Error ? err.message : String(err);
+          getBranchEntries: () =>
+            ctx.sessionManager.getBranch().map((e) => {
+              if (e.type === 'custom') {
+                return {
+                  type: 'custom',
+                  customType: (e as { customType?: string }).customType,
+                  data: (e as { data?: unknown }).data,
+                };
+              }
+              return { type: e.type };
+            }),
+        });
+        endpointKey = snap.key;
+        retainCleanWorktree = true;
+      } catch (err) {
+        // Pre-execution register failure: only remove owned-new clean trees.
+        const message = err instanceof Error ? err.message : String(err);
+        // Preserve formal structured codes (validation_error, dispose_failed, acp_*, …).
+        const formalCode =
+          err &&
+          typeof err === 'object' &&
+          'code' in err &&
+          typeof (err as { code?: unknown }).code === 'string'
+            ? (err as { code: string }).code
+            : undefined;
+        const failure = synthesizeFailure(
+          agentName,
+          agent,
+          task,
+          step,
+          formalCode ?? 'context_error',
+          `Interactive link registration failed: ${message}`,
+          options.title
+        );
+        if (formalCode) failure.errorCode = formalCode;
+        maybeRemoveOwnedCleanWorktree(failure);
+        markEnd(failure, 'failed');
+        return failure;
+      }
+    }
+
+    // Fail closed before spawn when this invocation began with an attempted Pi
+    // unit that already had a session path with original prompt unconfirmed
+    // (prior stamp-before-prompt crash window). Do not send continuation-only
+    // and do not auto-replay the original task. A first path write this turn
+    // still proceeds to send the original prompt and then mark established.
+    if (options.resumePrompt && !isGrokFamily && priorUnestablishedSession) {
       const failure = synthesizeFailure(
         agentName,
         agent,
         task,
         step,
-        'context_error',
-        `Interactive link registration failed: ${message}`,
+        'session_prompt_unestablished',
+        'Original prompt was never established for this Pi session (session_prompt_unestablished). Resume is blocked; do not continuation-only and do not auto-replay the original task.',
         options.title
       );
+      failure.errorCode = 'session_prompt_unestablished';
+      maybeRemoveOwnedCleanWorktree(failure);
       markEnd(failure, 'failed');
       return failure;
     }
-  }
 
-  // Mark the unit started (running attempt + unit_started event) before spawn.
-  if (options.unitContext && options.beginUnit) {
-    options.beginUnit(options.unitContext);
-  }
-
-  try {
+    executionStarted = true;
     const result = await runSingleAgent(
       fallbackCwd,
       agents,
@@ -2115,22 +2420,132 @@ async function runStepWithContext(
         ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
         ...(options.unitContext ? { unitContext: options.unitContext } : {}),
         ...(options.getAbortOrigin ? { getAbortOrigin: options.getAbortOrigin } : {}),
+        // Pi: durable original-prompt establishment after spawn/RPC activate.
+        ...(!isGrokAcp && options.markSessionPromptEstablished
+          ? {
+              onSessionPromptEstablished: async () => {
+                await options.markSessionPromptEstablished!();
+                if (options.unitContext) {
+                  options.unitContext.sessionPromptEstablished = true;
+                }
+              },
+            }
+          : {}),
         ...(options.resumePrompt
           ? {
               resumePrompt: options.resumePrompt,
               resumeHadStoredSession: hadStoredSession,
-              ...(options.markContinuationDelivered && options.unitContext
+              // Pi marks delivery on accept; Grok ACP uses onAcpPromptCompleted below.
+              ...(!isGrokAcp && options.markContinuationDelivered && options.unitContext
                 ? {
                     onResumePromptAccepted: () =>
                       options.markContinuationDelivered!(options.unitContext!.unitId),
                   }
                 : {}),
+              ...(isGrokAcp && options.markContinuationDelivered && options.unitContext
+                ? {
+                    onAcpPromptCompleted: () =>
+                      options.markContinuationDelivered!(options.unitContext!.unitId),
+                  }
+                : {}),
             }
           : {}),
-        ...(options.interactiveRegistry && endpointKey
+        // Pass registry for TUI Pi (with key) and TUI Grok ACP (with or without key).
+        ...(options.interactiveRegistry && (endpointKey || (isGrokAcp && ctx.mode === 'tui'))
           ? {
               interactiveRegistry: options.interactiveRegistry,
-              endpointKey,
+              ...(endpointKey ? { endpointKey } : {}),
+            }
+          : {}),
+        // Fresh Grok ACP: persist protocol session ID before the first prompt.
+        ...(isGrokAcp && options.unitContext
+          ? {
+              onAcpSessionEstablished: async (sessionId: string) => {
+                const unitCtx = options.unitContext!;
+                if (options.persistAcpSessionId) {
+                  await options.persistAcpSessionId(sessionId);
+                }
+                unitCtx.acpSessionId = sessionId;
+              },
+              // TUI fresh: attach live transport after ID flush (same process for first prompt).
+              // Precompute throwable work before acceptOwnership so a throw leaves
+              // transport/lease with the execution caller (dispose + release once).
+              ...(ctx.mode === 'tui' && options.interactiveRegistry && !endpointKey
+                ? {
+                    registerGrokAcpLiveEndpoint: async (input: {
+                      sessionId: string;
+                      transport: import('./interactive-transport.ts').InteractiveAgentTransport;
+                      leaseRelease: (err?: Error) => void;
+                      acceptOwnership: () => void;
+                    }) => {
+                      const unitCtx = options.unitContext!;
+                      // Throwable precompute — ownership still with execution caller.
+                      const hostSessionId = ctx.sessionManager.getSessionId();
+                      const isolation = resolveIsolation(agent!, taskIsolation);
+                      const launchAgent: AgentConfig = {
+                        ...agent!,
+                        model: options.modelOverride ?? agent!.model,
+                        thinking: options.thinkingOverride ?? agent!.thinking,
+                        runtime: options.runtimeOverride ?? agent!.runtime ?? GROK_ACP_RUNTIME,
+                      };
+                      // Pure handoff: beginPendingOwner + acceptOwnership, then register.
+                      return options
+                        .interactiveRegistry!.registerGrokAcpLive({
+                          runId: unitCtx.runId,
+                          unitId: unitCtx.unitId,
+                          hostSessionId,
+                          transport: input.transport,
+                          leaseRelease: input.leaseRelease,
+                          acceptOwnership: input.acceptOwnership,
+                          launchSpec: {
+                            agent: launchAgent,
+                            request: {
+                              mode: 'single',
+                              agentScope: 'both',
+                              model: options.modelOverride,
+                              thinking: options.thinkingOverride,
+                              runtime: options.runtimeOverride ?? GROK_ACP_RUNTIME,
+                              isolation,
+                              agent: agentName,
+                              task,
+                              title: options.title,
+                              cwd: effectiveCwd ?? fallbackCwd,
+                            },
+                            sessionFile: '',
+                            sessionArtifact: {
+                              runtime: 'grok-acp',
+                              sessionId: input.sessionId,
+                            },
+                            effectiveCwd: effectiveCwd ?? fallbackCwd,
+                            worktreePath: worktree?.path,
+                            title: options.title,
+                            modelOverride: options.modelOverride,
+                            thinkingOverride: options.thinkingOverride,
+                            runtimeOverride: options.runtimeOverride ?? GROK_ACP_RUNTIME,
+                            isolation,
+                            agentScope: 'both',
+                            registrationKind: 'initial',
+                          },
+                          getBranchEntries: () =>
+                            ctx.sessionManager.getBranch().map((e) => {
+                              if (e.type === 'custom') {
+                                return {
+                                  type: 'custom',
+                                  customType: (e as { customType?: string }).customType,
+                                  data: (e as { data?: unknown }).data,
+                                };
+                              }
+                              return { type: e.type };
+                            }),
+                        })
+                        .then((snap) => {
+                          endpointKey = snap.key;
+                          retainCleanWorktree = true;
+                          return snap.key;
+                        });
+                    },
+                  }
+                : {}),
             }
           : {}),
       }
@@ -2151,20 +2566,57 @@ async function runStepWithContext(
       const origin = options.getAbortOrigin?.() ?? 'unknown';
       const abortResult = getAbortResult(err);
       if (abortResult) {
+        // Retain worktree after execution/abort; stamp path/dirty when available.
+        if (worktree) stampWorktreeOnFailure(abortResult);
         applyPostprocess(abortResult);
         markEnd(abortResult, originToUnitStatus(origin));
       }
+      throw err;
     }
-    if (worktree) {
-      // Retain worktrees for aborted/failed units (their Pi session cwd must
-      // remain valid for resume). Stamp path + dirty metadata so the
-      // coordinator can persist them.
-      const status = getWorktreeDirtyStatus(worktree.path);
-      // We cannot stamp onto the result here (it doesn't exist yet), but the
-      // worktree path is already on options.unitContext.worktreePath.
-      void status;
+
+    // Failure path: only remove owned-new worktrees that never started execution
+    // and are confirmed clean. Once execution started or the tree is dirty,
+    // retain and stamp path/dirty on the failure result.
+    if (options.unitContext && !hadStoredSession) {
+      delete options.unitContext.sessionFile;
+      delete options.unitContext.sessionPromptEstablished;
     }
-    throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    const formalCode =
+      err &&
+      typeof err === 'object' &&
+      'code' in err &&
+      typeof (err as { code?: unknown }).code === 'string'
+        ? (err as { code: string }).code
+        : undefined;
+    const failureCode =
+      formalCode ??
+      (message.includes('session_file_conflict')
+        ? 'session_file_conflict'
+        : message.includes('session_file_unavailable')
+          ? 'session_file_unavailable'
+          : message.includes('session_prompt_unestablished')
+            ? 'session_prompt_unestablished'
+            : 'context_error');
+    const failure = synthesizeFailure(
+      agentName,
+      agent,
+      task,
+      step,
+      failureCode,
+      message,
+      options.title
+    );
+    if (formalCode) failure.errorCode = formalCode;
+    maybeRemoveOwnedCleanWorktree(failure);
+    // Always terminalize when we own a unit context (including post-begin stamp
+    // failure) so durable state is not left running without a finishUnit.
+    if (options.unitContext && options.endUnit) {
+      markEnd(failure, 'failed');
+      return failure;
+    }
+    if (beganUnit) throw err;
+    return failure;
   } finally {
     await agentContext.cleanup();
   }

@@ -281,6 +281,22 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           },
         };
       }
+      if (u.acpSessionId !== undefined) {
+        if (
+          typeof u.acpSessionId !== 'string' ||
+          u.acpSessionId.trim().length === 0 ||
+          u.acpSessionId !== u.acpSessionId.trim()
+        ) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} acpSessionId must be a trimmed non-empty string`,
+            },
+          };
+        }
+      }
       if (u.worktreePath !== undefined && typeof u.worktreePath !== 'string') {
         return {
           ok: false,
@@ -327,7 +343,25 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           },
         };
       }
+      const continuationTaskCount = Array.isArray(r.continuationTasks)
+        ? r.continuationTasks.length
+        : 0;
+      const units =
+        r.units && typeof r.units === 'object' && r.units !== null
+          ? (r.units as Record<string, unknown>)
+          : undefined;
       for (const [unitId, entry] of Object.entries(r.continuationDelivery)) {
+        // Orphan delivery keys (no matching unit) are corrupt.
+        if (!units || !(unitId in units)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `continuationDelivery[${unitId}] has no matching unit`,
+            },
+          };
+        }
         if (!entry || typeof entry !== 'object') {
           return {
             ok: false,
@@ -350,6 +384,17 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
               code: 'corrupt_run',
               runId: expectedRunId,
               message: `continuationDelivery[${unitId}].deliveredCount is invalid`,
+            },
+          };
+        }
+        // deliveredCount is how many of continuationTasks[0..n) were confirmed.
+        if (deliveredCount > continuationTaskCount) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `continuationDelivery[${unitId}].deliveredCount ${deliveredCount} exceeds continuationTasks length ${continuationTaskCount}`,
             },
           };
         }

@@ -66,11 +66,11 @@ On resume, background delivery is restored from the stored run and cannot be ove
 
 ### Resume parameters
 
-| Parameter     | Required | Description                                                                                                                               |
-| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `runId`       | yes      | Public durable run id (from a prior `agent` result or `/agent runs`).                                                                     |
-| `task`        | no       | Continuation instruction appended to incomplete units only. Trimmed; blank values are ignored.                                            |
-| `allowReplay` | no       | When `true`, allows replay-capable (Grok / Grok ACP) units to re-run. Required when any incomplete unit has `resumeCapability: "replay"`. |
+| Parameter     | Required | Description                                                                                                                                                                   |
+| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `runId`       | yes      | Public durable run id (from a prior `agent` result or `/agent runs`).                                                                                                         |
+| `task`        | no       | Continuation instruction appended to incomplete units only. Trimmed; blank values are ignored.                                                                                |
+| `allowReplay` | no       | When `true`, allows plain Grok (`runtime: "grok"`) units to re-run. Required when any incomplete unit needs replay acknowledgement. Never applies to Grok ACP session resume. |
 
 When `runId` is present, reject these fresh-launch fields (error
 `resume_error: conflicting parameters for runId: <sorted fields>`):
@@ -83,13 +83,16 @@ When `runId` is present, reject these fresh-launch fields (error
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | Pi with stored session        | Fixed safety continuation + **undelivered** `continuationTasks` for that unit. Original task not resent.        |
 | Pi never started (no session) | Resolved original task + **all** durable `continuationTasks` (even if a new session file is created this call). |
-| Grok / Grok ACP (replay)      | Resolved original task + **all** durable `continuationTasks`, from a fresh process.                             |
+| Grok ACP existing session     | Fixed continuation prompt + **undelivered** continuations via `session/load` (original task not resent).        |
+| Grok ACP never-started        | Resolved original task + **all** durable `continuationTasks`, after first `session/new`.                        |
+| Plain Grok (replay)           | Resolved original task + **all** durable `continuationTasks`, from a fresh process.                             |
 
 Per-unit delivery progress is stored in `continuationDelivery[unitId].deliveredCount`
-(how many of `continuationTasks[0..n)` have been confirmed accepted by that unit).
-Delivery is marked only after the child accepts the prompt (JSON spawn or RPC
-activate). Crash after claim, background rejection, or partial dispatch leaves
-undelivered entries for the next resume.
+(how many of `continuationTasks[0..n)` have been confirmed for that unit).
+Pi marks delivery after spawn/RPC activate accepts the prompt. Grok ACP marks
+delivery only after the matching `session/prompt` response, with an awaited
+strict durable write. Crash after claim, background rejection, or partial
+dispatch leaves undelivered entries for the next resume.
 
 Continuation text is applied **after** chain placeholder and fanout `{item}`
 resolution so braces in the new instruction are not treated as templates.

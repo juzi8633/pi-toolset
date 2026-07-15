@@ -49,6 +49,12 @@ export interface SingleResult {
   thinking?: string;
   stopReason?: string;
   errorMessage?: string;
+  /**
+   * Structured failure code when available (e.g. `dispose_failed`,
+   * `acp_session_not_found`, `acp_cwd_mismatch`, `transport_error`).
+   * Copied from InteractiveAgentError / GrokAcpClientError / endpoint snapshots.
+   */
+  errorCode?: string;
   step?: number;
   /** Present when this result is a fanout execution unit. */
   fanout?: FanoutIdentity;
@@ -68,6 +74,11 @@ export interface SingleResult {
   attempt?: number;
   /** Persisted Pi session file backing this unit, when any. */
   sessionFile?: string;
+  /**
+   * ACP protocol session ID for `runtime: "grok-acp"` units.
+   * Protocol identity only — never a private Grok session-file path.
+   */
+  acpSessionId?: string;
   /** Resume capability this unit advertises (`session` or `replay`). */
   resumeCapability?: ResumeCapability;
 }

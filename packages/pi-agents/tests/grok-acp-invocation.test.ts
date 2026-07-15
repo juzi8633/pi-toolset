@@ -10,6 +10,7 @@ import {
   buildGrokAcpEnv,
   buildGrokAcpInitializeParams,
   buildGrokAcpPromptParams,
+  buildGrokAcpSessionLoadParams,
   buildGrokAcpSessionMeta,
   buildGrokAcpSessionNewParams,
   selectGrokAcpAuthMethod,
@@ -135,6 +136,14 @@ describe('session metadata and prompt payloads', () => {
     });
     expect(serialized(meta)).not.toContain('maxTurns');
     expect(serialized(meta)).not.toContain('3');
+  });
+
+  it('builds exact session/load params with empty mcpServers', () => {
+    expect(buildGrokAcpSessionLoadParams('sess-1', '/work')).toEqual({
+      sessionId: 'sess-1',
+      cwd: '/work',
+      mcpServers: [],
+    });
   });
 
   it('omits empty session meta and builds session/new + prompt without maxTurns', () => {

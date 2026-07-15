@@ -28,6 +28,33 @@ import { buildChildAgentEnv, isAgentDelegationAllowed } from './security.ts';
 import { resolveSkillNames } from './skills.ts';
 import { getGitRoot, openAgentWorktree } from './worktree.ts';
 import type { SpawnFn } from './execution.ts';
+import {
+  acquireSessionLease,
+  awaitSessionLease,
+  buildSessionLeaseKey,
+  canonicalizeSessionLeaseKey,
+  disposalCertaintyFromCaught,
+  getSessionLeaseGlobalKeyForTest,
+  getSessionLeaseStoreSizesForTest,
+  isDisposeFailedError,
+  releaseSessionLeaseWithCertainty,
+  type SessionLeaseToken,
+} from './session-lease.ts';
+import type {
+  InteractiveAgentTransport,
+  InteractiveSessionArtifact,
+} from './interactive-transport.ts';
+
+export {
+  acquireSessionLease,
+  awaitSessionLease,
+  buildSessionLeaseKey,
+  canonicalizeSessionLeaseKey,
+  getSessionLeaseGlobalKeyForTest,
+  getSessionLeaseStoreSizesForTest,
+};
+export type { SessionLeaseToken };
+export type { InteractiveSessionArtifact };
 
 export const INTERACTIVE_LINK_TYPE = 'pi-agents-interactive-link';
 export const MAX_IDLE_TRANSPORTS = 4;
@@ -50,7 +77,17 @@ export type InteractiveErrorCode =
   | 'transport_error'
   | 'validation_error'
   | 'hydrate_error'
-  | 'rejected';
+  | 'rejected'
+  | 'running_input_unsupported'
+  | 'cwd_missing'
+  | 'worktree_unavailable'
+  | 'acp_session_unavailable'
+  | 'acp_load_unsupported'
+  | 'acp_session_not_found'
+  | 'acp_cwd_mismatch'
+  | 'acp_session_history_empty'
+  | 'acp_load_error'
+  | 'dispose_failed';
 
 export interface InteractiveToolActivity {
   toolCallId: string;
@@ -85,13 +122,21 @@ export interface InteractiveActivation {
    * agent_settled from a prior turn cannot settle a newer activation B.
    */
   observedAgentStart?: boolean;
+  /**
+   * True after a real matching prompt_completed event for this activation.
+   * Grok ACP continuation delivery requires this flag; cancel-grace settlement
+   * and prompt_failed never set it.
+   */
+  promptCompleted?: boolean;
 }
 
 export interface InteractiveLaunchSpec {
   agent: AgentConfig;
   request: StoredRunRequest;
   resolvedSkillPaths?: string[];
+  /** @deprecated Prefer sessionArtifact; retained for Pi call-site compatibility. */
   sessionFile: string;
+  sessionArtifact?: InteractiveSessionArtifact;
   effectiveCwd: string;
   worktreePath?: string;
   title?: string;
@@ -111,7 +156,9 @@ export interface InteractiveAgentEndpoint {
   bindingId: string;
   agent: string;
   title?: string;
+  /** @deprecated Prefer sessionArtifact; retained for Pi call-site compatibility. */
   sessionFile: string;
+  sessionArtifact?: InteractiveSessionArtifact;
   effectiveCwd: string;
   worktreePath?: string;
   status: InteractiveEndpointStatus;
@@ -132,10 +179,10 @@ export interface InteractiveAgentEndpoint {
   steeringQueue: string[];
   followUpQueue: string[];
   activation?: InteractiveActivation;
-  transportReady?: Promise<PiRpcTransport>;
+  transportReady?: Promise<PiRpcTransport | InteractiveAgentTransport>;
   lastError?: string;
   errorCode?: InteractiveErrorCode | string;
-  client?: PiRpcTransport;
+  client?: PiRpcTransport | InteractiveAgentTransport;
   /**
    * Monotonic spawn generation. Handshake resolve/reject/events/dispose only
    * mutate this endpoint when the event's generation still matches.
@@ -189,6 +236,7 @@ export type InteractiveEndpointSnapshot = Omit<
   activeTools: InteractiveToolActivity[];
   hasTransport: boolean;
   queueCount: number;
+  sessionArtifact?: InteractiveSessionArtifact;
 };
 
 /**
@@ -205,6 +253,7 @@ export type InteractiveEndpointListItem = Pick<
   | 'agent'
   | 'title'
   | 'sessionFile'
+  | 'sessionArtifact'
   | 'effectiveCwd'
   | 'worktreePath'
   | 'status'
@@ -262,6 +311,13 @@ export interface InteractiveRegistryOptions {
   runCoordinator: RunCoordinator;
   spawnFn?: SpawnFn;
   transportFactory?: (options: PiRpcTransportOptions) => Promise<PiRpcTransport>;
+  /**
+   * Injectable Grok ACP transport factory (hydrate + spawn/reopen). Defaults to
+   * the production `createGrokAcpInteractiveTransport` helper.
+   */
+  grokAcpTransportFactory?: (
+    options: import('./grok-acp-interactive-transport.ts').GrokAcpInteractiveTransportOptions
+  ) => Promise<InteractiveAgentTransport>;
   clock?: () => number;
   idleLimit?: number;
   discoverAgentsFn?: typeof discoverAgents;
@@ -385,6 +441,7 @@ function snapshotOf(ep: InteractiveAgentEndpoint): InteractiveEndpointSnapshot {
     agent: ep.agent,
     title: ep.title,
     sessionFile: ep.sessionFile,
+    sessionArtifact: ep.sessionArtifact,
     effectiveCwd: ep.effectiveCwd,
     worktreePath: ep.worktreePath,
     status: ep.status,
@@ -419,6 +476,7 @@ function listItemOf(ep: InteractiveAgentEndpoint): InteractiveEndpointListItem {
     agent: ep.agent,
     title: ep.title,
     sessionFile: ep.sessionFile,
+    sessionArtifact: ep.sessionArtifact,
     effectiveCwd: ep.effectiveCwd,
     worktreePath: ep.worktreePath,
     status: ep.status,
@@ -442,260 +500,26 @@ const DEFAULT_ABORT_SETTLE_TIMEOUT_MS = 10_000;
 const DEFAULT_IDLE_SETTLE_WAIT_MS = 10_000;
 
 /**
- * Process-scoped session writer lease (canonical path → owner).
- * Installed at the start of spawnTransport (before temp prompt / factory / getState)
- * and held until that owner transport confirms dispose or spawn fails with cleanup.
- * Survives registry shutdown so a new registry cannot open the same session while a
- * prior factory hang, dispose, or sticky dispose failure is still outstanding.
- *
- * Store lives on `globalThis` under `Symbol.for` so Jiti `moduleCache: false` reloads
- * (new module instances) still share the same lease map. Process restart clears it.
+ * Session lease implementation lives in session-lease.ts and is re-exported above
+ * for compatibility with existing tests and call sites.
  */
-export type SessionLeaseToken = object;
-
-type SessionLeaseRecord = {
-  token: SessionLeaseToken;
-  /** Settles when owner releases (resolve) or sticky-fails (reject). */
-  done: Promise<void>;
-  settle: (err?: Error) => void;
-  settled: boolean;
-};
-
-const SESSION_LEASE_STORE_VERSION = 1;
-const SESSION_LEASE_GLOBAL_KEY = Symbol.for('@balaenis/pi-agents/session-lease-store@v1');
-
-type SessionLeaseStore = {
-  version: typeof SESSION_LEASE_STORE_VERSION;
-  leases: Map<string, SessionLeaseRecord>;
-  /** Serializes concurrent acquire attempts per canonical key (install only). */
-  acquireTails: Map<string, Promise<void>>;
-};
-
-function isSessionLeaseStore(value: unknown): value is SessionLeaseStore {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Partial<SessionLeaseStore>;
-  return (
-    v.version === SESSION_LEASE_STORE_VERSION &&
-    v.leases instanceof Map &&
-    v.acquireTails instanceof Map
-  );
-}
-
-function getSessionLeaseStore(): SessionLeaseStore {
-  const g = globalThis as typeof globalThis & {
-    [SESSION_LEASE_GLOBAL_KEY]?: unknown;
-  };
-  const existing = g[SESSION_LEASE_GLOBAL_KEY];
-  if (isSessionLeaseStore(existing)) return existing;
-  const store: SessionLeaseStore = {
-    version: SESSION_LEASE_STORE_VERSION,
-    leases: new Map(),
-    acquireTails: new Map(),
-  };
-  g[SESSION_LEASE_GLOBAL_KEY] = store;
-  return store;
-}
 
 /**
  * Per-transport release for the lease acquired by that spawn. WeakMap so a disposed
  * transport does not pin the release closure forever. Module-local is fine: transports
  * are never shared across Jiti reloads.
  */
-const transportLeaseReleases = new WeakMap<PiRpcTransport, (err?: Error) => void>();
+const transportLeaseReleases = new WeakMap<object, (err?: Error) => void>();
 
 /**
- * Canonical lease key for a session file path.
- * - Existing real path: realpath
- * - Dangling symlink: resolve via lstat/readlink to the target path, then nearest
- *   existing parent realpath + remaining components (stable once the target appears)
- * - Missing planned path: realpath(nearest existing parent) + remaining components
- * Symlink aliases and restore canonical paths must hash to the same key.
+ * Global per-transport dispose promise: shutdown, hydrate, register, and execution
+ * callers share one dispose() invocation even when multiple layers race disposeTracked.
  */
-export function canonicalizeSessionLeaseKey(sessionFile: string): string {
-  if (!sessionFile) return '';
-  return canonicalizeResolvedPath(path.resolve(sessionFile), new Set());
-}
-
-/**
- * Walk missing path components up to the nearest existing ancestor, realpath that
- * ancestor, and rejoin the trailing components for a stable planned key.
- */
-function canonicalizeMissingPath(resolved: string): string {
-  const trailing: string[] = [];
-  let cur = resolved;
-  for (;;) {
-    try {
-      if (fs.existsSync(cur)) {
-        const real = fs.realpathSync(cur);
-        return path.normalize(path.join(real, ...trailing.reverse()));
-      }
-    } catch {
-      /* keep walking */
-    }
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    trailing.push(path.basename(cur));
-    cur = parent;
-  }
-  return path.normalize(resolved);
-}
-
-function canonicalizeResolvedPath(resolved: string, seen: Set<string>): string {
-  if (seen.has(resolved)) {
-    // Cycle: fall back to planned-missing resolution on the last path.
-    return canonicalizeMissingPath(resolved);
-  }
-  seen.add(resolved);
-
-  try {
-    const st = fs.lstatSync(resolved);
-    if (st.isSymbolicLink()) {
-      let target: string;
-      try {
-        target = fs.readlinkSync(resolved);
-      } catch {
-        return canonicalizeMissingPath(resolved);
-      }
-      const absTarget = path.resolve(path.dirname(resolved), target);
-      // Follow the link text (dangling or not) so alias and final realpath match.
-      return canonicalizeResolvedPath(absTarget, seen);
-    }
-    // Existing non-link: realpath (resolves intermediate dir symlinks).
-    return fs.realpathSync(resolved);
-  } catch {
-    /* path missing — planned or intermediate */
-  }
-  return canonicalizeMissingPath(resolved);
-}
-
-/**
- * Wait for any previous session owner to release (or sticky-fail).
- * Does not await self when `selfToken` matches the current owner (avoids deadlock).
- * Separate from acquire so callers can validate before installing ownership.
- */
-export async function awaitSessionLease(
-  sessionFile: string,
-  selfToken?: SessionLeaseToken
-): Promise<void> {
-  if (!sessionFile) return;
-  const key = canonicalizeSessionLeaseKey(sessionFile);
-  const rec = getSessionLeaseStore().leases.get(key);
-  if (!rec) return;
-  if (selfToken && rec.token === selfToken) return;
-  await rec.done;
-}
-
-/**
- * Wait for prior owner (if any), then install a new owner deferred.
- * Release only via the returned handle (token-guarded); success deletes the lease,
- * failure keeps a sticky rejected promise (fail-closed).
- * Acquire-tail entries are dropped when the install slot completes so the map
- * does not grow unboundedly across many sessions (sticky leases keep only `leases`).
- */
-export async function acquireSessionLease(sessionFile: string): Promise<{
-  token: SessionLeaseToken;
-  key: string;
-  release: (err?: Error) => void;
-}> {
-  const store = getSessionLeaseStore();
-  const key = canonicalizeSessionLeaseKey(sessionFile);
-  if (!key) {
-    const token: SessionLeaseToken = Object.create(null);
-    return { token, key: '', release: () => undefined };
-  }
-
-  // Serialize acquire install so two waiters cannot both become owner.
-  const prevTail = store.acquireTails.get(key) ?? Promise.resolve();
-  let releaseAcquireSlot!: () => void;
-  const mySlot = new Promise<void>((r) => {
-    releaseAcquireSlot = r;
-  });
-  const myChain = prevTail.then(
-    () => mySlot,
-    () => mySlot
-  );
-  store.acquireTails.set(key, myChain);
-
-  await prevTail.catch(() => undefined);
-  try {
-    // Prior owner (including sticky fail) must finish before we install.
-    const existing = store.leases.get(key);
-    if (existing) {
-      await existing.done;
-    }
-
-    const token: SessionLeaseToken = Object.create(null);
-    let settled = false;
-    let resolveDone!: () => void;
-    let rejectDone!: (e: Error) => void;
-    const done = new Promise<void>((res, rej) => {
-      resolveDone = res;
-      rejectDone = rej;
-    });
-    // Sticky rejects must not become unhandled when no waiter is attached yet.
-    done.catch(() => undefined);
-
-    const record: SessionLeaseRecord = {
-      token,
-      done,
-      settled: false,
-      settle(err?: Error) {
-        if (settled) return;
-        settled = true;
-        record.settled = true;
-        if (err) {
-          rejectDone(err);
-          // Keep rejected entry sticky so later acquires fail closed.
-        } else {
-          resolveDone();
-          if (store.leases.get(key)?.token === token) {
-            store.leases.delete(key);
-          }
-        }
-      },
-    };
-    store.leases.set(key, record);
-
-    return {
-      token,
-      key,
-      release(err?: Error) {
-        // Only this owner may settle; ignore late foreign releases.
-        if (settled) return;
-        const cur = store.leases.get(key);
-        if (cur && cur.token !== token) return;
-        record.settle(err);
-      },
-    };
-  } finally {
-    releaseAcquireSlot();
-    // Drop completed acquire tail when we still own the slot entry.
-    if (store.acquireTails.get(key) === myChain) {
-      store.acquireTails.delete(key);
-    }
-  }
-}
+const transportDisposePromises = new WeakMap<object, Promise<void>>();
 
 /** @deprecated Use awaitSessionLease — kept as the dispose-barrier alias for call sites. */
 async function awaitSessionFileDispose(sessionFile: string): Promise<void> {
   await awaitSessionLease(sessionFile);
-}
-
-/**
- * Test seam: process-scoped lease store sizes (leases + acquire tails).
- * Successful acquire/release leaves tails empty; sticky fail retains only leases.
- */
-export function getSessionLeaseStoreSizesForTest(): {
-  leases: number;
-  acquireTails: number;
-} {
-  const store = getSessionLeaseStore();
-  return { leases: store.leases.size, acquireTails: store.acquireTails.size };
-}
-
-/** Test seam: Symbol.for key used for the process-scoped lease container. */
-export function getSessionLeaseGlobalKeyForTest(): symbol {
-  return SESSION_LEASE_GLOBAL_KEY;
 }
 
 export function createInteractiveAgentRegistry(options: InteractiveRegistryOptions) {
@@ -733,6 +557,37 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
    * fully dispose so the same sessionFile has a single writer.
    */
   const disposeBarriers = new Map<string, Promise<void>>();
+  /**
+   * While shutdown runs, transports disposed via disposeSpawned (handshake cancel)
+   * are recorded here so a deadline timeout can sticky-fail their leases.
+   */
+  let shutdownTransportBag: Array<PiRpcTransport | InteractiveAgentTransport> | undefined;
+  /**
+   * Unified pending-owner tracking for every registry-internal pre-acquired
+   * lease/transport (hydrate-only, registerGrokAcpLive, spawn/reopen). Entry
+   * registers owner token + release immediately; transport bind follows factory
+   * return; clean dispose / handoff removes the entry. Shutdown dynamically
+   * drains pending owners; deadline sticky-settles any still open so a late
+   * clean dispose cannot clear fail-closed session identity.
+   */
+  const pendingOwners = new Map<
+    string,
+    {
+      ownerId: string;
+      key?: string;
+      generation?: number;
+      release: (err?: Error) => void;
+      transport?: PiRpcTransport | InteractiveAgentTransport;
+    }
+  >();
+  /**
+   * Per-key registration generation + serial chain. Entry reserves generation
+   * synchronously; only the latest generation may insert endpoint/trust/attach
+   * after awaits. Concurrent losers fail closed and never overwrite a live owner.
+   */
+  const registrationGeneration = new Map<string, number>();
+  const registrationSerial = new Map<string, Promise<void>>();
+  type RegistrationHandle = { key: string; generation: number; leave: () => void };
   const idleLimit = options.idleLimit ?? MAX_IDLE_TRANSPORTS;
   const abortSettleTimeoutMs = options.abortSettleTimeoutMs ?? DEFAULT_ABORT_SETTLE_TIMEOUT_MS;
   /** Unified absolute budget for the whole shutdown path (not N × killTimeout). */
@@ -780,41 +635,188 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
   }
 
   /**
+   * Register a pre-acquired lease (and optional transport) as a pending owner.
+   * Must be called at the acquisition site before any await that can race shutdown.
+   */
+  function beginPendingOwner(opts: {
+    key?: string;
+    generation?: number;
+    release: (err?: Error) => void;
+    transport?: PiRpcTransport | InteractiveAgentTransport;
+  }): {
+    ownerId: string;
+    release: (err?: Error) => void;
+    bindTransport: (transport: PiRpcTransport | InteractiveAgentTransport) => void;
+    /** Drop pending entry once long-lived path (ep.client) or settle owns the lease. */
+    complete: () => void;
+  } {
+    const ownerId = crypto.randomBytes(8).toString('hex');
+    let settled = false;
+    const wrappedRelease = (err?: Error): void => {
+      if (settled) return;
+      settled = true;
+      pendingOwners.delete(ownerId);
+      opts.release(err);
+    };
+    const entry: {
+      ownerId: string;
+      key?: string;
+      generation?: number;
+      release: (err?: Error) => void;
+      transport?: PiRpcTransport | InteractiveAgentTransport;
+    } = {
+      ownerId,
+      key: opts.key,
+      generation: opts.generation,
+      release: wrappedRelease,
+      transport: opts.transport,
+    };
+    pendingOwners.set(ownerId, entry);
+    if (opts.transport) {
+      transportLeaseReleases.set(opts.transport, wrappedRelease);
+    }
+    return {
+      ownerId,
+      release: wrappedRelease,
+      bindTransport(transport) {
+        entry.transport = transport;
+        transportLeaseReleases.set(transport, wrappedRelease);
+      },
+      complete() {
+        // Leave transportLeaseReleases bound; only drop the pending map entry.
+        pendingOwners.delete(ownerId);
+      },
+    };
+  }
+
+  async function createGrokAcpTransport(
+    factoryOpts: import('./grok-acp-interactive-transport.ts').GrokAcpInteractiveTransportOptions
+  ): Promise<InteractiveAgentTransport> {
+    if (options.grokAcpTransportFactory) {
+      return options.grokAcpTransportFactory(factoryOpts);
+    }
+    const { createGrokAcpInteractiveTransport } =
+      await import('./grok-acp-interactive-transport.ts');
+    return createGrokAcpInteractiveTransport(factoryOpts);
+  }
+
+  /**
    * Dispose a transport and track it on the per-endpoint barrier.
    * Session lease release is bound to the transport at spawn time (WeakMap);
    * dispose settles that lease (success or sticky fail-closed).
+   * Per-transport WeakMap caches a single dispose promise so concurrent
+   * shutdown/hydrate/register/execution callers never call dispose() twice.
    */
   function disposeTracked(
     key: string,
-    transport: PiRpcTransport,
+    transport: PiRpcTransport | InteractiveAgentTransport,
     _sessionFile?: string
   ): Promise<void> {
-    const work = Promise.resolve()
-      .then(() => transport.dispose())
-      .then(
-        () => {
-          const rel = transportLeaseReleases.get(transport);
-          if (rel) {
-            transportLeaseReleases.delete(transport);
-            rel();
+    let work = transportDisposePromises.get(transport);
+    if (!work) {
+      work = Promise.resolve()
+        .then(() => transport.dispose())
+        .then(
+          () => {
+            const rel = transportLeaseReleases.get(transport);
+            if (rel) {
+              transportLeaseReleases.delete(transport);
+              rel();
+            }
+          },
+          (err) => {
+            const rel = transportLeaseReleases.get(transport);
+            if (rel) {
+              transportLeaseReleases.delete(transport);
+              rel(err instanceof Error ? err : new Error(String(err)));
+            }
+            throw err;
           }
-        },
-        (err) => {
-          const rel = transportLeaseReleases.get(transport);
-          if (rel) {
-            transportLeaseReleases.delete(transport);
-            rel(err instanceof Error ? err : new Error(String(err)));
-          }
-          throw err;
-        }
-      );
+        );
+      transportDisposePromises.set(transport, work);
+    }
     return noteDispose(key, work);
   }
 
+  /**
+   * Reserve a per-key registration generation synchronously, then wait for the
+   * previous registration on that key to leave. After the wait, only the latest
+   * generation remains current — earlier reservations fail closed.
+   */
+  async function acquireRegistration(key: string): Promise<RegistrationHandle> {
+    const generation = (registrationGeneration.get(key) ?? 0) + 1;
+    registrationGeneration.set(key, generation);
+
+    const prev = registrationSerial.get(key) ?? Promise.resolve();
+    let leave!: () => void;
+    const done = new Promise<void>((resolve) => {
+      leave = resolve;
+    });
+    registrationSerial.set(
+      key,
+      prev.then(
+        () => done,
+        () => done
+      )
+    );
+
+    try {
+      await prev;
+    } catch {
+      /* prior registration failure does not block the next */
+    }
+
+    if (shutDown) {
+      leave();
+      throw new InteractiveAgentError('shutdown', 'Interactive registry is shut down');
+    }
+    if (registrationGeneration.get(key) !== generation) {
+      leave();
+      throw new InteractiveAgentError(
+        'session_busy',
+        `Registration for ${key} superseded by a newer attempt`
+      );
+    }
+    return { key, generation, leave };
+  }
+
+  /** Fail closed when this registration generation is no longer current or shutdown began. */
+  function assertRegistration(handle: RegistrationHandle): void {
+    if (shutDown) {
+      throw new InteractiveAgentError('shutdown', 'Interactive registry is shut down');
+    }
+    if (registrationGeneration.get(handle.key) !== handle.generation) {
+      throw new InteractiveAgentError(
+        'session_busy',
+        `Registration for ${handle.key} superseded by a newer attempt`
+      );
+    }
+  }
+
+  /** Build the process-global lease key for an endpoint (Pi path or Grok ACP identity). */
+  function endpointLeaseKey(ep: InteractiveAgentEndpoint): string {
+    const artifact =
+      ep.sessionArtifact ??
+      (ep.sessionFile
+        ? ({ runtime: 'pi' as const, sessionFile: ep.sessionFile } as const)
+        : undefined);
+    if (artifact?.runtime === 'grok-acp') {
+      return buildSessionLeaseKey({
+        runtime: 'grok-acp',
+        cwd: ep.worktreePath ?? ep.effectiveCwd,
+        sessionIdentity: artifact.sessionId,
+      });
+    }
+    return ep.sessionFile || '';
+  }
+
   /** Await endpoint dispose barrier + process-scoped session lease before spawn. */
-  async function awaitSpawnDisposeBarriers(key: string, sessionFile: string): Promise<void> {
+  async function awaitSpawnDisposeBarriers(
+    key: string,
+    leaseKeyOrSessionFile: string
+  ): Promise<void> {
     await awaitDisposeBarrier(key);
-    await awaitSessionLease(sessionFile);
+    await awaitSessionLease(leaseKeyOrSessionFile);
   }
 
   /**
@@ -825,7 +827,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
   function noteReadyDispose(
     key: string,
     _sessionFile: string,
-    ready: Promise<PiRpcTransport>
+    ready: Promise<PiRpcTransport | InteractiveAgentTransport>
   ): Promise<void> {
     return noteDispose(
       key,
@@ -838,6 +840,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
   const now = options.clock ?? (() => Date.now());
   const discover = options.discoverAgentsFn ?? discoverAgents;
   let shutDown = false;
+  /** Single cached shutdown promise — success and rejection are both reused. */
+  let shutdownPromise: Promise<void> | undefined;
   let sequenceCounter = 0;
   /** Host-session link writer installed by the extension entrypoint. */
   let hostLinkAppender: ((link: InteractiveAgentLinkV1) => void) | undefined;
@@ -1140,6 +1144,17 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       ep.transcriptHydrated = true;
       return;
     }
+
+    const artifact =
+      ep.sessionArtifact ??
+      (ep.sessionFile ? ({ runtime: 'pi', sessionFile: ep.sessionFile } as const) : undefined);
+
+    // Grok ACP: hydrate-only session/load, hold lease through dispose.
+    if (artifact?.runtime === 'grok-acp') {
+      await hydrateGrokAcpTranscript(ep, artifact.sessionId, opts);
+      return;
+    }
+
     if (!ep.sessionFile || !fs.existsSync(ep.sessionFile)) {
       // Missing session: leave false so a later path can retry once the file exists.
       // Planned empty (flag set, never written) is still not authoritative history.
@@ -1178,6 +1193,150 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     if (endpoints.get(ep.key) !== ep) return;
     replaceFinalizedMessages(ep, loaded.messages);
     ep.transcriptHydrated = true;
+  }
+
+  async function hydrateGrokAcpTranscript(
+    ep: InteractiveAgentEndpoint,
+    sessionId: string,
+    opts: { required?: boolean } = {}
+  ): Promise<void> {
+    const leaseKey = buildSessionLeaseKey({
+      runtime: 'grok-acp',
+      cwd: ep.worktreePath ?? ep.effectiveCwd,
+      sessionIdentity: sessionId,
+    });
+    await awaitSessionLease(leaseKey);
+    if (shutDown || endpoints.get(ep.key) !== ep) return;
+    if (ep.transcriptHydrated) return;
+    if (ep.client || ep.activation || ep.status === 'running' || ep.status === 'starting') {
+      ep.transcriptHydrated = true;
+      return;
+    }
+
+    const lease = await acquireSessionLease(leaseKey);
+    // Register pending owner immediately so shutdown can wait/sticky-settle.
+    const pending = beginPendingOwner({
+      key: ep.key,
+      release: (err) => lease.release(err),
+    });
+    let transport: InteractiveAgentTransport | undefined;
+    try {
+      if (shutDown || endpoints.get(ep.key) !== ep) {
+        pending.release();
+        return;
+      }
+      const agent = ep.launchSpec?.agent;
+      if (!agent) {
+        throw new InteractiveAgentError(
+          'hydrate_error',
+          'Missing launch specification for Grok ACP hydrate'
+        );
+      }
+      transport = await createGrokAcpTransport({
+        agent,
+        cwd: ep.worktreePath ?? ep.effectiveCwd,
+        sessionId,
+        hydrateOnly: true,
+        spawnFn: options.spawnFn as never,
+        configuredModel: ep.launchSpec?.modelOverride ?? agent.model,
+      });
+      pending.bindTransport(transport);
+      if (shutDown || endpoints.get(ep.key) !== ep) {
+        // Fail closed: tracked dispose; do not publish hydrate results.
+        await disposeTracked(ep.key, transport);
+        pending.complete();
+        return;
+      }
+      const messages =
+        'getFinalizedMessages' in transport &&
+        typeof (transport as { getFinalizedMessages?: () => readonly AgentMessage[] })
+          .getFinalizedMessages === 'function'
+          ? (
+              transport as { getFinalizedMessages: () => readonly AgentMessage[] }
+            ).getFinalizedMessages()
+          : ([] as readonly AgentMessage[]);
+      replaceFinalizedMessages(ep, messages);
+      ep.transcriptHydrated = true;
+      ep.status = ep.status === 'unavailable' ? ep.status : 'detached';
+      ep.lastError = undefined;
+      ep.errorCode = undefined;
+      publish(ep, 'full');
+      await disposeTracked(ep.key, transport);
+      pending.complete();
+    } catch (err) {
+      let disposeError: Error | undefined;
+      if (transport) {
+        try {
+          // disposeTracked settles the lease via transportLeaseReleases.
+          await disposeTracked(ep.key, transport);
+        } catch (disposeErr) {
+          disposeError = disposeErr instanceof Error ? disposeErr : new Error(String(disposeErr));
+        }
+        pending.complete();
+      } else {
+        // Factory may have spawned then failed cleanup without returning a handle.
+        // Never treat !transport as never-spawned when dispose_failed is present.
+        const certainty = disposalCertaintyFromCaught(err);
+        if (certainty.kind === 'failed') disposeError = certainty.error;
+        releaseSessionLeaseWithCertainty(pending.release, certainty);
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      // Prefer structured GrokAcpClientError.code over message matching.
+      const clientCode =
+        err &&
+        typeof err === 'object' &&
+        'code' in err &&
+        typeof (err as { code?: unknown }).code === 'string'
+          ? ((err as { code: string }).code as string)
+          : undefined;
+      const code =
+        err instanceof InteractiveAgentError
+          ? err.code
+          : disposeError || isDisposeFailedError(err)
+            ? 'dispose_failed'
+            : clientCode === 'dispose_failed' ||
+                clientCode === 'acp_session_not_found' ||
+                clientCode === 'acp_cwd_mismatch' ||
+                clientCode === 'acp_load_unsupported' ||
+                clientCode === 'acp_session_history_empty' ||
+                clientCode === 'acp_load_error' ||
+                clientCode === 'transport_error' ||
+                clientCode === 'aborted'
+              ? clientCode
+              : message.includes('acp_session_history_empty')
+                ? 'acp_session_history_empty'
+                : message.includes('loadSession') || message.includes('acp_load_unsupported')
+                  ? 'acp_load_unsupported'
+                  : message.includes('not found') || message.includes('Path not found')
+                    ? 'acp_session_not_found'
+                    : message.includes('cwd') && message.includes('mismatch')
+                      ? 'acp_cwd_mismatch'
+                      : message.includes('cwd_missing')
+                        ? 'cwd_missing'
+                        : message.includes('worktree')
+                          ? 'worktree_unavailable'
+                          : 'acp_load_error';
+      const permanent =
+        code === 'acp_session_unavailable' ||
+        code === 'acp_session_not_found' ||
+        code === 'acp_cwd_mismatch' ||
+        code === 'acp_session_history_empty' ||
+        code === 'acp_load_unsupported' ||
+        code === 'cwd_missing' ||
+        code === 'worktree_unavailable';
+      if (endpoints.get(ep.key) === ep) {
+        ep.status = permanent ? 'unavailable' : 'error';
+        ep.lastError = disposeError?.message ?? message;
+        ep.errorCode = disposeError || isDisposeFailedError(err) ? 'dispose_failed' : code;
+        publish(ep, 'full');
+      }
+      if (opts.required) {
+        throw new InteractiveAgentError(
+          disposeError || isDisposeFailedError(err) ? 'dispose_failed' : code,
+          disposeError?.message ?? message
+        );
+      }
+    }
   }
 
   /**
@@ -1256,54 +1415,307 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     });
   }
 
-  function branchHasLink(
+  /**
+   * Exact host-branch link match: version/runId/unitId/bindingId/hostSessionId/createdAt.
+   * Forged or stale links that only share run/unit must not suppress append or grant trust.
+   */
+  function branchHasExactLink(
     entries: Array<{ type: string; customType?: string; data?: unknown }>,
-    runId: string,
-    unitId: string
+    link: InteractiveAgentLinkV1
   ): boolean {
     for (const entry of entries) {
       if (entry.type !== 'custom' || entry.customType !== INTERACTIVE_LINK_TYPE) continue;
       if (!isLinkData(entry.data)) continue;
-      if (entry.data.runId === runId && entry.data.unitId === unitId) return true;
+      if (
+        entry.data.version === link.version &&
+        entry.data.runId === link.runId &&
+        entry.data.unitId === link.unitId &&
+        entry.data.bindingId === link.bindingId &&
+        entry.data.hostSessionId === link.hostSessionId &&
+        entry.data.createdAt === link.createdAt
+      ) {
+        return true;
+      }
     }
     return false;
   }
 
+  /** Locate the exact branch link for an existing endpoint binding, if present. */
+  function findExactBranchLink(
+    entries: Array<{ type: string; customType?: string; data?: unknown }>,
+    link: InteractiveAgentLinkV1
+  ): InteractiveAgentLinkV1 | undefined {
+    for (const entry of entries) {
+      if (entry.type !== 'custom' || entry.customType !== INTERACTIVE_LINK_TYPE) continue;
+      if (!isLinkData(entry.data)) continue;
+      if (
+        entry.data.version === link.version &&
+        entry.data.runId === link.runId &&
+        entry.data.unitId === link.unitId &&
+        entry.data.bindingId === link.bindingId &&
+        entry.data.hostSessionId === link.hostSessionId &&
+        entry.data.createdAt === link.createdAt
+      ) {
+        return entry.data;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Validate Grok ACP registerInitial/resume against authoritative RunStore.
+   * Requires runtime=grok-acp, capability=session, exact trimmed session ID,
+   * and rejects replay-capability bypass. When a binding already exists for
+   * this host, bindingId/hostSessionId/createdAt must match the endpoint link.
+   */
+  function validateGrokAcpRegistrationFromStore(input: {
+    runId: string;
+    unitId: string;
+    sessionId: string;
+    hostSessionId: string;
+    existing?: InteractiveAgentEndpoint;
+  }): void {
+    const sessionId = input.sessionId.trim();
+    if (!sessionId) {
+      throw new InteractiveAgentError(
+        'validation_error',
+        'Grok ACP registration requires a non-empty sessionId'
+      );
+    }
+    const loaded = options.runStore.getRun(input.runId);
+    if (!loaded.ok) {
+      throw new InteractiveAgentError(
+        'validation_error',
+        `Run ${input.runId} not found for Grok ACP registration`
+      );
+    }
+    const unit = loaded.loaded.record.units[input.unitId];
+    if (!unit) {
+      throw new InteractiveAgentError(
+        'validation_error',
+        `Unit ${input.unitId} not found in run ${input.runId}`
+      );
+    }
+    const runtime = unit.runtime ?? loaded.loaded.record.request.runtime ?? DEFAULT_RUNTIME;
+    if (runtime !== GROK_ACP_RUNTIME) {
+      throw new InteractiveAgentError(
+        'validation_error',
+        `Grok ACP registration requires runtime=grok-acp (got ${runtime})`
+      );
+    }
+    // Never allow replay capability to register as an interactive session endpoint.
+    if (unit.capability !== 'session') {
+      throw new InteractiveAgentError(
+        'validation_error',
+        `Grok ACP registration requires capability=session (got ${unit.capability})`
+      );
+    }
+    const storedId = unit.acpSessionId?.trim();
+    if (!storedId || unit.acpSessionId !== storedId) {
+      throw new InteractiveAgentError(
+        'acp_session_unavailable',
+        'Grok ACP registration requires a non-empty trimmed acpSessionId on the unit'
+      );
+    }
+    if (storedId !== sessionId) {
+      throw new InteractiveAgentError(
+        'validation_error',
+        `Grok ACP sessionId mismatch: launchSpec=${sessionId}, runStore=${storedId}`
+      );
+    }
+    // Existing endpoint: re-validate host/binding/timestamp/link against store.
+    if (input.existing) {
+      const ep = input.existing;
+      if (ep.hostSessionId !== input.hostSessionId) {
+        throw new InteractiveAgentError(
+          'validation_error',
+          'Grok ACP hostSessionId mismatch on existing endpoint'
+        );
+      }
+      const art = ep.sessionArtifact;
+      if (!art || art.runtime !== 'grok-acp' || art.sessionId.trim() !== storedId) {
+        throw new InteractiveAgentError(
+          'validation_error',
+          'Grok ACP existing endpoint session artifact mismatch'
+        );
+      }
+      const binding = unit.interactiveBindings?.[ep.bindingId];
+      if (!binding) {
+        throw new InteractiveAgentError(
+          'validation_error',
+          'Grok ACP existing endpoint binding missing from RunStore'
+        );
+      }
+      if (
+        binding.bindingId !== ep.bindingId ||
+        binding.hostSessionId !== ep.hostSessionId ||
+        binding.createdAt !== ep.linkCreatedAt ||
+        binding.hostSessionId !== input.hostSessionId
+      ) {
+        throw new InteractiveAgentError(
+          'validation_error',
+          'Grok ACP existing endpoint binding/link mismatch'
+        );
+      }
+    }
+  }
+
   async function registerInitial(
-    input: InteractiveRegisterInput
+    input: InteractiveRegisterInput,
+    /** When set, caller already holds the per-key registration slot (e.g. registerGrokAcpLive). */
+    heldRegistration?: RegistrationHandle
   ): Promise<InteractiveEndpointSnapshot> {
     assertNotShutdown();
     const key = endpointKey(input.runId, input.unitId);
-    if (endpoints.has(key)) {
-      const existing = endpoints.get(key)!;
-      grantTrustedBranch(key, existing.bindingId);
-      return snapshotOf(existing);
-    }
-
-    const sessionFile = input.launchSpec.sessionFile;
-    if (input.launchSpec.registrationKind === 'initial') {
-      // Planned path may not exist yet.
-    } else if (!fs.existsSync(sessionFile)) {
-      throw new InteractiveAgentError(
-        'validation_error',
-        `Session file missing for registration: ${sessionFile}`
-      );
-    }
-
-    claimSessionFile(key, sessionFile);
-
-    const bindingId = crypto.randomBytes(16).toString('hex');
-    const createdAt = now();
-    const binding: InteractiveAgentBindingV1 = {
-      bindingId,
-      hostSessionId: input.hostSessionId,
-      createdAt,
-    };
+    const reg = heldRegistration ?? (await acquireRegistration(key));
+    const ownsSlot = !heldRegistration;
 
     try {
-      await persistBinding(input.runId, input.unitId, binding);
+      assertRegistration(reg);
 
-      if (!branchHasLink(input.getBranchEntries(), input.runId, input.unitId)) {
+      const artifact =
+        input.launchSpec.sessionArtifact ??
+        (input.launchSpec.sessionFile
+          ? ({ runtime: 'pi' as const, sessionFile: input.launchSpec.sessionFile } as const)
+          : undefined);
+      const isGrokAcp = artifact?.runtime === 'grok-acp';
+
+      // Existing-key path: every live endpoint (Pi and Grok ACP) requires an
+      // exact six-field branch link + resolveTrusted / RunStore revalidation
+      // before grant. Forged/second-host/empty-branch without same-host append
+      // must not bypass. Grok ACP unavailable may be replaced by a fresh register.
+      // Supersede: after serial wait, a trusted live endpoint is reused — never
+      // overwritten by a concurrent registration.
+      if (endpoints.has(key)) {
+        const existing = endpoints.get(key)!;
+        const liveOrReady =
+          existing.status === 'starting' ||
+          existing.status === 'running' ||
+          existing.status === 'idle' ||
+          existing.status === 'registered' ||
+          existing.status === 'detached' ||
+          existing.status === 'error' ||
+          !!existing.client ||
+          !!existing.activation ||
+          !!existing.transportReady;
+
+        // Grok ACP unavailable (not live): drop and fall through to full register.
+        if (isGrokAcp && !liveOrReady) {
+          endpoints.delete(key);
+          revokeTrustedBranch(key);
+          treeClaimKeys.delete(key);
+        } else {
+          const desiredLink: InteractiveAgentLinkV1 = {
+            version: 1,
+            runId: input.runId,
+            unitId: input.unitId,
+            bindingId: existing.bindingId,
+            hostSessionId: input.hostSessionId,
+            createdAt: existing.linkCreatedAt,
+          };
+          // Fail closed: existing-key re-entry requires an authoritative exact
+          // six-field branch link. Never trust a local desiredLink, appender
+          // no-op, empty branch, or forged-only branch.
+          const exactLink = findExactBranchLink(input.getBranchEntries(), desiredLink);
+          if (!exactLink) {
+            if (existing.hostSessionId !== input.hostSessionId) {
+              // Second host / forged host cannot steal an existing binding.
+              throw new InteractiveAgentError(
+                'validation_error',
+                'Existing endpoint requires matching hostSessionId and an exact branch link'
+              );
+            }
+            // Same host with empty/missing/forged-only branch: revoke relay trust.
+            revokeTrustedBranch(key);
+            throw new InteractiveAgentError(
+              'validation_error',
+              'Existing endpoint requires an exact six-field branch link on the active branch'
+            );
+          }
+
+          // Grok: store revalidation before grant so capability/session
+          // failures do not mutate trust state incorrectly.
+          const grokSessionId =
+            artifact?.runtime === 'grok-acp'
+              ? artifact.sessionId
+              : existing.sessionArtifact?.runtime === 'grok-acp'
+                ? existing.sessionArtifact.sessionId
+                : undefined;
+          if (grokSessionId) {
+            validateGrokAcpRegistrationFromStore({
+              runId: input.runId,
+              unitId: input.unitId,
+              sessionId: grokSessionId,
+              hostSessionId: input.hostSessionId,
+              existing,
+            });
+          }
+
+          assertRegistration(reg);
+          const trust = resolveTrusted(exactLink, input.hostSessionId, {
+            allowPlannedMissing: existing.allowPlannedMissingSession,
+          });
+          if (!trust.ok) {
+            revokeTrustedBranch(key);
+            throw new InteractiveAgentError(
+              'validation_error',
+              `Existing endpoint failed resolveTrusted: ${trust.reason}`
+            );
+          }
+
+          // Trusted launch spec only — never grant from unvalidated caller input.
+          applyTrustedLaunchSpec(existing, trust.resolved, exactLink);
+          grantTrustedBranch(key, existing.bindingId);
+          treeClaimKeys.add(key);
+          return publish(existing, 'full');
+        }
+      }
+
+      const sessionFile = isGrokAcp ? '' : input.launchSpec.sessionFile;
+      if (!isGrokAcp) {
+        if (input.launchSpec.registrationKind === 'initial') {
+          // Planned path may not exist yet.
+        } else if (!fs.existsSync(sessionFile)) {
+          throw new InteractiveAgentError(
+            'validation_error',
+            `Session file missing for registration: ${sessionFile}`
+          );
+        }
+      } else {
+        if (!artifact.sessionId?.trim()) {
+          throw new InteractiveAgentError(
+            'validation_error',
+            'Grok ACP registration requires a non-empty sessionId'
+          );
+        }
+        // Resume/initial registration must match durable RunStore session identity.
+        validateGrokAcpRegistrationFromStore({
+          runId: input.runId,
+          unitId: input.unitId,
+          sessionId: artifact.sessionId,
+          hostSessionId: input.hostSessionId,
+        });
+      }
+
+      // Pi claims the session-file path; Grok ACP uses process-global session lease
+      // keys (runtime+cwd+sessionId) at spawn/hydrate time instead.
+      if (!isGrokAcp && sessionFile) {
+        claimSessionFile(key, sessionFile);
+      }
+
+      const bindingId = crypto.randomBytes(16).toString('hex');
+      const createdAt = now();
+      const binding: InteractiveAgentBindingV1 = {
+        bindingId,
+        hostSessionId: input.hostSessionId,
+        createdAt,
+      };
+
+      try {
+        await persistBinding(input.runId, input.unitId, binding);
+        // After await: refuse endpoint insert if superseded or shutdown mid-binding.
+        assertRegistration(reg);
+
         const link: InteractiveAgentLinkV1 = {
           version: 1,
           runId: input.runId,
@@ -1312,97 +1724,295 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           hostSessionId: input.hostSessionId,
           createdAt,
         };
-        if (input.appendLink) {
-          input.appendLink(link);
+        // Exact match only — forged/stale run:unit links must not block the precise append.
+        if (!branchHasExactLink(input.getBranchEntries(), link)) {
+          if (input.appendLink) {
+            input.appendLink(link);
+          } else {
+            appendHostLink(link);
+          }
+        }
+        assertRegistration(reg);
+      } catch (err) {
+        // Binding or link persistence failed: roll back the in-process session claim
+        // so a retry can re-register without session_busy.
+        if (!isGrokAcp && sessionFile) {
+          releaseSessionFile(key, sessionFile);
+        }
+        throw err;
+      }
+
+      assertRegistration(reg);
+
+      // Prefer durable run request/scope when available; launchSpec remains authoritative
+      // for the live agent object, cwd, session path, and first-process overrides.
+      const loaded = options.runStore.getRun(input.runId);
+      const durableRequest = loaded.ok ? loaded.loaded.record.request : undefined;
+      const durableScope = loaded.ok ? loaded.loaded.record.agentScope : undefined;
+      const launchSpec: InteractiveLaunchSpec = {
+        ...input.launchSpec,
+        request: durableRequest ?? input.launchSpec.request,
+        agentScope: durableScope ?? input.launchSpec.agentScope,
+        title: input.launchSpec.title ?? durableRequest?.title,
+        modelOverride: input.launchSpec.modelOverride ?? durableRequest?.model,
+        thinkingOverride: input.launchSpec.thinkingOverride ?? durableRequest?.thinking,
+        runtimeOverride: input.launchSpec.runtimeOverride ?? durableRequest?.runtime,
+        isolation: input.launchSpec.isolation ?? durableRequest?.isolation,
+      };
+
+      const sessionArtifact: InteractiveSessionArtifact =
+        launchSpec.sessionArtifact ??
+        (sessionFile ? { runtime: 'pi', sessionFile } : { runtime: 'pi', sessionFile: '' });
+      const ep: InteractiveAgentEndpoint = {
+        key,
+        hostSessionId: input.hostSessionId,
+        runId: input.runId,
+        unitId: input.unitId,
+        bindingId,
+        agent: launchSpec.agent.name,
+        title: launchSpec.title,
+        sessionFile,
+        sessionArtifact,
+        effectiveCwd: launchSpec.effectiveCwd,
+        worktreePath: launchSpec.worktreePath,
+        status: 'registered',
+        messages: EMPTY_FINALIZED,
+        finalizedMessagesView: EMPTY_FINALIZED,
+        messagesRevision: 0,
+        streamRevision: 0,
+        activeTools: new Map(),
+        steeringQueue: [],
+        followUpQueue: [],
+        transportGeneration: 0,
+        // Only mark hydrated when memory is authoritative. Non-empty fork/resume
+        // session history must hydrate on get/detail/activate, not stay empty forever.
+        transcriptHydrated: false,
+        lastUsedAt: createdAt,
+        createdAt,
+        linkCreatedAt: createdAt,
+        launchSpec: { ...launchSpec, sessionArtifact },
+        usage: {
+          turns: 0,
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          contextTokens: 0,
+        },
+      };
+      // Grok ACP: no local session file; hydrate lazily via session/load.
+      if (sessionArtifact.runtime === 'grok-acp') {
+        assertRegistration(reg);
+        ep.transcriptHydrated = false;
+        ep.allowPlannedMissingSession = false;
+        endpoints.set(key, ep);
+        grantTrustedBranch(key, bindingId);
+        treeClaimKeys.add(key);
+        publish(ep, 'full');
+        emitEndpointsChanged();
+        return snapshotOf(ep);
+      }
+      // Fresh planned path (file not created yet): empty view is authoritative for
+      // live turns, but reopen may still need the planned-missing grace flag.
+      // Existing session (fork/resume): wait for any prior writer lease, then hydrate
+      // so baseline reflects the final JSONL (never a partial dispose write).
+      if (!sessionFile || !fs.existsSync(sessionFile)) {
+        ep.transcriptHydrated = true;
+        ep.allowPlannedMissingSession = true;
+      } else {
+        // Non-read validation (claim/bind/path) already completed above; only now read.
+        await awaitSessionLease(sessionFile);
+        assertRegistration(reg);
+        const existing = hydrateMessages(sessionFile);
+        if (!existing.ok) {
+          // File present but unreadable: leave unhydrated so get/activate can retry.
+          ep.transcriptHydrated = false;
+        } else if (existing.messages.length === 0) {
+          ep.transcriptHydrated = true;
         } else {
-          appendHostLink(link);
+          replaceFinalizedMessages(ep, existing.messages);
+          ep.transcriptHydrated = true;
         }
       }
-    } catch (err) {
-      // Binding or link persistence failed: roll back the in-process session claim
-      // so a retry can re-register without session_busy.
-      releaseSessionFile(key, sessionFile);
-      throw err;
+      assertRegistration(reg);
+      endpoints.set(key, ep);
+      grantTrustedBranch(key, bindingId);
+      emitEndpointsChanged();
+      return publish(ep);
+    } finally {
+      if (ownsSlot) reg.leave();
     }
+  }
 
-    // Prefer durable run request/scope when available; launchSpec remains authoritative
-    // for the live agent object, cwd, session path, and first-process overrides.
-    const loaded = options.runStore.getRun(input.runId);
-    const durableRequest = loaded.ok ? loaded.loaded.record.request : undefined;
-    const durableScope = loaded.ok ? loaded.loaded.record.agentScope : undefined;
-    const launchSpec: InteractiveLaunchSpec = {
-      ...input.launchSpec,
-      request: durableRequest ?? input.launchSpec.request,
-      agentScope: durableScope ?? input.launchSpec.agentScope,
-      title: input.launchSpec.title ?? durableRequest?.title,
-      modelOverride: input.launchSpec.modelOverride ?? durableRequest?.model,
-      thinkingOverride: input.launchSpec.thinkingOverride ?? durableRequest?.thinking,
-      runtimeOverride: input.launchSpec.runtimeOverride ?? durableRequest?.runtime,
-      isolation: input.launchSpec.isolation ?? durableRequest?.isolation,
-    };
-
-    const ep: InteractiveAgentEndpoint = {
+  /**
+   * Register a Grok ACP endpoint that already owns a live transport after
+   * session/new + durable ID flush. Keeps the same process for the first prompt
+   * (no second owner / no re-load).
+   *
+   * Ownership transfer: the first effective operation is `beginPendingOwner` of
+   * `transport` + `leaseRelease`, then optional `acceptOwnership` so the caller
+   * drops local handles. Callers must not dispose or release after acceptOwnership
+   * — fail-closed cleanup runs once via disposeTracked for acquire, validation,
+   * shutdown, and generation failure.
+   */
+  async function registerGrokAcpLive(input: {
+    runId: string;
+    unitId: string;
+    hostSessionId: string;
+    launchSpec: InteractiveLaunchSpec;
+    transport: InteractiveAgentTransport;
+    leaseRelease: (err?: Error) => void;
+    /** Sync: invoke immediately after beginPendingOwner so the caller clears handles. */
+    acceptOwnership?: () => void;
+    getBranchEntries: () => Array<{ type: string; customType?: string; data?: unknown }>;
+    appendLink?: (link: InteractiveAgentLinkV1) => void;
+  }): Promise<InteractiveEndpointSnapshot> {
+    // First effective op: own the caller's lease/transport before any check/await.
+    // acceptOwnership tells the caller to drop local handles; registry alone disposes.
+    const key = endpointKey(input.runId, input.unitId);
+    const pending = beginPendingOwner({
       key,
-      hostSessionId: input.hostSessionId,
-      runId: input.runId,
-      unitId: input.unitId,
-      bindingId,
-      agent: launchSpec.agent.name,
-      title: launchSpec.title,
-      sessionFile,
-      effectiveCwd: launchSpec.effectiveCwd,
-      worktreePath: launchSpec.worktreePath,
-      status: 'registered',
-      messages: EMPTY_FINALIZED,
-      finalizedMessagesView: EMPTY_FINALIZED,
-      messagesRevision: 0,
-      streamRevision: 0,
-      activeTools: new Map(),
-      steeringQueue: [],
-      followUpQueue: [],
-      transportGeneration: 0,
-      // Only mark hydrated when memory is authoritative. Non-empty fork/resume
-      // session history must hydrate on get/detail/activate, not stay empty forever.
-      transcriptHydrated: false,
-      lastUsedAt: createdAt,
-      createdAt,
-      linkCreatedAt: createdAt,
-      launchSpec,
-      usage: {
-        turns: 0,
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        cost: 0,
-        contextTokens: 0,
-      },
-    };
-    // Fresh planned path (file not created yet): empty view is authoritative for
-    // live turns, but reopen may still need the planned-missing grace flag.
-    // Existing session (fork/resume): wait for any prior writer lease, then hydrate
-    // so baseline reflects the final JSONL (never a partial dispose write).
-    if (!fs.existsSync(sessionFile)) {
-      ep.transcriptHydrated = true;
-      ep.allowPlannedMissingSession = true;
-    } else {
-      // Non-read validation (claim/bind/path) already completed above; only now read.
-      await awaitSessionLease(sessionFile);
-      const existing = hydrateMessages(sessionFile);
-      if (!existing.ok) {
-        // File present but unreadable: leave unhydrated so get/activate can retry.
-        ep.transcriptHydrated = false;
-      } else if (existing.messages.length === 0) {
-        ep.transcriptHydrated = true;
-      } else {
-        replaceFinalizedMessages(ep, existing.messages);
-        ep.transcriptHydrated = true;
+      release: input.leaseRelease,
+      transport: input.transport,
+    });
+    input.acceptOwnership?.();
+    let handedOff = false;
+    let disposedBeforeHandoff = false;
+    let reg: RegistrationHandle | undefined;
+
+    const trackedDisposeBeforeHandoff = async (): Promise<void> => {
+      if (disposedBeforeHandoff) return;
+      disposedBeforeHandoff = true;
+      if (shutdownTransportBag) {
+        shutdownTransportBag.push(input.transport);
       }
+      try {
+        await disposeTracked(key, input.transport);
+      } catch {
+        /* dispose_failed sticky path; lease settled by disposeTracked */
+      }
+      pending.complete();
+    };
+
+    const failClosedTrackedDispose = async (code: InteractiveErrorCode, message: string) => {
+      await trackedDisposeBeforeHandoff();
+      throw new InteractiveAgentError(code, message);
+    };
+
+    try {
+      assertNotShutdown();
+      const artifact = input.launchSpec.sessionArtifact;
+      if (!artifact || artifact.runtime !== 'grok-acp' || !artifact.sessionId.trim()) {
+        throw new InteractiveAgentError(
+          'validation_error',
+          'registerGrokAcpLive requires a grok-acp sessionArtifact with sessionId'
+        );
+      }
+
+      // Reserve generation + serial slot under pending ownership so a superseded
+      // acquire still disposes transport and releases the lease once.
+      reg = await acquireRegistration(key);
+      assertRegistration(reg);
+
+      // Supersede: after serial wait, never overwrite a live endpoint owner.
+      if (endpoints.has(key)) {
+        const existing = endpoints.get(key)!;
+        const liveOwner =
+          !!existing.client ||
+          !!existing.activation ||
+          !!existing.transportReady ||
+          existing.status === 'starting' ||
+          existing.status === 'running' ||
+          existing.status === 'idle' ||
+          existing.status === 'registered' ||
+          existing.status === 'detached';
+        if (liveOwner) {
+          await failClosedTrackedDispose(
+            'session_busy',
+            `Endpoint ${key} already registered; refuse to overwrite live owner`
+          );
+        }
+      }
+
+      const snap = await registerInitial(
+        {
+          runId: input.runId,
+          unitId: input.unitId,
+          hostSessionId: input.hostSessionId,
+          launchSpec: input.launchSpec,
+          getBranchEntries: input.getBranchEntries,
+          appendLink: input.appendLink,
+        },
+        reg
+      );
+
+      // After every await: refuse attach if superseded or shutdown mid-registration.
+      assertRegistration(reg);
+
+      const ep = endpoints.get(key);
+      if (!ep) {
+        await failClosedTrackedDispose('unavailable', `Failed to register ${key}`);
+      }
+      // Never attach over a different live transport already bound to this key.
+      if (ep!.client && ep!.client !== input.transport) {
+        await failClosedTrackedDispose(
+          'session_busy',
+          `Endpoint ${key} already has a live transport owner`
+        );
+      }
+      // Attach the live transport as the sole process owner for this session.
+      // Lease release remains on transportLeaseReleases via pending owner.
+      ep!.client = input.transport;
+      ep!.transcriptHydrated = true;
+      ep!.status = 'registered';
+      ep!.sessionArtifact = artifact;
+      ep!.sessionFile = '';
+      if (ep!.launchSpec) {
+        ep!.launchSpec.sessionArtifact = artifact;
+        ep!.launchSpec.sessionFile = '';
+      }
+
+      input.transport.subscribe((event: unknown) => {
+        const current = endpoints.get(key);
+        if (!current || current.client !== input.transport) return;
+        if (isPiRpcTransportExitEvent(event)) {
+          if (event.intentional) return;
+          void enqueueTransition(key, () => {
+            const cur = endpoints.get(key);
+            if (!cur || cur.client !== input.transport) return;
+            handleUnexpectedTransportExit(cur, event.error.message);
+          });
+          return;
+        }
+        const evtType =
+          event && typeof event === 'object' ? (event as { type?: unknown }).type : undefined;
+        if (evtType === 'message_update' || evtType === 'message_start') {
+          holdCoalescedStream(key, event);
+          return;
+        }
+        const sealed = sealCoalescedStream(key);
+        void enqueueTransition(key, () => {
+          const cur = endpoints.get(key);
+          if (!cur || cur.client !== input.transport) return;
+          if (sealed !== undefined) reduceEvent(cur, sealed);
+          reduceEvent(cur, event);
+        });
+      });
+
+      // Long-lived ownership is ep.client; drop pending so shutdown uses client path.
+      pending.complete();
+      handedOff = true;
+      publish(ep!, 'full');
+      return snapshotOf(ep!) ?? snap;
+    } catch (err) {
+      if (!handedOff && !disposedBeforeHandoff) {
+        await trackedDisposeBeforeHandoff();
+      }
+      throw err;
+    } finally {
+      reg?.leave();
     }
-    endpoints.set(key, ep);
-    grantTrustedBranch(key, bindingId);
-    emitEndpointsChanged();
-    return publish(ep);
   }
 
   /**
@@ -1434,6 +2044,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
 
   interface ResolvedArtifacts {
     sessionFile: string;
+    sessionArtifact: InteractiveSessionArtifact;
     effectiveCwd: string;
     worktreePath?: string;
     agent: AgentConfig;
@@ -1461,11 +2072,28 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     if (record.version !== 1) return { ok: false, reason: 'invalid_run_version' };
     const unit = record.units[link.unitId];
     if (!unit) return { ok: false, reason: 'unit_not_found' };
-    if (unit.capability !== 'session') return { ok: false, reason: 'non_session_capability' };
     const runtime = unit.runtime ?? record.request.runtime ?? DEFAULT_RUNTIME;
-    if (runtime === GROK_RUNTIME || runtime === GROK_ACP_RUNTIME) {
+
+    // Plain Grok is never interactive. Grok ACP requires session capability + ID.
+    if (runtime === GROK_RUNTIME) {
       return { ok: false, reason: 'non_pi_runtime' };
     }
+
+    if (runtime === GROK_ACP_RUNTIME) {
+      // Grok ACP requires a durable protocol session ID and session capability.
+      // Legacy attempted units stored as capability "replay" are not trusted until
+      // the first successful ID write normalizes them to "session".
+      const acpId = unit.acpSessionId?.trim();
+      if (!acpId || unit.acpSessionId !== acpId) {
+        return { ok: false, reason: 'acp_session_unavailable' };
+      }
+      if (unit.capability !== 'session') {
+        return { ok: false, reason: 'non_session_capability' };
+      }
+    } else if (unit.capability !== 'session') {
+      return { ok: false, reason: 'non_session_capability' };
+    }
+
     const bindings = unit.interactiveBindings;
     const binding = bindings?.[link.bindingId];
     if (!binding) return { ok: false, reason: 'binding_missing' };
@@ -1475,40 +2103,6 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       binding.createdAt !== link.createdAt
     ) {
       return { ok: false, reason: 'binding_mismatch' };
-    }
-    if (!unit.sessionFile) return { ok: false, reason: 'session_missing' };
-
-    const sessionsDir = path.join(loaded.loaded.runDir, 'sessions');
-    const resolvedSessionsDir = fs.existsSync(sessionsDir)
-      ? fs.realpathSync(sessionsDir)
-      : path.resolve(sessionsDir);
-    let resolvedSession: string;
-    let sessionFileMissing = false;
-    try {
-      resolvedSession = fs.realpathSync(unit.sessionFile);
-    } catch {
-      // Live-only planned path: same-process initial registration may reopen
-      // before Pi persists the JSONL. Restored links never pass this flag.
-      if (!opts.allowPlannedMissing) {
-        return { ok: false, reason: 'session_unreadable' };
-      }
-      resolvedSession = path.resolve(unit.sessionFile);
-      sessionFileMissing = true;
-    }
-    if (
-      resolvedSession !== resolvedSessionsDir &&
-      !resolvedSession.startsWith(resolvedSessionsDir + path.sep)
-    ) {
-      return { ok: false, reason: 'session_outside_run' };
-    }
-    if (!sessionFileMissing) {
-      try {
-        if (!fs.statSync(resolvedSession).isFile()) {
-          return { ok: false, reason: 'session_not_file' };
-        }
-      } catch {
-        return { ok: false, reason: 'session_unreadable' };
-      }
     }
 
     const effectiveCwd = unit.worktreePath ?? unit.effectiveCwd;
@@ -1525,6 +2119,49 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       if (!opened.ok) {
         return { ok: false, reason: 'worktree_unavailable' };
       }
+    }
+
+    let sessionArtifact: InteractiveSessionArtifact;
+    let resolvedSession = '';
+
+    if (runtime === GROK_ACP_RUNTIME) {
+      const acpId = unit.acpSessionId!.trim();
+      sessionArtifact = { runtime: 'grok-acp', sessionId: acpId };
+    } else {
+      if (!unit.sessionFile) return { ok: false, reason: 'session_missing' };
+
+      const sessionsDir = path.join(loaded.loaded.runDir, 'sessions');
+      const resolvedSessionsDir = fs.existsSync(sessionsDir)
+        ? fs.realpathSync(sessionsDir)
+        : path.resolve(sessionsDir);
+      let sessionFileMissing = false;
+      try {
+        resolvedSession = fs.realpathSync(unit.sessionFile);
+      } catch {
+        // Live-only planned path: same-process initial registration may reopen
+        // before Pi persists the JSONL. Restored links never pass this flag.
+        if (!opts.allowPlannedMissing) {
+          return { ok: false, reason: 'session_unreadable' };
+        }
+        resolvedSession = path.resolve(unit.sessionFile);
+        sessionFileMissing = true;
+      }
+      if (
+        resolvedSession !== resolvedSessionsDir &&
+        !resolvedSession.startsWith(resolvedSessionsDir + path.sep)
+      ) {
+        return { ok: false, reason: 'session_outside_run' };
+      }
+      if (!sessionFileMissing) {
+        try {
+          if (!fs.statSync(resolvedSession).isFile()) {
+            return { ok: false, reason: 'session_not_file' };
+          }
+        } catch {
+          return { ok: false, reason: 'session_unreadable' };
+        }
+      }
+      sessionArtifact = { runtime: 'pi', sessionFile: resolvedSession };
     }
 
     const agentScope = record.agentScope;
@@ -1548,6 +2185,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       ok: true,
       resolved: {
         sessionFile: resolvedSession,
+        sessionArtifact,
         effectiveCwd,
         worktreePath: unit.worktreePath,
         agent,
@@ -1556,11 +2194,30 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         resolvedSkillPaths,
         modelOverride: request.model,
         thinkingOverride: request.thinking,
-        runtimeOverride: request.runtime,
+        runtimeOverride: request.runtime ?? runtime,
         isolation: request.isolation,
         title: request.title,
       },
     };
+  }
+
+  function mapTrustReasonToErrorCode(reason: string): InteractiveErrorCode | string {
+    if (
+      reason === 'cwd_missing' ||
+      reason === 'worktree_unavailable' ||
+      reason === 'worktree_missing' ||
+      reason === 'acp_session_unavailable' ||
+      reason === 'session_busy' ||
+      reason === 'acp_load_unsupported' ||
+      reason === 'acp_session_not_found' ||
+      reason === 'acp_cwd_mismatch' ||
+      reason === 'acp_session_history_empty' ||
+      reason === 'dispose_failed'
+    ) {
+      if (reason === 'worktree_missing') return 'worktree_unavailable';
+      return reason;
+    }
+    return 'unavailable';
   }
 
   function applyUnavailable(
@@ -1598,7 +2255,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       if (existing.sessionFile) releaseSessionFile(key, existing.sessionFile);
       existing.status = 'unavailable';
       existing.lastError = reason;
-      existing.errorCode = reason === 'session_busy' ? 'session_busy' : 'unavailable';
+      existing.errorCode = mapTrustReasonToErrorCode(reason);
       existing.bindingId = link.bindingId;
       existing.hostSessionId = link.hostSessionId;
       existing.linkCreatedAt = link.createdAt;
@@ -1634,7 +2291,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       steeringQueue: [],
       followUpQueue: [],
       lastError: reason,
-      errorCode: reason === 'session_busy' ? 'session_busy' : 'unavailable',
+      errorCode: mapTrustReasonToErrorCode(reason),
       transportGeneration: 0,
       // Not authoritative empty — trusted restore may hydrate real history.
       transcriptHydrated: false,
@@ -1659,6 +2316,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     ep.agent = resolved.agent.name;
     ep.title = resolved.title;
     ep.sessionFile = resolved.sessionFile;
+    ep.sessionArtifact = resolved.sessionArtifact;
     ep.effectiveCwd = resolved.effectiveCwd;
     ep.worktreePath = resolved.worktreePath;
     ep.launchSpec = {
@@ -1666,6 +2324,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       request: resolved.request,
       resolvedSkillPaths: resolved.resolvedSkillPaths,
       sessionFile: resolved.sessionFile,
+      sessionArtifact: resolved.sessionArtifact,
       effectiveCwd: resolved.effectiveCwd,
       worktreePath: resolved.worktreePath,
       title: resolved.title,
@@ -1745,10 +2404,15 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         }
 
         try {
-          if (existing.sessionFile && existing.sessionFile !== trust.resolved.sessionFile) {
+          // Pi-only session-file claim; Grok ACP uses process-global lease at spawn/hydrate.
+          if (trust.resolved.sessionArtifact.runtime === 'pi') {
+            if (existing.sessionFile && existing.sessionFile !== trust.resolved.sessionFile) {
+              releaseSessionFile(key, existing.sessionFile);
+            }
+            claimSessionFile(key, trust.resolved.sessionFile);
+          } else if (existing.sessionFile) {
             releaseSessionFile(key, existing.sessionFile);
           }
-          claimSessionFile(key, trust.resolved.sessionFile);
         } catch (err) {
           restored.push(
             applyUnavailable(
@@ -1758,6 +2422,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
               {
                 agent: trust.resolved.agent.name,
                 sessionFile: trust.resolved.sessionFile,
+                sessionArtifact: trust.resolved.sessionArtifact,
                 effectiveCwd: trust.resolved.effectiveCwd,
                 worktreePath: trust.resolved.worktreePath,
               }
@@ -1780,7 +2445,10 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       }
 
       try {
-        claimSessionFile(key, trust.resolved.sessionFile);
+        // Pi-only: claim the native session file path. Grok ACP never uses claimSessionFile.
+        if (trust.resolved.sessionArtifact.runtime === 'pi' && trust.resolved.sessionFile) {
+          claimSessionFile(key, trust.resolved.sessionFile);
+        }
       } catch (err) {
         restored.push(
           applyUnavailable(
@@ -1790,6 +2458,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             {
               agent: trust.resolved.agent.name,
               sessionFile: trust.resolved.sessionFile,
+              sessionArtifact: trust.resolved.sessionArtifact,
               effectiveCwd: trust.resolved.effectiveCwd,
               worktreePath: trust.resolved.worktreePath,
             }
@@ -1799,6 +2468,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       }
 
       // Metadata-only restore: do not open session files / hydrate child history.
+      // Grok ACP: restore full sessionArtifact; sessionFile stays empty (not a path).
       const ep: InteractiveAgentEndpoint = {
         key,
         hostSessionId: link.hostSessionId,
@@ -1808,6 +2478,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         agent: trust.resolved.agent.name,
         title: trust.resolved.title,
         sessionFile: trust.resolved.sessionFile,
+        sessionArtifact: trust.resolved.sessionArtifact,
         effectiveCwd: trust.resolved.effectiveCwd,
         worktreePath: trust.resolved.worktreePath,
         status: 'detached',
@@ -1828,6 +2499,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           request: trust.resolved.request,
           resolvedSkillPaths: trust.resolved.resolvedSkillPaths,
           sessionFile: trust.resolved.sessionFile,
+          sessionArtifact: trust.resolved.sessionArtifact,
           effectiveCwd: trust.resolved.effectiveCwd,
           worktreePath: trust.resolved.worktreePath,
           title: trust.resolved.title,
@@ -1954,7 +2626,19 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     if (ep.allowPlannedMissingSession && fs.existsSync(trust.resolved.sessionFile)) {
       ep.allowPlannedMissingSession = false;
     }
-    // Reopen needs transcript for baselineMessageCount and detail continuity.
+    // Grok ACP reopen keeps a single load transport for the subsequent prompt.
+    // Hydrate-only load+dispose would create a lease gap and a wrong baseline —
+    // detail reads use ensureTranscript/hydrateGrokAcpTranscript instead.
+    const artifact =
+      ep.sessionArtifact ??
+      (ep.sessionFile
+        ? ({ runtime: 'pi' as const, sessionFile: ep.sessionFile } as const)
+        : undefined);
+    if (artifact?.runtime === 'grok-acp') {
+      // Trust revalidation only; transcript + baseline come from spawn load barrier.
+      return;
+    }
+    // Pi reopen needs transcript for baselineMessageCount and detail continuity.
     // ensureTranscriptHydrated awaits the process-scoped writer lease barrier.
     ep.transcriptHydrated = false;
     await ensureTranscriptHydrated(ep, { required: true });
@@ -1979,6 +2663,87 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         ep.lastError = undefined;
         ep.errorCode = undefined;
         break;
+      case 'prompt_completed': {
+        // Grok ACP turn completion metadata; settle still comes from agent_settled.
+        // Only a real matching prompt response emits this event (never cancel grace).
+        // stopReason is formal SingleResult vocabulary (end/max_turns/error/aborted).
+        if (ep.usage) {
+          const usage = evt.usage as
+            | {
+                input?: number;
+                output?: number;
+                cacheRead?: number;
+                cacheWrite?: number;
+                cost?: number;
+                contextTokens?: number;
+                turns?: number;
+              }
+            | undefined;
+          if (usage) {
+            if (typeof usage.input === 'number') ep.usage.input = usage.input;
+            if (typeof usage.output === 'number') ep.usage.output = usage.output;
+            if (typeof usage.cacheRead === 'number') ep.usage.cacheRead = usage.cacheRead;
+            if (typeof usage.cacheWrite === 'number') ep.usage.cacheWrite = usage.cacheWrite;
+            if (typeof usage.cost === 'number') ep.usage.cost = usage.cost;
+            if (typeof usage.contextTokens === 'number') {
+              ep.usage.contextTokens = usage.contextTokens;
+            }
+            if (typeof usage.turns === 'number') ep.usage.turns = usage.turns;
+          }
+          if (typeof evt.model === 'string' && evt.model) {
+            ep.usage.model = evt.model;
+          }
+          if (typeof evt.stopReason === 'string') {
+            ep.usage.stopReason = evt.stopReason;
+          }
+        }
+        if (ep.activation && !ep.activation.settled) {
+          const formalStop =
+            typeof evt.stopReason === 'string' ? evt.stopReason : ep.usage?.stopReason;
+          // Non-success formal terminals must fail closed (no delivery).
+          if (formalStop && formalStop !== 'end') {
+            if (formalStop === 'aborted') {
+              ep.activation.terminalOverride = ep.activation.terminalOverride ?? 'cancelled';
+            } else if (formalStop === 'max_turns') {
+              ep.activation.terminalOverride = 'max_turns';
+            } else {
+              ep.activation.terminalOverride = 'error';
+              ep.status = 'error';
+              ep.errorCode = formalStop === 'error' ? 'error' : formalStop;
+            }
+            const errMsg =
+              typeof (evt as { errorMessage?: unknown }).errorMessage === 'string'
+                ? (evt as { errorMessage: string }).errorMessage
+                : undefined;
+            if (errMsg) {
+              ep.activation.error = errMsg;
+              ep.lastError = errMsg;
+            }
+            // Real response observed, but not a successful completed delivery.
+            ep.activation.promptCompleted = false;
+          } else {
+            ep.activation.promptCompleted = true;
+          }
+        }
+        kind = 'meta';
+        break;
+      }
+      case 'prompt_failed': {
+        // Structured transport/prompt failure: activation must be terminal failed.
+        // Delivery must not run (promptCompleted stays false).
+        const failMsg =
+          typeof evt.error === 'string' && evt.error ? evt.error : 'Grok ACP prompt failed';
+        const failCode = typeof evt.code === 'string' && evt.code ? evt.code : 'transport_error';
+        ep.status = 'error';
+        ep.lastError = failMsg;
+        ep.errorCode = failCode;
+        if (ep.activation && !ep.activation.settled) {
+          ep.activation.terminalOverride = 'error';
+          ep.activation.error = failMsg;
+        }
+        kind = 'meta';
+        break;
+      }
       // Pi 0.80.6 RPC: agent_end = one low-level run completed (may still retry,
       // compact, or run queued follow-ups). Do not idle, clear queues/tools/streaming,
       // settle activation, trigger relay/LRU, or complete runSingleAgentPiRpc waiters.
@@ -1997,6 +2762,14 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           if (!ep.activation.observedAgentStart && !ep.activation.terminalOverride) {
             kind = 'meta';
             break;
+          }
+          // Grok ACP: settle without a real prompt_completed is cancel-grace or
+          // incomplete — never treat as successful completed delivery.
+          const isGrokAcp = ep.sessionArtifact?.runtime === 'grok-acp';
+          if (isGrokAcp && !ep.activation.promptCompleted && !ep.activation.terminalOverride) {
+            ep.activation.terminalOverride = 'cancelled';
+            ep.activation.error =
+              ep.activation.error ?? 'Prompt cancelled before matching response';
           }
           ep.activation.settled = true;
           const activationId = ep.activation.id;
@@ -2163,15 +2936,23 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
   async function spawnTransport(
     ep: InteractiveAgentEndpoint,
     generation: number
-  ): Promise<PiRpcTransport> {
+  ): Promise<PiRpcTransport | InteractiveAgentTransport> {
     const spec = ep.launchSpec;
     if (!spec) {
       throw new InteractiveAgentError('validation_error', 'Missing launch specification');
     }
 
+    const artifact =
+      ep.sessionArtifact ??
+      spec.sessionArtifact ??
+      (ep.sessionFile
+        ? ({ runtime: 'pi' as const, sessionFile: ep.sessionFile } as const)
+        : undefined);
+    const isGrokAcp = artifact?.runtime === 'grok-acp';
+
     let tmpPromptPath: string | undefined;
     let tmpPromptDir: string | undefined;
-    let transport: PiRpcTransport | undefined;
+    let transport: PiRpcTransport | InteractiveAgentTransport | undefined;
     let handshakeOk = false;
     let transportDisposed = false;
     let leaseHandedToTransport = false;
@@ -2188,13 +2969,28 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     if (!isCurrentGeneration()) {
       throw new InteractiveAgentError('rejected', 'Transport generation superseded');
     }
-    const lease = await acquireSessionLease(ep.sessionFile);
-    let leaseReleased = false;
-    const releaseLease = (err?: Error): void => {
-      if (leaseReleased) return;
-      leaseReleased = true;
-      lease.release(err);
-    };
+    const leaseKey = isGrokAcp
+      ? buildSessionLeaseKey({
+          runtime: 'grok-acp',
+          cwd: ep.worktreePath ?? ep.effectiveCwd,
+          sessionIdentity: artifact.sessionId,
+        })
+      : ep.sessionFile;
+    if (isGrokAcp && !leaseKey) {
+      throw new InteractiveAgentError(
+        'acp_session_unavailable',
+        'Grok ACP spawn requires a non-empty sessionId'
+      );
+    }
+    const lease = await acquireSessionLease(leaseKey);
+    // Track pre-acquired lease so shutdown deadline can sticky-settle even when
+    // the factory has not returned a transport yet (not in shuttingDownTransports).
+    const pending = beginPendingOwner({
+      key: ep.key,
+      generation,
+      release: (err) => lease.release(err),
+    });
+    const releaseLease = pending.release;
 
     const disposeSpawned = async (): Promise<void> => {
       // Already scheduled dispose for this spawn: do not release early — the in-flight
@@ -2207,40 +3003,170 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       }
       transportDisposed = true;
       // Dispose immediately and register on the endpoint barrier for later spawns.
-      // Do not await disposeTracked chain: abort may have chained that barrier behind
-      // `ready` (this spawn), which would deadlock. Also do not await the dispose
-      // promise itself — killTimeout/gates must not block the spawn rejection path.
-      // Session lease stays held until dispose settles (success or sticky fail-closed).
+      // Do not await disposeTracked's barrier chain: abort may have chained that
+      // barrier behind `ready` (this spawn), which would deadlock. Also do not
+      // await the dispose promise itself — killTimeout/gates must not block the
+      // spawn rejection path. Session lease stays held until dispose settles.
+      // Still share the module WeakMap so shutdown/hydrate/register/execution
+      // never invoke transport.dispose() twice for the same instance.
       const owned = transport;
-      const d = owned.dispose().then(
-        () => {
-          const rel = transportLeaseReleases.get(owned);
-          if (rel) {
-            transportLeaseReleases.delete(owned);
-            rel();
-          } else {
-            releaseLease();
-          }
-        },
-        (err) => {
-          const rel = transportLeaseReleases.get(owned);
-          const e = err instanceof Error ? err : new Error(String(err));
-          if (rel) {
-            transportLeaseReleases.delete(owned);
-            rel(e);
-          } else {
-            releaseLease(e);
-          }
-          throw err;
+      if (shutdownTransportBag) {
+        shutdownTransportBag.push(owned);
+      }
+      let work = transportDisposePromises.get(owned);
+      if (!work) {
+        work = Promise.resolve()
+          .then(() => owned.dispose())
+          .then(
+            () => {
+              const rel = transportLeaseReleases.get(owned);
+              if (rel) {
+                transportLeaseReleases.delete(owned);
+                // Clean release only when this handle still owns settlement. If
+                // shutdown already sticky-settled via the same handle, lease.release
+                // is a no-op (settled guard). Never install a second clean path.
+                rel();
+              } else {
+                // Transport map entry already consumed (e.g. deadline sticky-settle).
+                // Still call releaseLease so pending bookkeeping clears;
+                // session-lease settle is a no-op once sticky.
+                releaseLease();
+              }
+            },
+            (err) => {
+              const rel = transportLeaseReleases.get(owned);
+              const e = err instanceof Error ? err : new Error(String(err));
+              if (rel) {
+                transportLeaseReleases.delete(owned);
+                rel(e);
+              } else {
+                releaseLease(e);
+              }
+              throw err;
+            }
+          );
+        transportDisposePromises.set(owned, work);
+      }
+      void noteDispose(ep.key, work);
+    };
+
+    const attachTransportEvents = (t: PiRpcTransport | InteractiveAgentTransport): void => {
+      t.subscribe((event) => {
+        // Generation guard: stale T1 must never write through T2's endpoint.
+        if (!isCurrentGeneration()) return;
+
+        if (isPiRpcTransportExitEvent(event)) {
+          // Seal pre-boundary stream cell before the exit transition.
+          const sealed = sealCoalescedStream(ep.key);
+          void enqueueTransition(ep.key, () => {
+            if (!isCurrentGeneration()) return;
+            const current = endpoints.get(ep.key);
+            if (!current) return;
+            if (event.intentional) return;
+            if (current.client && current.client !== t) return;
+            if (sealed !== undefined) reduceEvent(current, sealed);
+            handleUnexpectedTransportExit(current, event.error.message);
+          });
+          return;
         }
-      );
-      void noteDispose(ep.key, d);
+
+        const evtType =
+          event && typeof event === 'object' ? (event as { type?: unknown }).type : undefined;
+        // Cumulative stream deltas: keep only the latest while the transition
+        // queue is busy; flush before any non-transcript event.
+        if (evtType === 'message_update' || evtType === 'message_start') {
+          holdCoalescedStream(ep.key, event);
+          return;
+        }
+
+        // Non-stream boundary: seal pre-boundary held event now so a later U2
+        // cannot be consumed by the flush that runs with this boundary.
+        const sealed = sealCoalescedStream(ep.key);
+        void enqueueTransition(ep.key, () => {
+          if (!isCurrentGeneration()) return;
+          const current = endpoints.get(ep.key);
+          if (!current) return;
+          if (current.client !== t) return;
+          if (sealed !== undefined) reduceEvent(current, sealed);
+          reduceEvent(current, event);
+        });
+      });
     };
 
     try {
       if (!isCurrentGeneration()) {
         releaseLease();
         throw new InteractiveAgentError('rejected', 'Transport generation superseded');
+      }
+
+      if (isGrokAcp) {
+        // Durable TUI resume/reopen: load the existing ACP session on one connection
+        // that will also accept the subsequent prompt (same process owner).
+        const configuredModel = spec.modelOverride ?? spec.agent.model;
+        transport = await createGrokAcpTransport({
+          agent: {
+            ...spec.agent,
+            model: configuredModel,
+            thinking: spec.thinkingOverride ?? spec.agent.thinking,
+            runtime: spec.runtimeOverride ?? spec.agent.runtime ?? GROK_ACP_RUNTIME,
+          },
+          cwd: ep.worktreePath ?? ep.effectiveCwd,
+          sessionId: artifact.sessionId,
+          spawnFn: options.spawnFn as never,
+          configuredModel,
+          onLoadComplete: (messages) => {
+            if (!isCurrentGeneration()) return;
+            // Replace transcript wholesale after the load barrier (no dual reduce).
+            replaceFinalizedMessages(ep, messages);
+            ep.transcriptHydrated = true;
+            // Reopen/activate: baseline is post-load so SingleResult only includes
+            // this activation's live prompt messages (not historical replay).
+            if (ep.activation && !ep.activation.settled) {
+              ep.activation.baselineMessageCount = messages.length;
+            }
+          },
+        });
+
+        pending.bindTransport(transport);
+        leaseHandedToTransport = true;
+
+        if (!isCurrentGeneration() || shutDown) {
+          await disposeSpawned();
+          throw new InteractiveAgentError(
+            shutDown ? 'shutdown' : 'rejected',
+            shutDown ? 'Interactive registry is shut down' : 'Transport generation superseded'
+          );
+        }
+
+        attachTransportEvents(transport);
+
+        const cancelErr = new InteractiveAgentError('rejected', 'Transport generation superseded');
+        const cancelled = new Promise<never>((_, reject) => {
+          spawnCancelByKey.set(ep.key, { generation, reject });
+        });
+        try {
+          await Promise.race([transport.getState(), cancelled]);
+        } finally {
+          const waiter = spawnCancelByKey.get(ep.key);
+          if (waiter && waiter.generation === generation) {
+            spawnCancelByKey.delete(ep.key);
+          }
+        }
+        if (!isCurrentGeneration() || shutDown) {
+          await disposeSpawned();
+          throw shutDown
+            ? new InteractiveAgentError('shutdown', 'Interactive registry is shut down')
+            : cancelErr;
+        }
+        handshakeOk = true;
+        ep.client = transport;
+        ep.lastError = undefined;
+        ep.errorCode = undefined;
+        // Handshake complete: lease ownership stays on transport map; pending
+        // entry is no longer needed for deadline coverage of "no transport yet".
+        pending.complete();
+        // Lease stays held until this transport's dispose path releases it.
+        return transport;
       }
 
       if (spec.agent.systemPrompt.trim()) {
@@ -2277,56 +3203,20 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
 
       // Bind lease release to this transport before any gen check so late dispose paths
       // (disposeTracked / disposeSpawned) settle the correct owner token.
-      transportLeaseReleases.set(transport, releaseLease);
+      pending.bindTransport(transport);
       leaseHandedToTransport = true;
 
       // Abort/detach may have advanced generation while factory was in flight.
-      if (!isCurrentGeneration()) {
+      if (!isCurrentGeneration() || shutDown) {
         await disposeSpawned();
-        throw new InteractiveAgentError('rejected', 'Transport generation superseded');
+        throw new InteractiveAgentError(
+          shutDown ? 'shutdown' : 'rejected',
+          shutDown ? 'Interactive registry is shut down' : 'Transport generation superseded'
+        );
       }
 
       // Subscribe before handshake so unexpected exit during get_state is observed.
-      transport.subscribe((event) => {
-        // Generation guard: stale T1 must never write through T2's endpoint.
-        if (!isCurrentGeneration()) return;
-
-        if (isPiRpcTransportExitEvent(event)) {
-          // Seal pre-boundary stream cell before the exit transition.
-          const sealed = sealCoalescedStream(ep.key);
-          void enqueueTransition(ep.key, () => {
-            if (!isCurrentGeneration()) return;
-            const current = endpoints.get(ep.key);
-            if (!current) return;
-            if (event.intentional) return;
-            if (current.client && current.client !== transport) return;
-            if (sealed !== undefined) reduceEvent(current, sealed);
-            handleUnexpectedTransportExit(current, event.error.message);
-          });
-          return;
-        }
-
-        const evtType =
-          event && typeof event === 'object' ? (event as { type?: unknown }).type : undefined;
-        // Cumulative stream deltas: keep only the latest while the transition
-        // queue is busy; flush before any non-transcript event.
-        if (evtType === 'message_update' || evtType === 'message_start') {
-          holdCoalescedStream(ep.key, event);
-          return;
-        }
-
-        // Non-stream boundary: seal pre-boundary held event now so a later U2
-        // cannot be consumed by the flush that runs with this boundary.
-        const sealed = sealCoalescedStream(ep.key);
-        void enqueueTransition(ep.key, () => {
-          if (!isCurrentGeneration()) return;
-          const current = endpoints.get(ep.key);
-          if (!current) return;
-          if (current.client !== transport) return;
-          if (sealed !== undefined) reduceEvent(current, sealed);
-          reduceEvent(current, event);
-        });
-      });
+      attachTransportEvents(transport);
 
       // Handshake: race get_state against generation cancel so abort/invalidate
       // unblocks waiters without awaiting a hung child RPC.
@@ -2342,15 +3232,20 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           spawnCancelByKey.delete(ep.key);
         }
       }
-      if (!isCurrentGeneration()) {
+      if (!isCurrentGeneration() || shutDown) {
         await disposeSpawned();
-        throw cancelErr;
+        throw shutDown
+          ? new InteractiveAgentError('shutdown', 'Interactive registry is shut down')
+          : cancelErr;
       }
       handshakeOk = true;
 
-      if (!isCurrentGeneration()) {
+      if (!isCurrentGeneration() || shutDown) {
         await disposeSpawned();
-        throw new InteractiveAgentError('rejected', 'Transport generation superseded');
+        throw new InteractiveAgentError(
+          shutDown ? 'shutdown' : 'rejected',
+          shutDown ? 'Interactive registry is shut down' : 'Transport generation superseded'
+        );
       }
 
       // Only the current generation may install the client.
@@ -2359,6 +3254,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       // in-flight failure (we only reach here on successful get_state).
       ep.lastError = undefined;
       ep.errorCode = undefined;
+      pending.complete();
       // Lease stays held until this transport's dispose path releases it.
       return transport;
     } catch (err) {
@@ -2367,11 +3263,12 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       if (transport && (!handshakeOk || !isCurrentGeneration())) {
         await disposeSpawned();
       } else if (!leaseHandedToTransport) {
-        // Factory never returned a transport (or failed before bind): release now.
-        releaseLease();
+        // Factory never returned a transport — may still have spawned then failed
+        // dispose. Settle lease with structured certainty (never assume never-spawned).
+        releaseSessionLeaseWithCertainty(releaseLease, disposalCertaintyFromCaught(err));
       } else if (!transportDisposed && !handshakeOk) {
-        // Transport exists but we are not disposing via disposeSpawned — still release.
-        releaseLease();
+        // Transport exists but we are not disposing via disposeSpawned — settle carefully.
+        releaseSessionLeaseWithCertainty(releaseLease, disposalCertaintyFromCaught(err));
       }
       throw err;
     } finally {
@@ -2414,9 +3311,19 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     }
     const client = ep.client;
     const activationId = ep.activation.id;
-    let state: { isStreaming?: boolean; isCompacting?: boolean };
+    let state: { isStreaming?: boolean; isCompacting?: boolean; running?: boolean };
     try {
-      state = await client.getState();
+      const raw = await client.getState();
+      // Pi RPC exposes isStreaming/isCompacting; Grok ACP uses running/idle.
+      state = {
+        isStreaming:
+          'isStreaming' in raw
+            ? Boolean((raw as { isStreaming?: boolean }).isStreaming)
+            : Boolean((raw as { running?: boolean }).running),
+        isCompacting:
+          'isCompacting' in raw ? Boolean((raw as { isCompacting?: boolean }).isCompacting) : false,
+        running: 'running' in raw ? Boolean((raw as { running?: boolean }).running) : undefined,
+      };
     } catch {
       return;
     }
@@ -2500,6 +3407,24 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         throw new InteractiveAgentError('unavailable', ep.lastError ?? 'Endpoint unavailable');
       }
 
+      // Grok ACP: reject text input while starting/running/active BEFORE creating
+      // a second activation or mutating queues/endpoints.
+      const isGrokAcpEndpoint =
+        ep.sessionArtifact?.runtime === 'grok-acp' ||
+        ep.launchSpec?.sessionArtifact?.runtime === 'grok-acp' ||
+        (ep.client !== undefined &&
+          'runningInput' in ep.client &&
+          (ep.client as InteractiveAgentTransport).runningInput === 'unsupported');
+      if (
+        isGrokAcpEndpoint &&
+        (ep.activation || ep.status === 'starting' || ep.status === 'running')
+      ) {
+        throw new InteractiveAgentError(
+          'running_input_unsupported',
+          'Grok ACP input is unavailable while running; wait or press Ctrl+X to cancel.'
+        );
+      }
+
       // Dispose a failed/stale transport fully before revalidation or spawn
       // (single writer: await dispose barrier before any new process).
       if ((ep.status === 'error' || ep.status === 'detached') && ep.client) {
@@ -2537,13 +3462,20 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         // Idle/detached: demote stale steer/follow_up to a fresh prompt turn.
         effectiveMode = mode === 'steer' || mode === 'follow_up' ? 'prompt' : mode;
       }
+      // Grok ACP never steers or follow-ups — always prompt when idle.
+      if (isGrokAcpEndpoint) {
+        effectiveMode = 'prompt';
+      }
 
       // Baseline must include any prior session messages on reopen.
       // Hydrate failures throw here — before activation assignment — so activate
       // never leaves a zombie activation without activation_settled.
-      // ensureTranscriptHydrated awaits the writer lease barrier before disk open.
+      // Pi: hydrate from session file. Grok ACP: skip hydrate-only (lease gap);
+      // spawnTransport loads once, sets baseline after the load barrier, then prompts.
       if (!ep.activation) {
-        await ensureTranscriptHydrated(ep, { required: true });
+        if (!isGrokAcpEndpoint) {
+          await ensureTranscriptHydrated(ep, { required: true });
+        }
       }
 
       const activationId = `act_${++sequenceCounter}_${now()}`;
@@ -2569,7 +3501,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       // Ensure a single shared transportReady barrier exists for concurrent waiters.
       if (!ep.client && !ep.transportReady) {
         // Wait for any prior dispose (abort/detach/invalidate/cross-registry) before spawning.
-        await awaitSpawnDisposeBarriers(key, ep.sessionFile);
+        await awaitSpawnDisposeBarriers(key, endpointLeaseKey(ep));
         ep.status = 'starting';
         publish(ep);
         const generation = ++ep.transportGeneration;
@@ -2594,7 +3526,17 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             }
             ep.status = 'error';
             ep.lastError = err instanceof Error ? err.message : String(err);
-            ep.errorCode = 'transport_error';
+            // Preserve structured codes (GrokAcpClientError / InteractiveAgentError).
+            const structured =
+              err instanceof InteractiveAgentError
+                ? err.code
+                : err &&
+                    typeof err === 'object' &&
+                    'code' in err &&
+                    typeof (err as { code?: unknown }).code === 'string'
+                  ? (err as { code: string }).code
+                  : undefined;
+            ep.errorCode = structured ?? 'transport_error';
             ep.transportReady = undefined;
             if (ep.activation && !ep.activation.settled) {
               // Leave activation for phase-2 catch / abort to settle once.
@@ -2607,9 +3549,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
 
       // Capture the readiness barrier now: a later failed spawn clears
       // ep.transportReady, but phase 2 must still observe the rejection reason.
-      const readyBarrier: Promise<PiRpcTransport> | undefined = ep.client
-        ? Promise.resolve(ep.client)
-        : ep.transportReady;
+      const readyBarrier: Promise<PiRpcTransport | InteractiveAgentTransport> | undefined =
+        ep.client ? Promise.resolve(ep.client) : ep.transportReady;
       return {
         activationId: ep.activation.id,
         effectiveMode,
@@ -2645,39 +3586,41 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         }
         // Race readiness against activation cancel so a hung handshake cannot
         // block the outbound queue after abort/settle of this activation.
-        const transport = await new Promise<PiRpcTransport>((resolve, reject) => {
-          let settled = false;
-          const finish = (fn: () => void) => {
-            if (settled) return;
-            settled = true;
-            unsub();
-            fn();
-          };
-          const unsub = subscribe((ev) => {
-            if (ev.type === 'activation_settled' && ev.activationId === prepared.activationId) {
+        const transport = await new Promise<PiRpcTransport | InteractiveAgentTransport>(
+          (resolve, reject) => {
+            let settled = false;
+            const finish = (fn: () => void) => {
+              if (settled) return;
+              settled = true;
+              unsub();
+              fn();
+            };
+            const unsub = subscribe((ev) => {
+              if (ev.type === 'activation_settled' && ev.activationId === prepared.activationId) {
+                finish(() =>
+                  reject(new InteractiveAgentError('rejected', 'Activation cancelled before send'))
+                );
+              }
+            });
+            // Already cancelled before we subscribed.
+            const snap = endpoints.get(key);
+            if (
+              !snap?.activation ||
+              snap.activation.id !== prepared.activationId ||
+              snap.activation.settled ||
+              snap.activation.terminalOverride === 'cancelled'
+            ) {
               finish(() =>
                 reject(new InteractiveAgentError('rejected', 'Activation cancelled before send'))
               );
+              return;
             }
-          });
-          // Already cancelled before we subscribed.
-          const snap = endpoints.get(key);
-          if (
-            !snap?.activation ||
-            snap.activation.id !== prepared.activationId ||
-            snap.activation.settled ||
-            snap.activation.terminalOverride === 'cancelled'
-          ) {
-            finish(() =>
-              reject(new InteractiveAgentError('rejected', 'Activation cancelled before send'))
+            void ready.then(
+              (t) => finish(() => resolve(t)),
+              (err) => finish(() => reject(err))
             );
-            return;
           }
-          void ready.then(
-            (t) => finish(() => resolve(t)),
-            (err) => finish(() => reject(err))
-          );
-        });
+        );
 
         const after = endpoints.get(key);
         if (
@@ -2686,20 +3629,56 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           after.activation.settled ||
           after.activation.terminalOverride === 'cancelled'
         ) {
+          // Cancel-ready race: always dispose via tracked helper so lease releases
+          // and dispose barriers stay consistent (never raw transport.dispose()).
+          if (after?.client === transport) {
+            after.client = undefined;
+          }
           try {
-            await transport.dispose();
-          } catch {
-            /* ignore */
+            await disposeTracked(key, transport, after?.sessionFile);
+          } catch (disposeErr) {
+            const disposeError =
+              disposeErr instanceof Error ? disposeErr : new Error(String(disposeErr));
+            throw new InteractiveAgentError('dispose_failed', disposeError.message);
           }
           throw new InteractiveAgentError('rejected', 'Activation cancelled before send');
+        }
+
+        // Grok ACP (and any transport with runningInput unsupported) rejects
+        // steer/follow-up while starting/running; only idle prompt is accepted.
+        const runningInput =
+          'runningInput' in transport
+            ? (transport as InteractiveAgentTransport).runningInput
+            : 'steer-follow-up';
+        if (
+          runningInput === 'unsupported' &&
+          prepared.effectiveMode !== 'prompt' &&
+          (after.status === 'starting' || after.status === 'running')
+        ) {
+          throw new InteractiveAgentError(
+            'running_input_unsupported',
+            'Grok ACP input is unavailable while running; wait or press Ctrl+X to cancel.'
+          );
         }
 
         if (prepared.effectiveMode === 'prompt') {
           await transport.prompt(trimmed);
         } else if (prepared.effectiveMode === 'steer') {
-          await transport.steer(trimmed);
-        } else {
+          if (typeof transport.steer === 'function') {
+            await transport.steer(trimmed);
+          } else {
+            throw new InteractiveAgentError(
+              'running_input_unsupported',
+              'Steer is not supported for this interactive runtime'
+            );
+          }
+        } else if (typeof transport.followUp === 'function') {
           await transport.followUp(trimmed);
+        } else {
+          throw new InteractiveAgentError(
+            'running_input_unsupported',
+            'Follow-up is not supported for this interactive runtime'
+          );
         }
       });
 
@@ -2731,7 +3710,17 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           if (cancelled === 'error') {
             current.status = 'error';
             current.lastError = current.activation.error;
-            current.errorCode = 'transport_error';
+            // Preserve structured codes — never blanket-overwrite as transport_error.
+            const structured =
+              err instanceof InteractiveAgentError
+                ? err.code
+                : err &&
+                    typeof err === 'object' &&
+                    'code' in err &&
+                    typeof (err as { code?: unknown }).code === 'string'
+                  ? (err as { code: string }).code
+                  : undefined;
+            current.errorCode = structured ?? 'transport_error';
           } else if (current.status === 'starting') {
             current.status = 'detached';
           }
@@ -2907,81 +3896,250 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     }
   }
 
-  async function shutdown(): Promise<void> {
-    if (shutDown) return;
+  /** Wrap any dispose rejection as dispose_failed; preserve existing dispose_failed. */
+  function asDisposeFailed(err: Error): InteractiveAgentError {
+    if (err instanceof InteractiveAgentError && err.code === 'dispose_failed') return err;
+    if (isDisposeFailedError(err)) {
+      return err instanceof InteractiveAgentError
+        ? err
+        : new InteractiveAgentError('dispose_failed', err.message || 'Dispose failed');
+    }
+    return new InteractiveAgentError(
+      'dispose_failed',
+      err.message || 'Registry shutdown dispose failed'
+    );
+  }
+
+  function shutdown(): Promise<void> {
+    // Single cached promise: first/repeat callers share success or the same rejection.
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = runShutdown();
+    return shutdownPromise;
+  }
+
+  async function runShutdown(): Promise<void> {
     shutDown = true;
-    // One absolute deadline for abort + settle + dispose + barrier (not two serial races).
-    const deadlineAt = now() + shutdownDisposeBudgetMs;
-    const remainingMs = () => Math.max(0, deadlineAt - now());
+    // Absolute real-time deadline for abort + settle + dispose + barrier.
+    // Uses Date.now() (not the injectable clock) so a fixed test clock cannot
+    // freeze remainingMs and hang shutdown forever.
+    const realNow = () => Date.now();
+    const deadlineAt = realNow() + shutdownDisposeBudgetMs;
+    const remainingMs = () => Math.max(0, deadlineAt - realNow());
+    // Single non-resetting deadline promise/timer for the whole drain loop.
+    let timedOut = false;
+    let deadlineTimer: unknown;
+    const deadlinePromise = new Promise<void>((resolve) => {
+      deadlineTimer = timers.setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, shutdownDisposeBudgetMs);
+    });
     const keys = [...endpoints.keys()];
-    const disposeWork: Promise<void>[] = [];
+    /** Live transports taken for dispose — used to fail-closed leases on timeout. */
+    const shuttingDownTransports: Array<PiRpcTransport | InteractiveAgentTransport> = [];
+    shutdownTransportBag = shuttingDownTransports;
 
-    for (const key of keys) {
-      clearAbortSettleTimer(key);
-      const ep = endpoints.get(key);
-      if (!ep) continue;
-      // Invalidate generation immediately so late factory/getState is guarded
-      // and disposed even after maps are cleared at the end of shutdown.
-      ep.transportGeneration += 1;
-      if (ep.client && (ep.status === 'running' || ep.status === 'starting' || ep.activation)) {
-        // Fire-and-catch abort; do not await the full RPC timeout.
-        void ep.client.abort().catch(() => undefined);
+    try {
+      for (const key of keys) {
+        clearAbortSettleTimer(key);
+        const ep = endpoints.get(key);
+        if (!ep) continue;
+        // Invalidate generation immediately so late factory/getState is guarded
+        // and disposed even after maps are cleared at the end of shutdown.
+        ep.transportGeneration += 1;
+        if (ep.client && (ep.status === 'running' || ep.status === 'starting' || ep.activation)) {
+          // Fire-and-catch abort; do not await the full RPC timeout.
+          void ep.client.abort().catch(() => undefined);
+        }
+        // Force-settle any leftover activation so shutdown never hangs waiters.
+        if (ep.activation && !ep.activation.settled) {
+          settleActivationError(ep, 'Registry shutdown', 'cancelled');
+        }
+        rejectSpawnWaiter(
+          key,
+          new InteractiveAgentError('shutdown', 'Interactive registry is shut down')
+        );
+        const ready = ep.transportReady;
+        const sessionFile = ep.sessionFile;
+        ep.transportReady = undefined;
+        if (ep.client) {
+          // Live client owns dispose; do not also dispose via ready (same transport).
+          const client = ep.client;
+          ep.client = undefined;
+          shuttingDownTransports.push(client);
+          // Track on barriers. Session lease stays sticky on dispose failure so a
+          // new registry cannot open the same session identity.
+          void disposeTracked(key, client, sessionFile);
+        } else if (ready) {
+          // Handshake-only: on success dispose via disposeTracked; on reject the
+          // spawn path's disposeSpawned notes barrier work asynchronously. Never
+          // treat ready rejection as "no dispose" — dynamic drain waits for late
+          // disposeTracked/noteDispose registrations under the shared deadline.
+          void noteDispose(
+            key,
+            ready.then(
+              (transport) => {
+                shuttingDownTransports.push(transport);
+                return disposeTracked(key, transport, sessionFile);
+              },
+              async () => {
+                // Yield so spawnTransport catch can register disposeSpawned on the
+                // barrier before the first drain iteration snapshots work.
+                await Promise.resolve();
+              }
+            )
+          );
+        }
+        releaseSessionFile(key, ep.sessionFile);
       }
-      // Force-settle any leftover activation so shutdown never hangs waiters.
-      if (ep.activation && !ep.activation.settled) {
-        settleActivationError(ep, 'Registry shutdown', 'cancelled');
+
+      // Dispose every pending owner that already has a transport but is not yet
+      // installed as ep.client (hydrate-only, registerGrokAcpLive mid-binding,
+      // spawn between factory return and handshake install).
+      for (const entry of pendingOwners.values()) {
+        if (!entry.transport) continue;
+        const alreadyQueued = shuttingDownTransports.includes(entry.transport);
+        if (alreadyQueued) continue;
+        shuttingDownTransports.push(entry.transport);
+        const barrierKey = entry.key ?? `pending:${entry.ownerId}`;
+        void disposeTracked(barrierKey, entry.transport);
       }
-      rejectSpawnWaiter(
-        key,
-        new InteractiveAgentError('shutdown', 'Interactive registry is shut down')
-      );
-      const ready = ep.transportReady;
-      const sessionFile = ep.sessionFile;
-      ep.transportReady = undefined;
-      if (ep.client) {
-        // Live client owns dispose; do not also dispose via ready (same transport).
-        const client = ep.client;
-        ep.client = undefined;
-        // Track on barriers (local + sessionFile). Session barrier stays sticky on
-        // dispose failure so a new registry cannot open the same sessionFile.
-        disposeWork.push(disposeTracked(key, client, sessionFile));
-      } else if (ready) {
-        // Handshake-only: dispose when the spawn promise settles; share the budget.
-        disposeWork.push(noteReadyDispose(key, sessionFile, ready));
+
+      // Dynamic work set: keep draining disposeBarriers + pending owners until
+      // empty or deadline. Late disposeTracked (getState hang → disposeSpawned,
+      // hydrate factory return, registerGrokAcpLive mid-await) must still be
+      // observed; a single snapshot would miss them and falsely succeed.
+      const disposeErrors: Error[] = [];
+      const trackedBarriers = new Set<Promise<void>>();
+      const inFlight = new Set<Promise<void>>();
+
+      const trackBarrier = (p: Promise<void>): void => {
+        if (trackedBarriers.has(p)) return;
+        trackedBarriers.add(p);
+        const settled = p.then(
+          () => undefined,
+          (err) => {
+            disposeErrors.push(err instanceof Error ? err : new Error(String(err)));
+          }
+        );
+        inFlight.add(settled);
+        void settled.finally(() => {
+          inFlight.delete(settled);
+        });
+      };
+
+      while (true) {
+        for (const p of disposeBarriers.values()) {
+          trackBarrier(p);
+        }
+        const hasPendingOwners = pendingOwners.size > 0;
+        if (inFlight.size === 0 && !hasPendingOwners) {
+          // One more scan: a just-settled barrier may have unblocked a microtask
+          // that registered new disposal (disposeSpawned after ready reject).
+          await Promise.resolve();
+          for (const p of disposeBarriers.values()) {
+            trackBarrier(p);
+          }
+          // Also pick up transports bound to pending owners after the yield.
+          for (const entry of pendingOwners.values()) {
+            if (!entry.transport) continue;
+            if (shuttingDownTransports.includes(entry.transport)) continue;
+            shuttingDownTransports.push(entry.transport);
+            const barrierKey = entry.key ?? `pending:${entry.ownerId}`;
+            void disposeTracked(barrierKey, entry.transport);
+          }
+          for (const p of disposeBarriers.values()) {
+            trackBarrier(p);
+          }
+          if (inFlight.size === 0 && pendingOwners.size === 0) break;
+        }
+        if (timedOut || remainingMs() <= 0) {
+          timedOut = true;
+          break;
+        }
+        await Promise.race([
+          // When no barrier work but pending owners lack transport yet, wait only
+          // on the shared deadline (or a short real tick for late factory registration).
+          inFlight.size > 0
+            ? Promise.all([...inFlight])
+            : new Promise<void>((resolve) => {
+                const tick = timers.setTimeout(() => resolve(), Math.min(remainingMs() || 5, 5));
+                void tick;
+              }),
+          deadlinePromise,
+        ]);
+        if (timedOut) break;
+        if (remainingMs() <= 0 && (inFlight.size > 0 || pendingOwners.size > 0)) {
+          timedOut = true;
+          break;
+        }
       }
-      releaseSessionFile(key, ep.sessionFile);
+
+      // Background cleanup continues after deadline; do not cancel dispose work.
+      if (timedOut) {
+        // Fail-closed any lease still bound to a shutting-down transport
+        // (live client path and late disposeSpawned handshake path).
+        const timeoutErr = new InteractiveAgentError(
+          'dispose_failed',
+          'Registry shutdown dispose deadline exceeded'
+        );
+        for (const t of shuttingDownTransports) {
+          const rel = transportLeaseReleases.get(t);
+          if (rel) {
+            transportLeaseReleases.delete(t);
+            rel(timeoutErr);
+          }
+        }
+        // Sticky-settle every still-open pending owner (hydrate/register/spawn).
+        // Late factory + clean dispose must not clear this failure.
+        for (const entry of [...pendingOwners.values()]) {
+          entry.release(timeoutErr);
+        }
+        pendingOwners.clear();
+        disposeErrors.push(timeoutErr);
+      }
+      shutdownTransportBag = undefined;
+      pendingOwners.clear();
+
+      endpoints.clear();
+      sessionOwners.clear();
+      treeClaimKeys.clear();
+      trustedBranchBindings.clear();
+      outboundPoisonByKey.clear();
+      coalescedStreamEvents.clear();
+      streamCoalesceScheduled.clear();
+      coalesceCellSeq.clear();
+      // Per-endpoint barriers only — process-scoped session leases stay sticky so
+      // a new registry cannot bypass incomplete/failed same-session disposal.
+      disposeBarriers.clear();
+      for (const id of abortSettleTimers.values()) timers.clearTimeout(id);
+      abortSettleTimers.clear();
+      emit({ type: 'shutdown' });
+      listeners.clear();
+
+      // Surface dispose failures to callers (sticky fail-closed must not be swallowed).
+      // Every rejection is dispose_failed; only an existing dispose_failed is preserved.
+      if (disposeErrors.length > 0) {
+        const first = asDisposeFailed(
+          disposeErrors[0] instanceof Error ? disposeErrors[0] : new Error(String(disposeErrors[0]))
+        );
+        if (disposeErrors.length === 1) throw first;
+        throw new InteractiveAgentError(
+          'dispose_failed',
+          `Registry shutdown dispose failed (${disposeErrors.length}): ${first.message}`
+        );
+      }
+    } finally {
+      // Always clear the single deadline timer so a fast path leaves no residual.
+      if (deadlineTimer !== undefined) {
+        timers.clearTimeout(deadlineTimer);
+      }
     }
-
-    // Wait for all dispose work + any leftover barriers under the shared absolute deadline.
-    // Session-file barriers are process-scoped and intentionally NOT cleared here so a
-    // new registry cannot bypass incomplete/failed same-session disposal.
-    const pending = [...disposeWork, ...disposeBarriers.values()];
-    if (pending.length > 0) {
-      await Promise.race([
-        Promise.all(pending.map((p) => p.catch(() => undefined))),
-        new Promise<void>((resolve) => {
-          timers.setTimeout(() => resolve(), remainingMs());
-        }),
-      ]);
-    }
-
-    endpoints.clear();
-    sessionOwners.clear();
-    treeClaimKeys.clear();
-    trustedBranchBindings.clear();
-    outboundPoisonByKey.clear();
-    coalescedStreamEvents.clear();
-    streamCoalesceScheduled.clear();
-    coalesceCellSeq.clear();
-    disposeBarriers.clear();
-    for (const id of abortSettleTimers.values()) timers.clearTimeout(id);
-    abortSettleTimers.clear();
-    emit({ type: 'shutdown' });
-    listeners.clear();
   }
 
   return {
     registerInitial,
+    registerGrokAcpLive,
     restoreActiveBranch,
     listVisible,
     listVisibleMeta,
@@ -3011,6 +4169,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     _canonicalizeSessionLeaseKey: canonicalizeSessionLeaseKey,
     /** Test helper: process-scoped lease store sizes. */
     _getSessionLeaseStoreSizes: getSessionLeaseStoreSizesForTest,
+    /** Test helper: count of pre-acquired pending owners (hydrate/register/spawn). */
+    _pendingOwnerCount: () => pendingOwners.size,
   };
 }
 

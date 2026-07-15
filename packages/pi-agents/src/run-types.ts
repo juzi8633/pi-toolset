@@ -96,6 +96,18 @@ export interface RunUnitRecord {
   attempt: number;
   attempts: RunUnitAttempt[];
   sessionFile?: string;
+  /**
+   * ACP protocol session ID for `runtime: "grok-acp"` units.
+   * Protocol identity only — never a private Grok session-file path.
+   */
+  acpSessionId?: string;
+  /**
+   * Pi original-prompt establishment. `false` after a first sessionFile stamp and
+   * before the unit's original prompt is accepted; `true` after accept is durably
+   * recorded. Absent on legacy units (treat as established when a sessionFile is
+   * present). Session file presence alone must not imply the original task ran.
+   */
+  sessionPromptEstablished?: boolean;
   effectiveCwd: string;
   worktreePath?: string;
   result?: SingleResult;

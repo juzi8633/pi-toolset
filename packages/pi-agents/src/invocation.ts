@@ -189,6 +189,9 @@ function buildSharedPiFlags(
   return args;
 }
 
-/** Fixed continuation instruction for resumed Pi sessions. */
+/**
+ * Fixed continuation instruction for resumed native sessions (Pi session files
+ * and Grok ACP protocol sessions). Text must remain stable across runtimes.
+ */
 export const RESUME_CONTINUATION_PROMPT =
   'You are resuming an interrupted task. Inspect the filesystem and git state to understand what was already completed. Treat any unfinished tool call as unconfirmed. Continue the original task to completion, and run validation before finishing.';

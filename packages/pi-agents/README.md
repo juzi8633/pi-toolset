@@ -12,7 +12,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Dynamic fanout** - chain steps expand a prior step's array output into parallel subtasks with a collected result
 - **Package agents** - install agents from npm packages that declare `pi.agents`
 - **Slash-command invocation** - `/agent:<name> <task>` runs a discovered agent directly; `/agent list` enumerates them
-- **Interactive agent view (TUI)** - `/agent view` or `Ctrl+Alt+Down` opens a navigator for current-session Pi subagents; steer, follow-up, and abort child turns without switching the host session
+- **Interactive agent view (TUI)** - `/agent view` or `Ctrl+Alt+Down` opens a navigator for current-session Pi and Grok ACP subagents; Pi supports steer/follow-up, Grok ACP supports idle prompt and cancel
 - **Worktree isolation + setup hook** - run agents in a throw-away git worktree with an optional shell `worktreeSetupHook` and per-run diff metadata
 - **Completion check** - require final-message headings via frontmatter
 - **Compact live rendering** - collapsed view is a status summary (glyph, agent, truncated task or a short `title`, usage, at most one latest activity); Ctrl+O expands full task/transcript/final output
@@ -21,7 +21,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Usage tracking** - turns, tokens, and context per execution unit; aggregates sum tokens/turns and use `ctx:max` (no aggregate model/thinking); partial stats stream live for `grok-acp`
 - **Abort support** - Ctrl+C propagates and kills active subprocesses
 - **Durable runs** - every invocation persists a run record, unit state, and native Pi sessions under `~/.pi/agent/@balaenis/pi-agents/runs/`; interrupted runs can be inspected and resumed without re-running completed work
-- **Resume** - `agent({ runId })` resumes an interrupted durable run from its stored workflow and sessions; optional `task` appends a continuation instruction; Pi-runtime units reopen their stored session, Grok-runtime units replay from the beginning with explicit `allowReplay` acknowledgement
+- **Resume** - `agent({ runId })` resumes an interrupted durable run from its stored workflow and sessions; optional `task` appends a continuation instruction; Pi and Grok ACP units reopen native sessions; plain Grok units replay from the beginning with explicit `allowReplay` acknowledgement
 - **Reconciliation** - on session start, runs left running by a dead process are automatically marked interrupted
 
 ## Local development
@@ -87,10 +87,18 @@ Optional `task` is a continuation instruction appended for incomplete units only
 
 ### Pi vs Grok resume
 
-- **Pi-runtime units with a stored session** (`resumeCapability: "session"`) reopen the native Pi session with a safety-oriented continuation prompt plus every **undelivered** continuation instruction for that unit. Already-delivered continuations are not resent. The original task is not resent.
-- **Pi-runtime units that never started** receive their resolved original task plus every continuation instruction recorded on the run (even after `prepareAgentContext` creates a new session file).
-- **Grok-runtime units** (`resumeCapability: "replay"`) re-run from a fresh process with the original task plus all durable continuation instructions. Set `allowReplay: true` only after accepting that side effects (edits, commands, network writes) may be duplicated.
-- Continuation delivery is tracked per unit (`continuationDelivery`). A continuation is marked delivered only after the child accepts the prompt (spawn / RPC activate). Crash after claim, background-mode rejection, or partial dispatch leaves undelivered instructions for the next resume.
+| Runtime    | Capability | Resume behavior                                      | `allowReplay`                          |
+| ---------- | ---------- | ---------------------------------------------------- | -------------------------------------- |
+| `pi`       | `session`  | Reopen native Pi session file                        | Not required                           |
+| `grok-acp` | `session`  | `session/load` with protocol session ID              | Not required (and not an escape hatch) |
+| `grok`     | `replay`   | Fresh process with original task + all continuations | Required for incomplete units          |
+
+- **Pi-runtime units with a stored session** reopen the native Pi session with a safety-oriented continuation prompt plus every **undelivered** continuation instruction for that unit. Already-delivered continuations are not resent. The original task is not resent.
+- **Grok ACP units with a stored `acpSessionId`** call ACP `session/load` with the original cwd/worktree, then send only the fixed continuation prompt plus undelivered instructions. The original task is never resent. Attempted units without a stored ID fail closed (`acp_session_unavailable`).
+- **Never-started units** (Pi or Grok ACP, queued/skipped with no attempt history) create their first session and receive the resolved original task plus every continuation instruction recorded on the run.
+- **Plain Grok units** (`resumeCapability: "replay"`) re-run from a fresh process with the original task plus all durable continuation instructions. Set `allowReplay: true` only after accepting that side effects (edits, commands, network writes) may be duplicated.
+- Continuation delivery is tracked per unit (`continuationDelivery`). Pi marks delivery after spawn/RPC activate accepts the prompt. **Grok ACP** marks delivery only after the matching `session/prompt` response (and awaits a strict durable write). Crash after claim, background-mode rejection, or partial dispatch leaves undelivered instructions for the next resume.
+- Grok ACP run records store the protocol session ID and original cwd/worktree only — never private paths under `~/.grok/sessions`. Cross-machine restore and recovery after deleting Grok storage are unsupported.
 
 ### Chain fanout resume
 

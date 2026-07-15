@@ -11,6 +11,7 @@ import { openAgentWorktree, createAgentWorktree, removeAgentWorktree } from '../
 import {
   incrementIncompleteAttempts,
   inspectResume,
+  isNeverStartedUnit,
   reconcileDeadOwnerUnits,
   validateFanoutResumeState,
 } from '../src/resume.ts';
@@ -523,6 +524,337 @@ describe('inspectResume', () => {
     }
   });
 
+  it('blocks attempted Grok ACP units missing acpSessionId without allowReplay escape', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'grok-acp-agent',
+        description: 'grok-acp',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/grok-acp.md',
+        runtime: 'grok-acp',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      // Legacy attempted unit may still store capability "replay" without an ID.
+      await store.updateRun(runId, (r) => {
+        r.units.single!.runtime = 'grok-acp';
+        r.units.single!.capability = 'replay';
+        r.units.single!.effectiveCwd = tmpRoot;
+        delete r.units.single!.acpSessionId;
+      });
+      const result = inspectResume(runId, store, {
+        agents: [agent],
+        allowReplay: true,
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.requiresReplay).toBe(false);
+        expect(result.blockingReasons.some((r) => r.includes('acp_session_unavailable'))).toBe(
+          true
+        );
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('allows never-started Grok ACP units without an ACP session ID', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'grok-acp-agent',
+        description: 'grok-acp',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/grok-acp.md',
+        runtime: 'grok-acp',
+      };
+      // Start as interrupted then rewrite to never-started queued for preflight.
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      await store.updateRun(runId, (r) => {
+        r.status = 'interrupted';
+        r.units.single!.runtime = 'grok-acp';
+        r.units.single!.capability = 'session';
+        r.units.single!.status = 'queued';
+        r.units.single!.attempts = [];
+        r.units.single!.effectiveCwd = tmpRoot;
+        delete r.units.single!.acpSessionId;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.requiresReplay).toBe(false);
+        expect(result.blockingReasons).toEqual([]);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('allows attempted Grok ACP units with a stored acpSessionId without allowReplay', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'grok-acp-agent',
+        description: 'grok-acp',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/grok-acp.md',
+        runtime: 'grok-acp',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      await store.updateRun(runId, (r) => {
+        r.units.single!.runtime = 'grok-acp';
+        r.units.single!.capability = 'session';
+        r.units.single!.acpSessionId = 'sess-stored';
+        r.units.single!.effectiveCwd = tmpRoot;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.requiresReplay).toBe(false);
+        expect(result.blockingReasons).toEqual([]);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks queued Grok ACP units that have attempt history but no acpSessionId', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'grok-acp-agent',
+        description: 'grok-acp',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/grok-acp.md',
+        runtime: 'grok-acp',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      // Re-queued after a prior attempt — not never-started despite status=queued.
+      await store.updateRun(runId, (r) => {
+        r.status = 'interrupted';
+        r.units.single!.runtime = 'grok-acp';
+        r.units.single!.capability = 'session';
+        r.units.single!.status = 'queued';
+        r.units.single!.attempt = 2;
+        r.units.single!.attempts = [
+          { attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 },
+        ];
+        r.units.single!.effectiveCwd = tmpRoot;
+        delete r.units.single!.acpSessionId;
+      });
+      const result = inspectResume(runId, store, {
+        agents: [agent],
+        allowReplay: true,
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.blockingReasons.some((b) => b.includes('acp_session_unavailable'))).toBe(
+          true
+        );
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('allows queued Grok ACP units with attempt history when acpSessionId is present', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'grok-acp-agent',
+        description: 'grok-acp',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/grok-acp.md',
+        runtime: 'grok-acp',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      await store.updateRun(runId, (r) => {
+        r.status = 'interrupted';
+        r.units.single!.runtime = 'grok-acp';
+        r.units.single!.capability = 'session';
+        r.units.single!.status = 'queued';
+        r.units.single!.attempt = 2;
+        r.units.single!.attempts = [
+          { attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 },
+        ];
+        r.units.single!.acpSessionId = 'sess-after-history';
+        r.units.single!.effectiveCwd = tmpRoot;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.blockingReasons).toEqual([]);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fail-closes attempted Pi units whose planned sessionFile does not exist on disk', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'pi-agent',
+        description: 'pi',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/pi.md',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      const planned = path.join(tmpRoot, 'planned-missing.jsonl');
+      await store.updateRun(runId, (r) => {
+        r.units.single!.status = 'interrupted';
+        r.units.single!.capability = 'session';
+        r.units.single!.sessionFile = planned;
+        r.units.single!.attempts = [
+          { attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 },
+        ];
+        r.units.single!.effectiveCwd = tmpRoot;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.blockingReasons.some((b) => b.includes('session file missing'))).toBe(true);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fail-closes attempted Pi units with sessionFile but unestablished original prompt', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'pi-agent',
+        description: 'pi',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/pi.md',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      const sessionFile = path.join(tmpRoot, 'fork-existing.jsonl');
+      writeFileSync(sessionFile, '{}\n');
+      await store.updateRun(runId, (r) => {
+        r.units.single!.status = 'interrupted';
+        r.units.single!.capability = 'session';
+        r.units.single!.sessionFile = sessionFile;
+        r.units.single!.sessionPromptEstablished = false;
+        r.units.single!.attempts = [
+          { attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 },
+        ];
+        r.units.single!.effectiveCwd = tmpRoot;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.blockingReasons.some((b) => b.includes('session_prompt_unestablished'))).toBe(
+          true
+        );
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('allows never-started Pi units with a planned sessionFile path (preflight)', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'pi-agent',
+        description: 'pi',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/pi.md',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      const planned = path.join(tmpRoot, 'planned-not-prompted.jsonl');
+      await store.updateRun(runId, (r) => {
+        r.status = 'interrupted';
+        r.units.single!.status = 'queued';
+        r.units.single!.attempts = [];
+        r.units.single!.capability = 'session';
+        r.units.single!.sessionFile = planned;
+        r.units.single!.effectiveCwd = tmpRoot;
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.blockingReasons).toEqual([]);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   it('treats an absent continuationTasks field as an empty history (backward compatible)', async () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
@@ -667,6 +999,32 @@ function makeFanoutResult(
   };
 }
 
+describe('isNeverStartedUnit', () => {
+  it('is true only for queued/skipped with empty attempts', () => {
+    expect(isNeverStartedUnit({ status: 'queued', attempts: [] })).toBe(true);
+    expect(isNeverStartedUnit({ status: 'skipped', attempts: [] })).toBe(true);
+    expect(
+      isNeverStartedUnit({
+        status: 'queued',
+        attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+      })
+    ).toBe(false);
+    expect(
+      isNeverStartedUnit({
+        status: 'skipped',
+        attempts: [{ attempt: 1, status: 'failed', startedAt: 1, finishedAt: 2 }],
+      })
+    ).toBe(false);
+    expect(
+      isNeverStartedUnit({
+        status: 'interrupted',
+        attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+      })
+    ).toBe(false);
+    expect(isNeverStartedUnit({ status: 'running', attempts: [] })).toBe(false);
+  });
+});
+
 describe('incrementIncompleteAttempts', () => {
   it('does not increment never-started queued/skipped units', () => {
     const units: Record<string, RunUnitRecord> = {
@@ -684,6 +1042,19 @@ describe('incrementIncompleteAttempts', () => {
     expect(units.b!.status).toBe('queued');
     expect(units.c!.attempt).toBe(2);
     expect(units.c!.status).toBe('queued');
+  });
+
+  it('increments queued units that already have attempt history', () => {
+    const units: Record<string, RunUnitRecord> = {
+      requeued: {
+        ...fanoutUnit(2, 0, 'queued'),
+        attempt: 2,
+        attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+      },
+    };
+    incrementIncompleteAttempts(units);
+    expect(units.requeued!.attempt).toBe(3);
+    expect(units.requeued!.status).toBe('queued');
   });
 });
 

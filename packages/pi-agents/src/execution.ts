@@ -28,13 +28,30 @@ import { createGrokParserState, parseGrokEvent } from './grok-parser.ts';
 import {
   appendContinuationTasks,
   buildPiArgs,
+  buildSessionContinuationPrompt,
   getPiInvocation,
   writePromptToTempFile,
 } from './invocation.ts';
 import { applyTerminalStatus, getFinalOutput } from './output.ts';
 import type { UnitExecutionContext } from './run-coordinator.ts';
 import { buildChildAgentEnv, isAgentDelegationAllowed } from './security.ts';
+import {
+  disposalCertaintyFromCaught,
+  isDisposeFailedError,
+  releaseSessionLeaseWithCertainty,
+  type DisposalCertainty,
+} from './session-lease.ts';
 import { cloneSingleResult, emptyUsage, type SingleResult, type SubagentDetails } from './types.ts';
+
+/** True when Grok ACP SingleResult is a successful matching-prompt completion. */
+function isGrokAcpSuccessfulCompletion(result: SingleResult): boolean {
+  return (
+    result.status === 'completed' &&
+    result.stopReason === 'end' &&
+    result.exitCode === 0 &&
+    !result.errorMessage
+  );
+}
 
 export interface SpawnedChild extends ChildProcess {
   stdout: Readable;
@@ -91,6 +108,37 @@ export interface RunSingleAgentOptions {
   resumeHadStoredSession?: boolean;
   /** Called once the child has accepted the resume/fresh prompt (spawn or RPC activate). */
   onResumePromptAccepted?: () => void;
+  /**
+   * Awaited once Pi has accepted the unit's original (or fresh) prompt so durable
+   * sessionPromptEstablished can be written. Write failure must fail-close the turn.
+   * Not used for Grok ACP (session history after load is the authority).
+   */
+  onSessionPromptEstablished?: () => void | Promise<void>;
+  /**
+   * Awaited after session/new returns a non-empty ACP session ID and before the
+   * first prompt. Used for durable disk-first session-ID persistence.
+   */
+  onAcpSessionEstablished?: (sessionId: string) => void | Promise<void>;
+  /**
+   * Grok ACP only: awaited after the matching prompt response (not dispatch accept).
+   * Used for strict continuation-delivery persistence.
+   */
+  onAcpPromptCompleted?: () => void | Promise<void>;
+  /**
+   * Fresh TUI Grok ACP: after durable session ID + lease, register the live
+   * transport on the interactive registry (binding/link) and return endpoint key.
+   *
+   * Ownership: caller keeps transport/lease until `acceptOwnership` runs
+   * (synchronously after registry `beginPendingOwner`). Adapter may throw during
+   * precompute before that call; caller catch still disposes.
+   */
+  registerGrokAcpLiveEndpoint?: (input: {
+    sessionId: string;
+    transport: import('./interactive-transport.ts').InteractiveAgentTransport;
+    leaseRelease: (err?: Error) => void;
+    /** Sync handoff: registry owns cleanup after this returns. */
+    acceptOwnership: () => void;
+  }) => Promise<string>;
 }
 
 export const ABORT_MESSAGE = 'Subagent was aborted';
@@ -102,6 +150,9 @@ function stampUnitContext(result: SingleResult, options: RunSingleAgentOptions):
   result.unitId = ctx.unitId;
   result.attempt = ctx.attempt;
   result.sessionFile = ctx.sessionFile;
+  if (ctx.acpSessionId !== undefined) {
+    result.acpSessionId = ctx.acpSessionId;
+  }
   result.resumeCapability = ctx.resumeCapability;
 }
 
@@ -467,22 +518,18 @@ export async function runSingleAgent(
     });
     let wasAborted = false;
     let maxTurnsExceeded = false;
-    let promptAccepted = false;
 
-    const exitCode = await new Promise<number>((resolve) => {
-      const invocation = getPiInvocation(args);
-      const spawnFn = options.spawnFn ?? (spawn as unknown as SpawnFn);
-      const proc = spawnFn(invocation.command, invocation.args, {
-        cwd: cwd ?? defaultCwd,
-        env: childEnv,
-        shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      // Child accepted the argv prompt once spawn returns a process handle.
-      if (!promptAccepted) {
-        promptAccepted = true;
-        options.onResumePromptAccepted?.();
-      }
+    const invocation = getPiInvocation(args);
+    const spawnFn = options.spawnFn ?? (spawn as unknown as SpawnFn);
+    const proc = spawnFn(invocation.command, invocation.args, {
+      cwd: cwd ?? defaultCwd,
+      env: childEnv,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    // Wire I/O before durable establishment so early stdout is not lost.
+    const exitCodePromise = new Promise<number>((resolve) => {
       let buffer = '';
       let killTimer: ReturnType<typeof setTimeout> | null = null;
       let hasClosed = false;
@@ -607,6 +654,24 @@ export async function runSingleAgent(
         else signal.addEventListener('abort', killProc, { once: true });
       }
     });
+
+    // Durable original-prompt establishment after spawn accepts argv. Write
+    // failure fail-closes this turn (kill child, rethrow).
+    try {
+      await options.onSessionPromptEstablished?.();
+    } catch (err) {
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        /* ignore */
+      }
+      void exitCodePromise;
+      throw err;
+    }
+    // Continuation delivery may remain fire-and-forget (separate deferred follow-up).
+    options.onResumePromptAccepted?.();
+
+    const exitCode = await exitCodePromise;
 
     if (maxTurnsExceeded && exitCode === 0) {
       currentResult.exitCode = 1;
@@ -817,10 +882,25 @@ async function runSingleAgentGrokAcp(
 
   const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
 
-  // Replay-capable units always start fresh; append all durable continuations.
-  const invocationTask = options.resumePrompt
-    ? appendContinuationTasks(task, options.resumePrompt.continuationTasks)
-    : task;
+  // Prefer explicit resumeHadStoredSession so a session ID created during this
+  // invocation is not mistaken for a prior stored ACP session.
+  const resumePrompt = options.resumePrompt;
+  const acpSessionId = options.unitContext?.acpSessionId?.trim();
+  const useSessionLoad = Boolean(
+    resumePrompt && (options.resumeHadStoredSession ?? Boolean(acpSessionId)) && acpSessionId
+  );
+
+  // Never-started resume: original task + all continuations.
+  // Existing session: fixed continuation prompt + undelivered only.
+  // Fresh (non-resume): original task.
+  const invocationTask = useSessionLoad
+    ? buildSessionContinuationPrompt(
+        resumePrompt?.undeliveredContinuationTasks ??
+          (resumePrompt?.currentContinuationTask ? [resumePrompt.currentContinuationTask] : [])
+      )
+    : resumePrompt
+      ? appendContinuationTasks(task, resumePrompt.continuationTasks)
+      : task;
 
   const parserState = createGrokAcpParserState(effectiveModel);
   const workCwd = cwd ?? defaultCwd;
@@ -828,50 +908,265 @@ async function runSingleAgentGrokAcp(
   const args = buildGrokAcpArgs(effectiveAgent);
   const invocation = getGrokInvocation(args);
 
-  try {
-    const acpResult = await runGrokAcpClient({
-      command: invocation.command,
-      args: invocation.args,
-      cwd: workCwd,
-      env: childEnv,
-      spawnFn: options.spawnFn as never,
+  const deliveryAfterPrompt = async (): Promise<void> => {
+    if (options.onAcpPromptCompleted) {
+      await options.onAcpPromptCompleted();
+    }
+  };
+
+  // TUI with a registered interactive endpoint: registry is the sole reducer.
+  if (options.hostMode === 'tui' && options.interactiveRegistry && options.endpointKey) {
+    const { runSingleAgentInteractive } = await import('./interactive-execution.ts');
+    return runSingleAgentInteractive(
+      defaultCwd,
+      agents,
+      agentName,
+      task,
+      cwd,
+      step,
       signal,
-      initializeParams: buildGrokAcpInitializeParams(),
-      sessionNewParams: buildGrokAcpSessionNewParams(workCwd, effectiveAgent),
-      task: invocationTask,
-      onSessionUpdate: (notification) => {
-        handleGrokAcpSessionUpdate(notification, currentResult, parserState, emitUpdate);
-      },
-    });
-    // ACP accepted the prompt once the client completed a session interaction.
-    options.onResumePromptAccepted?.();
-
-    currentResult.stderr = acpResult.stderr;
-    finalizeGrokAcpPrompt(
-      currentResult,
-      acpResult.promptResponse.stopReason,
-      acpResult.promptResponse._meta as Record<string, unknown> | null | undefined,
-      parserState,
-      { wasAborted: acpResult.wasAborted },
-      emitUpdate
+      onUpdate,
+      makeDetails,
+      {
+        ...options,
+        interactiveRegistry: options.interactiveRegistry,
+        endpointKey: options.endpointKey,
+        hostMode: 'tui',
+        runtime: 'grok-acp',
+        onAcpPromptCompleted: options.onAcpPromptCompleted,
+      }
     );
+  }
 
-    // Successful ACP prompt completion is treated as process success even when
-    // the long-lived agent exits non-zero during shutdown cleanup.
-    if (currentResult.stopReason === 'end') {
-      currentResult.exitCode = 0;
-    } else if (currentResult.exitCode === 0 && acpResult.exitCode !== 0) {
-      currentResult.exitCode = acpResult.exitCode;
+  // Fresh TUI without endpoint yet: create transport → ID flush → register live → prompt.
+  // Registry/transport is the only reducer; no one-shot facade dual-owner.
+  if (
+    options.hostMode === 'tui' &&
+    options.interactiveRegistry &&
+    options.unitContext &&
+    !options.endpointKey &&
+    !useSessionLoad
+  ) {
+    return runFreshTuiGrokAcp(
+      defaultCwd,
+      agents,
+      agentName,
+      task,
+      cwd,
+      step,
+      signal,
+      onUpdate,
+      makeDetails,
+      options,
+      {
+        effectiveAgent,
+        effectiveModel: effectiveModel ?? '',
+        workCwd,
+        invocationTask,
+        currentResult,
+      }
+    );
+  }
+
+  try {
+    const { openGrokAcpConnection } = await import('./grok-acp-client.ts');
+    const { buildGrokAcpSessionLoadParams } = await import('./grok-acp-invocation.ts');
+    const { createGrokAcpTranscriptProjector } = await import('./grok-acp-transcript.ts');
+    const { acquireSessionLease, buildSessionLeaseKey } = await import('./session-lease.ts');
+
+    if (useSessionLoad && acpSessionId) {
+      // Durable non-TUI resume: lease before spawn → load → barrier → continuation.
+      const leaseKey = buildSessionLeaseKey({
+        runtime: 'grok-acp',
+        cwd: workCwd,
+        sessionIdentity: acpSessionId,
+      });
+      const lease = await acquireSessionLease(leaseKey);
+      const loadProjector = createGrokAcpTranscriptProjector({ configuredModel: effectiveModel });
+      let connection: Awaited<ReturnType<typeof openGrokAcpConnection>> | undefined;
+      try {
+        connection = await openGrokAcpConnection({
+          command: invocation.command,
+          args: invocation.args,
+          cwd: workCwd,
+          env: childEnv,
+          spawnFn: options.spawnFn as never,
+          signal,
+          initializeParams: buildGrokAcpInitializeParams(),
+          onSessionUpdate: (notification, phase) => {
+            if (phase === 'load') {
+              loadProjector.handleSessionUpdate(notification, phase);
+              return;
+            }
+            if (phase === 'prompt') {
+              handleGrokAcpSessionUpdate(notification, currentResult, parserState, emitUpdate);
+            }
+          },
+        });
+        await connection.loadSession(buildGrokAcpSessionLoadParams(acpSessionId, workCwd));
+        loadProjector.finalizeLoadBarrier();
+        if (!loadProjector.hasUserHistory) {
+          throw new GrokAcpClientError(
+            'load',
+            'Loaded ACP session has no replayed user history (acp_session_history_empty)',
+            connection.stderr,
+            'acp_session_history_empty'
+          );
+        }
+        currentResult.acpSessionId = acpSessionId;
+        const dispatch = connection.prompt(invocationTask);
+        await dispatch.accepted;
+        const completion = await dispatch.completed;
+        currentResult.stderr = connection.stderr;
+        const wasAborted = connection.wasAborted || completion.source === 'cancel_grace';
+        // Structured terminal mapping before any delivery decision.
+        finalizeGrokAcpPrompt(
+          currentResult,
+          completion.response.stopReason,
+          completion.response._meta as Record<string, unknown> | null | undefined,
+          parserState,
+          { wasAborted },
+          emitUpdate
+        );
+        if (wasAborted) {
+          const exitCode = await connection.dispose();
+          lease.release();
+          if (currentResult.exitCode === 0 && exitCode !== 0) {
+            currentResult.exitCode = exitCode;
+          }
+          const origin = resolveAbortOrigin(signal, options);
+          finalizeAborted(currentResult, origin);
+          emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+          throw new AgentAbortError(currentResult, origin);
+        }
+        if (currentResult.stopReason === 'end') {
+          currentResult.exitCode = 0;
+        }
+        applyTerminalStatus(currentResult);
+        // Delivery only for matching response + final successful completed.
+        if (completion.source === 'response' && isGrokAcpSuccessfulCompletion(currentResult)) {
+          await deliveryAfterPrompt();
+        }
+        const exitCode = await connection.dispose();
+        lease.release();
+        if (currentResult.stopReason === 'end') {
+          currentResult.exitCode = 0;
+        } else if (currentResult.exitCode === 0 && exitCode !== 0) {
+          currentResult.exitCode = exitCode;
+        }
+        return currentResult;
+      } catch (err) {
+        let certainty: DisposalCertainty;
+        if (connection) {
+          try {
+            await connection.dispose();
+            certainty = { kind: 'confirmed' };
+          } catch (disposeErr) {
+            const de = disposeErr instanceof Error ? disposeErr : new Error(String(disposeErr));
+            releaseSessionLeaseWithCertainty(lease.release, { kind: 'failed', error: de });
+            if (isDisposeFailedError(disposeErr)) throw disposeErr;
+            throw err;
+          }
+        } else {
+          // open may have spawned then failed cleanup (dispose_failed) without
+          // returning a handle — never assume !connection ⇒ never spawned.
+          certainty = disposalCertaintyFromCaught(err);
+        }
+        releaseSessionLeaseWithCertainty(lease.release, certainty);
+        throw err;
+      }
     }
 
-    if (acpResult.wasAborted) {
-      const origin = resolveAbortOrigin(signal, options);
-      finalizeAborted(currentResult, origin);
-      emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
-      throw new AgentAbortError(currentResult, origin);
+    // Fresh / never-started non-TUI: session/new with lease after ID, before persist/prompt.
+    let heldLease: { release: (err?: Error) => void } | undefined;
+    try {
+      const acpResult = await runGrokAcpClient({
+        command: invocation.command,
+        args: invocation.args,
+        cwd: workCwd,
+        env: childEnv,
+        spawnFn: options.spawnFn as never,
+        signal,
+        initializeParams: buildGrokAcpInitializeParams(),
+        sessionNewParams: buildGrokAcpSessionNewParams(workCwd, effectiveAgent),
+        task: invocationTask,
+        onSessionEstablished: async (sessionId) => {
+          // Acquire process-global lease after ID, before durable flush / prompt.
+          // On persist failure keep the lease held: the process is still alive and
+          // the facade will dispose; outer catch settles the lease with certainty.
+          const leaseKey = buildSessionLeaseKey({
+            runtime: 'grok-acp',
+            cwd: workCwd,
+            sessionIdentity: sessionId,
+          });
+          heldLease = await acquireSessionLease(leaseKey);
+          const persist = options.onAcpSessionEstablished;
+          if (persist) await persist(sessionId);
+          // Only after disk-first persist succeeds, stamp live result/context.
+          currentResult.acpSessionId = sessionId;
+          if (options.unitContext) {
+            options.unitContext.acpSessionId = sessionId;
+          }
+        },
+        onSessionUpdate: (notification) => {
+          handleGrokAcpSessionUpdate(notification, currentResult, parserState, emitUpdate);
+        },
+      });
+
+      currentResult.stderr = acpResult.stderr;
+      if (acpResult.sessionId) {
+        currentResult.acpSessionId = acpResult.sessionId;
+        if (options.unitContext) options.unitContext.acpSessionId = acpResult.sessionId;
+      }
+      finalizeGrokAcpPrompt(
+        currentResult,
+        acpResult.promptResponse.stopReason,
+        acpResult.promptResponse._meta as Record<string, unknown> | null | undefined,
+        parserState,
+        { wasAborted: acpResult.wasAborted },
+        emitUpdate
+      );
+
+      // Successful ACP prompt completion is treated as process success even when
+      // the long-lived agent exits non-zero during shutdown cleanup.
+      if (currentResult.stopReason === 'end') {
+        currentResult.exitCode = 0;
+      } else if (currentResult.exitCode === 0 && acpResult.exitCode !== 0) {
+        currentResult.exitCode = acpResult.exitCode;
+      }
+
+      if (acpResult.wasAborted) {
+        if (heldLease) {
+          heldLease.release();
+          heldLease = undefined;
+        }
+        const origin = resolveAbortOrigin(signal, options);
+        finalizeAborted(currentResult, origin);
+        emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+        throw new AgentAbortError(currentResult, origin);
+      }
+      applyTerminalStatus(currentResult);
+      // Delivery only after terminal mapping: matching response + final success.
+      if (
+        acpResult.promptCompletionSource === 'response' &&
+        isGrokAcpSuccessfulCompletion(currentResult)
+      ) {
+        await deliveryAfterPrompt();
+      }
+
+      if (heldLease) {
+        heldLease.release();
+        heldLease = undefined;
+      }
+      return currentResult;
+    } catch (err) {
+      if (heldLease) {
+        // Facade already disposed (or failed dispose). Settle lease with certainty.
+        releaseSessionLeaseWithCertainty(heldLease.release, disposalCertaintyFromCaught(err));
+        heldLease = undefined;
+      }
+      throw err;
     }
-    applyTerminalStatus(currentResult);
-    return currentResult;
   } catch (err) {
     if (isAbortError(err)) {
       if (!(err instanceof AgentAbortError)) {
@@ -889,14 +1184,193 @@ async function runSingleAgentGrokAcp(
     currentResult.errorMessage = message;
     if (err instanceof GrokAcpClientError) {
       currentResult.stderr = err.stderr || currentResult.stderr;
-      if (!currentResult.errorMessage.startsWith('Grok ACP')) {
+      // Structured code for callers/UI (session not found, cwd mismatch, dispose, …).
+      if (err.code) {
+        currentResult.errorCode = err.code;
+      }
+      if (err.code === 'dispose_failed') {
+        currentResult.errorMessage = message;
+      } else if (!currentResult.errorMessage.startsWith('Grok ACP')) {
         currentResult.errorMessage = `Grok ACP ${err.stage} failed: ${message}`;
       }
+    } else if (
+      err &&
+      typeof err === 'object' &&
+      'code' in err &&
+      typeof (err as { code?: unknown }).code === 'string'
+    ) {
+      currentResult.errorCode = (err as { code: string }).code;
+      if (!currentResult.stderr) currentResult.stderr = message;
     } else if (!currentResult.stderr) {
       currentResult.stderr = message;
     }
     applyTerminalStatus(currentResult);
     emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
     return currentResult;
+  }
+}
+
+/**
+ * Fresh TUI Grok ACP: provisional transport → session/new → lease → ID flush →
+ * binding/link registration with the same live transport → first prompt via registry.
+ */
+async function runFreshTuiGrokAcp(
+  defaultCwd: string,
+  agents: AgentConfig[],
+  agentName: string,
+  task: string,
+  cwd: string | undefined,
+  step: number | undefined,
+  signal: AbortSignal | undefined,
+  onUpdate: OnUpdateCallback | undefined,
+  makeDetails: (results: SingleResult[]) => SubagentDetails,
+  options: RunSingleAgentOptions,
+  ctx: {
+    effectiveAgent: AgentConfig;
+    effectiveModel: string;
+    workCwd: string;
+    invocationTask: string;
+    currentResult: SingleResult;
+  }
+): Promise<SingleResult> {
+  const registry = options.interactiveRegistry!;
+  const unitCtx = options.unitContext!;
+  const { GrokAcpInteractiveTransport } = await import('./grok-acp-interactive-transport.ts');
+  const { acquireSessionLease, buildSessionLeaseKey } = await import('./session-lease.ts');
+
+  let leaseRelease: ((err?: Error) => void) | undefined;
+  let transport: InstanceType<typeof GrokAcpInteractiveTransport> | undefined;
+
+  try {
+    transport = new GrokAcpInteractiveTransport({
+      agent: ctx.effectiveAgent,
+      cwd: ctx.workCwd,
+      spawnFn: options.spawnFn as never,
+      signal,
+      configuredModel: ctx.effectiveModel,
+      onSessionEstablished: async (sessionId) => {
+        // Keep lease held through persist failures; process is live until dispose.
+        const leaseKey = buildSessionLeaseKey({
+          runtime: 'grok-acp',
+          cwd: ctx.workCwd,
+          sessionIdentity: sessionId,
+        });
+        const lease = await acquireSessionLease(leaseKey);
+        leaseRelease = lease.release;
+        if (options.onAcpSessionEstablished) {
+          await options.onAcpSessionEstablished(sessionId);
+        }
+        ctx.currentResult.acpSessionId = sessionId;
+        unitCtx.acpSessionId = sessionId;
+      },
+    });
+    await transport.start();
+    const sessionId = transport.getSessionId();
+    if (!sessionId) {
+      throw new GrokAcpClientError('session', 'session/new returned an empty sessionId', '');
+    }
+    if (!leaseRelease) {
+      const lease = await acquireSessionLease(
+        buildSessionLeaseKey({
+          runtime: 'grok-acp',
+          cwd: ctx.workCwd,
+          sessionIdentity: sessionId,
+        })
+      );
+      leaseRelease = lease.release;
+    }
+
+    const registerLive = options.registerGrokAcpLiveEndpoint;
+    if (!registerLive) {
+      throw new Error(
+        'Fresh TUI Grok ACP requires registerGrokAcpLiveEndpoint after session ID persistence'
+      );
+    }
+
+    // Keep local ownership until acceptOwnership (sync, after beginPendingOwner).
+    // Adapter precompute may throw before that; this catch still disposes once.
+    // After acceptOwnership, registry alone disposes — local handles are cleared.
+    const endpointKey = await registerLive({
+      sessionId,
+      transport: transport!,
+      leaseRelease: leaseRelease!,
+      acceptOwnership: () => {
+        transport = undefined;
+        leaseRelease = undefined;
+      },
+    });
+
+    const { runSingleAgentInteractive } = await import('./interactive-execution.ts');
+    return runSingleAgentInteractive(
+      defaultCwd,
+      agents,
+      agentName,
+      task,
+      cwd,
+      step,
+      signal,
+      onUpdate,
+      makeDetails,
+      {
+        ...options,
+        interactiveRegistry: registry,
+        endpointKey,
+        hostMode: 'tui',
+        runtime: 'grok-acp',
+        onAcpPromptCompleted: options.onAcpPromptCompleted,
+        unitContext: unitCtx,
+      }
+    );
+  } catch (err) {
+    let certainty: DisposalCertainty;
+    if (transport) {
+      try {
+        await transport.dispose();
+        certainty = { kind: 'confirmed' };
+      } catch (disposeErr) {
+        certainty = {
+          kind: 'failed',
+          error: disposeErr instanceof Error ? disposeErr : new Error(String(disposeErr)),
+        };
+      }
+    } else {
+      // start()/factory may have spawned then failed without assigning transport.
+      certainty = disposalCertaintyFromCaught(err);
+    }
+    releaseSessionLeaseWithCertainty(leaseRelease, certainty);
+    // Prefer sticky dispose_failed over the original business error.
+    if (certainty.kind === 'failed') {
+      ctx.currentResult.stopReason = 'error';
+      ctx.currentResult.exitCode = 1;
+      ctx.currentResult.errorMessage = certainty.error.message;
+      ctx.currentResult.errorCode = 'dispose_failed';
+      applyTerminalStatus(ctx.currentResult);
+      emitTerminalSnapshot(onUpdate, ctx.currentResult, makeDetails);
+      return ctx.currentResult;
+    }
+    if (isAbortError(err)) {
+      const origin = resolveAbortOrigin(signal, options);
+      finalizeAborted(ctx.currentResult, origin);
+      emitTerminalSnapshot(onUpdate, ctx.currentResult, makeDetails);
+      throw new AgentAbortError(ctx.currentResult, origin);
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    ctx.currentResult.stopReason = 'error';
+    ctx.currentResult.exitCode = 1;
+    ctx.currentResult.errorMessage = message;
+    // Fresh TUI catch: preserve GrokAcpClientError and any structured {code}.
+    if (err instanceof GrokAcpClientError && err.code) {
+      ctx.currentResult.errorCode = err.code;
+    } else if (
+      err &&
+      typeof err === 'object' &&
+      'code' in err &&
+      typeof (err as { code?: unknown }).code === 'string'
+    ) {
+      ctx.currentResult.errorCode = (err as { code: string }).code;
+    }
+    applyTerminalStatus(ctx.currentResult);
+    emitTerminalSnapshot(onUpdate, ctx.currentResult, makeDetails);
+    return ctx.currentResult;
   }
 }

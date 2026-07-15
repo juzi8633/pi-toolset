@@ -576,16 +576,30 @@ export class AgentDetailPanel implements Component, Focusable {
     return view;
   }
 
+  private isGrokAcp(): boolean {
+    return this.snap?.sessionArtifact?.runtime === 'grok-acp';
+  }
+
+  private isRunningInputBlocked(): boolean {
+    if (!this.isGrokAcp()) return false;
+    const status = this.snap?.status;
+    return status === 'starting' || status === 'running' || !!this.snap?.activation;
+  }
+
   private async send(value: string, kind: 'default' | 'follow_up'): Promise<void> {
     const text = value.trim();
     if (!text) return;
+    if (this.isRunningInputBlocked()) {
+      this.statusMessage =
+        'Grok ACP input is unavailable while running; wait or press Ctrl+X to cancel.';
+      this.opts.tui.requestRender();
+      return;
+    }
     const status = this.snap?.status;
     const hasActivation = !!this.snap?.activation || status === 'running' || status === 'starting';
-    const mode: InteractiveOutboundMode = hasActivation
-      ? kind === 'follow_up'
-        ? 'follow_up'
-        : 'steer'
-      : 'prompt';
+    // Grok ACP never steers or queues follow-ups; idle/detached always prompt.
+    const mode: InteractiveOutboundMode =
+      this.isGrokAcp() || !hasActivation ? 'prompt' : kind === 'follow_up' ? 'follow_up' : 'steer';
     try {
       await this.opts.registry.send(this.opts.endpointKey, text, mode);
       this.input.setValue('');
@@ -610,21 +624,48 @@ export class AgentDetailPanel implements Component, Focusable {
     // Top/bottom rules: accent + full-width ─.
     const border = this.opts.theme.fg('accent', '─'.repeat(Math.max(1, width)));
     const header = truncateToWidth(this.opts.theme.fg('accent', title), width);
+    const sessionLabel = snap?.sessionArtifact
+      ? snap.sessionArtifact.runtime === 'grok-acp'
+        ? `acp:${snap.sessionArtifact.sessionId.length > 12 ? `${snap.sessionArtifact.sessionId.slice(0, 6)}…${snap.sessionArtifact.sessionId.slice(-4)}` : snap.sessionArtifact.sessionId}`
+        : snap.sessionFile
+          ? 'session'
+          : 'no-session'
+      : snap?.sessionFile
+        ? 'session'
+        : 'no-session';
     const status =
       this.statusMessage ||
-      (snap ? `queues ${snap.queueCount} · ${snap.sessionFile ? 'session' : 'no-session'}` : '');
+      (this.isRunningInputBlocked()
+        ? 'Grok ACP input is unavailable while running; wait or press Ctrl+X to cancel.'
+        : snap
+          ? `queues ${snap.queueCount} · ${sessionLabel}`
+          : '');
     const statusLine = this.opts.theme.fg(
-      this.statusMessage ? 'error' : 'dim',
+      this.statusMessage || this.isRunningInputBlocked() ? 'warning' : 'dim',
       truncateToWidth(status, width)
     );
     // Collapsed: hint expand-all; expanded: hint fold back to last-N preview.
-    const helpKeys = this.contentExpanded
-      ? 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O collapse · Up/Down · End · Esc back'
-      : 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O expand all · Up/Down · End · Esc back';
+    const helpKeys = this.isGrokAcp()
+      ? this.contentExpanded
+        ? 'Enter send · Ctrl+X cancel · Ctrl+O collapse · Up/Down · End · Esc back'
+        : 'Enter send · Ctrl+X cancel · Ctrl+O expand all · Up/Down · End · Esc back'
+      : this.contentExpanded
+        ? 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O collapse · Up/Down · End · Esc back'
+        : 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O expand all · Up/Down · End · Esc back';
     const help = truncateToWidth(this.opts.theme.fg('dim', helpKeys), width);
-    const inputLines = this.input
-      .render(width)
-      .map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
+    const inputLines = this.isRunningInputBlocked()
+      ? [
+          truncateToWidth(
+            this.opts.theme.fg(
+              'dim',
+              'Grok ACP input is unavailable while running; wait or press Ctrl+X to cancel.'
+            ),
+            width
+          ),
+        ]
+      : this.input
+          .render(width)
+          .map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
     const safeView = view.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
     return [border, header, ...safeView, statusLine, ...inputLines, help, border];
   }
@@ -670,8 +711,20 @@ export class AgentDetailPanel implements Component, Focusable {
       this.opts.tui.requestRender();
       return;
     }
-    // Alt+Enter: many terminals send \x1b\r
+    // Running Grok ACP: reject text/steer/follow-up input (cancel still works above).
+    if (this.isRunningInputBlocked()) {
+      this.statusMessage =
+        'Grok ACP input is unavailable while running; wait or press Ctrl+X to cancel.';
+      this.opts.tui.requestRender();
+      return;
+    }
+    // Alt+Enter: many terminals send \x1b\r — no follow-up for Grok ACP.
     if (data === '\x1b\r' || data === '\x1b\n' || matchesKey(data, 'alt+enter')) {
+      if (this.isGrokAcp()) {
+        this.statusMessage = 'Follow-up is not supported for Grok ACP; wait for idle then Enter.';
+        this.opts.tui.requestRender();
+        return;
+      }
       void this.send(this.input.getValue(), 'follow_up');
       return;
     }
@@ -834,10 +887,19 @@ function formatAssistantMessage(
       const p = part as {
         type?: string;
         text?: string;
+        thinking?: string;
         name?: string;
         arguments?: Record<string, unknown>;
         args?: Record<string, unknown>;
       };
+      if (p.type === 'thinking' && typeof p.thinking === 'string') {
+        flushText();
+        const thinkingLines = wrapPlain(p.thinking, width).map((line) =>
+          fg('dim', truncateToWidth(`💭 ${line}`, width))
+        );
+        lines.push(...thinkingLines);
+        continue;
+      }
       if (p.type === 'text' && typeof p.text === 'string') {
         textBuf += p.text;
         continue;

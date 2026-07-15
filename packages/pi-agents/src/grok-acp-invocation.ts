@@ -97,6 +97,21 @@ export function buildGrokAcpPromptParams(sessionId: string, task: string): Promp
   };
 }
 
+/**
+ * Build exact ACP session/load parameters.
+ * Always passes an empty mcpServers list; cwd is the original effective cwd/worktree.
+ */
+export function buildGrokAcpSessionLoadParams(
+  sessionId: string,
+  cwd: string
+): { sessionId: string; cwd: string; mcpServers: [] } {
+  return {
+    sessionId,
+    cwd,
+    mcpServers: [],
+  };
+}
+
 function authMethodId(method: AuthMethod): string {
   return method.id;
 }

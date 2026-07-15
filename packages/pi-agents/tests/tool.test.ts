@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { AgentToolResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -895,7 +895,10 @@ describe('durable chain fanout item lifecycle', () => {
       'chain-0002-fanout-0003',
     ]);
 
-    const finish = (index: number, text: string) => {
+    // Production order: persistSessionFile (strict first-write) before start/finish.
+    // Full merge is disk-exact for sessionFile — startUnit/finishUnit alone cannot
+    // establish a first path (stale live snapshots must not inject sessionFile).
+    const finish = async (index: number, text: string) => {
       const unitId = expansion.unitIds[index]!;
       const sessionFile = `/sessions/${unitId}.jsonl`;
       const ctx = {
@@ -910,6 +913,7 @@ describe('durable chain fanout item lifecycle', () => {
         fanoutIndex: index,
         sessionFile,
       };
+      await coordinator.persistSessionFile({ runId, unitId, sessionFile });
       coordinator.startUnit(runId, ctx);
       const result = {
         agent: 'worker',
@@ -935,9 +939,10 @@ describe('durable chain fanout item lifecycle', () => {
       coordinator.finishUnit(runId, ctx, result, 'completed');
     };
 
-    finish(1, 'item-1');
-    finish(2, 'item-2');
-    finish(0, 'item-0');
+    // Out-of-order terminals (1, 2, 0) — each unit keeps its own sessionFile.
+    await finish(1, 'item-1');
+    await finish(2, 'item-2');
+    await finish(0, 'item-0');
     await new Promise((r) => setTimeout(r, 30));
 
     const loaded = store.getRun(runId);
@@ -947,16 +952,126 @@ describe('durable chain fanout item lifecycle', () => {
     expect(units['chain-0002-fanout-0001']!.result?.finalOutput).toBe('item-0');
     expect(units['chain-0002-fanout-0002']!.result?.finalOutput).toBe('item-1');
     expect(units['chain-0002-fanout-0003']!.result?.finalOutput).toBe('item-2');
+    expect(units['chain-0002-fanout-0001']!.sessionFile).toContain('chain-0002-fanout-0001');
+    expect(units['chain-0002-fanout-0002']!.sessionFile).toContain('chain-0002-fanout-0002');
+    expect(units['chain-0002-fanout-0003']!.sessionFile).toContain('chain-0002-fanout-0003');
     expect(units['chain-0002-fanout-0001']!.result?.sessionFile).toContain(
       'chain-0002-fanout-0001'
     );
     expect(units['chain-0002-fanout-0002']!.result?.sessionFile).toContain(
       'chain-0002-fanout-0002'
     );
+    expect(units['chain-0002-fanout-0003']!.result?.sessionFile).toContain(
+      'chain-0002-fanout-0003'
+    );
     expect(units['chain-0002-fanout-0001']!.attempt).toBe(1);
     expect(units['chain-0002-fanout-0002']!.attempt).toBe(1);
     expect(units['chain-0002-fanout-0003']!.attempt).toBe(1);
     expect(units['chain-0002-fanout']).toBeUndefined();
+  });
+
+  it('live-only sessionFile on start/finish is not first-written by full merge', async () => {
+    const store = createRunStore({ rootDir: tmpRoot });
+    const coordinator = createRunCoordinator({ store });
+    const created = await store.createRun({
+      mode: 'chain',
+      agentScope: 'user',
+      background: false,
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [{ agent: 'seed', task: 'seed step' }],
+      },
+      details: {
+        mode: 'chain',
+        agentScope: 'user',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+        results: [],
+      },
+      units: {
+        'chain-0001': {
+          unitId: 'chain-0001',
+          agent: 'seed',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'completed',
+          step: 1,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/tmp',
+        },
+      },
+    });
+    const runId = created.runId;
+    const live = created.record;
+    live.status = 'running';
+    coordinator.registerRun(runId, live);
+
+    const expansion = await coordinator.expandFanout(runId, {
+      step: 2,
+      items: ['only'],
+      agent: {
+        name: 'worker',
+        description: '',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/w.md',
+      },
+      runtime: undefined,
+      effectiveCwd: '/tmp',
+    });
+    const unitId = expansion.unitIds[0]!;
+    const ctx = {
+      runId,
+      unitId,
+      agent: 'worker',
+      runtime: undefined,
+      resumeCapability: 'session' as const,
+      effectiveCwd: '/tmp',
+      attempt: 1,
+      step: 2,
+      fanoutIndex: 0,
+      sessionFile: `/sessions/${unitId}.jsonl`,
+    };
+    // Intentionally skip persistSessionFile — full merge must not accept live-only path.
+    coordinator.startUnit(runId, ctx);
+    coordinator.finishUnit(
+      runId,
+      ctx,
+      {
+        agent: 'worker',
+        agentSource: 'builtin' as const,
+        task: 'only',
+        exitCode: 0,
+        status: 'completed' as const,
+        messages: [],
+        stderr: '',
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          contextTokens: 0,
+          turns: 1,
+        },
+        step: 2,
+        fanout: { index: 0, count: 1, itemTask: 'only' },
+        finalOutput: 'only',
+      },
+      'completed'
+    );
+    await new Promise((r) => setTimeout(r, 30));
+
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    const unit = loaded.loaded.record.units[unitId]!;
+    expect(unit.result?.finalOutput).toBe('only');
+    expect(unit.sessionFile).toBeUndefined();
+    expect(unit.result?.sessionFile).toBeUndefined();
   });
 
   it('persists empty fanout mapping with no child units or placeholder', async () => {
@@ -1485,6 +1600,8 @@ describe('executeAgentTool public runId resume', () => {
     capability?: 'session' | 'replay';
     unitStatus?: RunUnitRecord['status'];
     sessionFile?: string | null;
+    /** When set, stamps the durable original-prompt establishment flag. */
+    sessionPromptEstablished?: boolean;
     continuationTasks?: string[];
     request?: Partial<AgentRunRecordV1['request']>;
   }): Promise<string> {
@@ -1539,6 +1656,9 @@ describe('executeAgentTool public runId resume', () => {
               ],
         effectiveCwd: tmpRoot,
         ...(sessionFile ? { sessionFile } : {}),
+        ...(options.sessionPromptEstablished !== undefined
+          ? { sessionPromptEstablished: options.sessionPromptEstablished }
+          : {}),
       },
     };
 
@@ -2406,5 +2526,908 @@ describe('executeAgentTool public runId resume', () => {
     );
     expect(allowed.isError).toBeUndefined();
     expect(grokDispatched).toBe(true);
+  });
+
+  it('single queued legacy Grok ACP (capability=replay) resumes without allowReplay and normalizes to session', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const created = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'Legacy ACP queued',
+        runtime: 'grok-acp',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'replay',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: tmpRoot,
+          result: {
+            agent: 'explore',
+            agentSource: 'builtin',
+            task: 'Legacy ACP queued',
+            exitCode: -1,
+            status: 'queued',
+            messages: [],
+            stderr: '',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+            resumeCapability: 'replay',
+          },
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    let invoked = false;
+    const result = await executeAgentTool(
+      { runId: created.runId },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runWorkflow: async () => {
+          invoked = true;
+          // Post-claim durable update must already have normalized capability.
+          const mid = store.getRun(created.runId);
+          expect(mid.ok).toBe(true);
+          if (mid.ok) {
+            expect(mid.loaded.record.units.single.capability).toBe('session');
+            expect(mid.loaded.record.units.single.result?.resumeCapability).toBe('session');
+          }
+          return okResult('acp queued ok');
+        },
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBeUndefined();
+    expect(invoked).toBe(true);
+    expect(JSON.stringify(result.content)).not.toContain('requires replay');
+    const loaded = store.getRun(created.runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.units.single.capability).toBe('session');
+  });
+
+  it('parallel queued legacy Grok ACP (capability=replay) dispatches without allowReplay', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const created = await store.createRun({
+      mode: 'parallel',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'parallel',
+        agentScope: 'both',
+        tasks: [
+          { agent: 'explore', task: 'Legacy ACP A' },
+          { agent: 'explore', task: 'Legacy ACP B' },
+        ],
+        runtime: 'grok-acp',
+      },
+      details: {
+        mode: 'parallel',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        'parallel-0001': {
+          unitId: 'parallel-0001',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'replay',
+          status: 'queued',
+          fanoutIndex: 0,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: tmpRoot,
+        },
+        'parallel-0002': {
+          unitId: 'parallel-0002',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'replay',
+          status: 'queued',
+          fanoutIndex: 1,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: tmpRoot,
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    let spawnCount = 0;
+    const result = await executeAgentTool(
+      { runId: created.runId },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        // Grok ACP may still fail client-side; assert we passed the replay gate.
+        spawnFn: fakeGrokSpawn(() => spawnCount++, false),
+      }
+    );
+    expect(JSON.stringify(result.content)).not.toContain('requires replay');
+    expect(JSON.stringify(result.details)).not.toContain('requires replay');
+    const loaded = store.getRun(created.runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.units['parallel-0001']!.capability).toBe('session');
+    expect(loaded.loaded.record.units['parallel-0002']!.capability).toBe('session');
+    // Spawn attempted (gate did not block); client may still error without real ACP.
+    expect(spawnCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('attempted legacy Grok ACP with acpSessionId resumes without allowReplay and is canonical session', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const created = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'Legacy ACP attempted',
+        runtime: 'grok-acp',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'replay',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: tmpRoot,
+          acpSessionId: 'sess-legacy-id',
+          result: {
+            agent: 'explore',
+            agentSource: 'builtin',
+            task: 'Legacy ACP attempted',
+            exitCode: 1,
+            status: 'interrupted',
+            messages: [],
+            stderr: '',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              contextTokens: 0,
+              turns: 0,
+            },
+            resumeCapability: 'replay',
+            acpSessionId: 'sess-legacy-id',
+          },
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    let seenCapability: string | undefined;
+    const result = await executeAgentTool(
+      { runId: created.runId },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runWorkflow: async () => {
+          const mid = store.getRun(created.runId);
+          if (mid.ok) {
+            seenCapability = mid.loaded.record.units.single.capability;
+            expect(mid.loaded.record.units.single.acpSessionId).toBe('sess-legacy-id');
+            expect(mid.loaded.record.units.single.result?.resumeCapability).toBe('session');
+          }
+          return okResult('acp load ok');
+        },
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBeUndefined();
+    expect(seenCapability).toBe('session');
+    expect(JSON.stringify(result.content)).not.toContain('requires replay');
+    // Canonical session without calling persistAcpSessionId on this path.
+    const loaded = store.getRun(created.runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.units.single.capability).toBe('session');
+    expect(loaded.loaded.record.units.single.acpSessionId).toBe('sess-legacy-id');
+  });
+
+  it('attempted legacy Grok ACP without acpSessionId stays unavailable even with allowReplay', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const created = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'Legacy ACP missing id',
+        runtime: 'grok-acp',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: 'grok-acp',
+          capability: 'replay',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: tmpRoot,
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    const result = await executeAgentTool(
+      { runId: created.runId, allowReplay: true },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runWorkflow: async () => okResult('should not run'),
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('acp_session_unavailable');
+    const loaded = store.getRun(created.runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    // Preflight blocked before claim write — capability stays legacy replay.
+    expect(loaded.loaded.record.units.single.capability).toBe('replay');
+    expect(loaded.loaded.record.units.single.acpSessionId).toBeUndefined();
+  });
+
+  it('worktree strict stamp failure cleans resources, fails unit, leaves no uncommitted session path', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-stamp-fail-wt-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+      let stampCalls = 0;
+      const origStamp = coordinator.persistSessionFile.bind(coordinator);
+      coordinator.persistSessionFile = async (input) => {
+        stampCalls++;
+        void origStamp;
+        throw new Error(
+          `session_file_conflict: unit ${input.unitId} already has sessionFile /other.jsonl, refusing ${input.sessionFile}`
+        );
+      };
+
+      let spawnCount = 0;
+      const result = await executeAgentTool(
+        {
+          agent: 'explore',
+          task: 'stamp should fail',
+          isolation: 'worktree',
+        },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          spawnFn: ((_cmd: string) => {
+            spawnCount++;
+            throw new Error('spawn must not run after stamp failure');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      expect(stampCalls).toBeGreaterThanOrEqual(1);
+      expect(spawnCount).toBe(0);
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toMatch(/session_file_conflict|context_error|Agent failed/);
+
+      const runs = await store.listRuns();
+      expect(runs.length).toBe(1);
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      expect(unit.sessionFile).toBeUndefined();
+      expect(unit.result?.sessionFile).toBeUndefined();
+
+      // New worktree cleaned up on pre-execution stamp failure.
+      const wtRoot = path.join(repo, '.worktrees');
+      if (existsSync(wtRoot)) {
+        expect(readdirSync(wtRoot).length).toBe(0);
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('registerInitial failure retains dirty stored worktree and durable path diagnostic', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-dirty-wt-resume-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      // Create a real dirty worktree under the repo.
+      const wtPath = path.join(repo, '.worktrees', 'resume-dirty');
+      mkdirSync(path.dirname(wtPath), { recursive: true });
+      const add = spawnSync('git', ['-C', repo, 'worktree', 'add', '--detach', wtPath, 'HEAD'], {
+        encoding: 'utf-8',
+      });
+      expect(add.status).toBe(0);
+      const dirtyFile = path.join(wtPath, 'dirty-marker.txt');
+      writeFileSync(dirtyFile, 'keep me\n');
+
+      const agent = exploreAgent();
+      const sessionFile = path.join(repo, 'seed-session.jsonl');
+      writeFileSync(sessionFile, '{}\n');
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+      const created = await store.createRun({
+        mode: 'single',
+        agentScope: 'both',
+        background: false,
+        request: {
+          mode: 'single',
+          agentScope: 'both',
+          agent: 'explore',
+          task: 'Resume with dirty worktree',
+          isolation: 'worktree',
+        },
+        details: {
+          mode: 'single',
+          agentScope: 'both',
+          projectAgentsDir: null,
+          builtinAgentsDir: '/builtin',
+          results: [],
+        },
+        units: {
+          single: {
+            unitId: 'single',
+            agent: agent.name,
+            agentFingerprint: agentFingerprint(agent),
+            runtime: undefined,
+            capability: 'session',
+            status: 'interrupted',
+            attempt: 1,
+            attempts: [{ attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 }],
+            effectiveCwd: wtPath,
+            worktreePath: wtPath,
+            sessionFile,
+          },
+        },
+      });
+      await store.updateRun(created.runId, (r) => {
+        r.status = 'interrupted';
+      });
+
+      const interactiveRegistry = {
+        registerInitial: async () => {
+          throw Object.assign(new Error('forced registerInitial failure'), {
+            code: 'validation_error',
+          });
+        },
+      } as unknown as import('../src/interactive-agent.ts').InteractiveAgentRegistry;
+
+      let spawnCount = 0;
+      const result = await executeAgentTool(
+        { runId: created.runId },
+        undefined,
+        undefined,
+        makeCtx({
+          cwd: repo,
+          mode: 'tui',
+          sessionManager: {
+            getSessionId: () => 'host-session',
+            getBranch: () => [],
+            getSessionFile: () => undefined,
+            getLeafId: () => undefined,
+          },
+        } as never),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          interactiveRegistry,
+          spawnFn: ((_cmd: string) => {
+            spawnCount++;
+            throw new Error('spawn must not run after registerInitial failure');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      expect(spawnCount).toBe(0);
+      // Dirty stored worktree must remain on disk with modifications intact.
+      expect(existsSync(wtPath)).toBe(true);
+      expect(existsSync(dirtyFile)).toBe(true);
+      expect(readdirSync(path.join(repo, '.worktrees'))).toContain('resume-dirty');
+
+      const loaded = store.getRun(created.runId);
+      expect(loaded.ok).toBe(true);
+      if (!loaded.ok) return;
+      const unit = loaded.loaded.record.units.single!;
+      expect(unit.status).toBe('failed');
+      expect(unit.worktreePath).toBe(wtPath);
+      expect(unit.result?.worktreePath).toBe(wtPath);
+      expect(unit.result?.worktreeDirty).toBe(true);
+      expect(unit.result?.errorMessage ?? unit.result?.stderr ?? '').toMatch(
+        /Interactive link registration failed|validation_error/
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('never-started with planned sessionFile path sends original task (not continuation-only)', async () => {
+    const { store, coordinator } = makeStore();
+    const planned = path.join(tmpRoot, 'planned-crash-window.jsonl');
+    // Path is recorded on the durable unit but the native file was never created
+    // (stamp-before-begin crash window from older ordering).
+    const runId = await seedInterruptedRun({
+      store,
+      unitStatus: 'queued',
+      sessionFile: planned,
+      continuationTasks: ['Prior undelivered'],
+    });
+    // Ensure the planned path is absent so resume must not treat it as established.
+    if (existsSync(planned)) rmSync(planned);
+
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+    let lastPrompt = '';
+    const spawnFn = ((_cmd: string, args: string[]) => {
+      lastPrompt = args[args.length - 1] ?? '';
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    const result = await executeAgentTool(
+      { runId, task: 'New continuation' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    expect(result.isError).toBeUndefined();
+    // Original task must be delivered; must not send continuation-only resume text.
+    expect(lastPrompt).toContain('Task: Original stored task');
+    expect(lastPrompt).toContain('Prior undelivered');
+    expect(lastPrompt).toContain('New continuation');
+    expect(lastPrompt).not.toMatch(/continuing from a previous interruption/i);
+  });
+
+  it('attempted Pi with planned missing sessionFile fail-closes without replaying original task', async () => {
+    const { store, coordinator } = makeStore();
+    const planned = path.join(tmpRoot, 'attempted-planned-missing.jsonl');
+    const runId = await seedInterruptedRun({
+      store,
+      unitStatus: 'interrupted',
+      sessionFile: planned,
+      continuationTasks: ['Do not deliver this'],
+    });
+    if (existsSync(planned)) rmSync(planned);
+
+    let spawnCount = 0;
+    const result = await executeAgentTool(
+      { runId, task: 'Should not run' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: ((_cmd: string) => {
+          spawnCount++;
+          throw new Error('spawn must not run when session file is missing');
+        }) as unknown as import('../src/execution.ts').SpawnFn,
+      }
+    );
+    expect(result.isError).toBe(true);
+    expect(spawnCount).toBe(0);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toMatch(/session file missing|preflight_failed|session_unavailable/);
+    // Durable unit remains unrecovered — no original-task replay side effects.
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.status).toBe('interrupted');
+    expect(loaded.loaded.record.units.single!.attempts.length).toBe(1);
+  });
+
+  it('attempted Pi with sessionFile but unestablished original prompt fail-closes (fork crash window)', async () => {
+    const { store, coordinator } = makeStore();
+    // Fork-like: session file exists on disk (branched parent history) but the
+    // unit's original prompt was never accepted after begin+stamp.
+    const forkSession = path.join(tmpRoot, 'fork-existing.jsonl');
+    writeFileSync(
+      forkSession,
+      `${JSON.stringify({ type: 'session', version: 1 })}\n${JSON.stringify({
+        type: 'message',
+        message: { role: 'user', content: [{ type: 'text', text: 'parent history only' }] },
+      })}\n`
+    );
+    const runId = await seedInterruptedRun({
+      store,
+      unitStatus: 'interrupted',
+      sessionFile: forkSession,
+      sessionPromptEstablished: false,
+      continuationTasks: ['Must not deliver as continuation-only'],
+    });
+
+    let spawnCount = 0;
+    const result = await executeAgentTool(
+      { runId, task: 'Must not run' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+        spawnFn: ((_cmd: string) => {
+          spawnCount++;
+          throw new Error('spawn must not run when original prompt is unestablished');
+        }) as unknown as import('../src/execution.ts').SpawnFn,
+      }
+    );
+    expect(result.isError).toBe(true);
+    expect(spawnCount).toBe(0);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toMatch(
+      /session_prompt_unestablished|preflight_failed|original prompt not established/
+    );
+    // No continuation-only and no original-task auto-replay side effects.
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.status).toBe('interrupted');
+    expect(loaded.loaded.record.units.single!.sessionPromptEstablished).toBe(false);
+    expect(loaded.loaded.record.units.single!.attempts.length).toBe(1);
+  });
+
+  it('fresh Pi marks sessionPromptEstablished after original prompt accept', async () => {
+    const { store, coordinator } = makeStore();
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+    let lastPrompt = '';
+    const spawnFn = ((_cmd: string, args: string[]) => {
+      lastPrompt = args[args.length - 1] ?? '';
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'done' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    const result = await executeAgentTool(
+      { agent: 'explore', task: 'Establish original prompt' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    expect(result.isError).toBeUndefined();
+    expect(lastPrompt).toContain('Task: Establish original prompt');
+    const runs = await store.listRuns();
+    expect(runs.length).toBe(1);
+    const rec = loadedRecordOf(runs[0]!);
+    const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+    expect(unit.sessionFile).toBeDefined();
+    expect(unit.sessionPromptEstablished).toBe(true);
+  });
+
+  it('confirmed Pi session resume sends continuation-only (not original task)', async () => {
+    const { store, coordinator } = makeStore();
+    const sessionFile = path.join(tmpRoot, 'confirmed-resume.jsonl');
+    writeFileSync(sessionFile, '{}\n');
+    const runId = await seedInterruptedRun({
+      store,
+      unitStatus: 'interrupted',
+      sessionFile,
+      sessionPromptEstablished: true,
+      continuationTasks: ['Prior undelivered'],
+    });
+
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+    let lastPrompt = '';
+    const spawnFn = ((_cmd: string, args: string[]) => {
+      lastPrompt = args[args.length - 1] ?? '';
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'resumed' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    const result = await executeAgentTool(
+      { runId, task: 'New continuation' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    expect(result.isError).toBeUndefined();
+    // Session-continuation prompt: no original task resend.
+    expect(lastPrompt).not.toContain('Original stored task');
+    expect(lastPrompt).toMatch(
+      /continuing|resume|interrupt|undelivered|Prior undelivered|New continuation/i
+    );
+  });
+
+  it('retains dirty new worktree when execution started then fails', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-wt-retain-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+
+      // After spawn (execution started), agent dirties the worktree then crashes.
+      const spawnFn = ((_cmd: string, _args: string[], opts?: { cwd?: string }) => {
+        const cwd = opts?.cwd ?? repo;
+        writeFileSync(path.join(cwd, 'agent-edited.txt'), 'agent work product\n');
+        throw new Error('simulated crash after agent modified worktree');
+      }) as unknown as import('../src/execution.ts').SpawnFn;
+
+      const result = await executeAgentTool(
+        {
+          agent: 'explore',
+          task: 'modify then crash',
+          isolation: 'worktree',
+        },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        { runStore: store, runCoordinator: coordinator, spawnFn }
+      );
+
+      expect(result.isError).toBe(true);
+      const wtRoot = path.join(repo, '.worktrees');
+      expect(existsSync(wtRoot)).toBe(true);
+      const entries = readdirSync(wtRoot);
+      expect(entries.length).toBe(1);
+      const wtPath = path.join(wtRoot, entries[0]!);
+      expect(existsSync(path.join(wtPath, 'agent-edited.txt'))).toBe(true);
+
+      const runs = await store.listRuns();
+      expect(runs.length).toBe(1);
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      expect(unit.result?.worktreePath).toBe(wtPath);
+      expect(unit.result?.worktreeDirty).toBe(true);
+      expect(unit.worktreePath ?? unit.result?.worktreePath).toBe(wtPath);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('durable begin runs before session stamp so crash leaves attempted state', async () => {
+    const { store, coordinator } = makeStore();
+    const order: string[] = [];
+    const origStart = coordinator.startUnit.bind(coordinator);
+    coordinator.startUnit = async (runId, ctx, result) => {
+      order.push('begin');
+      await origStart(runId, ctx, result);
+    };
+    const origStamp = coordinator.persistSessionFile.bind(coordinator);
+    coordinator.persistSessionFile = async (input) => {
+      order.push('stamp');
+      // After begin, durable unit must already be running with attempt history.
+      const mid = store.getRun(input.runId);
+      expect(mid.ok).toBe(true);
+      if (mid.ok) {
+        const unit = mid.loaded.record.units.single ?? Object.values(mid.loaded.record.units)[0]!;
+        expect(unit.status).toBe('running');
+        expect(unit.attempts.length).toBeGreaterThan(0);
+      }
+      await origStamp(input);
+    };
+
+    const EventEmitter = (await import('node:events')).EventEmitter;
+    const { Readable } = await import('node:stream');
+    class FakeChild extends EventEmitter {
+      stdout = new Readable({ read() {} });
+      stderr = new Readable({ read() {} });
+      kill() {
+        this.stdout.push(null);
+        this.stderr.push(null);
+        setImmediate(() => this.emit('close', 0));
+        return true;
+      }
+    }
+    const spawnFn = ((_cmd: string) => {
+      order.push('spawn');
+      const fake = new FakeChild();
+      setImmediate(() => {
+        fake.stdout.push(
+          JSON.stringify({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              usage: { input: 1, output: 1, totalTokens: 2 },
+            },
+          }) + '\n'
+        );
+        fake.kill();
+      });
+      return fake as never;
+    }) as unknown as import('../src/execution.ts').SpawnFn;
+
+    const result = await executeAgentTool(
+      { agent: 'explore', task: 'order check' },
+      undefined,
+      undefined,
+      makeCtx({ cwd: tmpRoot }),
+      { runStore: store, runCoordinator: coordinator, spawnFn }
+    );
+    expect(result.isError).toBeUndefined();
+    expect(order.indexOf('begin')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('stamp')).toBeGreaterThan(order.indexOf('begin'));
+    expect(order.indexOf('spawn')).toBeGreaterThan(order.indexOf('stamp'));
   });
 });

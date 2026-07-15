@@ -601,6 +601,9 @@ function appendExpandedResultSections(
     if (r.sessionFile) {
       container.addChild(new Text(theme.fg('dim', `session: ${r.sessionFile}`), 0, 0));
     }
+    if (r.acpSessionId) {
+      container.addChild(new Text(theme.fg('dim', `acp session: ${r.acpSessionId}`), 0, 0));
+    }
     container.addChild(new Spacer(1));
     container.addChild(
       new Text(theme.fg('dim', `To resume: agent({ runId: "${r.runId}" })`), 0, 0)

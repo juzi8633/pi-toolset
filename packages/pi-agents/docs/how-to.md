@@ -194,10 +194,11 @@ items stay completed and only incomplete items run again.
 
    Optional `task` appends a continuation instruction to every incomplete unit
    after placeholder/`{item}` resolution. Completed item results and original
-   indexes are retained. Interrupted Pi items continue their stored session;
-   never-started Pi items and Grok replay units receive the original resolved
-   task plus all durable continuation instructions. Never-started items keep
-   attempt `1`. Collection order remains the original expansion order.
+   indexes are retained. Interrupted Pi and Grok ACP items continue their native
+   sessions; never-started Pi/Grok ACP items and plain Grok replay units receive
+   the original resolved task plus all durable continuation instructions.
+   Never-started items keep attempt `1`. Collection order remains the original
+   expansion order. Grok ACP does not require `allowReplay`.
 
 ### Blocking errors
 
@@ -209,7 +210,8 @@ If resume is refused, the blocking reason explains what to do:
 | `stored_output_invalid`           | A completed child unit is missing a valid terminal result               | Start a fresh chain; completed output is unsafe |
 | `fanout_state_conflict`           | A concurrent or conflicting expansion write tried to change the mapping | Rare; inspect the run and retry or re-invoke    |
 | fingerprint / session / worktree  | Agent definition or artifacts changed or went missing                   | Restore the agent/session/worktree, then resume |
-| requires replay (`allowReplay`)   | Grok/replay units need explicit acknowledgement                         | `agent({ runId, allowReplay: true })` if safe   |
+| requires replay (`allowReplay`)   | Plain Grok units need explicit acknowledgement                          | `agent({ runId, allowReplay: true })` if safe   |
+| `acp_session_unavailable`         | Attempted Grok ACP unit has no stored protocol session ID               | Not resumable; start a fresh run                |
 
 Unsafe legacy partial fanouts (item results or unit fragments without a stored
 `workflowState.fanouts` mapping) are never reconstructed automatically. Re-run
@@ -371,6 +373,23 @@ The bundled `/work-with-grok <task>` prompt is a shortcut for this: it
 delegates the task to the `general` agent with `runtime: "grok-acp"`,
 `model: "grok-4.5"`, `thinking: "high"`.
 
+### Resume and Agent View for Grok ACP
+
+1. Start a durable Grok ACP unit (TUI or otherwise). The protocol session ID is
+   persisted to `run.json` as `units.<id>.acpSessionId` before the first prompt.
+2. If interrupted, resume with `agent({ runId })` — **no** `allowReplay`. The
+   client calls `session/load` with the stored ID and original cwd/worktree,
+   then sends only the fixed continuation prompt plus undelivered instructions.
+3. In TUI, open `/agent view` (or `Ctrl+Alt+Down`). Restored Grok ACP endpoints
+   appear as detached metadata; open detail to lazy-hydrate full history via a
+   hydrate-only `session/load` (no model prompt).
+4. While idle, Enter sends a new prompt on the same ACP session. While starting
+   or running, text input is disabled (no steer/follow-up). Ctrl+X cancels the
+   current turn via `session/cancel`.
+5. Cross-machine restore and recovery after deleting Grok's private session
+   storage are unsupported. Linked clean worktrees are retained so Grok can
+   still resolve the session cwd.
+
 ## Use the bundled workflow prompts
 
 The package ships three workflow prompts, available as slash commands:
@@ -389,7 +408,7 @@ fix)`, `## Warnings (should fix)`, and `## Suggestions (consider)`, writing
 
 ## Interactive agent view
 
-In TUI mode, Pi-runtime subagents can be inspected and messaged without switching the host session.
+In TUI mode, Pi and Grok ACP subagents can be inspected and messaged without switching the host session. Plain Grok (`runtime: "grok"`) is not shown.
 
 ### Open the navigator
 
@@ -403,27 +422,30 @@ or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC 
 
 ### Select and inspect
 
-1. The list shows `main` first, then linked Pi endpoints ordered by link creation time.
+1. The list shows `main` first, then linked endpoints ordered by link creation time.
 2. Enter on `main` closes the view; Enter on a child opens its detail transcript (last 15 lines by default).
 3. In detail, Ctrl+O expands the full transcript; Ctrl+O again collapses to the last 15 lines at the tail.
 4. Escape returns from detail to the list, or closes the list.
+5. Grok ACP history hydrates lazily on first detail open via `session/load` replay (no model prompt).
 
-### Steer, follow-up, and reopen
+### Input by runtime
 
-| Child state             | Enter                                                       | Alt+Enter                               |
-| ----------------------- | ----------------------------------------------------------- | --------------------------------------- |
-| Running / starting      | Steer (delivered after current tools, before next LLM call) | Queue follow-up after the child settles |
-| Idle / detached / error | New prompt on the same native session                       | Same as Enter (prompt)                  |
+| Runtime  | Child state             | Enter                                                       | Alt+Enter                               |
+| -------- | ----------------------- | ----------------------------------------------------------- | --------------------------------------- |
+| Pi       | Running / starting      | Steer (delivered after current tools, before next LLM call) | Queue follow-up after the child settles |
+| Pi       | Idle / detached / error | New prompt on the same native session                       | Same as Enter (prompt)                  |
+| Grok ACP | Running / starting      | Rejected (`running_input_unsupported`)                      | Rejected (no follow-up queue)           |
+| Grok ACP | Idle / detached / error | New prompt after `session/load` reopen when detached        | Same as Enter (prompt only)             |
 
-- Ctrl+X aborts only the selected child's current turn.
+- Ctrl+X aborts/cancels only the selected child's current turn (Pi abort RPC or Grok ACP `session/cancel`).
 - Ctrl+O toggles between the last-15-line preview and the full transcript.
 - After idle, a new message continues the child session without replaying the original task prompt.
-- Detached idle children reopen lazily on the next prompt (same session file, cwd/worktree, and fingerprint).
+- Detached idle children reopen lazily on the next prompt (same session artifact, cwd/worktree, and fingerprint).
 
 ### Detach and retention
 
-- Up to four idle RPC children stay attached; excess idle endpoints detach but keep their sessions on disk.
-- Linked clean worktrees are retained in Version 1 so reattach keeps a valid cwd. Clean them up manually when finished.
+- Up to four idle children stay attached; excess idle endpoints detach but keep their session identity on disk (Pi session file or Grok ACP protocol ID).
+- Linked clean worktrees are retained in Version 1 so reattach keeps a valid cwd (required for Grok session lookup). Clean them up manually when finished.
 - `/tree` away from a link hides it from the navigator; navigating back restores the summary without auto-spawning.
 - `/reload` and session switch dispose live transports, then restore links on the next session start.
 
@@ -431,5 +453,6 @@ or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC 
 
 - The host `SessionManager` is never switched to the child.
 - Post-completion interactive messages do not rewrite the completed durable unit result. After a normal completion they stay in the child session only. When the original tool-call activation was interrupted/cancelled, the next view continuation that settles is relayed back to the bound host model as a clearly-marked interactive continuation (once per activation); normal completed agents never relay.
-- Grok / Grok ACP units are not shown.
+- Plain Grok (`runtime: "grok"`) units are not shown.
 - Child slash commands are rejected; child extension UI dialogs are cancelled.
+- Private Grok session files under `~/.grok/sessions` are never parsed or displayed.

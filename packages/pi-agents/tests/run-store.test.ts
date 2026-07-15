@@ -344,6 +344,77 @@ describe('listRuns', () => {
       expect(bad.error.code).toBe('corrupt_run');
       expect(bad.error.message).toContain('continuationDelivery');
     }
+
+    // Orphan delivery key (no matching unit) is corrupt.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        continuationDelivery: { 'missing-unit': { deliveredCount: 0 } },
+      })
+    );
+    const orphan = store.getRun(runId);
+    expect(orphan.ok).toBe(false);
+    if (!orphan.ok) {
+      expect(orphan.error.code).toBe('corrupt_run');
+      expect(orphan.error.message).toContain('no matching unit');
+    }
+  });
+
+  it('returns corrupt_run for untrimmed or blank acpSessionId', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], acpSessionId: '  padded  ' },
+        },
+      })
+    );
+    const padded = store.getRun(runId);
+    expect(padded.ok).toBe(false);
+    if (!padded.ok) {
+      expect(padded.error.code).toBe('corrupt_run');
+      expect(padded.error.message).toContain('acpSessionId');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], acpSessionId: '   ' },
+        },
+      })
+    );
+    const blank = store.getRun(runId);
+    expect(blank.ok).toBe(false);
+    if (!blank.ok) {
+      expect(blank.error.code).toBe('corrupt_run');
+      expect(blank.error.message).toContain('acpSessionId');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], acpSessionId: 'sess-ok' },
+        },
+      })
+    );
+    const ok = store.getRun(runId);
+    expect(ok.ok).toBe(true);
+    if (ok.ok) expect(ok.loaded.record.units[unitId]!.acpSessionId).toBe('sess-ok');
   });
 
   it('returns corrupt_run for request mode/topology mismatches without throwing', async () => {
