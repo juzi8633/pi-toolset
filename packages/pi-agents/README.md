@@ -118,7 +118,7 @@ The below-editor agent list appears only while at least one visible agent is `st
 | Ctrl+X                | Abort only the selected child's current turn            |
 | Ctrl+O                | Toggle last-15-line preview vs full transcript          |
 | Escape                | Return to the navigator list                            |
-| PageUp/PageDown / End | Scroll transcript / resume tail-follow                  |
+| Up/Down / End         | Scroll transcript / resume tail-follow                  |
 
 Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the full content; Ctrl+O again collapses to the last 15 lines and jumps back to the tail.
 

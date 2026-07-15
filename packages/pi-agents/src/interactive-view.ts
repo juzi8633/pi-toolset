@@ -621,8 +621,8 @@ export class AgentDetailPanel implements Component, Focusable {
     );
     // Collapsed: hint expand-all; expanded: hint fold back to last-N preview.
     const helpKeys = this.contentExpanded
-      ? 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O collapse · PgUp/PgDn · End · Esc back'
-      : 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O expand all · PgUp/PgDn · End · Esc back';
+      ? 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O collapse · Up/Down · End · Esc back'
+      : 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O expand all · Up/Down · End · Esc back';
     const help = truncateToWidth(this.opts.theme.fg('dim', helpKeys), width);
     const inputLines = this.input
       .render(width)
@@ -636,14 +636,14 @@ export class AgentDetailPanel implements Component, Focusable {
       this.opts.onBack();
       return;
     }
-    if (matchesKey(data, 'pageUp')) {
+    if (matchesKey(data, 'up')) {
       this.followTail = false;
       // Page against the collapsed preview height; expanded shows all lines at once.
       this.scrollOffset += DETAIL_PREVIEW_LINES;
       this.opts.tui.requestRender();
       return;
     }
-    if (matchesKey(data, 'pageDown')) {
+    if (matchesKey(data, 'down')) {
       this.scrollOffset = Math.max(0, this.scrollOffset - DETAIL_PREVIEW_LINES);
       if (this.scrollOffset === 0) this.followTail = true;
       this.opts.tui.requestRender();

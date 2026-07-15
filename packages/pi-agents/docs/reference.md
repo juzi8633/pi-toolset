@@ -361,7 +361,7 @@ TUI-only navigator for Pi-runtime durable units linked to the active main-sessio
 | Navigator | Up/Down         | Move between `main` and linked endpoints        |
 | Navigator | Enter           | Close for `main`; open child detail otherwise   |
 | Navigator | Escape          | Close to host editor                            |
-| Detail    | PageUp/PageDown | Scroll transcript viewport                      |
+| Detail    | Up/Down         | Scroll transcript viewport                      |
 | Detail    | End             | Resume tail-following                           |
 | Detail    | Enter           | `prompt` when not running; `steer` when running |
 | Detail    | Alt+Enter       | `follow_up` when running; `prompt` otherwise    |

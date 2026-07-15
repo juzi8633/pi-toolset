@@ -1684,8 +1684,8 @@ describe('interactive-view detail preview (last 15 + Ctrl+O)', () => {
     }
     expect(joined).toMatch(/Ctrl\+O expand all/i);
 
-    // Page up while collapsed, then expand+collapse must snap back to the tail.
-    panel.handleInput('\x1b[5~'); // pageUp
+    // Scroll up while collapsed, then expand+collapse must snap back to the tail.
+    panel.handleInput('\x1b[A'); // up
     panel.handleInput(CTRL_O); // expand
     panel.handleInput(CTRL_O); // collapse → last N at tail
     const after = panel.render(80).join('\n');
