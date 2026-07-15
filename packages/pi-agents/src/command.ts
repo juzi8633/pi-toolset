@@ -140,23 +140,7 @@ async function runAgentFallbackCommand(
 
   if (lower.startsWith('resume ') && options.runStore) {
     const runId = trimmed.slice(7).trim();
-    const loaded = options.runStore.getRun(runId);
-    // Plain Grok (and legacy stored replay labels for non-ACP) need allowReplay.
-    // Grok ACP is session-capable via session/load and must not request allowReplay.
-    const hasReplay =
-      loaded.ok &&
-      Object.values(loaded.loaded.record.units).some((u) => {
-        if (u.runtime === 'grok-acp') return false;
-        if (u.runtime === 'grok') return true;
-        return u.capability === 'replay';
-      });
-    const lines = [`To resume run ${runId}, use: agent({ runId: "${runId}" })`];
-    if (hasReplay) {
-      lines.push(
-        'This run includes replay-capable (plain Grok) units; set allowReplay: true only after accepting duplicate-side-effect risk.'
-      );
-    }
-    ctx.ui.notify(lines.join('\n'), 'info');
+    ctx.ui.notify(`To resume run ${runId}, use: agent({ runId: "${runId}" })`, 'info');
     return;
   }
 

@@ -16,14 +16,14 @@ import {
   getBuiltinAgentsDir,
 } from './agents.ts';
 import type { BackgroundManager } from './background.ts';
-import { runChainWorkflow, synthesizeFailure, type FanoutExpandRequest } from './chain.ts';
-import type { WorkflowFanoutState } from './run-types.ts';
 import {
-  GROK_ACP_RUNTIME,
-  GROK_RUNTIME,
-  MAX_CONCURRENCY,
-  MAX_PARALLEL_TASKS,
-} from './constants.ts';
+  buildRestoredLogicalSteps,
+  runChainWorkflow,
+  synthesizeFailure,
+  type FanoutExpandRequest,
+} from './chain.ts';
+import type { WorkflowFanoutState } from './run-types.ts';
+import { GROK_ACP_RUNTIME, MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
 import { enforceCompletionCheck } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
 import { listAvailableSkillNames, resolveSkillNames } from './skills.ts';
@@ -54,12 +54,7 @@ import {
 import { normalizeStoredRequest, startDurableRun, type StartedRun } from './run-persistence.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import type { RunStore } from './run-store.ts';
-import {
-  chainFanoutUnitId,
-  chainStepUnitId,
-  pad,
-  unitRequiresReplayAcknowledgement,
-} from './run-coordinator.ts';
+import { chainFanoutUnitId, chainStepUnitId, pad } from './run-coordinator.ts';
 import type { RunCoordinator, UnitExecutionContext } from './run-coordinator.ts';
 import type { SubagentParams } from './schema.ts';
 import { assertAgentDelegationAllowed } from './security.ts';
@@ -83,7 +78,12 @@ import {
   removeAgentWorktree,
   runWorktreeSetupHook,
 } from './worktree.ts';
-import { inspectResume, incrementIncompleteAttempts, isNeverStartedUnit } from './resume.ts';
+import {
+  inspectResume,
+  incrementIncompleteAttempts,
+  isNeverStartedUnit,
+  reopenCompletedUnitsForResume,
+} from './resume.ts';
 import type { ResumePromptContext } from './execution.ts';
 import type { StoredRunRequest } from './run-types.ts';
 
@@ -95,7 +95,6 @@ type DetailsFactory = (mode: Mode) => (results: SingleResult[]) => SubagentDetai
 /** Public resume inputs resolved at the start of executeAgentTool. */
 interface ResumeDescriptor {
   runId: string;
-  allowReplay: boolean;
   currentContinuationTask?: string;
 }
 
@@ -227,6 +226,15 @@ function stampRunOnDetails(
   durable: DurableRunContext,
   finalStatus: import('./run-types.ts').RunStatus
 ): void {
+  // Apply terminal status before aggregate so resumability uses finalStatus
+  // (failed/cancelled/interrupted with queued siblings), not a stale derived
+  // running status from never-started units still marked queued.
+  details.run = {
+    runId: details.run?.runId ?? durable.started.runId,
+    status: finalStatus,
+    resumable: details.run?.resumable ?? false,
+    capability: details.run?.capability ?? 'session',
+  };
   const base = durable.coordinator.aggregateRun(details, durable.started.units);
   details.run = {
     runId: base.runId || durable.started.runId,
@@ -248,8 +256,6 @@ interface DurableRunContext {
   isResume: boolean;
   /** Resume prompt metadata when this durable context was restored via runId. */
   resume?: ResumePromptContext;
-  /** Whether the caller acknowledged replay side effects. */
-  allowReplay?: boolean;
   /**
    * Project/workspace cwd restored from the durable run (request.cwd or unit
    * effectiveCwd). Used for agent discovery and git root resolution on resume.
@@ -418,9 +424,6 @@ async function maybeStartDurableRun(
     const unit = units[unitId];
     if (unit) {
       unit.acpSessionId = sessionId.trim();
-      if (unit.runtime === GROK_ACP_RUNTIME && unit.capability === 'replay') {
-        unit.capability = 'session';
-      }
     }
   };
   const expandFanout = async (req: FanoutExpandRequest): Promise<WorkflowFanoutState> => {
@@ -486,10 +489,12 @@ async function maybeResumeDurableRun(
   if (!store || !coordinator) return { error: 'persistence_not_configured' };
 
   const resumeRunId = resume.runId;
-  const inspection = inspectResume(resumeRunId, store, {
+  const hasContinuation = Boolean(resume.currentContinuationTask);
+  const inspectOptions = {
     agents,
-    allowReplay: resume.allowReplay,
-  });
+    hasContinuation,
+  };
+  const inspection = inspectResume(resumeRunId, store, inspectOptions);
   if (!inspection.ok) return { error: inspection.reason };
   if (inspection.blockingReasons.length > 0) {
     return { error: `preflight_failed: ${inspection.blockingReasons.join('; ')}` };
@@ -499,18 +504,14 @@ async function maybeResumeDurableRun(
   const claim = await store.claimRun(resumeRunId);
   if (!claim.ok) return { error: `claim_failed: ${claim.error.message}` };
 
-  // Re-validate eligibility on the post-claim record so a race that completed
-  // or corrupted the run between preflight and claim fails safely without
-  // mutating a completed run.
+  // Re-validate eligibility on the post-claim record so a race that corrupts
+  // the run between preflight and claim fails safely without mutating it.
   const loaded = store.getRun(resumeRunId);
   if (!loaded.ok) {
     await store.releaseRun(resumeRunId, claim.claimId);
     return { error: 'run_not_found_after_claim' };
   }
-  const postClaim = inspectResume(resumeRunId, store, {
-    agents,
-    allowReplay: resume.allowReplay,
-  });
+  const postClaim = inspectResume(resumeRunId, store, inspectOptions);
   if (!postClaim.ok) {
     await store.releaseRun(resumeRunId, claim.claimId);
     return { error: postClaim.reason };
@@ -518,10 +519,6 @@ async function maybeResumeDurableRun(
   if (postClaim.blockingReasons.length > 0) {
     await store.releaseRun(resumeRunId, claim.claimId);
     return { error: `preflight_failed: ${postClaim.blockingReasons.join('; ')}` };
-  }
-  if (loaded.loaded.record.status === 'completed') {
-    await store.releaseRun(resumeRunId, claim.claimId);
-    return { error: 'run_already_completed' };
   }
 
   const record = loaded.loaded.record;
@@ -531,6 +528,9 @@ async function maybeResumeDurableRun(
     units[id] = { ...unit, attempts: [...unit.attempts] };
   }
 
+  // Fully completed runs reopen finished units so continuation can continue
+  // from stored context; selective resume leaves completed siblings alone.
+  reopenCompletedUnitsForResume(units);
   // Increment attempts only after post-claim eligibility succeeds.
   incrementIncompleteAttempts(units);
 
@@ -564,20 +564,7 @@ async function maybeResumeDurableRun(
     });
     await store.updateRun(resumeRunId, (r) => {
       r.status = 'running';
-      // Normalize eligible incomplete Grok ACP units: capability is always session
-      // (including legacy stored "replay"). Attempted units without an ID are kept
-      // unavailable by preflight and never reach this write.
-      for (const unit of Object.values(units)) {
-        if (unit.status === 'completed' || unit.status === 'skipped') continue;
-        if (unit.runtime !== GROK_ACP_RUNTIME) continue;
-        // Only normalize units that preflight already admitted (never-started, or
-        // attempted with a stored acpSessionId).
-        if (!isNeverStartedUnit(unit) && !unit.acpSessionId?.trim()) continue;
-        unit.capability = 'session';
-        if (unit.result) {
-          unit.result.resumeCapability = 'session';
-        }
-      }
+      delete r.finishedAt;
       r.units = units;
       r.updatedAt = Date.now();
       r.startedAt = r.startedAt ?? Date.now();
@@ -599,7 +586,10 @@ async function maybeResumeDurableRun(
   // Sync the in-memory record with the persisted running state before
   // registering so the coordinator's live units stay aliased to the handle
   // the workflow mutates via beginUnit/endUnit/stampUnitSessionFile.
+  // Clear finishedAt here too: disk already dropped it, and a stale terminal
+  // timestamp on the live record would re-persist on the next flush.
   record.status = 'running';
+  delete record.finishedAt;
   record.units = units;
   record.continuationTasks = accumulatedContinuations;
   record.continuationDelivery = { ...priorDelivery };
@@ -684,9 +674,6 @@ async function maybeResumeDurableRun(
     const unit = units[unitId];
     if (unit) {
       unit.acpSessionId = sessionId.trim();
-      if (unit.runtime === GROK_ACP_RUNTIME && unit.capability === 'replay') {
-        unit.capability = 'session';
-      }
     }
   };
   const expandFanout = async (req: FanoutExpandRequest): Promise<WorkflowFanoutState> => {
@@ -759,13 +746,22 @@ async function maybeResumeDurableRun(
     },
   };
 
-  // Build restored chain state if applicable.
+  // Build restored chain state from the stored request topology. Presentation
+  // metadata may be absent or shortened; frozen fanout mappings and units are
+  // always attached so resume never re-expands from mutable outputs.
   let restoredChain: import('./chain.ts').RestoredChainState | undefined;
-  if (mode === 'chain' && record.details.chain) {
+  if (mode === 'chain' && Array.isArray(record.request.chain) && record.request.chain.length > 0) {
+    const chain = record.request.chain as import('./chain.ts').ChainItemInput[];
+    const logicalSteps = buildRestoredLogicalSteps(
+      chain,
+      record.details.chain?.steps,
+      units,
+      record.workflowState?.fanouts
+    );
     restoredChain = {
       results: record.details.results,
       outputs: record.details.outputs ?? {},
-      logicalSteps: record.details.chain.steps,
+      logicalSteps,
       units,
       fanouts: record.workflowState?.fanouts,
     };
@@ -786,7 +782,6 @@ async function maybeResumeDurableRun(
       coordinator,
       isResume: true,
       resume: resumePrompt,
-      allowReplay: resume.allowReplay,
       projectCwd,
       unitFor,
       beginUnit,
@@ -813,17 +808,20 @@ function syntheticAgent(name: string): AgentConfig {
   };
 }
 
-/** Map a workflow position to its stable unit id. */
+/**
+ * Map a workflow position to its stable canonical unit id.
+ * Never derives identity from Object.keys order or mutable position fields.
+ */
 function resolveUnitId(
   mode: Mode,
-  unitIds: string[],
+  _unitIds: string[],
   step: number | undefined,
   fanoutIndex: number | undefined
 ): string {
-  if (mode === 'single') return unitIds[0] ?? 'single';
+  if (mode === 'single') return 'single';
   if (mode === 'parallel') {
     const idx = fanoutIndex ?? 0;
-    return unitIds[idx] ?? `parallel-${pad(idx + 1)}`;
+    return `parallel-${pad(idx + 1)}`;
   }
   // chain — resolve directly from immutable step/index; never index unitIds.
   if (fanoutIndex !== undefined) return chainFanoutUnitId(step ?? 1, fanoutIndex);
@@ -844,11 +842,13 @@ function collectResolvedUnits(
   fanoutIndex?: number;
 }> {
   if (mode === 'single') {
-    const agent = agents.find((a) => a.name === params.agent) ?? agents[0];
+    // Exact topology name; synthetic fallback never substitutes agents[0].
+    const name = params.agent ?? 'agent';
+    const agent = agents.find((a) => a.name === name) ?? syntheticAgent(name);
     return [
       {
-        agent: agent ?? syntheticAgent(params.agent ?? 'agent'),
-        runtime: params.runtime ?? agent?.runtime,
+        agent,
+        runtime: params.runtime ?? agent.runtime,
         effectiveCwd: params.cwd ?? ctx.cwd,
       },
     ];
@@ -856,10 +856,10 @@ function collectResolvedUnits(
   if (mode === 'parallel') {
     const tasks = params.tasks ?? [];
     return tasks.map((t, i) => {
-      const agent = agents.find((a) => a.name === t.agent) ?? agents[0];
+      const agent = agents.find((a) => a.name === t.agent) ?? syntheticAgent(t.agent);
       return {
-        agent: agent ?? syntheticAgent(t.agent),
-        runtime: params.runtime ?? agent?.runtime,
+        agent,
+        runtime: params.runtime ?? agent.runtime,
         effectiveCwd: t.cwd ?? ctx.cwd,
         fanoutIndex: i,
       };
@@ -884,10 +884,10 @@ function collectResolvedUnits(
       continue;
     }
     const name = entry.agent ?? 'agent';
-    const agent = agents.find((a) => a.name === name) ?? agents[0];
+    const agent = agents.find((a) => a.name === name) ?? syntheticAgent(name);
     resolved.push({
-      agent: agent ?? syntheticAgent(name),
-      runtime: params.runtime ?? agent?.runtime,
+      agent,
+      runtime: params.runtime ?? agent.runtime,
       effectiveCwd: ctx.cwd,
       step: i + 1,
     });
@@ -927,20 +927,6 @@ export async function executeAgentTool(
       };
     }
   }
-  // allowReplay is resume-only.
-  if (params.allowReplay !== undefined && params.runId === undefined) {
-    return {
-      content: [
-        {
-          type: 'text',
-          text: 'resume_error: allowReplay requires runId',
-        },
-      ],
-      details: emptyErrorDetails(),
-      isError: true,
-    };
-  }
-
   // Resolve public runId resume before discovery so stored scope is authoritative.
   const publicRunId =
     typeof params.runId === 'string' && params.runId.trim().length > 0
@@ -988,7 +974,6 @@ export async function executeAgentTool(
     const trimmedContinuation = params.task?.trim();
     resumeDescriptor = {
       runId: publicRunId,
-      allowReplay: params.allowReplay === true,
       ...(trimmedContinuation ? { currentContinuationTask: trimmedContinuation } : {}),
     };
     effectiveParams = paramsFromStoredRequest(
@@ -1449,9 +1434,6 @@ async function runChain(
                         markContinuationDelivered: durable.markContinuationDelivered,
                       }
                     : {}),
-                  ...(durable.allowReplay !== undefined
-                    ? { allowReplay: durable.allowReplay }
-                    : {}),
                   ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
                 };
               })()
@@ -1500,7 +1482,7 @@ async function runParallel(
         return { ...existing };
       }
       // Completed unit without a usable result: keep a completed slot so we do
-      // not re-dispatch (replay gate still applies to incomplete units only).
+      // not re-dispatch (selective resume leaves completed siblings alone).
       return {
         agent: t.agent,
         agentSource: 'unknown' as const,
@@ -1573,30 +1555,6 @@ async function runParallel(
         return allResults[index];
       }
       const unitCtx = durable?.unitFor(undefined, index, t.agent);
-      // Replay gate at dispatch: runtime-aware — plain Grok needs allowReplay;
-      // legacy Grok ACP stored as capability "replay" does not.
-      if (
-        unitCtx &&
-        durable?.isResume &&
-        unitRequiresReplayAcknowledgement({
-          runtime: unitCtx.runtime,
-          capability: unitCtx.resumeCapability,
-        }) &&
-        !durable.allowReplay
-      ) {
-        const blocked: SingleResult = {
-          ...allResults[index],
-          agent: t.agent,
-          task: t.task,
-          exitCode: 1,
-          status: 'failed',
-          stopReason: 'error',
-          errorMessage: `unit ${unitCtx.unitId}: requires replay (allowReplay not set)`,
-        };
-        allResults[index] = blocked;
-        emitParallelUpdate();
-        return blocked;
-      }
       allResults[index] = {
         ...allResults[index],
         status: 'running',
@@ -1660,9 +1618,6 @@ async function runParallel(
                     ? {
                         markContinuationDelivered: durable.markContinuationDelivered,
                       }
-                    : {}),
-                  ...(durable.allowReplay !== undefined
-                    ? { allowReplay: durable.allowReplay }
                     : {}),
                   ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
                 }
@@ -1771,27 +1726,6 @@ async function runSingle(
         };
       }
     }
-    // Runtime-aware replay gate: plain Grok needs allowReplay; legacy Grok ACP
-    // stored as capability "replay" must still create/load sessions without it.
-    if (
-      durable.isResume &&
-      unitRequiresReplayAcknowledgement({
-        runtime: unitCtx.runtime,
-        capability: unitCtx.resumeCapability,
-      }) &&
-      !durable.allowReplay
-    ) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `resume_error: preflight_failed: unit ${unitCtx.unitId}: requires replay (allowReplay not set)`,
-          },
-        ],
-        details: makeDetails('single')([]),
-        isError: true,
-      };
-    }
   }
   try {
     const unitCtx = durable?.unitFor(undefined, undefined, agentName);
@@ -1842,7 +1776,6 @@ async function runSingle(
               ...(durable.markContinuationDelivered
                 ? { markContinuationDelivered: durable.markContinuationDelivered }
                 : {}),
-              ...(durable.allowReplay !== undefined ? { allowReplay: durable.allowReplay } : {}),
               ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
             }
           : {}),
@@ -1925,7 +1858,7 @@ async function runStepWithContext(
     /** Runs before worktree cleanup and durable endUnit (schema validation, metadata). */
     postprocessTerminal?: (result: SingleResult) => void;
     interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
-    /** Durable resume prompt context (session continuation vs fresh/replay). */
+    /** Durable resume prompt context (session continuation vs original task). */
     resumePrompt?: ResumePromptContext;
     /** Mark continuation delivery (Pi: after accept; Grok ACP: after prompt completed). */
     markContinuationDelivered?: (unitId: string) => void | Promise<void>;
@@ -1933,7 +1866,6 @@ async function runStepWithContext(
     markSessionPromptEstablished?: () => Promise<void>;
     /** Strict Grok ACP session-ID persistence before the first prompt. */
     persistAcpSessionId?: (sessionId: string) => Promise<void>;
-    allowReplay?: boolean;
     /** Restored project/workspace cwd for resume (overrides ctx.cwd for git/cwd fallbacks). */
     projectCwd?: string;
     spawnFn?: import('./execution.ts').SpawnFn;
@@ -1994,7 +1926,7 @@ async function runStepWithContext(
 
   const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
 
-  const isGrokFamily = effectiveRuntime === GROK_RUNTIME || effectiveRuntime === GROK_ACP_RUNTIME;
+  const isGrokFamily = effectiveRuntime === GROK_ACP_RUNTIME;
 
   let resolvedSkillPaths: string[] | undefined;
   if (isGrokFamily) {

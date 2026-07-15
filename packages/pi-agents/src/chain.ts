@@ -31,6 +31,7 @@ import {
 import { renderTaskTemplate } from './template.ts';
 import {
   cloneResults,
+  cloneSingleResult,
   emptyUsage,
   type ChainExecutionDetails,
   type ChainFanoutStep,
@@ -41,6 +42,7 @@ import {
   type SingleResult,
   type SubagentDetails,
 } from './types.ts';
+import { chainFanoutStepId, chainStepUnitId } from './run-coordinator.ts';
 import type { RunUnitRecord, WorkflowFanoutState } from './run-types.ts';
 
 export type ChainItemInput = Static<typeof ChainItem>;
@@ -173,6 +175,145 @@ function initLogicalSteps(chain: ChainItemInput[]): ChainLogicalStep[] {
   });
 }
 
+/**
+ * Overlay trustworthy presentation counters/status onto a topology-backed step.
+ * Topology fields (agent, task, expand source) stay from the request; only
+ * presentation progress fields are copied when kinds match.
+ */
+function overlayPresentationStep(
+  base: ChainLogicalStep,
+  presentation: ChainLogicalStep
+): ChainLogicalStep {
+  if (base.kind !== presentation.kind || base.step !== presentation.step) {
+    return base;
+  }
+  if (base.kind === 'sequential' && presentation.kind === 'sequential') {
+    return {
+      ...base,
+      status: presentation.status,
+      ...(presentation.title !== undefined ? { title: presentation.title } : {}),
+    };
+  }
+  if (base.kind === 'fanout' && presentation.kind === 'fanout') {
+    return {
+      ...base,
+      status: presentation.status,
+      ...(presentation.title !== undefined ? { title: presentation.title } : {}),
+      ...(presentation.concurrency !== undefined ? { concurrency: presentation.concurrency } : {}),
+      executedCount: presentation.executedCount,
+      completedCount: presentation.completedCount,
+      failedCount: presentation.failedCount,
+      runningCount: presentation.runningCount,
+      queuedCount: presentation.queuedCount,
+      skippedCount: presentation.skippedCount,
+      ...(presentation.latestIndex !== undefined ? { latestIndex: presentation.latestIndex } : {}),
+    };
+  }
+  return base;
+}
+
+/**
+ * True when an empty fanout has durable completion evidence beyond the frozen
+ * expansion mapping. Expansion is persisted before collect output, so mapping
+ * alone is not proof that `[]` was written into previous/output context.
+ */
+function hasEmptyFanoutCompletionEvidence(
+  logical: ChainFanoutStep,
+  outputs?: Record<string, ChainOutputEntry>
+): boolean {
+  if (logical.status === 'completed') return true;
+  const entry = outputs?.[logical.collectName];
+  return entry !== undefined && entry.step === logical.step;
+}
+
+/**
+ * Build a complete restored logical-step array from request topology.
+ * Overlays trustworthy presentation state by step number (never by unchecked
+ * index into a shortened presentation array). When presentation is absent or
+ * short, derive completed/queued status from durable units and frozen fanout
+ * mappings so selective resume skips finished sequential work. All-completed
+ * continuation reopens units to non-completed first, so those steps re-queue.
+ */
+export function buildRestoredLogicalSteps(
+  chain: ChainItemInput[],
+  presentationSteps: ChainLogicalStep[] | undefined,
+  units: Record<string, RunUnitRecord>,
+  fanouts?: Record<string, WorkflowFanoutState>,
+  outputs?: Record<string, ChainOutputEntry>
+): ChainLogicalStep[] {
+  const logicalSteps = initLogicalSteps(chain);
+
+  if (presentationSteps && presentationSteps.length > 0) {
+    const byStep = new Map<number, ChainLogicalStep>();
+    for (const step of presentationSteps) {
+      if (typeof step.step === 'number' && step.step >= 1) {
+        byStep.set(step.step, step);
+      }
+    }
+    for (let i = 0; i < logicalSteps.length; i++) {
+      const base = logicalSteps[i]!;
+      const presentation = byStep.get(base.step);
+      if (presentation) {
+        logicalSteps[i] = overlayPresentationStep(base, presentation);
+      }
+    }
+  }
+
+  // Authoritative status from durable units / frozen mappings. Presentation
+  // may be absent, shortened, or stale; unit status is the resume authority.
+  // Sequential completed work is marked completed so selective resume skips it.
+  // Fanout steps re-queue whenever any child is incomplete (including reopened
+  // continuation units). Fully completed fanouts keep presentation status so
+  // runFanoutStep can rebuild slots without redispatch when needed.
+  for (let i = 0; i < logicalSteps.length; i++) {
+    const logical = logicalSteps[i]!;
+    const stepNumber = logical.step;
+    if (logical.kind === 'sequential') {
+      const unit = units[chainStepUnitId(stepNumber)];
+      if (!unit) continue;
+      logicalSteps[i] = {
+        ...logical,
+        status: unit.status === 'completed' ? 'completed' : 'queued',
+      };
+      continue;
+    }
+
+    // Fanout: prefer frozen mapping; fall back to durable children for the step.
+    const mapping = fanouts?.[chainFanoutStepId(stepNumber)];
+    if (mapping) {
+      if (mapping.unitIds.length === 0) {
+        // Empty frozen mapping alone is not completed evidence: expansion is
+        // written before collect output. Absent/incomplete presentation/output
+        // re-queues so the zero-worker fanout reconstructs `[]` context.
+        const fanout = logical as ChainFanoutStep;
+        logicalSteps[i] = {
+          ...fanout,
+          status: hasEmptyFanoutCompletionEvidence(fanout, outputs) ? 'completed' : 'queued',
+        };
+        continue;
+      }
+      const anyIncomplete = mapping.unitIds.some((id) => {
+        const unit = units[id];
+        return !unit || unit.status !== 'completed';
+      });
+      if (anyIncomplete) {
+        logicalSteps[i] = { ...logical, status: 'queued' };
+      }
+      continue;
+    }
+
+    const children = Object.values(units).filter(
+      (u) => u.step === stepNumber && u.fanoutIndex !== undefined
+    );
+    if (children.length === 0) continue;
+    if (children.some((u) => u.status !== 'completed')) {
+      logicalSteps[i] = { ...logical, status: 'queued' };
+    }
+  }
+
+  return logicalSteps;
+}
+
 function markLaterSkipped(logicalSteps: ChainLogicalStep[], fromIndex: number): void {
   for (let j = fromIndex; j < logicalSteps.length; j++) {
     if (logicalSteps[j].status === 'queued' || logicalSteps[j].status === 'running') {
@@ -192,6 +333,89 @@ function cloneLogicalSteps(steps: ChainLogicalStep[]): ChainLogicalStep[] {
   return steps.map((s) => ({ ...s }));
 }
 
+/** Read-only completed sequential unit result; never mutate the returned object. */
+function durableCompletedSequentialResult(
+  units: Record<string, RunUnitRecord>,
+  stepNumber: number
+): SingleResult | undefined {
+  const unit = units[chainStepUnitId(stepNumber)];
+  if (unit?.status === 'completed' && unit.result) return unit.result;
+  return undefined;
+}
+
+function resultText(result: SingleResult): string {
+  return result.finalOutput ?? getFinalOutput(result.messages);
+}
+
+/**
+ * Prefer authoritative durable sequential unit results over lagging presentation
+ * `details.results` / `details.outputs`. Clones into mutable workflow state so
+ * stored unit results are never mutated.
+ */
+function rehydrateCompletedSequentialFromDurable(
+  chain: ChainItemInput[],
+  results: SingleResult[],
+  outputs: Map<string, ChainOutputEntry>,
+  units: Record<string, RunUnitRecord>
+): void {
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
+    if (!step || isFanoutChainStep(step) || isAmbiguousChainStep(step)) continue;
+    const sequential = step as SequentialStep;
+    const stepNumber = i + 1;
+    const durableResult = durableCompletedSequentialResult(units, stepNumber);
+    if (!durableResult) continue;
+
+    // Clone before inserting into mutable presentation results.
+    const cloned = cloneSingleResult(durableResult);
+    if (cloned.step === undefined) cloned.step = stepNumber;
+    upsertSequentialResult(results, cloned);
+
+    if (!sequential.name) continue;
+    // Later-step-wins: never overwrite a same-named entry recorded by a later
+    // sequential or fanout collect step. Replace only missing, same-step stale,
+    // or earlier-step entries.
+    const existing = outputs.get(sequential.name);
+    if (existing !== undefined && existing.step > stepNumber) continue;
+    outputs.set(sequential.name, {
+      text: resultText(durableResult),
+      structured:
+        durableResult.structuredOutput !== undefined
+          ? structuredClone(durableResult.structuredOutput)
+          : undefined,
+      agent: sequential.agent,
+      step: stepNumber,
+    });
+  }
+}
+
+/**
+ * Previous-output text for a completed logical step: presentation result first
+ * when present, else durable sequential unit result, else fanout collect output.
+ */
+function completedStepPreviousOutput(
+  logical: ChainLogicalStep,
+  results: SingleResult[],
+  outputs: Map<string, ChainOutputEntry>,
+  units: Record<string, RunUnitRecord> | undefined
+): string | undefined {
+  const stepNumber = logical.step;
+  const stepResults = results.filter((r) => r.step === stepNumber);
+  const last = stepResults[stepResults.length - 1];
+  if (last) return resultText(last);
+
+  if (logical.kind === 'sequential' && units) {
+    const durableResult = durableCompletedSequentialResult(units, stepNumber);
+    if (durableResult) return resultText(durableResult);
+  }
+
+  if (logical.kind === 'fanout') {
+    const entry = outputs.get(logical.collectName);
+    if (entry) return entry.text;
+  }
+  return undefined;
+}
+
 export async function runChainWorkflow(options: RunChainWorkflowOptions): Promise<ChainResult> {
   const { chain, signal, onUpdate, makeDetails, runStep, restored, onFanoutExpand } = options;
   let results: SingleResult[];
@@ -202,17 +426,26 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
   if (restored) {
     results = cloneResults(restored.results);
     for (const [name, entry] of Object.entries(restored.outputs)) {
-      outputs.set(name, entry);
+      // Shallow-copy entries so later rehydrate cannot mutate durable details.outputs.
+      outputs.set(name, { ...entry });
     }
-    logicalSteps = cloneLogicalSteps(restored.logicalSteps);
+    // Prefer durable completed sequential unit results when presentation lags.
+    rehydrateCompletedSequentialFromDurable(chain, results, outputs, restored.units);
+    // Prefer a complete topology-backed array; pad any short restored snapshot
+    // from the request chain so later step indexing is never unchecked.
+    logicalSteps = buildRestoredLogicalSteps(
+      chain,
+      restored.logicalSteps,
+      restored.units,
+      restored.fanouts,
+      Object.fromEntries(outputs)
+    );
     // Recompute previousOutput from the last completed sequential/fanout step.
     for (let i = logicalSteps.length - 1; i >= 0; i--) {
-      if (logicalSteps[i].status === 'completed') {
-        const stepResults = results.filter((r) => r.step === i + 1);
-        const last = stepResults[stepResults.length - 1];
-        if (last) {
-          previousOutput = last.finalOutput ?? getFinalOutput(last.messages);
-        }
+      const logical = logicalSteps[i];
+      if (logical?.status === 'completed') {
+        const text = completedStepPreviousOutput(logical, results, outputs, restored.units);
+        if (text !== undefined) previousOutput = text;
         break;
       }
     }
@@ -243,8 +476,23 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
 
   try {
     for (let i = 0; i < chain.length; i++) {
+      const logical = logicalSteps[i];
+      if (!logical) {
+        // Topology length is authoritative; a short restored array is a hard error.
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Chain restore error: missing logical step ${i + 1} of ${chain.length}`,
+            },
+          ],
+          details: buildDetails(),
+          isError: true,
+        };
+      }
+
       if (signal?.aborted) {
-        logicalSteps[i].status = 'cancelled';
+        logical.status = 'cancelled';
         markLaterSkipped(logicalSteps, i + 1);
         return {
           content: [{ type: 'text', text: `Chain cancelled at step ${i + 1}` }],
@@ -257,17 +505,15 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
       const stepNumber = i + 1;
 
       // Skip completed steps from restored state; their outputs are already in `outputs`.
-      if (logicalSteps[i].status === 'completed') {
-        const stepResults = results.filter((r) => r.step === stepNumber);
-        const last = stepResults[stepResults.length - 1];
-        if (last) {
-          previousOutput = last.finalOutput ?? getFinalOutput(last.messages);
-        }
+      // Prefer presentation results, then durable sequential unit results, then fanout collect.
+      if (logical.status === 'completed') {
+        const text = completedStepPreviousOutput(logical, results, outputs, restored?.units);
+        if (text !== undefined) previousOutput = text;
         continue;
       }
       // Reset non-completed steps to queued for retry.
-      if (logicalSteps[i].status !== 'queued') {
-        logicalSteps[i].status = 'queued';
+      if (logical.status !== 'queued') {
+        logical.status = 'queued';
       }
 
       if (isFanoutChainStep(step)) {
@@ -804,18 +1050,23 @@ async function runFanoutStep(
   }
 
   const slots: SingleResult[] = renderedTasks.map((task, index) => {
-    // Prefer durable unit result; fall back to presentation results for restore.
+    // Durable unit status is authoritative when a mapped unit exists.
+    // Completed units keep their terminal result; reopened/incomplete units get
+    // a queued slot and must not fall back to stale completed presentation.
     if (opts.restored) {
       const unitId = restoredFanout?.unitIds[index];
       const unit = unitId ? opts.restored.units[unitId] : undefined;
       if (unit?.status === 'completed' && unit.result) {
         return { ...unit.result };
       }
-      const existing = opts.restored.results.find(
-        (r) => r.step === stepNumber && r.fanout?.index === index
-      );
-      if (existing && resolveExecutionStatus(existing) === 'completed') {
-        return { ...existing };
+      // Mapped unit that is not completed: skip presentation fallback and queue.
+      if (!unit || unit.status === 'completed') {
+        const existing = opts.restored.results.find(
+          (r) => r.step === stepNumber && r.fanout?.index === index
+        );
+        if (existing && resolveExecutionStatus(existing) === 'completed') {
+          return { ...existing };
+        }
       }
     }
     return {

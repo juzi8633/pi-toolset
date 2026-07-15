@@ -9,8 +9,8 @@ export const RUN_RECORD_VERSION = 1;
 /** Durable run-level status persisted in `run.json`. */
 export type RunStatus = 'queued' | 'running' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
 
-/** Resume behavior a runtime unit supports. */
-export type ResumeCapability = 'session' | 'replay';
+/** Resume behavior a runtime unit supports (session-only). */
+export type ResumeCapability = 'session';
 
 /** Where an abort originated, carried through abort errors and lifecycle events. */
 export type RunAbortOrigin = 'user' | 'session_shutdown' | 'owner_process_missing' | 'unknown';

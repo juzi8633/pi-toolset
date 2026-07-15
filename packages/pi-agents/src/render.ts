@@ -592,11 +592,7 @@ function appendExpandedResultSections(
     }
     container.addChild(new Text(theme.fg('dim', `attempt: ${r.attempt ?? '—'}`), 0, 0));
     if (r.resumeCapability) {
-      const capLabel =
-        r.resumeCapability === 'replay'
-          ? theme.fg('warning', 'replay (⚠ may repeat side effects)')
-          : 'session';
-      container.addChild(new Text(theme.fg('dim', `capability: ${capLabel}`), 0, 0));
+      container.addChild(new Text(theme.fg('dim', `capability: ${r.resumeCapability}`), 0, 0));
     }
     if (r.sessionFile) {
       container.addChild(new Text(theme.fg('dim', `session: ${r.sessionFile}`), 0, 0));

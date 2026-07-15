@@ -5,7 +5,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from '@earendil-works/pi-coding-agent';
-import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
+import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
 import { discoverPackageAgentDirs } from './package-agents.ts';
 import type { DefaultContext, IsolationMode, SystemPromptMode } from './types.ts';
 
@@ -15,9 +15,9 @@ const CONFIG_FILE_NAME = 'config.json';
 export type AgentScope = 'user' | 'project' | 'both';
 export type AgentSource = 'builtin' | 'package' | 'user' | 'project';
 
-export type Runtime = typeof DEFAULT_RUNTIME | typeof GROK_RUNTIME | typeof GROK_ACP_RUNTIME;
+export type Runtime = typeof DEFAULT_RUNTIME | typeof GROK_ACP_RUNTIME;
 
-const RUNTIME_VALUES = [DEFAULT_RUNTIME, GROK_RUNTIME, GROK_ACP_RUNTIME] as const;
+const RUNTIME_VALUES = [DEFAULT_RUNTIME, GROK_ACP_RUNTIME] as const;
 
 export interface AgentConfig {
   name: string;

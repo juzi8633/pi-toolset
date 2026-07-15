@@ -6542,7 +6542,7 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
 });
 
 describe('Grok ACP session resume + Agent View restoration', () => {
-  it('restores Grok ACP endpoint with sessionArtifact and rejects replay capability', async () => {
+  it('restores Grok ACP endpoint with sessionArtifact and session capability', async () => {
     const { root, store, coordinator } = makeTempStore();
     const agent = makeAgent({ name: 'gagent', runtime: 'grok-acp' as never, model: 'grok' });
     const { runId } = await store.createRun({
@@ -6610,24 +6610,6 @@ describe('Grok ACP session resume + Agent View restoration', () => {
     });
     expect(restored[0]!.sessionFile).toBe('');
     expect(restored[0]!.messages.length).toBe(0);
-
-    // Capability replay must fail closed even with a stored ID.
-    await store.updateRun(runId, (r) => {
-      r.units.single.capability = 'replay';
-    });
-    const live2 = store.getRun(runId);
-    if (live2.ok) {
-      coordinator.unregisterRun(runId);
-      coordinator.registerRun(runId, live2.loaded.record);
-    }
-    const restored2 = registry.restoreActiveBranch({
-      sessionManager: fakeSm as never,
-      cwd: root,
-    });
-    expect(restored2[0]!.status).toBe('unavailable');
-    expect(restored2[0]!.errorCode).toBe('unavailable');
-    // non_session_capability maps to unavailable code
-    expect(restored2[0]!.lastError).toMatch(/non_session_capability|capability/);
 
     await registry.shutdown();
     fs.rmSync(root, { recursive: true, force: true });

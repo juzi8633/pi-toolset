@@ -234,7 +234,7 @@ Provide exactly one entry form:
 - \`agent\` + \`task\`: run a single agent.
 - \`tasks\`: run multiple {agent, task} items in parallel.
 - \`chain\`: run sequential steps with output passing between them, optionally fanning out one step's structured output across parallel workers.
-- \`runId\`: resume a durable run from its stored workflow and sessions. Optional \`task\` appends a continuation instruction; set \`allowReplay: true\` only for replay-capable (Grok) units after accepting duplicate-side-effect risk. Do not supply fresh launch fields with \`runId\`.
+- \`runId\`: resume a durable run from its stored workflow and sessions. Optional \`task\` appends a continuation instruction (required to resume a fully completed run). Do not supply fresh launch fields with \`runId\`.
 ## When to use
 Use when the task matches an agent type, for parallel independent work, or when answering requires reading several files - delegate and keep the conclusion, not the file dumps. For a single-fact lookup, search directly. Once delegated, don't redo the work yourself - wait for the result.
 - The agent's final message is returned as the tool result (not shown to the user) - relay what matters.

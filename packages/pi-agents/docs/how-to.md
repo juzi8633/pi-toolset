@@ -189,16 +189,14 @@ items stay completed and only incomplete items run again.
    ```
    agent({ runId: "<run-id>" })
    agent({ runId: "<run-id>", task: "Also verify the remaining items." })
-   agent({ runId: "<run-id>", allowReplay: true })
    ```
 
    Optional `task` appends a continuation instruction to every incomplete unit
    after placeholder/`{item}` resolution. Completed item results and original
    indexes are retained. Interrupted Pi and Grok ACP items continue their native
-   sessions; never-started Pi/Grok ACP items and plain Grok replay units receive
-   the original resolved task plus all durable continuation instructions.
-   Never-started items keep attempt `1`. Collection order remains the original
-   expansion order. Grok ACP does not require `allowReplay`.
+   sessions; never-started Pi/Grok ACP items receive the original resolved task
+   plus all durable continuation instructions. Never-started items keep attempt
+   `1`. Collection order remains the original expansion order.
 
 ### Blocking errors
 
@@ -210,7 +208,6 @@ If resume is refused, the blocking reason explains what to do:
 | `stored_output_invalid`           | A completed child unit is missing a valid terminal result               | Start a fresh chain; completed output is unsafe |
 | `fanout_state_conflict`           | A concurrent or conflicting expansion write tried to change the mapping | Rare; inspect the run and retry or re-invoke    |
 | fingerprint / session / worktree  | Agent definition or artifacts changed or went missing                   | Restore the agent/session/worktree, then resume |
-| requires replay (`allowReplay`)   | Plain Grok units need explicit acknowledgement                          | `agent({ runId, allowReplay: true })` if safe   |
 | `acp_session_unavailable`         | Attempted Grok ACP unit has no stored protocol session ID               | Not resumable; start a fresh run                |
 
 Unsafe legacy partial fanouts (item results or unit fragments without a stored
@@ -333,28 +330,6 @@ in flight per session; the parent abort signal (Ctrl+C) does not cancel a
 launched background job. Background mode is rejected in `json` and `print` host
 modes.
 
-## Use the Grok runtime
-
-Set `runtime: "grok"` to spawn the [Grok Build CLI](https://docs.x.ai/build/cli)
-(`grok -p --output-format streaming-json`) instead of `pi`:
-
-```markdown
----
-name: grok-reviewer
-description: Code review powered by Grok
-runtime: grok
-model: grok-4.5
-thinking: high
-maxTurns: 10
-systemPromptMode: append
----
-```
-
-Prerequisites: install the Grok CLI and authenticate with `grok login` or set
-`XAI_API_KEY`. See [Explanation: Grok streaming-json vs ACP](./explanation.md#grok-streaming-json-vs-acp)
-for caveats (no usage stats, no tool-call visibility, skills are no-ops, fork
-context ignored).
-
 ## Use the Grok ACP runtime
 
 Set `runtime: "grok-acp"` to speak the [Agent Client Protocol](https://agentclientprotocol.com)
@@ -366,7 +341,7 @@ ACP cancellation:
 ```
 
 `maxTurns` is accepted at the config layer but ignored by `grok-acp`. See
-[Explanation: Grok streaming-json vs ACP](./explanation.md#grok-streaming-json-vs-acp)
+[Explanation: Grok ACP runtime](./explanation.md#grok-acp-runtime)
 for the field mapping.
 
 The bundled `/work-with-grok <task>` prompt is a shortcut for this: it
@@ -377,8 +352,7 @@ delegates the task to the `general` agent with `runtime: "grok-acp"`,
 
 1. Start a durable Grok ACP unit (TUI or otherwise). The protocol session ID is
    persisted to `run.json` as `units.<id>.acpSessionId` before the first prompt.
-2. If interrupted, resume with `agent({ runId })` — **no** `allowReplay`. The
-   client calls `session/load` with the stored ID and original cwd/worktree,
+2. If interrupted, resume with `agent({ runId })`. The client calls `session/load` with the stored ID and original cwd/worktree,
    then sends only the fixed continuation prompt plus undelivered instructions.
 3. In TUI, open `/agent view` (or `Ctrl+Alt+Down`). Restored Grok ACP endpoints
    appear as detached metadata; open detail to lazy-hydrate full history via a
@@ -408,7 +382,7 @@ fix)`, `## Warnings (should fix)`, and `## Suggestions (consider)`, writing
 
 ## Interactive agent view
 
-In TUI mode, Pi and Grok ACP subagents can be inspected and messaged without switching the host session. Plain Grok (`runtime: "grok"`) is not shown.
+In TUI mode, Pi and Grok ACP subagents can be inspected and messaged without switching the host session.
 
 ### Open the navigator
 
@@ -455,6 +429,5 @@ The below-editor chrome (when any agent is `starting`/`running`) lists only thos
 
 - The host `SessionManager` is never switched to the child.
 - Post-completion interactive messages do not rewrite the completed durable unit result. After a normal completion they stay in the child session only. When the original tool-call activation was interrupted/cancelled, the next view continuation that settles is relayed back to the bound host model as a clearly-marked interactive continuation (once per activation); normal completed agents never relay.
-- Plain Grok (`runtime: "grok"`) units are not shown.
 - Child slash commands are rejected; child extension UI dialogs are cancelled.
 - Private Grok session files under `~/.grok/sessions` are never parsed or displayed.

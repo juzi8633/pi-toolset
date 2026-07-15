@@ -183,36 +183,15 @@ as `name: reviewer` inside `@acme/pi-frontend` is invocable as
 Package agents are not pulled from a project's `dependencies`/`node_modules`;
 only packages explicitly listed in a pi settings file are considered.
 
-## Grok streaming-json vs ACP
-
-Two Grok runtimes are supported. They are opt-in and do not replace each other.
-
-**`runtime: "grok"`** spawns `grok -p --output-format streaming-json` and remains
-fully supported. Field mapping: `model` -> `--model`; `thinking` (downgraded to
-3 levels) -> `--effort`; `maxTurns` -> `--max-turns`; `systemPrompt` (append) ->
-`--rules`; `systemPrompt` (replace) -> `--system-prompt-override`; `tools` ->
-`--tools`; `excludeTools` -> `--disallowed-tools`. Hardcoded flags:
-`--no-auto-update`, `--always-approve`, `--output-format streaming-json`,
-`--no-memory`, `--no-subagents`.
-
-`thinking` -> `effort` downgrade: `off` -> omitted; `minimal`/`low` -> `low`;
-`medium` -> `medium`; `high`/`xhigh`/`max` -> `high`.
-
-Streaming-json caveats: no usage stats (usage is all zeros; `turns` reflects
-assistant turns detected via thought boundaries); no tool-call visibility
-(`messages` has no `toolCall` parts; text is split into one assistant message
-per turn); `EndTurn` -> `end`, `Cancelled` -> `max_turns`; skills are no-ops (a
-warning is emitted if `skills` is set); `worktreeSetupHook` still runs;
-`defaultContext: "fork"` is treated as `fresh` with a warning; tool names are
-runtime-specific and passed through as-is; `--system-prompt-override` may not
-fully suppress Grok's defaults; Grok ignores nesting env vars and always passes
-`--no-subagents`.
+## Grok ACP runtime
 
 **`runtime: "grok-acp"`** spawns `grok agent … stdio` and speaks ACP v1 over
 NDJSON. Process invocation:
 `grok agent [--model <model>] [--reasoning-effort <effort>] --always-approve --no-leader stdio`,
 with `GROK_DISABLE_AUTOUPDATER=1`, `GROK_MEMORY=0`, `GROK_SUBAGENTS=0` in the
-env. Configuration is passed via `session/new._meta`: `systemPrompt` (append) ->
+env. `thinking` is mapped to reasoning effort as follows: `off` is omitted;
+`minimal`/`low` -> `low`; `medium` -> `medium`; `high`/`xhigh`/`max` -> `high`.
+Configuration is passed via `session/new._meta`: `systemPrompt` (append) ->
 `_meta.rules`; (replace) -> `_meta.systemPromptOverride`; `tools`/`excludeTools`
 -> `_meta.agentProfile.tools`/`.disallowedTools`; `maxTurns` is **ignored** (not
 sent in CLI, env, session meta, or prompt).
@@ -225,8 +204,8 @@ from prompt-response `_meta` and `usage_update` notifications populate
 `SingleResult.usage` (cost when currency is `USD`); `AbortSignal` sends
 `session/cancel`, cancels pending permissions, then SIGTERM/SIGKILL (the public
 run still throws `Subagent was aborted`); the client advertises empty
-`clientCapabilities` so Grok uses its own built-in tools. Skills and fork context
-behave as in streaming-json (ignored/treated as fresh with a warning).
+`clientCapabilities` so Grok uses its own built-in tools. Skills are ignored with
+a warning, and fork context is treated as fresh with a warning.
 
 **Progressive usage (grok-acp):** During a turn, standard `usage_update`
 notifications may set `cost` and/or `contextTokens` while input/output/cache
@@ -236,8 +215,8 @@ only the other fields that are already known (e.g. `ctx:111 model`). When the
 (`turns`, `↑input`, `↓output`, cache read/write, ctx, model) is shown together.
 Zero/unknown fields are never printed as misleading zeros.
 
-**Session resume and Agent View (grok-acp):** Unlike plain `runtime: "grok"`
-(streaming-json replay), Grok ACP is session-capable. After `session/new`, the
+**Session resume and Agent View (grok-acp):** Grok ACP is session-capable. After
+`session/new`, the
 protocol session ID is flushed to the durable run record before any prompt. On
 resume or Agent View hydrate, the client requires
 `agentCapabilities.loadSession === true`, calls `session/load` with the stored
@@ -291,11 +270,21 @@ If the expansion write fails, the run fails without launching any item. Once it
 succeeds, crash recovery can distinguish completed items, started-but-incomplete
 items, and never-started items without re-reading mutable upstream output.
 
-Resume treats per-item unit records as authoritative: completed results are
-reused in original order; only non-completed units dispatch. Attempt numbers
-increment only for units that already executed; never-started units stay at
-attempt `1`. Presentation fields such as `details.results` remain a projection
-for display and completed historical runs, not the selective-resume authority.
+Resume treats per-item unit records as authoritative. Two cases:
+
+- **Selective resume** (any non-completed unit): completed fanout children keep
+  their terminal results in original order; only incomplete children dispatch.
+  Attempt numbers increment only for units that already executed; never-started
+  units stay at attempt `1`.
+- **Fully completed continuation** (every unit completed plus a non-empty
+  continuation `task`): every completed fanout child is reopened and redispatched
+  with the continuation. Frozen `workflowState.fanouts` mappings are required and
+  validated even when `details.chain.steps` is absent or stale; durable units
+  alone establish which fanout steps need a mapping.
+
+Presentation fields such as `details.results` remain a projection for display,
+not the resume authority. Stale completed presentation slots must not mask a
+reopened durable unit.
 
 ### Why legacy partial fanouts are not reconstructed
 
@@ -304,8 +293,10 @@ identity without a stored expansion mapping. Reconstructing item identity,
 attempt history, session paths, and side effects from that evidence would be
 guesswork. The package therefore refuses such runs with
 `stored_fanout_state_unavailable` (or `stored_output_invalid` when a completed
-child lacks a terminal result) and requires a fresh chain invocation. Completed
-V1 records remain readable for listing and inspection.
+child lacks a terminal result) and requires a fresh chain invocation. Fully
+completed fanouts resumed with a continuation also fail closed when the frozen
+mapping is missing or non-canonical. Completed V1 records without continuation
+remain readable for listing and inspection.
 
 ## Interactive view vs host session switching
 

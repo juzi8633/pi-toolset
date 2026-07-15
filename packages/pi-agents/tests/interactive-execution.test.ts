@@ -429,44 +429,6 @@ describe('interactive-execution production path (Grok ACP)', () => {
     });
     expect(again.key).toBe(snap.key);
 
-    // Replay capability must be rejected (exact branch link present so capability check runs).
-    await store.updateRun(runId, (r) => {
-      r.units.single.capability = 'replay';
-    });
-    await expect(
-      registry.registerInitial({
-        runId,
-        unitId: 'single',
-        hostSessionId: 'host-1',
-        launchSpec: {
-          agent,
-          request: record.request,
-          sessionFile: '',
-          sessionArtifact: { runtime: 'grok-acp', sessionId: 'sess-tui-1' },
-          effectiveCwd: root,
-          agentScope: 'both',
-          registrationKind: 'initial',
-        },
-        getBranchEntries: () => [
-          {
-            type: 'custom',
-            customType: INTERACTIVE_LINK_TYPE,
-            data: {
-              version: 1,
-              runId,
-              unitId: 'single',
-              bindingId: snap.bindingId,
-              hostSessionId: 'host-1',
-              createdAt: snap.linkCreatedAt,
-            },
-          },
-        ],
-      })
-    ).rejects.toThrow(/capability=session/);
-    await store.updateRun(runId, (r) => {
-      r.units.single.capability = 'session';
-    });
-
     const delivered: number[] = [];
     const result = await runSingleAgentInteractive(
       root,

@@ -5,6 +5,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
+import { chainFanoutUnitId, chainStepUnitId, generateUnitIds, pad } from './run-coordinator.ts';
 import type {
   AgentRunRecordV1,
   ClaimOwner,
@@ -29,6 +31,25 @@ const RUN_STATUS_VALUES = new Set([
   'failed',
   'cancelled',
 ]);
+
+/** Durable runtimes accepted on current records; absent means the Pi default. */
+const ALLOWED_DURABLE_RUNTIMES = new Set<string>([DEFAULT_RUNTIME, GROK_ACP_RUNTIME]);
+
+/** Durable resume capabilities accepted on current records (session-only). */
+const ALLOWED_DURABLE_CAPABILITIES = new Set<string>(['session']);
+
+function isAllowedDurableRuntime(runtime: unknown): boolean {
+  return typeof runtime === 'string' && ALLOWED_DURABLE_RUNTIMES.has(runtime);
+}
+
+function isAllowedDurableCapability(capability: unknown): boolean {
+  return typeof capability === 'string' && ALLOWED_DURABLE_CAPABILITIES.has(capability);
+}
+
+/** Effective unit runtime: explicit value or the Pi default when absent. */
+function effectiveUnitRuntime(runtime: unknown): string {
+  return typeof runtime === 'string' ? runtime : DEFAULT_RUNTIME;
+}
 
 export function getDefaultRunsRoot(): string {
   // Tests inject a custom rootDir; the process-level HOME env override
@@ -253,6 +274,13 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         error: { code: 'corrupt_run', runId: expectedRunId, message: requestError },
       };
     }
+    // Explicit request.runtime is a run-wide override; every unit's effective
+    // runtime (unit.runtime ?? pi default) must match so preflight and dispatch
+    // cannot apply different rules. Absent request.runtime allows per-agent runtimes.
+    const explicitRequestRuntime =
+      r.request && typeof r.request === 'object' && 'runtime' in r.request
+        ? (r.request as { runtime?: unknown }).runtime
+        : undefined;
     for (const [unitId, unit] of Object.entries(r.units)) {
       if (!isUnitIdValid(unitId)) {
         return {
@@ -271,6 +299,123 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         };
       }
       const u = unit as unknown as Record<string, unknown>;
+      if (typeof u.agent !== 'string') {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} agent is not a string`,
+          },
+        };
+      }
+      // Canonical unit identity first so swapped positions fail closed on
+      // identity rather than being misread through mutable fanoutIndex/step.
+      if (u.unitId !== unitId) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} unitId field "${String(u.unitId)}" does not match record key`,
+          },
+        };
+      }
+      if (r.request && typeof r.request === 'object') {
+        const identityError = validateUnitCanonicalIdentity(
+          r.mode as string,
+          r.request as unknown as Record<string, unknown>,
+          unitId,
+          { step: u.step, fanoutIndex: u.fanoutIndex }
+        );
+        if (identityError) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: identityError,
+            },
+          };
+        }
+        // Persisted unit.agent must match the request topology used at dispatch so
+        // preflight fingerprint checks and runtime resolution stay consistent.
+        const expectedAgent = expectedTopologyAgent(
+          r.mode as string,
+          r.request as unknown as Record<string, unknown>,
+          unitId,
+          { step: u.step, fanoutIndex: u.fanoutIndex }
+        );
+        if (expectedAgent === undefined) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} does not match request topology`,
+            },
+          };
+        }
+        if (u.agent !== expectedAgent) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} agent "${u.agent}" does not match request topology agent "${expectedAgent}"`,
+            },
+          };
+        }
+      }
+      if (u.runtime !== undefined && !isAllowedDurableRuntime(u.runtime)) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} has unsupported runtime ${String(u.runtime)}`,
+          },
+        };
+      }
+      if (typeof explicitRequestRuntime === 'string') {
+        const unitEffective = effectiveUnitRuntime(u.runtime);
+        if (unitEffective !== explicitRequestRuntime) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} effective runtime ${unitEffective} conflicts with request.runtime ${explicitRequestRuntime}`,
+            },
+          };
+        }
+      }
+      if (!isAllowedDurableCapability(u.capability)) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message:
+              u.capability === undefined
+                ? `unit ${unitId} is missing capability`
+                : `unit ${unitId} has unsupported capability ${String(u.capability)}`,
+          },
+        };
+      }
+      if (u.result !== undefined && u.result !== null && typeof u.result === 'object') {
+        const resumeCapability = (u.result as { resumeCapability?: unknown }).resumeCapability;
+        if (resumeCapability !== undefined && !isAllowedDurableCapability(resumeCapability)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} result.resumeCapability has unsupported value ${String(resumeCapability)}`,
+            },
+          };
+        }
+      }
       if (u.sessionFile !== undefined && typeof u.sessionFile !== 'string') {
         return {
           ok: false,
@@ -306,6 +451,61 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
             message: `unit ${unitId} worktreePath not string`,
           },
         };
+      }
+    }
+    // Exact coverage of statically known units (single / parallel / sequential
+    // chain). Dynamic fanout children are allowed only as mapped expansions.
+    if (r.request && typeof r.request === 'object') {
+      const coverageError = validateStaticUnitCoverage(
+        r.mode as string,
+        r.request as unknown as Record<string, unknown>,
+        r.units as Record<string, unknown>
+      );
+      if (coverageError) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: coverageError,
+          },
+        };
+      }
+    }
+    // Aggregate run capability and presentation result metadata, when present, are session-only.
+    if (r.details && typeof r.details === 'object') {
+      const details = r.details as { run?: unknown; results?: unknown };
+      const runMeta = details.run;
+      if (runMeta && typeof runMeta === 'object') {
+        const cap = (runMeta as { capability?: unknown }).capability;
+        if (cap !== undefined && !isAllowedDurableCapability(cap)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `details.run.capability has unsupported value ${String(cap)}`,
+            },
+          };
+        }
+      }
+      // Presentation results must not advertise unsupported resume capabilities.
+      if (Array.isArray(details.results)) {
+        for (let i = 0; i < details.results.length; i++) {
+          const result = details.results[i];
+          if (!result || typeof result !== 'object') continue;
+          const resumeCapability = (result as { resumeCapability?: unknown }).resumeCapability;
+          if (resumeCapability !== undefined && !isAllowedDurableCapability(resumeCapability)) {
+            return {
+              ok: false,
+              error: {
+                code: 'corrupt_run',
+                runId: expectedRunId,
+                message: `details.results[${i}].resumeCapability has unsupported value ${String(resumeCapability)}`,
+              },
+            };
+          }
+        }
       }
     }
     if (r.continuationTasks !== undefined) {
@@ -405,6 +605,242 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
   }
 
   /**
+   * Validate that a unit key and its step/fanoutIndex fields form the canonical
+   * identity for the stored request topology. Returns an error message or undefined.
+   */
+  function validateUnitCanonicalIdentity(
+    mode: string,
+    request: Record<string, unknown>,
+    unitId: string,
+    unit: { step?: unknown; fanoutIndex?: unknown }
+  ): string | undefined {
+    if (mode === 'single') {
+      if (unitId !== 'single') {
+        return `unit ${unitId} is not the canonical single-mode id`;
+      }
+      if (unit.step !== undefined) {
+        return `unit ${unitId} must not have step in single mode`;
+      }
+      if (unit.fanoutIndex !== undefined) {
+        return `unit ${unitId} must not have fanoutIndex in single mode`;
+      }
+      return undefined;
+    }
+    if (mode === 'parallel') {
+      const match = /^parallel-(\d+)$/.exec(unitId);
+      if (!match) {
+        return `unit ${unitId} is not a canonical parallel id`;
+      }
+      const index = Number(match[1]) - 1;
+      const tasks = request.tasks;
+      if (!Array.isArray(tasks) || index < 0 || index >= tasks.length) {
+        return `unit ${unitId} is outside parallel task range`;
+      }
+      if (unit.fanoutIndex !== index) {
+        return `unit ${unitId} fanoutIndex ${String(unit.fanoutIndex)} does not match canonical index ${index}`;
+      }
+      if (unit.step !== undefined) {
+        return `unit ${unitId} must not have step in parallel mode`;
+      }
+      return undefined;
+    }
+    if (mode === 'chain') {
+      const chain = request.chain;
+      if (!Array.isArray(chain)) {
+        return `unit ${unitId} chain request is invalid`;
+      }
+      const fanoutMatch = /^chain-(\d+)-fanout-(\d+)$/.exec(unitId);
+      if (fanoutMatch) {
+        const step = Number(fanoutMatch[1]);
+        const fanoutIndex = Number(fanoutMatch[2]) - 1;
+        if (step < 1 || step > chain.length) {
+          return `unit ${unitId} step is outside chain range`;
+        }
+        const entry = chain[step - 1];
+        const isFanout =
+          entry !== null && typeof entry === 'object' && 'expand' in entry && !('agent' in entry);
+        if (!isFanout) {
+          return `unit ${unitId} targets a non-fanout chain step`;
+        }
+        if (unit.step !== step) {
+          return `unit ${unitId} step ${String(unit.step)} does not match canonical step ${step}`;
+        }
+        if (unit.fanoutIndex !== fanoutIndex) {
+          return `unit ${unitId} fanoutIndex ${String(unit.fanoutIndex)} does not match canonical index ${fanoutIndex}`;
+        }
+        // Canonical id form must match helpers (rejects non-padded aliases).
+        try {
+          if (unitId !== chainFanoutUnitId(step, fanoutIndex)) {
+            return `unit ${unitId} is not the canonical fanout id`;
+          }
+        } catch {
+          return `unit ${unitId} has invalid fanout identity`;
+        }
+        return undefined;
+      }
+      const seqMatch = /^chain-(\d+)$/.exec(unitId);
+      if (!seqMatch) {
+        return `unit ${unitId} is not a canonical chain id`;
+      }
+      const step = Number(seqMatch[1]);
+      if (step < 1 || step > chain.length) {
+        return `unit ${unitId} step is outside chain range`;
+      }
+      const entry = chain[step - 1];
+      const isFanout =
+        entry !== null && typeof entry === 'object' && 'expand' in entry && !('agent' in entry);
+      if (isFanout) {
+        return `unit ${unitId} targets a fanout chain step without fanout identity`;
+      }
+      if (unit.step !== step) {
+        return `unit ${unitId} step ${String(unit.step)} does not match canonical step ${step}`;
+      }
+      if (unit.fanoutIndex !== undefined) {
+        return `unit ${unitId} must not have fanoutIndex on a sequential step`;
+      }
+      try {
+        if (unitId !== chainStepUnitId(step)) {
+          return `unit ${unitId} is not the canonical sequential id`;
+        }
+      } catch {
+        return `unit ${unitId} has invalid sequential identity`;
+      }
+      return undefined;
+    }
+    return `unit ${unitId} has unsupported mode ${mode}`;
+  }
+
+  /**
+   * Require exact coverage of statically known unit ids for the request topology.
+   * Dynamic fanout children may appear only as canonical fanout unit ids.
+   */
+  function validateStaticUnitCoverage(
+    mode: string,
+    request: Record<string, unknown>,
+    units: Record<string, unknown>
+  ): string | undefined {
+    const unitKeys = Object.keys(units);
+    if (mode === 'single') {
+      if (unitKeys.length !== 1 || unitKeys[0] !== 'single') {
+        return `static unit coverage invalid for single mode: expected exactly [single], got [${unitKeys.join(', ')}]`;
+      }
+      return undefined;
+    }
+    if (mode === 'parallel') {
+      const tasks = request.tasks;
+      if (!Array.isArray(tasks)) {
+        return 'static unit coverage invalid: parallel request.tasks is not an array';
+      }
+      const expected = Array.from({ length: tasks.length }, (_, i) => `parallel-${pad(i + 1)}`);
+      if (unitKeys.length !== expected.length) {
+        return `static unit coverage invalid for parallel mode: expected ${expected.length} units, got ${unitKeys.length}`;
+      }
+      for (const id of expected) {
+        if (!(id in units)) {
+          return `static unit coverage invalid for parallel mode: missing ${id}`;
+        }
+      }
+      for (const id of unitKeys) {
+        if (!expected.includes(id)) {
+          return `static unit coverage invalid for parallel mode: unexpected unit ${id}`;
+        }
+      }
+      return undefined;
+    }
+    if (mode === 'chain') {
+      const expectedStatic = generateUnitIds('chain', {
+        chain: Array.isArray(request.chain) ? request.chain : [],
+      });
+      for (const id of expectedStatic) {
+        if (!(id in units)) {
+          return `static unit coverage invalid for chain mode: missing ${id}`;
+        }
+      }
+      for (const id of unitKeys) {
+        if (expectedStatic.includes(id)) continue;
+        // Dynamic fanout children only; reject extra sequential or arbitrary ids.
+        if (!/^chain-\d+-fanout-\d+$/.test(id)) {
+          return `static unit coverage invalid for chain mode: unexpected unit ${id}`;
+        }
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve the agent name selected by the stored request topology for a unit.
+   * Used so preflight/dispatch cannot apply a different agent than durability.
+   * Returns undefined when the unit position cannot be resolved from the request.
+   */
+  function expectedTopologyAgent(
+    mode: string,
+    request: Record<string, unknown>,
+    unitId: string,
+    unit: { step?: unknown; fanoutIndex?: unknown }
+  ): string | undefined {
+    if (mode === 'single') {
+      return typeof request.agent === 'string' ? request.agent : undefined;
+    }
+    if (mode === 'parallel') {
+      const tasks = request.tasks;
+      if (!Array.isArray(tasks)) return undefined;
+      let index: number | undefined;
+      if (typeof unit.fanoutIndex === 'number' && Number.isInteger(unit.fanoutIndex)) {
+        index = unit.fanoutIndex;
+      } else {
+        const match = /^parallel-(\d+)$/.exec(unitId);
+        if (match) index = Number(match[1]) - 1;
+      }
+      if (index === undefined || index < 0 || index >= tasks.length) return undefined;
+      const item = tasks[index];
+      if (!item || typeof item !== 'object') return undefined;
+      const agent = (item as { agent?: unknown }).agent;
+      return typeof agent === 'string' ? agent : undefined;
+    }
+    if (mode === 'chain') {
+      const chain = request.chain;
+      if (!Array.isArray(chain)) return undefined;
+      let step: number | undefined;
+      if (typeof unit.step === 'number' && Number.isInteger(unit.step)) {
+        step = unit.step;
+      } else {
+        const fanoutMatch = /^chain-(\d+)-fanout-(\d+)$/.exec(unitId);
+        if (fanoutMatch) {
+          step = Number(fanoutMatch[1]);
+        } else {
+          const seqMatch = /^chain-(\d+)$/.exec(unitId);
+          if (seqMatch) step = Number(seqMatch[1]);
+        }
+      }
+      if (step === undefined || step < 1 || step > chain.length) return undefined;
+      const entry = chain[step - 1];
+      if (!entry || typeof entry !== 'object') return undefined;
+      const isFanout = 'expand' in entry && !('agent' in entry);
+      const hasFanoutIndex =
+        typeof unit.fanoutIndex === 'number' && Number.isInteger(unit.fanoutIndex);
+      // Fanout child units must use the parallel agent; sequential units use step.agent.
+      if (isFanout) {
+        if (!hasFanoutIndex && !/^chain-\d+-fanout-\d+$/.test(unitId)) {
+          // Sequential-shaped unit claiming a fanout step has no topology agent.
+          return undefined;
+        }
+        const parallel = (entry as { parallel?: unknown }).parallel;
+        if (!parallel || typeof parallel !== 'object') return undefined;
+        const agent = (parallel as { agent?: unknown }).agent;
+        return typeof agent === 'string' ? agent : undefined;
+      }
+      if (hasFanoutIndex) {
+        // Fanout index on a sequential step is not a valid topology position.
+        return undefined;
+      }
+      const agent = (entry as { agent?: unknown }).agent;
+      return typeof agent === 'string' ? agent : undefined;
+    }
+    return undefined;
+  }
+
+  /**
    * Validate StoredRunRequest shape and mode/topology consistency.
    * Returns an error message or undefined when valid. Never throws.
    */
@@ -432,6 +868,9 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
       if (req[key] !== undefined && typeof req[key] !== 'string') {
         return `request.${key} is not a string`;
       }
+    }
+    if (req.runtime !== undefined && !isAllowedDurableRuntime(req.runtime)) {
+      return `request.runtime has unsupported value ${String(req.runtime)}`;
     }
     if (mode === 'single') {
       if (typeof req.agent !== 'string' || typeof req.task !== 'string') {

@@ -28,7 +28,7 @@ const failure = {
   content: [
     {
       type: 'text',
-      text: 'resume_error: preflight_failed: unit single: requires replay',
+      text: 'resume_error: preflight_failed: unit single: ACP session unavailable',
     },
   ],
 };

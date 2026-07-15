@@ -9,7 +9,7 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig, AgentScope, Runtime } from './agents.ts';
 import { discoverAgents } from './agents.ts';
-import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
+import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
 import { getPiInvocation, buildPiRpcArgs, writePromptToTempFile } from './invocation.ts';
 import {
   isPiRpcTransportExitEvent,
@@ -1464,9 +1464,10 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
 
   /**
    * Validate Grok ACP registerInitial/resume against authoritative RunStore.
-   * Requires runtime=grok-acp, capability=session, exact trimmed session ID,
-   * and rejects replay-capability bypass. When a binding already exists for
-   * this host, bindingId/hostSessionId/createdAt must match the endpoint link.
+   * Requires runtime=grok-acp, session-only capability (`capability=session`),
+   * and an exact trimmed ACP session ID that matches the unit's stored
+   * `acpSessionId`. When a binding already exists for this host,
+   * bindingId/hostSessionId/createdAt must match the endpoint link.
    */
   function validateGrokAcpRegistrationFromStore(input: {
     runId: string;
@@ -1503,7 +1504,6 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         `Grok ACP registration requires runtime=grok-acp (got ${runtime})`
       );
     }
-    // Never allow replay capability to register as an interactive session endpoint.
     if (unit.capability !== 'session') {
       throw new InteractiveAgentError(
         'validation_error',
@@ -2074,23 +2074,14 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     if (!unit) return { ok: false, reason: 'unit_not_found' };
     const runtime = unit.runtime ?? record.request.runtime ?? DEFAULT_RUNTIME;
 
-    // Plain Grok is never interactive. Grok ACP requires session capability + ID.
-    if (runtime === GROK_RUNTIME) {
-      return { ok: false, reason: 'non_pi_runtime' };
-    }
-
     if (runtime === GROK_ACP_RUNTIME) {
       // Grok ACP requires a durable protocol session ID and session capability.
-      // Legacy attempted units stored as capability "replay" are not trusted until
-      // the first successful ID write normalizes them to "session".
       const acpId = unit.acpSessionId?.trim();
       if (!acpId || unit.acpSessionId !== acpId) {
         return { ok: false, reason: 'acp_session_unavailable' };
       }
-      if (unit.capability !== 'session') {
-        return { ok: false, reason: 'non_session_capability' };
-      }
-    } else if (unit.capability !== 'session') {
+    }
+    if (unit.capability !== 'session') {
       return { ok: false, reason: 'non_session_capability' };
     }
 

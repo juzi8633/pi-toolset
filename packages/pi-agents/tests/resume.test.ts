@@ -12,6 +12,8 @@ import {
   incrementIncompleteAttempts,
   inspectResume,
   isNeverStartedUnit,
+  preflightAndClaim,
+  reopenCompletedUnitsForResume,
   reconcileDeadOwnerUnits,
   validateFanoutResumeState,
 } from '../src/resume.ts';
@@ -47,7 +49,6 @@ async function startDurableRunSync(
     filePath: '/tmp/test.md',
   };
   const fp = agentFingerprint(agentConfig);
-  const isGrok = agentConfig.runtime === 'grok' || agentConfig.runtime === 'grok-acp';
   const unitId = mode === 'single' ? 'single' : 'parallel-0001';
   const request =
     mode === 'single'
@@ -86,7 +87,7 @@ async function startDurableRunSync(
         agent: agentConfig.name,
         agentFingerprint: fp,
         runtime: agentConfig.runtime ?? undefined,
-        capability: (isGrok ? 'replay' : 'session') as 'session' | 'replay',
+        capability: 'session',
         status: unitStatus,
         attempt: 1,
         attempts: [],
@@ -432,16 +433,68 @@ describe('runChainWorkflow with restored state', () => {
 // --- Resume preflight tests (Task 7) ---
 
 describe('inspectResume', () => {
-  it('rejects a completed run', async () => {
+  it('allows a completed run with a continuation by treating completed units as resume targets', async () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
       const store = createRunStore({ rootDir: tmpRoot });
       const coordinator = createRunCoordinator({ store });
-      // Create a completed run.
-      const { runId } = await startDurableRunSync(store, coordinator, 'single', 'completed');
-      const result = inspectResume(runId, store, { agents: [] });
-      expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.reason).toContain('completed');
+      const agent: AgentConfig = {
+        name: 'test-agent',
+        description: 'test',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/test.md',
+      };
+      const { runId } = await startDurableRunSync(store, coordinator, 'single', 'completed', agent);
+      // Attach a session artifact so session-capable preflight can succeed.
+      await store.updateRun(runId, (r) => {
+        const unit = r.units['single'];
+        if (unit) {
+          unit.sessionFile = path.join(tmpRoot, 'session.jsonl');
+          writeFileSync(unit.sessionFile, '{}\n');
+        }
+      });
+      const result = inspectResume(runId, store, { agents: [agent], hasContinuation: true });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.status).toBe('completed');
+      expect(result.incompleteUnits).toHaveLength(1);
+      expect(result.incompleteUnits[0]?.status).toBe('completed');
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a completed run without a continuation instruction', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const agent: AgentConfig = {
+        name: 'test-agent',
+        description: 'test',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/test.md',
+      };
+      const { runId } = await startDurableRunSync(store, coordinator, 'single', 'completed', agent);
+      await store.updateRun(runId, (r) => {
+        const unit = r.units['single'];
+        if (unit) {
+          unit.sessionFile = path.join(tmpRoot, 'session.jsonl');
+          writeFileSync(unit.sessionFile, '{}\n');
+        }
+      });
+      const withoutFlag = inspectResume(runId, store, { agents: [agent] });
+      expect(withoutFlag.ok).toBe(false);
+      if (!withoutFlag.ok) expect(withoutFlag.reason).toBe('completed_without_continuation');
+
+      const explicitFalse = inspectResume(runId, store, {
+        agents: [agent],
+        hasContinuation: false,
+      });
+      expect(explicitFalse.ok).toBe(false);
+      if (!explicitFalse.ok) expect(explicitFalse.reason).toBe('completed_without_continuation');
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -490,18 +543,18 @@ describe('inspectResume', () => {
     }
   });
 
-  it('reports replay requirement without allowReplay', async () => {
+  it('blocks when durable unit runtime disagrees with effective dispatch runtime', async () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
       const store = createRunStore({ rootDir: tmpRoot });
       const coordinator = createRunCoordinator({ store });
+      // Agent fingerprint is Pi-default (no runtime on config).
       const agent: AgentConfig = {
-        name: 'grok-agent',
-        description: 'grok',
+        name: 'test-agent',
+        description: 'test',
         systemPrompt: '',
         source: 'builtin',
-        filePath: '/tmp/grok.md',
-        runtime: 'grok',
+        filePath: '/tmp/test.md',
       };
       const { runId } = await startDurableRunSync(
         store,
@@ -510,21 +563,72 @@ describe('inspectResume', () => {
         'interrupted',
         agent
       );
-      const result = inspectResume(runId, store, {
-        agents: [agent],
-        allowReplay: false,
+      await store.updateRun(runId, (r) => {
+        const unit = r.units['single'];
+        if (unit) {
+          // Durable unit claims grok-acp while fingerprint still matches the Pi agent
+          // (simulates override-stamped runtime after request.runtime was lost).
+          unit.runtime = 'grok-acp';
+          unit.sessionFile = path.join(tmpRoot, 'session.jsonl');
+          writeFileSync(unit.sessionFile, '{}\n');
+        }
       });
+      // Fingerprint-matched agent still resolves dispatch to pi (no request override).
+      const result = inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.requiresReplay).toBe(true);
-        expect(result.blockingReasons.some((r) => r.includes('replay'))).toBe(true);
-      }
+      if (!result.ok) return;
+      expect(result.blockingReasons.some((r) => r.includes('runtime mismatch'))).toBe(true);
+      expect(result.blockingReasons.some((r) => r.includes('durable grok-acp'))).toBe(true);
+      expect(result.blockingReasons.some((r) => r.includes('dispatch pi'))).toBe(true);
+      // Block before artifact logic: durable is grok-acp but we must not require ACP
+      // session once the runtime mismatch is already blocking.
+      expect(result.blockingReasons.some((r) => r.includes('acp_session_unavailable'))).toBe(false);
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
   });
 
-  it('blocks attempted Grok ACP units missing acpSessionId without allowReplay escape', async () => {
+  it('preserves request.runtime override as effective dispatch runtime', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      // Agent config is Pi; fingerprint stays Pi. Launch override stamps unit runtime.
+      const agent: AgentConfig = {
+        name: 'test-agent',
+        description: 'test',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/test.md',
+      };
+      const { runId } = await startDurableRunSync(
+        store,
+        coordinator,
+        'single',
+        'interrupted',
+        agent
+      );
+      await store.updateRun(runId, (r) => {
+        // Explicit request override matches durable unit runtime (dispatch path).
+        r.request.runtime = 'grok-acp';
+        const unit = r.units['single'];
+        if (unit) {
+          unit.runtime = 'grok-acp';
+          unit.acpSessionId = 'sess-1';
+        }
+      });
+      const result = inspectResume(runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // Override wins over agent.runtime (pi); durable grok-acp matches dispatch.
+      expect(result.blockingReasons.some((r) => r.includes('runtime mismatch'))).toBe(false);
+      expect(result.blockingReasons.some((r) => r.includes('acp_session_unavailable'))).toBe(false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks attempted Grok ACP units missing acpSessionId', async () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
       const store = createRunStore({ rootDir: tmpRoot });
@@ -544,20 +648,18 @@ describe('inspectResume', () => {
         'interrupted',
         agent
       );
-      // Legacy attempted unit may still store capability "replay" without an ID.
+      // Attempted Grok ACP unit without an ID must fail closed.
       await store.updateRun(runId, (r) => {
         r.units.single!.runtime = 'grok-acp';
-        r.units.single!.capability = 'replay';
+        r.units.single!.capability = 'session';
         r.units.single!.effectiveCwd = tmpRoot;
         delete r.units.single!.acpSessionId;
       });
       const result = inspectResume(runId, store, {
         agents: [agent],
-        allowReplay: true,
       });
       expect(result.ok).toBe(true);
       if (result.ok) {
-        expect(result.requiresReplay).toBe(false);
         expect(result.blockingReasons.some((r) => r.includes('acp_session_unavailable'))).toBe(
           true
         );
@@ -600,7 +702,6 @@ describe('inspectResume', () => {
       const result = inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
-        expect(result.requiresReplay).toBe(false);
         expect(result.blockingReasons).toEqual([]);
       }
     } finally {
@@ -608,7 +709,7 @@ describe('inspectResume', () => {
     }
   });
 
-  it('allows attempted Grok ACP units with a stored acpSessionId without allowReplay', async () => {
+  it('allows attempted Grok ACP units with a stored acpSessionId', async () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
       const store = createRunStore({ rootDir: tmpRoot });
@@ -637,7 +738,6 @@ describe('inspectResume', () => {
       const result = inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
-        expect(result.requiresReplay).toBe(false);
         expect(result.blockingReasons).toEqual([]);
       }
     } finally {
@@ -680,7 +780,6 @@ describe('inspectResume', () => {
       });
       const result = inspectResume(runId, store, {
         agents: [agent],
-        allowReplay: true,
       });
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -895,18 +994,17 @@ describe('inspectResume', () => {
     }
   });
 
-  it('does not mutate continuationTasks when preflight fails', async () => {
+  it('blocks a skipped attempted unit with a missing session artifact', async () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
       const store = createRunStore({ rootDir: tmpRoot });
       const coordinator = createRunCoordinator({ store });
       const agent: AgentConfig = {
-        name: 'grok-agent',
-        description: 'grok',
+        name: 'pi-agent',
+        description: 'pi',
         systemPrompt: '',
         source: 'builtin',
-        filePath: '/tmp/grok.md',
-        runtime: 'grok',
+        filePath: '/tmp/pi.md',
       };
       const { runId } = await startDurableRunSync(
         store,
@@ -915,18 +1013,116 @@ describe('inspectResume', () => {
         'interrupted',
         agent
       );
-      // Preflight blocks on missing allowReplay; inspect is non-mutating.
-      const result = inspectResume(runId, store, {
-        agents: [agent],
-        allowReplay: false,
+      const missingSession = path.join(tmpRoot, 'skipped-missing-session.jsonl');
+      await store.updateRun(runId, (r) => {
+        r.status = 'interrupted';
+        r.units.single!.status = 'skipped';
+        r.units.single!.capability = 'session';
+        r.units.single!.sessionFile = missingSession;
+        r.units.single!.attempts = [
+          { attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 },
+        ];
+        r.units.single!.effectiveCwd = tmpRoot;
       });
+      const result = inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
-      if (result.ok) expect(result.blockingReasons.length).toBeGreaterThan(0);
-      const loaded = store.getRun(runId);
+      if (!result.ok) return;
+      expect(result.incompleteUnits).toHaveLength(1);
+      expect(result.incompleteUnits[0]?.status).toBe('skipped');
+      expect(result.blockingReasons.some((b) => b.includes('session file missing'))).toBe(true);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('selectively resumes skipped never-started units and leaves completed siblings completed', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const agent: AgentConfig = {
+        name: 'pi-agent',
+        description: 'pi',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/pi.md',
+      };
+      const fp = agentFingerprint(agent);
+      const sessionFile = path.join(tmpRoot, 'completed-sibling.jsonl');
+      writeFileSync(sessionFile, '{}\n');
+      const created = await store.createRun({
+        mode: 'parallel',
+        agentScope: 'user',
+        background: false,
+        request: {
+          mode: 'parallel',
+          agentScope: 'user',
+          tasks: [
+            { agent: agent.name, task: 'done' },
+            { agent: agent.name, task: 'skipped never started' },
+          ],
+        },
+        details: {
+          mode: 'parallel',
+          agentScope: 'user',
+          projectAgentsDir: null,
+          builtinAgentsDir: '/tmp',
+          results: [],
+        },
+        units: {
+          'parallel-0001': {
+            unitId: 'parallel-0001',
+            agent: agent.name,
+            agentFingerprint: fp,
+            runtime: undefined,
+            capability: 'session',
+            status: 'completed',
+            fanoutIndex: 0,
+            attempt: 1,
+            attempts: [{ attempt: 1, status: 'completed', startedAt: 1, finishedAt: 2 }],
+            effectiveCwd: tmpRoot,
+            sessionFile,
+          },
+          'parallel-0002': {
+            unitId: 'parallel-0002',
+            agent: agent.name,
+            agentFingerprint: fp,
+            runtime: undefined,
+            capability: 'session',
+            status: 'skipped',
+            fanoutIndex: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: tmpRoot,
+          },
+        },
+      });
+      await store.updateRun(created.runId, (r) => {
+        r.status = 'interrupted';
+      });
+
+      const result = inspectResume(created.runId, store, { agents: [agent] });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.incompleteUnits).toHaveLength(1);
+      expect(result.incompleteUnits[0]?.unitId).toBe('parallel-0002');
+      expect(result.incompleteUnits[0]?.status).toBe('skipped');
+      expect(result.blockingReasons).toEqual([]);
+
+      // Apply reopen + increment against a durable-shaped copy of the units.
+      const loaded = store.getRun(created.runId);
       expect(loaded.ok).toBe(true);
       if (!loaded.ok) return;
-      expect(loaded.loaded.record.continuationTasks).toBeUndefined();
-      expect(loaded.loaded.record.status).toBe('interrupted');
+      const staged: Record<string, RunUnitRecord> = {};
+      for (const [id, unit] of Object.entries(loaded.loaded.record.units)) {
+        staged[id] = { ...unit, attempts: [...unit.attempts] };
+      }
+      reopenCompletedUnitsForResume(staged);
+      incrementIncompleteAttempts(staged);
+      expect(staged['parallel-0001']!.status).toBe('completed');
+      expect(staged['parallel-0001']!.attempt).toBe(1);
+      expect(staged['parallel-0002']!.status).toBe('queued');
+      expect(staged['parallel-0002']!.attempt).toBe(1);
+      expect(staged['parallel-0002']!.attempts).toHaveLength(0);
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -1025,6 +1221,43 @@ describe('isNeverStartedUnit', () => {
   });
 });
 
+describe('reopenCompletedUnitsForResume', () => {
+  it('reopens completed units only when every unit is truly completed', () => {
+    const units: Record<string, RunUnitRecord> = {
+      a: { ...makeUnitRecord('completed'), unitId: 'a' },
+      b: { ...makeUnitRecord('completed'), unitId: 'b' },
+    };
+    reopenCompletedUnitsForResume(units);
+    expect(units.a!.status).toBe('interrupted');
+    expect(units.b!.status).toBe('interrupted');
+  });
+
+  it('leaves completed siblings alone when any incomplete unit remains', () => {
+    const units: Record<string, RunUnitRecord> = {
+      done: { ...makeUnitRecord('completed'), unitId: 'done' },
+      open: { ...makeUnitRecord('interrupted'), unitId: 'open' },
+    };
+    reopenCompletedUnitsForResume(units);
+    expect(units.done!.status).toBe('completed');
+    expect(units.open!.status).toBe('interrupted');
+  });
+
+  it('does not reopen completed units when a skipped sibling remains', () => {
+    const units: Record<string, RunUnitRecord> = {
+      done: { ...makeUnitRecord('completed'), unitId: 'done' },
+      skipped: {
+        ...makeUnitRecord('completed'),
+        unitId: 'skipped',
+        status: 'skipped',
+        attempts: [],
+      },
+    };
+    reopenCompletedUnitsForResume(units);
+    expect(units.done!.status).toBe('completed');
+    expect(units.skipped!.status).toBe('skipped');
+  });
+});
+
 describe('incrementIncompleteAttempts', () => {
   it('does not increment never-started queued/skipped units', () => {
     const units: Record<string, RunUnitRecord> = {
@@ -1101,7 +1334,14 @@ describe('validateFanoutResumeState', () => {
       request: {
         mode: 'chain',
         agentScope: 'user',
-        chain: [{ agent: 'seed', task: 'seed' }],
+        chain: [
+          { agent: 'seed', task: 'seed' },
+          {
+            expand: { from: { output: 'seed', path: '/items' } },
+            parallel: { agent: 'worker', task: 't' },
+            collect: { name: 'out' },
+          },
+        ],
       },
       background: false,
       agentScope: 'user',
@@ -1195,6 +1435,319 @@ describe('validateFanoutResumeState', () => {
       baseRecord(units, { [chainFanoutStepId(2)]: mapping })
     );
     expect(reasons.some((r) => r.includes('not canonical'))).toBe(true);
+  });
+
+  it('does not require mappings for completed fanout steps under selective resume', () => {
+    const ids = [0, 1].map((i) => chainFanoutUnitId(2, i));
+    const units = {
+      [ids[0]!]: fanoutUnit(2, 0, 'completed', makeFanoutResult(0, 'completed', 'a')),
+      [ids[1]!]: fanoutUnit(2, 1, 'completed', makeFanoutResult(1, 'completed', 'b')),
+      'chain-0001': {
+        ...makeUnitRecord('interrupted'),
+        unitId: 'chain-0001',
+        step: 1,
+      },
+    };
+    const record = baseRecord(units);
+    // Logical fanout step is completed; selective resume targets an earlier unit.
+    const steps = record.details.chain!.steps;
+    const fanoutStep = steps[1]!;
+    if (fanoutStep.kind === 'fanout') {
+      fanoutStep.status = 'completed';
+      fanoutStep.completedCount = 2;
+      fanoutStep.queuedCount = 0;
+    }
+    const reasons = validateFanoutResumeState(record);
+    expect(reasons).toEqual([]);
+  });
+
+  it('requires frozen mapping for completed fanout steps on completed-run continuation', () => {
+    const ids = [0, 1].map((i) => chainFanoutUnitId(2, i));
+    const units = {
+      [ids[0]!]: fanoutUnit(2, 0, 'completed', makeFanoutResult(0, 'completed', 'a')),
+      [ids[1]!]: fanoutUnit(2, 1, 'completed', makeFanoutResult(1, 'completed', 'b')),
+    };
+    const missing = baseRecord(units);
+    const missingFanout = missing.details.chain!.steps[1]!;
+    if (missingFanout.kind === 'fanout') {
+      missingFanout.status = 'completed';
+      missingFanout.completedCount = 2;
+      missingFanout.queuedCount = 0;
+    }
+    const without = validateFanoutResumeState(missing, {
+      requireCompletedFanoutMappings: true,
+    });
+    expect(without.some((r) => r.includes('stored_fanout_state_unavailable'))).toBe(true);
+
+    const mapping: WorkflowFanoutState = {
+      step: 2,
+      items: ['a', 'b'],
+      unitIds: ids,
+    };
+    const mapped = baseRecord(units, { [chainFanoutStepId(2)]: mapping });
+    const mappedFanout = mapped.details.chain!.steps[1]!;
+    if (mappedFanout.kind === 'fanout') {
+      mappedFanout.status = 'completed';
+      mappedFanout.completedCount = 2;
+      mappedFanout.queuedCount = 0;
+    }
+    expect(validateFanoutResumeState(mapped, { requireCompletedFanoutMappings: true })).toEqual([]);
+  });
+
+  it('derives completed fanout steps from durable units when chain.steps is absent', () => {
+    const ids = [0, 1].map((i) => chainFanoutUnitId(2, i));
+    const units = {
+      [ids[0]!]: fanoutUnit(2, 0, 'completed', makeFanoutResult(0, 'completed', 'a')),
+      [ids[1]!]: fanoutUnit(2, 1, 'completed', makeFanoutResult(1, 'completed', 'b')),
+    };
+    // Presentation metadata intentionally omitted/stale: no chain steps at all.
+    const durableOnly: AgentRunRecordV1 = {
+      ...baseRecord(units),
+      details: {
+        mode: 'chain',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+    };
+    const without = validateFanoutResumeState(durableOnly, {
+      requireCompletedFanoutMappings: true,
+    });
+    expect(without.some((r) => r.includes('stored_fanout_state_unavailable'))).toBe(true);
+    expect(without.some((r) => r.includes('step 2'))).toBe(true);
+
+    const mapping: WorkflowFanoutState = {
+      step: 2,
+      items: ['a', 'b'],
+      unitIds: ids,
+    };
+    const mapped: AgentRunRecordV1 = {
+      ...durableOnly,
+      workflowState: { fanouts: { [chainFanoutStepId(2)]: mapping } },
+    };
+    expect(validateFanoutResumeState(mapped, { requireCompletedFanoutMappings: true })).toEqual([]);
+
+    // Selective resume (no requireCompleted) still does not demand mappings for
+    // fully completed durable children when nothing else is incomplete.
+    expect(validateFanoutResumeState(durableOnly)).toEqual([]);
+  });
+
+  it('requires empty fanout mapping from request.chain on completed continuation', () => {
+    const units: Record<string, RunUnitRecord> = {
+      'chain-0001': {
+        ...makeUnitRecord('completed'),
+        unitId: 'chain-0001',
+        step: 1,
+        agent: 'seed',
+        result: makeCompletedResult('seed', JSON.stringify({ items: [] }), 1),
+      },
+    };
+    const requestWithEmptyFanout: AgentRunRecordV1 = {
+      ...baseRecord(units),
+      request: {
+        mode: 'chain',
+        agentScope: 'user',
+        chain: [
+          { agent: 'seed', task: 'seed' },
+          {
+            expand: { from: { output: 'seed', path: '/items' } },
+            parallel: { agent: 'worker', task: 'Process {item}' },
+            collect: { name: 'out' },
+          },
+        ],
+      },
+      details: {
+        mode: 'chain',
+        agentScope: 'user',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+        results: [],
+        // Presentation may claim the empty fanout completed without a mapping.
+        chain: {
+          totalSteps: 2,
+          steps: [
+            {
+              kind: 'sequential',
+              step: 1,
+              agent: 'seed',
+              task: 'seed',
+              status: 'completed',
+            },
+            {
+              kind: 'fanout',
+              step: 2,
+              agent: 'worker',
+              taskTemplate: 'Process {item}',
+              status: 'completed',
+              sourceOutput: 'seed',
+              sourcePath: '/items',
+              collectName: 'out',
+              executedCount: 0,
+              completedCount: 0,
+              failedCount: 0,
+              runningCount: 0,
+              queuedCount: 0,
+              skippedCount: 0,
+            },
+          ],
+        },
+      },
+    };
+
+    const without = validateFanoutResumeState(requestWithEmptyFanout, {
+      requireCompletedFanoutMappings: true,
+    });
+    expect(without.some((r) => r.includes('stored_fanout_state_unavailable'))).toBe(true);
+    expect(without.some((r) => r.includes('step 2'))).toBe(true);
+
+    const emptyMapping: WorkflowFanoutState = { step: 2, items: [], unitIds: [] };
+    const withMapping: AgentRunRecordV1 = {
+      ...requestWithEmptyFanout,
+      workflowState: { fanouts: { [chainFanoutStepId(2)]: emptyMapping } },
+    };
+    expect(
+      validateFanoutResumeState(withMapping, { requireCompletedFanoutMappings: true })
+    ).toEqual([]);
+  });
+
+  it('rejects wrong mapping key/step and truncated durable bijection', () => {
+    const ids = [0, 1].map((i) => chainFanoutUnitId(2, i));
+    const units = {
+      [ids[0]!]: fanoutUnit(2, 0, 'interrupted'),
+      [ids[1]!]: fanoutUnit(2, 1, 'interrupted'),
+    };
+
+    // Mapping step does not match the storage key (step 3 is also not a fanout).
+    const wrongKey: WorkflowFanoutState = {
+      step: 3,
+      items: ['a', 'b'],
+      unitIds: [chainFanoutUnitId(3, 0), chainFanoutUnitId(3, 1)],
+    };
+    const wrongKeyRecord = baseRecord(
+      {
+        [chainFanoutUnitId(3, 0)]: fanoutUnit(3, 0, 'interrupted'),
+        [chainFanoutUnitId(3, 1)]: fanoutUnit(3, 1, 'interrupted'),
+      },
+      // Stored under step-2 key but mapping.step is 3.
+      { [chainFanoutStepId(2)]: wrongKey }
+    );
+    // Force validation of step 2 so the wrong-key entry is inspected.
+    wrongKeyRecord.details.chain!.steps[1]!.status = 'interrupted';
+    const wrongKeyReasons = validateFanoutResumeState(wrongKeyRecord);
+    expect(
+      wrongKeyReasons.some(
+        (r) =>
+          r.includes('key/step mismatch') ||
+          r.includes('has no persisted expansion') ||
+          r.includes('is not a fanout request step')
+      )
+    ).toBe(true);
+
+    // Truncated mapping: only first child mapped while two durable children exist.
+    const truncated: WorkflowFanoutState = {
+      step: 2,
+      items: ['a'],
+      unitIds: [ids[0]!],
+    };
+    const truncatedReasons = validateFanoutResumeState(
+      baseRecord(units, { [chainFanoutStepId(2)]: truncated })
+    );
+    expect(
+      truncatedReasons.some(
+        (r) =>
+          r.includes('durable children') ||
+          r.includes('missing or misplaced') ||
+          r.includes('not canonical')
+      )
+    ).toBe(true);
+
+    // Complete canonical mapping is accepted.
+    const complete: WorkflowFanoutState = {
+      step: 2,
+      items: ['a', 'b'],
+      unitIds: ids,
+    };
+    expect(
+      validateFanoutResumeState(baseRecord(units, { [chainFanoutStepId(2)]: complete }))
+    ).toEqual([]);
+  });
+
+  it('rejects alias fanout mapping keys even when the canonical key is valid', () => {
+    const ids = [0, 1].map((i) => chainFanoutUnitId(2, i));
+    const units = {
+      [ids[0]!]: fanoutUnit(2, 0, 'interrupted'),
+      [ids[1]!]: fanoutUnit(2, 1, 'interrupted'),
+    };
+    const canonical: WorkflowFanoutState = {
+      step: 2,
+      items: ['a', 'b'],
+      unitIds: ids,
+    };
+    // Alias key claims the same step; must fail independently of the canonical entry.
+    const alias: WorkflowFanoutState = {
+      step: 2,
+      items: ['a', 'b'],
+      unitIds: ids,
+    };
+    const reasons = validateFanoutResumeState(
+      baseRecord(units, {
+        [chainFanoutStepId(2)]: canonical,
+        'chain-0002-fanout-alias': alias,
+      })
+    );
+    expect(reasons.some((r) => r.includes('key/step mismatch'))).toBe(true);
+    expect(reasons.some((r) => r.includes('chain-0002-fanout-alias'))).toBe(true);
+  });
+
+  it('safely rejects malformed mapping objects/arrays without throwing', () => {
+    const units = {
+      [chainFanoutUnitId(2, 0)]: fanoutUnit(2, 0, 'interrupted'),
+    };
+    const record = baseRecord(units);
+    record.details.chain!.steps[1]!.status = 'interrupted';
+
+    const cases: unknown[] = [
+      null,
+      'string',
+      42,
+      [],
+      { step: 'two', items: [], unitIds: [] },
+      { step: 2, items: 'not-array', unitIds: [] },
+      { step: 2, items: [], unitIds: 'not-array' },
+      { step: 2, items: [1], unitIds: [1] },
+      { step: 1, items: [], unitIds: [] }, // sequential step, not fanout
+    ];
+    for (const mapping of cases) {
+      const withMapping = {
+        ...record,
+        workflowState: {
+          fanouts: { [chainFanoutStepId(2)]: mapping as WorkflowFanoutState },
+        },
+      };
+      let reasons: string[] = [];
+      expect(() => {
+        reasons = validateFanoutResumeState(withMapping);
+      }).not.toThrow();
+      expect(reasons.some((r) => r.includes('stored_fanout_state_unavailable'))).toBe(true);
+    }
+  });
+
+  it('rejects mapping.step that is not a fanout request step', () => {
+    const units = {
+      [chainFanoutUnitId(2, 0)]: fanoutUnit(2, 0, 'interrupted'),
+    };
+    // Mapping claims step 1 which is sequential seed in baseRecord.
+    const mapping: WorkflowFanoutState = {
+      step: 1,
+      items: ['a'],
+      unitIds: [chainFanoutUnitId(1, 0)],
+    };
+    const record = baseRecord(units, { [chainFanoutStepId(1)]: mapping });
+    record.details.chain!.steps[1]!.status = 'interrupted';
+    // Also validate the step-1 key entry independently.
+    const reasons = validateFanoutResumeState(record);
+    expect(reasons.some((r) => r.includes('is not a fanout request step'))).toBe(true);
   });
 });
 
@@ -1510,5 +2063,297 @@ describe('runChainWorkflow selective fanout resume', () => {
       },
     });
     expect(dispatched.sort()).toEqual([1, 2, 3]);
+  });
+
+  it('reopened completed fanout dispatches every child and replaces stale presentation', async () => {
+    const items = ['a', 'b', 'c'];
+    const unitIds = items.map((_, i) => chainFanoutUnitId(2, i));
+    const stale0 = makeFanoutResult(0, 'completed', 'stale-0');
+    const stale1 = makeFanoutResult(1, 'completed', 'stale-1');
+    const stale2 = makeFanoutResult(2, 'completed', 'stale-2');
+    // Durable units reopened for continuation (interrupted), still carrying old results.
+    const units: Record<string, RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 1,
+        attempt: 2,
+        attempts: [{ attempt: 1, status: 'completed', startedAt: 1, finishedAt: 2 }],
+        effectiveCwd: '/tmp',
+        result: makeCompletedResult('seed', JSON.stringify({ items }), 1),
+      },
+      [unitIds[0]!]: {
+        ...fanoutUnit(2, 0, 'interrupted', stale0),
+        attempt: 2,
+      },
+      [unitIds[1]!]: {
+        ...fanoutUnit(2, 1, 'interrupted', stale1),
+        attempt: 2,
+      },
+      [unitIds[2]!]: {
+        ...fanoutUnit(2, 2, 'interrupted', stale2),
+        attempt: 2,
+      },
+    };
+
+    const calls: { fanoutIndex?: number; task: string }[] = [];
+    const res = await runChainWorkflow({
+      chain: [
+        {
+          agent: 'seed',
+          task: 'seed',
+          name: 'seed',
+          outputSchema: {
+            type: 'object',
+            required: ['items'],
+            properties: { items: { type: 'array', items: { type: 'string' } } },
+          },
+        },
+        {
+          expand: { from: { output: 'seed', path: '/items' } },
+          parallel: { agent: 'worker', task: 'Process {item}' },
+          collect: { name: 'out' },
+        },
+      ],
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        calls.push({ fanoutIndex: req.fanoutIndex, task: req.task });
+        if (req.fanoutIndex === undefined) {
+          return makeCompletedResult(req.agent, JSON.stringify({ items }), req.step ?? 1);
+        }
+        return makeFanoutResult(req.fanoutIndex, 'completed', `fresh-${req.fanoutIndex}`);
+      },
+      restored: {
+        // Stale completed presentation results must not suppress reopened units.
+        results: [
+          makeCompletedResult('seed', JSON.stringify({ items }), 1),
+          stale0,
+          stale1,
+          stale2,
+        ],
+        outputs: {
+          seed: {
+            text: JSON.stringify({ items }),
+            structured: { items },
+            agent: 'seed',
+            step: 1,
+          },
+        },
+        logicalSteps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'seed',
+            task: 'seed',
+            status: 'queued',
+          },
+          {
+            kind: 'fanout',
+            step: 2,
+            agent: 'worker',
+            taskTemplate: 'Process {item}',
+            status: 'queued',
+            sourceOutput: 'seed',
+            sourcePath: '/items',
+            collectName: 'out',
+            executedCount: 3,
+            completedCount: 3,
+            failedCount: 0,
+            runningCount: 0,
+            queuedCount: 0,
+            skippedCount: 0,
+          },
+        ],
+        units,
+        fanouts: {
+          [chainFanoutStepId(2)]: { step: 2, items, unitIds },
+        },
+      },
+    });
+
+    expect(res.isError).toBeUndefined();
+    // Seed is reopened so it may re-run; every fanout child must dispatch once.
+    const fanoutCalls = calls.filter((c) => c.fanoutIndex !== undefined);
+    expect(fanoutCalls.map((c) => c.fanoutIndex)).toEqual([0, 1, 2]);
+    expect(fanoutCalls[0]!.task).toContain('a');
+    expect(fanoutCalls[1]!.task).toContain('b');
+    expect(fanoutCalls[2]!.task).toContain('c');
+    const fanoutResults = res.details.results.filter((r) => r.fanout);
+    expect(fanoutResults).toHaveLength(3);
+    expect(fanoutResults.map((r) => r.finalOutput)).toEqual(['fresh-0', 'fresh-1', 'fresh-2']);
+  });
+});
+
+describe('completed fanout continuation preflight', () => {
+  it('blocks fully completed fanout without mapping before claim mutation', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-fanout-map-'));
+    try {
+      const store = createRunStore({ rootDir: tmpRoot });
+      const coordinator = createRunCoordinator({ store });
+      const seedAgent: AgentConfig = {
+        name: 'seed',
+        description: 'seed',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/seed.md',
+      };
+      const workerAgent: AgentConfig = {
+        name: 'worker',
+        description: 'worker',
+        systemPrompt: '',
+        source: 'builtin',
+        filePath: '/tmp/worker.md',
+      };
+      const sessionDir = path.join(tmpRoot, 'sessions');
+      mkdirSync(sessionDir, { recursive: true });
+      const items = ['a', 'b'];
+      const unitIds = items.map((_, i) => chainFanoutUnitId(2, i));
+      const seedSession = path.join(sessionDir, 'chain-0001.jsonl');
+      writeFileSync(seedSession, '{}\n');
+      for (const id of unitIds) {
+        writeFileSync(path.join(sessionDir, `${id}.jsonl`), '{}\n');
+      }
+
+      const seedResult = makeCompletedResult('seed', JSON.stringify({ items }), 1);
+      const fanoutResults = items.map((text, i) => makeFanoutResult(i, 'completed', `out-${text}`));
+      const created = await store.createRun({
+        mode: 'chain',
+        agentScope: 'user',
+        background: false,
+        request: {
+          mode: 'chain',
+          agentScope: 'user',
+          chain: [
+            { agent: 'seed', task: 'seed', name: 'seed' },
+            {
+              expand: { from: { output: 'seed', path: '/items' } },
+              parallel: { agent: 'worker', task: 'Process {item}' },
+              collect: { name: 'out' },
+            },
+          ],
+        },
+        details: {
+          mode: 'chain',
+          agentScope: 'user',
+          projectAgentsDir: null,
+          builtinAgentsDir: '/tmp',
+          results: [seedResult, ...fanoutResults],
+          chain: {
+            totalSteps: 2,
+            steps: [
+              {
+                kind: 'sequential',
+                step: 1,
+                agent: 'seed',
+                task: 'seed',
+                status: 'completed',
+              },
+              {
+                kind: 'fanout',
+                step: 2,
+                agent: 'worker',
+                taskTemplate: 'Process {item}',
+                status: 'completed',
+                sourceOutput: 'seed',
+                sourcePath: '/items',
+                collectName: 'out',
+                executedCount: 2,
+                completedCount: 2,
+                failedCount: 0,
+                runningCount: 0,
+                queuedCount: 0,
+                skippedCount: 0,
+              },
+            ],
+          },
+        },
+        units: {
+          'chain-0001': {
+            unitId: 'chain-0001',
+            agent: 'seed',
+            agentFingerprint: agentFingerprint(seedAgent),
+            runtime: undefined,
+            capability: 'session',
+            status: 'completed',
+            step: 1,
+            attempt: 1,
+            attempts: [{ attempt: 1, status: 'completed', startedAt: 1, finishedAt: 2 }],
+            effectiveCwd: tmpRoot,
+            sessionFile: seedSession,
+            sessionPromptEstablished: true,
+            result: seedResult,
+          },
+          [unitIds[0]!]: {
+            ...fanoutUnit(2, 0, 'completed', fanoutResults[0]),
+            agentFingerprint: agentFingerprint(workerAgent),
+            effectiveCwd: tmpRoot,
+            sessionFile: path.join(sessionDir, `${unitIds[0]}.jsonl`),
+            sessionPromptEstablished: true,
+          },
+          [unitIds[1]!]: {
+            ...fanoutUnit(2, 1, 'completed', fanoutResults[1]),
+            agentFingerprint: agentFingerprint(workerAgent),
+            effectiveCwd: tmpRoot,
+            sessionFile: path.join(sessionDir, `${unitIds[1]}.jsonl`),
+            sessionPromptEstablished: true,
+          },
+        },
+      });
+      // Intentionally omit workflowState.fanouts — completed continuation must fail closed.
+      await store.updateRun(created.runId, (r) => {
+        r.status = 'completed';
+        r.finishedAt = Date.now();
+      });
+
+      const before = store.getRun(created.runId);
+      expect(before.ok).toBe(true);
+      if (!before.ok) return;
+      const beforeUnits = structuredClone(before.loaded.record.units);
+      const beforeStatus = before.loaded.record.status;
+      const beforeContinuations = before.loaded.record.continuationTasks;
+
+      const inspection = inspectResume(created.runId, store, {
+        agents: [seedAgent, workerAgent],
+        hasContinuation: true,
+      });
+      expect(inspection.ok).toBe(true);
+      if (!inspection.ok) return;
+      expect(
+        inspection.blockingReasons.some((r) => r.includes('stored_fanout_state_unavailable'))
+      ).toBe(true);
+
+      const claim = await preflightAndClaim(created.runId, {
+        store,
+        coordinator,
+        ctx: {} as never,
+        agents: [seedAgent, workerAgent],
+        hasContinuation: true,
+      });
+      expect(claim.ok).toBe(false);
+      if (claim.ok) return;
+      expect(claim.reason).toContain('stored_fanout_state_unavailable');
+
+      const after = store.getRun(created.runId);
+      expect(after.ok).toBe(true);
+      if (!after.ok) return;
+      // No claim mutation: status, units, and continuation history unchanged.
+      expect(after.loaded.record.status).toBe(beforeStatus);
+      expect(after.loaded.record.units).toEqual(beforeUnits);
+      expect(after.loaded.record.continuationTasks).toEqual(beforeContinuations);
+      const claims = store.inspectClaims(created.runId);
+      expect(claims.ok).toBe(true);
+      if (claims.ok) {
+        const live = claims.claims.filter((c) => c.terminal === undefined && c.owner);
+        expect(live).toHaveLength(0);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

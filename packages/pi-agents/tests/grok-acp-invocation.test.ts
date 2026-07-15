@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'bun:test';
 import type { InitializeResponse } from '@agentclientprotocol/sdk';
 import type { AgentConfig } from '../src/agents.ts';
+import { GROK_BINARY } from '../src/constants.ts';
 import {
   buildGrokAcpArgs,
   buildGrokAcpAuthenticateParams,
@@ -15,6 +16,7 @@ import {
   buildGrokAcpSessionNewParams,
   selectGrokAcpAuthMethod,
 } from '../src/grok-acp-invocation.ts';
+import { getGrokInvocation } from '../src/grok-command.ts';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -32,6 +34,17 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 function serialized(...values: unknown[]): string {
   return JSON.stringify(values);
 }
+
+describe('getGrokInvocation', () => {
+  it('returns the configured Grok binary and the unchanged argument array', () => {
+    const args = ['agent', '--model', 'grok-4.5', 'stdio'];
+    const invocation = getGrokInvocation(args);
+    expect(invocation.command).toBe(GROK_BINARY);
+    expect(invocation.command).toBe('grok');
+    expect(invocation.args).toBe(args);
+    expect(invocation.args).toEqual(['agent', '--model', 'grok-4.5', 'stdio']);
+  });
+});
 
 describe('buildGrokAcpArgs', () => {
   it('builds agent stdio args with model and reasoning effort before stdio', () => {

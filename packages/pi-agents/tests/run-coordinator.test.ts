@@ -18,7 +18,6 @@ import {
   generateUnitIds,
   resumeCapabilityForRuntime,
   stampResultMetadata,
-  unitRequiresReplayAcknowledgement,
   type UnitExecutionContext,
 } from '../src/run-coordinator.ts';
 import { createRunStore, type RunStore } from '../src/run-store.ts';
@@ -178,32 +177,8 @@ describe('resumeCapabilityForRuntime', () => {
   it('returns session for pi/runtime=undefined', () => {
     expect(resumeCapabilityForRuntime(undefined)).toBe('session');
   });
-  it('returns replay for plain grok only', () => {
-    expect(resumeCapabilityForRuntime('grok' as Runtime)).toBe('replay');
-  });
   it('returns session for grok-acp', () => {
     expect(resumeCapabilityForRuntime('grok-acp' as Runtime)).toBe('session');
-  });
-});
-
-describe('unitRequiresReplayAcknowledgement', () => {
-  it('is true for plain grok regardless of stored capability', () => {
-    expect(unitRequiresReplayAcknowledgement({ runtime: 'grok', capability: 'session' })).toBe(
-      true
-    );
-    expect(unitRequiresReplayAcknowledgement({ runtime: 'grok', capability: 'replay' })).toBe(true);
-  });
-  it('is false for grok-acp even when legacy capability is replay', () => {
-    expect(unitRequiresReplayAcknowledgement({ runtime: 'grok-acp', capability: 'replay' })).toBe(
-      false
-    );
-    expect(unitRequiresReplayAcknowledgement({ runtime: 'grok-acp', capability: 'session' })).toBe(
-      false
-    );
-  });
-  it('falls back to stored capability for non-Grok runtimes', () => {
-    expect(unitRequiresReplayAcknowledgement({ runtime: 'pi', capability: 'replay' })).toBe(true);
-    expect(unitRequiresReplayAcknowledgement({ capability: 'session' })).toBe(false);
   });
 });
 
@@ -211,20 +186,11 @@ describe('aggregateCapability', () => {
   it('reduces an all-session set to session', () => {
     expect(aggregateCapability(['session', 'session'])).toBe('session');
   });
-  it('reduces an all-replay set to replay', () => {
-    expect(aggregateCapability(['replay'])).toBe('replay');
-  });
-  it('returns mixed when both are present', () => {
-    expect(aggregateCapability(['session', 'replay'])).toBe('mixed');
+  it('returns session for an empty set', () => {
+    expect(aggregateCapability([])).toBe('session');
   });
   it('aggregates Pi + Grok ACP as session', () => {
     expect(aggregateCapability(['session', 'session'])).toBe('session');
-  });
-  it('aggregates Pi + plain Grok as mixed', () => {
-    expect(aggregateCapability(['session', 'replay'])).toBe('mixed');
-  });
-  it('aggregates Pi + Grok ACP + plain Grok as mixed', () => {
-    expect(aggregateCapability(['session', 'session', 'replay'])).toBe('mixed');
   });
 });
 
@@ -259,6 +225,142 @@ describe('deriveRunStatus', () => {
   });
   it('cancelled when only cancelled/skipped remain', () => {
     expect(deriveRunStatus({ a: unit('cancelled'), b: unit('skipped') })).toBe('cancelled');
+  });
+});
+
+describe('aggregateRun resumable metadata', () => {
+  function unit(
+    unitId: string,
+    status: RunUnitRecord['status'],
+    overrides: Partial<RunUnitRecord> = {}
+  ): RunUnitRecord {
+    return {
+      unitId,
+      agent: 'a',
+      agentFingerprint: 'f',
+      runtime: undefined,
+      capability: 'session',
+      status,
+      attempt: 1,
+      attempts: [],
+      effectiveCwd: '/cwd',
+      ...overrides,
+    };
+  }
+
+  it('marks completed runs resumable for continuation tasks', () => {
+    const store = fakeStore({ now: () => 1 });
+    const coord = createRunCoordinator({ store, now: () => 1 });
+    const units = {
+      single: unit('single', 'completed'),
+    };
+    const agg = coord.aggregateRun(emptyDetails(), units);
+    expect(agg.status).toBe('completed');
+    expect(agg.resumable).toBe(true);
+    expect(agg.capability).toBe('session');
+  });
+
+  it('marks interrupted and failed runs with incomplete units resumable', () => {
+    const store = fakeStore({ now: () => 1 });
+    const coord = createRunCoordinator({ store, now: () => 1 });
+
+    const interrupted = coord.aggregateRun(emptyDetails(), {
+      a: unit('a', 'interrupted'),
+      b: unit('b', 'completed'),
+    });
+    expect(interrupted.status).toBe('interrupted');
+    expect(interrupted.resumable).toBe(true);
+
+    const failed = coord.aggregateRun(emptyDetails(), {
+      a: unit('a', 'failed'),
+      b: unit('b', 'completed'),
+    });
+    expect(failed.status).toBe('failed');
+    expect(failed.resumable).toBe(true);
+
+    const cancelled = coord.aggregateRun(emptyDetails(), {
+      a: unit('a', 'cancelled'),
+      b: unit('b', 'skipped'),
+    });
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.resumable).toBe(true);
+  });
+
+  it('does not claim active runs are concurrently resumable', () => {
+    const store = fakeStore({ now: () => 1 });
+    const coord = createRunCoordinator({ store, now: () => 1 });
+
+    const running = coord.aggregateRun(emptyDetails(), {
+      a: unit('a', 'running'),
+      b: unit('b', 'completed'),
+    });
+    expect(running.status).toBe('running');
+    expect(running.resumable).toBe(false);
+
+    const queuedPeer = coord.aggregateRun(emptyDetails(), {
+      a: unit('a', 'queued'),
+      b: unit('b', 'completed'),
+    });
+    expect(queuedPeer.status).toBe('running');
+    expect(queuedPeer.resumable).toBe(false);
+  });
+
+  it('marks terminal failed/cancelled/interrupted runs with queued units resumable', () => {
+    const store = fakeStore({ now: () => 1 });
+    const coord = createRunCoordinator({ store, now: () => 1 });
+
+    // Terminal status is authoritative from details.run even when units still
+    // include never-started queued siblings (crashed terminal snapshot).
+    const failed = coord.aggregateRun(
+      {
+        ...emptyDetails(),
+        run: { runId: 'r1', status: 'failed', resumable: true, capability: 'session' },
+      },
+      {
+        a: unit('a', 'failed'),
+        b: unit('b', 'queued'),
+      }
+    );
+    expect(failed.status).toBe('failed');
+    expect(failed.resumable).toBe(true);
+
+    const cancelled = coord.aggregateRun(
+      {
+        ...emptyDetails(),
+        run: { runId: 'r1', status: 'cancelled', resumable: true, capability: 'session' },
+      },
+      {
+        a: unit('a', 'cancelled'),
+        b: unit('b', 'queued'),
+      }
+    );
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.resumable).toBe(true);
+
+    const interrupted = coord.aggregateRun(
+      {
+        ...emptyDetails(),
+        run: { runId: 'r1', status: 'interrupted', resumable: true, capability: 'session' },
+      },
+      {
+        a: unit('a', 'interrupted'),
+        b: unit('b', 'queued'),
+      }
+    );
+    expect(interrupted.status).toBe('interrupted');
+    expect(interrupted.resumable).toBe(true);
+
+    // Pure queued terminal-claimed status is still non-resumable when the run
+    // itself is actively queued (not a terminal incomplete state).
+    const activelyQueued = coord.aggregateRun(
+      {
+        ...emptyDetails(),
+        run: { runId: 'r1', status: 'queued', resumable: false, capability: 'session' },
+      },
+      { a: unit('a', 'queued') }
+    );
+    expect(activelyQueued.status).toBe('queued');
+    expect(activelyQueued.resumable).toBe(false);
   });
 });
 
@@ -624,6 +726,15 @@ describe('createRunCoordinator persistence and attempts', () => {
   });
 });
 
+/** Request-topology fanout step whose parallel.agent matches durable children. */
+function fanoutChainStep(agentName: string) {
+  return {
+    expand: { from: { output: 'seed', path: '/items' } },
+    parallel: { agent: agentName, task: 't' },
+    collect: { name: 'c' },
+  };
+}
+
 function chainRecord(
   units: Record<string, RunUnitRecord> = {
     'chain-0001': {
@@ -648,10 +759,7 @@ function chainRecord(
     request: {
       mode: 'chain',
       agentScope: 'both',
-      chain: [
-        { agent: 'seed', task: 'seed' },
-        { expand: {}, parallel: { agent: 'worker', task: 't' }, collect: { name: 'c' } },
-      ],
+      chain: [{ agent: 'seed', task: 'seed' }, fanoutChainStep('worker')],
     },
     background: false,
     agentScope: 'both',
@@ -852,7 +960,7 @@ describe('expandFanout', () => {
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker-a')],
         },
         details: emptyDetails(),
         units: {
@@ -967,7 +1075,7 @@ describe('expandFanout', () => {
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker-a')],
         },
         details: emptyDetails(),
         units: {
@@ -1081,7 +1189,7 @@ describe('expandFanout', () => {
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker-a')],
         },
         details: emptyDetails(),
         units: {
@@ -1424,7 +1532,7 @@ describe('expandFanout', () => {
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker')],
         },
         details: emptyDetails(),
         units: {
@@ -1448,7 +1556,7 @@ describe('expandFanout', () => {
       await store.updateRun(runId, (r) => {
         r.units[childId] = {
           unitId: childId,
-          agent: 'preexisting',
+          agent: 'worker',
           agentFingerprint: 'fp-pre',
           runtime: undefined,
           capability: 'session',
@@ -1496,7 +1604,7 @@ describe('expandFanout', () => {
 
       // No disk mapping → live mapping for this step removed; pre-existing disk unit kept.
       expect(live.workflowState?.fanouts?.[chainFanoutStepId(2)]).toBeUndefined();
-      expect(live.units[childId]?.agent).toBe('preexisting');
+      expect(live.units[childId]?.agent).toBe('worker');
 
       // Pollute live mapping again and flush — disk still has no mapping.
       live.workflowState = {
@@ -1520,7 +1628,7 @@ describe('expandFanout', () => {
       expect(afterFlush.ok).toBe(true);
       if (afterFlush.ok) {
         expect(afterFlush.loaded.record.workflowState).toBeUndefined();
-        expect(afterFlush.loaded.record.units[childId]?.agent).toBe('preexisting');
+        expect(afterFlush.loaded.record.units[childId]?.agent).toBe('worker');
       }
       expect(live.workflowState).toBeUndefined();
     } finally {
@@ -1539,7 +1647,7 @@ describe('expandFanout', () => {
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker')],
         },
         details: emptyDetails(),
         units: {
@@ -1768,7 +1876,7 @@ describe('non-active persist / finalizeRun disk-first merge', () => {
         agent: 'tester',
         agentFingerprint: 'fp',
         runtime: 'grok-acp' as never,
-        capability: 'replay',
+        capability: 'session',
         status: 'running',
         attempt: 1,
         attempts: [],
@@ -1789,7 +1897,7 @@ describe('non-active persist / finalizeRun disk-first merge', () => {
           stderr: '',
           usage: emptyUsage(),
           // stale / missing identity
-          resumeCapability: 'replay',
+          resumeCapability: 'session',
         },
       };
       live.continuationDelivery = { single: { deliveredCount: 0 } };
@@ -2253,30 +2361,39 @@ describe('persistInteractiveBinding', () => {
     try {
       const store = createRunStore({ rootDir: root });
       const { runId, record } = await store.createRun({
-        mode: 'single',
+        mode: 'parallel',
         agentScope: 'both',
         background: false,
-        request: { mode: 'single', agentScope: 'both', agent: 'tester', task: 't' },
+        request: {
+          mode: 'parallel',
+          agentScope: 'both',
+          tasks: [
+            { agent: 'tester', task: 't1' },
+            { agent: 'tester', task: 't2' },
+          ],
+        },
         details: emptyDetails(),
         units: {
-          'u-a': {
-            unitId: 'u-a',
+          'parallel-0001': {
+            unitId: 'parallel-0001',
             agent: 'tester',
             agentFingerprint: 'fp',
             runtime: undefined,
             capability: 'session',
             status: 'queued',
+            fanoutIndex: 0,
             attempt: 1,
             attempts: [],
             effectiveCwd: root,
           },
-          'u-b': {
-            unitId: 'u-b',
-            agent: 'tester-b',
+          'parallel-0002': {
+            unitId: 'parallel-0002',
+            agent: 'tester',
             agentFingerprint: 'fp-b',
             runtime: undefined,
             capability: 'session',
             status: 'queued',
+            fanoutIndex: 1,
             attempt: 1,
             attempts: [],
             effectiveCwd: root,
@@ -2289,23 +2406,27 @@ describe('persistInteractiveBinding', () => {
       await Promise.all([
         coord.persistInteractiveBinding({
           runId,
-          unitId: 'u-a',
+          unitId: 'parallel-0001',
           binding: { bindingId: 'ba', hostSessionId: 'h', createdAt: 1 },
         }),
         coord.persistInteractiveBinding({
           runId,
-          unitId: 'u-b',
+          unitId: 'parallel-0002',
           binding: { bindingId: 'bb', hostSessionId: 'h', createdAt: 2 },
         }),
       ]);
 
-      expect(record.units['u-a'].interactiveBindings?.ba?.bindingId).toBe('ba');
-      expect(record.units['u-b'].interactiveBindings?.bb?.bindingId).toBe('bb');
+      expect(record.units['parallel-0001'].interactiveBindings?.ba?.bindingId).toBe('ba');
+      expect(record.units['parallel-0002'].interactiveBindings?.bb?.bindingId).toBe('bb');
       const loaded = store.getRun(runId);
       expect(loaded.ok).toBe(true);
       if (loaded.ok) {
-        expect(loaded.loaded.record.units['u-a'].interactiveBindings?.ba?.bindingId).toBe('ba');
-        expect(loaded.loaded.record.units['u-b'].interactiveBindings?.bb?.bindingId).toBe('bb');
+        expect(loaded.loaded.record.units['parallel-0001'].interactiveBindings?.ba?.bindingId).toBe(
+          'ba'
+        );
+        expect(loaded.loaded.record.units['parallel-0002'].interactiveBindings?.bb?.bindingId).toBe(
+          'bb'
+        );
       }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -2635,7 +2756,7 @@ describe('persistAcpSessionId', () => {
         messages: [],
         stderr: '',
         usage: emptyUsage(),
-        resumeCapability: 'replay',
+        resumeCapability: 'session',
         acpSessionId: 'sess-live-stale',
       };
     }
@@ -2675,7 +2796,7 @@ describe('persistAcpSessionId', () => {
             messages: [],
             stderr: '',
             usage: emptyUsage(),
-            resumeCapability: 'replay',
+            resumeCapability: 'session',
           };
         }
         record.units.single.result.acpSessionId = 'sess-live-poison';
@@ -2778,11 +2899,11 @@ describe('persistAcpSessionId', () => {
     expect(record.units.single.acpSessionId).toBe('sess-ok');
   });
 
-  it('normalizes legacy never-started Grok ACP capability from replay to session', async () => {
+  it('persistAcpSessionId stamps session ID and keeps session capability', async () => {
     let t = 100;
     const store = fakeStore({ now: () => t });
     const record = acpRecord({
-      capability: 'replay',
+      capability: 'session',
       status: 'queued',
       result: {
         agent: 'tester',
@@ -2792,7 +2913,7 @@ describe('persistAcpSessionId', () => {
         messages: [],
         stderr: '',
         usage: emptyUsage(),
-        resumeCapability: 'replay',
+        resumeCapability: 'session',
       },
     });
     store.records.set('run-acp', structuredClone(record));
@@ -2802,13 +2923,13 @@ describe('persistAcpSessionId', () => {
     await coord.persistAcpSessionId({
       runId: 'run-acp',
       unitId: 'single',
-      sessionId: 'sess-legacy',
+      sessionId: 'sess-new',
     });
 
     expect(record.units.single.capability).toBe('session');
-    expect(record.units.single.acpSessionId).toBe('sess-legacy');
+    expect(record.units.single.acpSessionId).toBe('sess-new');
     expect(record.units.single.result?.resumeCapability).toBe('session');
-    expect(record.units.single.result?.acpSessionId).toBe('sess-legacy');
+    expect(record.units.single.result?.acpSessionId).toBe('sess-new');
     expect(store.records.get('run-acp')!.units.single.capability).toBe('session');
 
     const agg = coord.aggregateRun(emptyDetails(), record.units);
@@ -3187,7 +3308,7 @@ describe('persistAcpSessionId', () => {
           attempt: 1,
           sessionFile: '/stale/other.jsonl',
           acpSessionId: 'sess-WRONG',
-          resumeCapability: 'replay',
+          resumeCapability: 'session',
         },
       };
       coord.registerRun(runId, live);
@@ -3223,7 +3344,7 @@ describe('persistAcpSessionId', () => {
     }
   });
 
-  it('canonical unit without acpSessionId / replay clears stale result session on restamp', async () => {
+  it('canonical unit without acpSessionId clears stale result session on restamp', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-result-clear-sess-'));
     try {
       const store = createRunStore({ rootDir: root });
@@ -3239,7 +3360,7 @@ describe('persistAcpSessionId', () => {
             agent: 'tester',
             agentFingerprint: 'fp',
             runtime: undefined,
-            capability: 'replay',
+            capability: 'session',
             status: 'running',
             attempt: 1,
             attempts: [],
@@ -3257,7 +3378,7 @@ describe('persistAcpSessionId', () => {
               runId: 'x',
               unitId: 'single',
               attempt: 1,
-              resumeCapability: 'replay',
+              resumeCapability: 'session',
             },
           },
         },
@@ -3303,12 +3424,12 @@ describe('persistAcpSessionId', () => {
         const r = loaded.loaded.record.units.single.result!;
         expect(r.unitId).toBe('single');
         expect(r.acpSessionId).toBeUndefined();
-        expect(r.resumeCapability).toBe('replay');
+        expect(r.resumeCapability).toBe('session');
         expect(r.status).toBe('completed');
         expect(r.finalOutput).toBe('done');
       }
       expect(live.units.single.result?.acpSessionId).toBeUndefined();
-      expect(live.units.single.result?.resumeCapability).toBe('replay');
+      expect(live.units.single.result?.resumeCapability).toBe('session');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -3571,7 +3692,7 @@ describe('disk-authoritative unit identity on full persist/finalize', () => {
     }
   });
 
-  it('Pi session capability wins over live replay without requiring acpSessionId', async () => {
+  it('Pi session capability and sessionFile win over live stale fields without requiring acpSessionId', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-pi-cap-'));
     try {
       const store = createRunStore({ rootDir: root });
@@ -3603,7 +3724,7 @@ describe('disk-authoritative unit identity on full persist/finalize', () => {
       const live = structuredClone(seeded.loaded.record);
       live.units.single = {
         ...live.units.single!,
-        capability: 'replay',
+        capability: 'session',
         sessionFile: '/stale/wrong.jsonl',
         status: 'completed',
         result: {
@@ -3617,7 +3738,7 @@ describe('disk-authoritative unit identity on full persist/finalize', () => {
           usage: emptyUsage(),
           finalOutput: 'pi-ok',
           sessionFile: '/stale/wrong.jsonl',
-          resumeCapability: 'replay',
+          resumeCapability: 'session',
         },
       };
       coord.registerRun(runId, live);
@@ -3758,7 +3879,7 @@ describe('disk-authoritative unit identity on full persist/finalize', () => {
           agent: 'tester',
           agentFingerprint: 'fp',
           runtime: undefined,
-          capability: 'replay',
+          capability: 'session',
           status: 'completed',
           attempt: 9,
           attempts: [],
@@ -3776,7 +3897,7 @@ describe('disk-authoritative unit identity on full persist/finalize', () => {
             finalOutput: 'finalized',
             attempt: 9,
             sessionFile: '/stale/final.jsonl',
-            resumeCapability: 'replay',
+            resumeCapability: 'session',
           },
         },
       };
@@ -4459,7 +4580,7 @@ describe('persistSessionFile', () => {
       usage: emptyUsage(),
       sessionFile: '/sessions/stale.jsonl',
       acpSessionId: 'stale-acp',
-      resumeCapability: 'replay',
+      resumeCapability: 'session',
     };
     coord.finishUnit('run-stale-clear', ctx, result, 'completed');
     expect(result.sessionFile).toBeUndefined();
@@ -4513,7 +4634,7 @@ describe('persistSessionFile', () => {
       unitId: 'single',
       agent: 'noop',
       runtime: 'grok-acp',
-      resumeCapability: 'replay',
+      resumeCapability: 'session',
       effectiveCwd: '/cwd',
       attempt: 1,
       sessionFile: '/sessions/stale.jsonl',
@@ -4530,7 +4651,7 @@ describe('persistSessionFile', () => {
       usage: emptyUsage(),
       sessionFile: '/sessions/stale.jsonl',
       acpSessionId: 'stale-acp',
-      resumeCapability: 'replay',
+      resumeCapability: 'session',
     };
     coord.finishUnit('run-stale-replace', ctx, result, 'completed');
     expect(result.sessionFile).toBe('/sessions/canonical.jsonl');
@@ -4555,7 +4676,7 @@ describe('persistSessionFile', () => {
         request: {
           mode: 'chain',
           agentScope: 'user',
-          chain: [{ agent: 'seed', task: 'seed' }],
+          chain: [{ agent: 'seed', task: 'seed' }, fanoutChainStep('worker')],
         },
         details: emptyDetails(),
         units: {
@@ -5280,7 +5401,7 @@ describe('inactive persist mutate via incoming snapshot', () => {
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker')],
           cwd: root,
         },
         details: emptyDetails(),
@@ -5401,7 +5522,7 @@ describe('expandFanout identity-matched mirror preserves mutable payload', () =>
         request: {
           mode: 'chain',
           agentScope: 'both',
-          chain: [{ agent: 'planner', task: 'p' }],
+          chain: [{ agent: 'planner', task: 'p' }, fanoutChainStep('worker-a')],
         },
         details: emptyDetails(),
         units: {

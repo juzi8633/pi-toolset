@@ -1,28 +1,22 @@
 // ABOUTME: Resume preflight and runtime dispatch - inspects stored runs and continues interrupted work.
-// ABOUTME: Verifies agent fingerprints, artifacts, and replay capability before claiming and executing.
+// ABOUTME: Verifies agent fingerprints, session artifacts, and worktrees before claiming and executing.
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig } from './agents.ts';
-import { GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
-import {
-  agentFingerprint,
-  chainFanoutStepId,
-  chainFanoutUnitId,
-  unitRequiresReplayAcknowledgement,
-} from './run-coordinator.ts';
+import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
+import { agentFingerprint, chainFanoutStepId, chainFanoutUnitId } from './run-coordinator.ts';
 import type { RunCoordinator } from './run-coordinator.ts';
 import type { RunStore } from './run-store.ts';
 import { createRunLifecycle } from './run-lifecycle.ts';
-import type {
-  AgentRunRecordV1,
-  ResumeCapability,
-  RunUnitRecord,
-  RunStatus,
-  WorkflowFanoutState,
-} from './run-types.ts';
+import type { AgentRunRecordV1, ResumeCapability, RunUnitRecord, RunStatus } from './run-types.ts';
+
+/** Pi-default-normalized runtime for durable unit or agent config values. */
+function normalizeRuntime(runtime: unknown): string {
+  return typeof runtime === 'string' ? runtime : DEFAULT_RUNTIME;
+}
 
 export type InspectResumeResult =
   | {
@@ -37,15 +31,17 @@ export type InspectResumeResult =
         capability: ResumeCapability;
         attempt: number;
       }>;
-      requiresReplay: boolean;
       blockingReasons: string[];
     }
   | { ok: false; runId: string; reason: string };
 
 export interface InspectResumeOptions {
   agents: AgentConfig[];
-  /** Allow replay-capable units to re-run from the beginning. */
-  allowReplay?: boolean;
+  /**
+   * True when the resume request supplies a non-empty continuation instruction
+   * (public `task`). Required to reopen a fully completed run.
+   */
+  hasContinuation?: boolean;
 }
 
 /**
@@ -57,25 +53,51 @@ export function isNeverStartedUnit(unit: Pick<RunUnitRecord, 'status' | 'attempt
   return (unit.status === 'queued' || unit.status === 'skipped') && unit.attempts.length === 0;
 }
 
+export interface ValidateFanoutResumeOptions {
+  /**
+   * When true, completed logical fanout steps must also have a frozen
+   * `workflowState.fanouts` mapping that passes canonical validation.
+   * Used only for all-completed runs resumed with a continuation task.
+   */
+  requireCompletedFanoutMappings?: boolean;
+}
+
+/** True when a stored request chain entry is a fanout step (expand without agent). */
+function isStoredRequestFanoutStep(step: unknown): boolean {
+  return step !== null && typeof step === 'object' && 'expand' in step && !('agent' in step);
+}
+
 /**
  * Validate persisted fanout mappings for incomplete fanout work. Rejects legacy
  * partial state without a mapping and completed children missing terminal results.
+ * Optionally also requires frozen mappings for completed fanout steps when an
+ * all-completed run is reopened with a continuation.
  */
-export function validateFanoutResumeState(record: AgentRunRecordV1): string[] {
+export function validateFanoutResumeState(
+  record: AgentRunRecordV1,
+  options?: ValidateFanoutResumeOptions
+): string[] {
   const reasons: string[] = [];
   const fanouts = record.workflowState?.fanouts ?? {};
-  const incompleteFanoutSteps = new Set<number>();
+  const stepsToValidate = new Set<number>();
 
   for (const step of record.details.chain?.steps ?? []) {
-    if (step.kind === 'fanout' && step.status !== 'completed') {
-      incompleteFanoutSteps.add(step.step);
+    if (step.kind !== 'fanout') continue;
+    if (step.status !== 'completed') {
+      stepsToValidate.add(step.step);
+    } else if (options?.requireCompletedFanoutMappings) {
+      stepsToValidate.add(step.step);
     }
   }
 
-  // Units with fanout positions that are not completed imply incomplete fanout work.
+  // Durable units are authoritative for which fanout steps exist. Incomplete
+  // children always require mapping validation; when completed-run continuation
+  // requires frozen mappings, completed children also contribute steps even if
+  // `details.chain.steps` is absent or stale.
   for (const unit of Object.values(record.units)) {
-    if (unit.fanoutIndex !== undefined && unit.step !== undefined && unit.status !== 'completed') {
-      incompleteFanoutSteps.add(unit.step);
+    if (unit.fanoutIndex === undefined || unit.step === undefined) continue;
+    if (unit.status !== 'completed' || options?.requireCompletedFanoutMappings) {
+      stepsToValidate.add(unit.step);
     }
   }
 
@@ -83,13 +105,28 @@ export function validateFanoutResumeState(record: AgentRunRecordV1): string[] {
   for (const result of record.details.results) {
     if (result.fanout !== undefined && typeof result.step === 'number') {
       const key = chainFanoutStepId(result.step);
-      if (!fanouts[key] && result.status !== 'completed') {
-        incompleteFanoutSteps.add(result.step);
+      if (
+        !fanouts[key] &&
+        (result.status !== 'completed' || options?.requireCompletedFanoutMappings)
+      ) {
+        stepsToValidate.add(result.step);
       }
     }
   }
 
-  for (const step of incompleteFanoutSteps) {
+  // Completed continuation must cover every request-topology fanout step,
+  // including empty fanouts that never produced durable children.
+  if (options?.requireCompletedFanoutMappings) {
+    const chain = record.request.chain ?? [];
+    for (let i = 0; i < chain.length; i++) {
+      if (isStoredRequestFanoutStep(chain[i])) {
+        stepsToValidate.add(i + 1);
+      }
+    }
+  }
+
+  const validatedKeys = new Set<string>();
+  for (const step of stepsToValidate) {
     const key = chainFanoutStepId(step);
     const mapping = fanouts[key];
     if (!mapping) {
@@ -97,37 +134,82 @@ export function validateFanoutResumeState(record: AgentRunRecordV1): string[] {
       continue;
     }
     reasons.push(...validateFanoutMapping(record, key, mapping));
+    validatedKeys.add(key);
   }
 
-  // Also validate mappings that have incomplete children even if the logical step is absent.
+  // Validate every persisted mapping key independently. An alias or wrong key
+  // for a step must fail closed even when the canonical mapping already passed.
   for (const [key, mapping] of Object.entries(fanouts)) {
-    if (incompleteFanoutSteps.has(mapping.step)) continue;
-    const hasIncompleteChild = mapping.unitIds.some((id) => {
-      const unit = record.units[id];
-      return unit !== undefined && unit.status !== 'completed';
-    });
-    if (hasIncompleteChild) {
-      reasons.push(...validateFanoutMapping(record, key, mapping));
-    }
+    if (validatedKeys.has(key)) continue;
+    reasons.push(...validateFanoutMapping(record, key, mapping));
   }
 
   return reasons;
 }
 
-function validateFanoutMapping(
-  record: AgentRunRecordV1,
-  key: string,
-  mapping: WorkflowFanoutState
-): string[] {
+/**
+ * Validate one frozen fanout mapping as a complete canonical bijection with
+ * durable children for that step. Key must equal chainFanoutStepId(mapping.step).
+ * Accepts untrusted persisted shapes and never throws on malformed data.
+ */
+function validateFanoutMapping(record: AgentRunRecordV1, key: string, mapping: unknown): string[] {
   const reasons: string[] = [];
-  if (mapping.items.length !== mapping.unitIds.length) {
+
+  if (mapping === null || typeof mapping !== 'object' || Array.isArray(mapping)) {
+    reasons.push(`stored_fanout_state_unavailable: ${key} mapping is not an object`);
+    return reasons;
+  }
+  const raw = mapping as Record<string, unknown>;
+  if (typeof raw.step !== 'number' || !Number.isInteger(raw.step) || raw.step < 1) {
+    reasons.push(`stored_fanout_state_unavailable: ${key} invalid step ${String(raw.step)}`);
+    return reasons;
+  }
+  if (!Array.isArray(raw.items) || !Array.isArray(raw.unitIds)) {
+    reasons.push(`stored_fanout_state_unavailable: ${key} items/unitIds must be arrays`);
+    return reasons;
+  }
+  // Only string unit ids participate in bijection checks; reject non-strings.
+  if (raw.unitIds.some((id) => typeof id !== 'string')) {
+    reasons.push(`stored_fanout_state_unavailable: ${key} unitIds must be strings`);
+    return reasons;
+  }
+
+  const step = raw.step;
+  const items = raw.items as unknown[];
+  const unitIds = raw.unitIds as string[];
+
+  // mapping.step must name an actual fanout entry in the stored request chain.
+  const chain = record.request.chain ?? [];
+  const requestStep = chain[step - 1];
+  if (requestStep === undefined || !isStoredRequestFanoutStep(requestStep)) {
     reasons.push(
-      `stored_fanout_state_unavailable: ${key} items.length (${mapping.items.length}) !== unitIds.length (${mapping.unitIds.length})`
+      `stored_fanout_state_unavailable: ${key} step ${step} is not a fanout request step`
+    );
+    return reasons;
+  }
+
+  let expectedKey: string;
+  try {
+    expectedKey = chainFanoutStepId(step);
+  } catch {
+    reasons.push(`stored_fanout_state_unavailable: ${key} invalid step ${step}`);
+    return reasons;
+  }
+  if (key !== expectedKey) {
+    reasons.push(
+      `stored_fanout_state_unavailable: ${key} key/step mismatch (expected ${expectedKey} for step ${step})`
     );
   }
+
+  if (items.length !== unitIds.length) {
+    reasons.push(
+      `stored_fanout_state_unavailable: ${key} items.length (${items.length}) !== unitIds.length (${unitIds.length})`
+    );
+  }
+
   const seen = new Set<string>();
-  for (let i = 0; i < mapping.unitIds.length; i++) {
-    const id = mapping.unitIds[i]!;
+  for (let i = 0; i < unitIds.length; i++) {
+    const id = unitIds[i]!;
     if (seen.has(id)) {
       reasons.push(`stored_fanout_state_unavailable: ${key} duplicate unit id ${id}`);
       continue;
@@ -135,9 +217,9 @@ function validateFanoutMapping(
     seen.add(id);
     let expected: string;
     try {
-      expected = chainFanoutUnitId(mapping.step, i);
+      expected = chainFanoutUnitId(step, i);
     } catch {
-      reasons.push(`stored_fanout_state_unavailable: ${key} invalid step ${mapping.step}`);
+      reasons.push(`stored_fanout_state_unavailable: ${key} invalid step ${step}`);
       continue;
     }
     if (id !== expected) {
@@ -151,9 +233,9 @@ function validateFanoutMapping(
       reasons.push(`stored_fanout_state_unavailable: ${key} missing unit record ${id}`);
       continue;
     }
-    if (unit.step !== mapping.step || unit.fanoutIndex !== i) {
+    if (unit.step !== step || unit.fanoutIndex !== i) {
       reasons.push(
-        `stored_fanout_state_unavailable: ${id} step/fanoutIndex mismatch (expected ${mapping.step}/${i})`
+        `stored_fanout_state_unavailable: ${id} step/fanoutIndex mismatch (expected ${step}/${i})`
       );
     }
     if (unit.status === 'completed' && !unit.result) {
@@ -167,6 +249,41 @@ function validateFanoutMapping(
       }
     }
   }
+
+  // Complete bijection: every durable fanout child for this step must appear in
+  // the mapping at its canonical index; reject truncated/extra durable sets.
+  const durableChildren = Object.values(record.units).filter(
+    (u) => u.step === step && u.fanoutIndex !== undefined
+  );
+  if (durableChildren.length !== unitIds.length) {
+    reasons.push(
+      `stored_fanout_state_unavailable: ${key} durable children (${durableChildren.length}) !== mapping unitIds (${unitIds.length})`
+    );
+  }
+  for (const unit of durableChildren) {
+    const index = unit.fanoutIndex!;
+    let expectedId: string;
+    try {
+      expectedId = chainFanoutUnitId(step, index);
+    } catch {
+      reasons.push(
+        `stored_fanout_state_unavailable: ${key} durable unit ${unit.unitId} has invalid fanoutIndex ${index}`
+      );
+      continue;
+    }
+    if (unit.unitId !== expectedId) {
+      reasons.push(
+        `stored_fanout_state_unavailable: ${key} durable unit ${unit.unitId} is not canonical ${expectedId}`
+      );
+      continue;
+    }
+    if (unitIds[index] !== unit.unitId) {
+      reasons.push(
+        `stored_fanout_state_unavailable: ${key} durable unit ${unit.unitId} missing or misplaced in mapping`
+      );
+    }
+  }
+
   return reasons;
 }
 
@@ -184,24 +301,38 @@ export function inspectResume(
   if (record.version !== 1) {
     return { ok: false, runId, reason: `unsupported_schema_version: ${record.version}` };
   }
-  if (record.status === 'completed') {
-    return { ok: false, runId, reason: 'run_already_completed' };
-  }
 
   const units = Object.values(record.units);
+  // Every non-completed unit is a selective resume target, including skipped.
   const incomplete = units.filter((u) => u.status !== 'completed');
+  // completed_without_continuation applies only when every unit is completed.
+  const fullyCompleted = incomplete.length === 0;
+  if (fullyCompleted && !options.hasContinuation) {
+    const hasCompleted = units.some((u) => u.status === 'completed');
+    if (hasCompleted) {
+      return { ok: false, runId, reason: 'completed_without_continuation' };
+    }
+  }
+  // Incomplete (including skipped) units are selective targets. Only when every
+  // unit is truly completed do we treat completed units as continuation targets.
+  const resumeTargets =
+    incomplete.length > 0 ? incomplete : units.filter((u) => u.status === 'completed');
 
-  if (incomplete.length === 0) {
+  if (resumeTargets.length === 0) {
     return { ok: false, runId, reason: 'no_incomplete_units' };
   }
 
   const blockingReasons: string[] = [];
-  let requiresReplay = false;
+  // Fanout mapping integrity before per-unit preflight. Fully completed runs
+  // reopened with a continuation must also have frozen mappings for completed
+  // fanout steps so claim/mutation cannot proceed without them.
+  blockingReasons.push(
+    ...validateFanoutResumeState(record, {
+      requireCompletedFanoutMappings: fullyCompleted && Boolean(options.hasContinuation),
+    })
+  );
 
-  // Fanout mapping integrity before per-unit preflight.
-  blockingReasons.push(...validateFanoutResumeState(record));
-
-  for (const unit of incomplete) {
+  for (const unit of resumeTargets) {
     // Verify effective cwd exists (worktree or original workspace).
     if (!fs.existsSync(unit.effectiveCwd)) {
       blockingReasons.push(`unit ${unit.unitId}: working directory missing: ${unit.effectiveCwd}`);
@@ -217,16 +348,21 @@ export function inspectResume(
       blockingReasons.push(`unit ${unit.unitId}: agent "${unit.agent}" fingerprint mismatch`);
     }
 
-    // Plain Grok requires allowReplay; Grok ACP never uses replay acknowledgement
-    // even when a legacy record still stores capability "replay".
-    if (unitRequiresReplayAcknowledgement(unit)) {
-      requiresReplay = true;
-      if (!options.allowReplay) {
-        blockingReasons.push(`unit ${unit.unitId}: requires replay (allowReplay not set)`);
-      }
+    // Effective dispatch runtime must match durable unit runtime (Pi-default
+    // normalized). Dispatch uses request override when present, otherwise the
+    // fingerprint-matched agent runtime — same resolution as resume tool path.
+    const durableRuntime = normalizeRuntime(unit.runtime);
+    const dispatchRuntime =
+      record.request.runtime !== undefined
+        ? normalizeRuntime(record.request.runtime)
+        : normalizeRuntime(agent.runtime);
+    if (durableRuntime !== dispatchRuntime) {
+      blockingReasons.push(
+        `unit ${unit.unitId}: runtime mismatch (durable ${durableRuntime}, dispatch ${dispatchRuntime})`
+      );
+      continue;
     }
 
-    const runtime = unit.runtime;
     // Only true never-started units may lack session artifacts. Queued/skipped
     // with prior attempt history are attempted and must have session identity.
     const needsSessionArtifact = !isNeverStartedUnit(unit);
@@ -234,7 +370,7 @@ export function inspectResume(
     // Grok ACP: attempted units require a stored protocol session ID. Never-started
     // units may create their first session during resume. Attempted units without
     // an ID are blocked (never normalize/create a replacement session).
-    if (runtime === GROK_ACP_RUNTIME) {
+    if (durableRuntime === GROK_ACP_RUNTIME) {
       if (needsSessionArtifact) {
         const acpId = unit.acpSessionId?.trim();
         if (!acpId) {
@@ -243,7 +379,7 @@ export function inspectResume(
           );
         }
       }
-    } else if (runtime !== GROK_RUNTIME && unit.capability === 'session') {
+    } else if (unit.capability === 'session') {
       // Pi (and other session-capable non-Grok runtimes): require a persisted
       // session file that exists on disk for attempted units. Planned paths that
       // were stamped before the native file/history existed fail closed so resume
@@ -302,14 +438,13 @@ export function inspectResume(
     runId,
     status: record.status,
     mode: record.mode,
-    incompleteUnits: incomplete.map((u) => ({
+    incompleteUnits: resumeTargets.map((u) => ({
       unitId: u.unitId,
       agent: u.agent,
       status: u.status,
       capability: u.capability,
       attempt: u.attempt,
     })),
-    requiresReplay,
     blockingReasons,
   };
 }
@@ -322,7 +457,8 @@ export interface ResumeRunOptions {
   coordinator: RunCoordinator;
   ctx: ExtensionContext;
   agents: AgentConfig[];
-  allowReplay?: boolean;
+  /** Non-empty continuation instruction present on the resume request. */
+  hasContinuation?: boolean;
   signal?: AbortSignal;
 }
 
@@ -345,10 +481,10 @@ export async function preflightAndClaim(
     }
   | { ok: false; runId: string; reason: string }
 > {
-  const { store, coordinator, agents, allowReplay } = options;
+  const { store, coordinator, agents, hasContinuation } = options;
 
   // Read-only preflight.
-  const inspection = inspectResume(runId, store, { agents, allowReplay });
+  const inspection = inspectResume(runId, store, { agents, hasContinuation });
   if (!inspection.ok) return inspection;
   if (inspection.blockingReasons.length > 0) {
     return {
@@ -402,6 +538,22 @@ export function buildRestoredDurable(
   const sessionsDir = path.join(store.getRunDir(runId), 'sessions');
 
   return { runId, lifecycle, units, unitIds, sessionsDir };
+}
+
+/**
+ * When every unit is already completed, mark them interrupted so a finished
+ * run can accept continuation work. No-op when any unit is still incomplete
+ * (including skipped) so selective resume does not re-open finished siblings.
+ */
+export function reopenCompletedUnitsForResume(units: Record<string, RunUnitRecord>): void {
+  const values = Object.values(units);
+  const hasIncomplete = values.some((u) => u.status !== 'completed');
+  if (hasIncomplete) return;
+  for (const unit of values) {
+    if (unit.status === 'completed') {
+      unit.status = 'interrupted';
+    }
+  }
 }
 
 /**

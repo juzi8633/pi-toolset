@@ -18,7 +18,7 @@ import {
 } from './grok-acp-invocation.ts';
 import { mapGrokAcpStopReason } from './grok-acp-parser.ts';
 import { createGrokAcpTranscriptProjector } from './grok-acp-transcript.ts';
-import { getGrokInvocation } from './grok-invocation.ts';
+import { getGrokInvocation } from './grok-command.ts';
 import type {
   InteractiveAgentTransport,
   InteractiveTransportEvent,

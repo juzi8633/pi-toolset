@@ -79,7 +79,7 @@ export interface SingleResult {
    * Protocol identity only — never a private Grok session-file path.
    */
   acpSessionId?: string;
-  /** Resume capability this unit advertises (`session` or `replay`). */
+  /** Resume capability this unit advertises (`session`). */
   resumeCapability?: ResumeCapability;
 }
 
@@ -177,8 +177,8 @@ export interface SubagentDetails {
     runId: string;
     status: import('./run-types.ts').RunStatus;
     resumable: boolean;
-    /** Aggregate resume capability across units: `session`, `replay`, or `mixed`. */
-    capability: 'session' | 'replay' | 'mixed';
+    /** Aggregate resume capability across units (`session`). */
+    capability: 'session';
   };
 }
 

@@ -1,4 +1,4 @@
-// ABOUTME: Grok ACP invocation helpers — CLI args, env overrides, and ACP startup payloads.
+// ABOUTME: Grok ACP invocation helpers — CLI args, env overrides, thinking->effort mapping, and ACP startup payloads.
 // ABOUTME: Omits maxTurns entirely; maps system prompt and tool filters into session/new._meta.
 
 import type {
@@ -11,7 +11,6 @@ import type {
 } from '@agentclientprotocol/sdk';
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
 import type { AgentConfig } from './agents.ts';
-import { mapThinkingToEffort } from './grok-invocation.ts';
 import { VERSION } from './version.ts';
 
 export const GROK_ACP_PROTOCOL_VERSION = PROTOCOL_VERSION;
@@ -110,6 +109,27 @@ export function buildGrokAcpSessionLoadParams(
     cwd,
     mcpServers: [],
   };
+}
+
+export function mapThinkingToEffort(thinking?: string): string | undefined {
+  switch (thinking) {
+    case 'off':
+      return undefined;
+    case 'minimal':
+      return 'low';
+    case 'low':
+      return 'low';
+    case 'medium':
+      return 'medium';
+    case 'high':
+      return 'high';
+    case 'xhigh':
+      return 'high';
+    case 'max':
+      return 'high';
+    default:
+      return undefined;
+  }
 }
 
 function authMethodId(method: AuthMethod): string {

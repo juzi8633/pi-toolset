@@ -21,7 +21,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Usage tracking** - turns, tokens, and context per execution unit; aggregates sum tokens/turns and use `ctx:max` (no aggregate model/thinking); partial stats stream live for `grok-acp`
 - **Abort support** - Ctrl+C propagates and kills active subprocesses
 - **Durable runs** - every invocation persists a run record, unit state, and native Pi sessions under `~/.pi/agent/@balaenis/pi-agents/runs/`; interrupted runs can be inspected and resumed without re-running completed work
-- **Resume** - `agent({ runId })` resumes an interrupted durable run from its stored workflow and sessions; optional `task` appends a continuation instruction; Pi and Grok ACP units reopen native sessions; plain Grok units replay from the beginning with explicit `allowReplay` acknowledgement
+- **Resume** - `agent({ runId })` resumes a durable run from its stored workflow and sessions; optional `task` appends a continuation instruction (required to resume a fully completed run); Pi and Grok ACP units reopen native sessions
 - **Reconciliation** - on session start, runs left running by a dead process are automatically marked interrupted
 
 ## Local development
@@ -54,14 +54,14 @@ Every validated invocation creates a durable run record under `~/.pi/agent/@bala
 
 ### Statuses
 
-| Status        | Resumable | Description                                      |
-| ------------- | --------- | ------------------------------------------------ |
-| `queued`      | Yes       | Created but not yet started                      |
-| `running`     | Yes       | Actively executing                               |
-| `completed`   | No        | All units finished successfully                  |
-| `failed`      | Yes       | One or more units failed                         |
-| `cancelled`   | Yes       | Aborted by the user (Ctrl+C)                     |
-| `interrupted` | Yes       | Interrupted by session shutdown or process death |
+| Status        | Resumable | Description                                        |
+| ------------- | --------- | -------------------------------------------------- |
+| `queued`      | Yes       | Created but not yet started                        |
+| `running`     | Yes       | Actively executing                                 |
+| `completed`   | With task | All units finished; a continuation can reopen them |
+| `failed`      | Yes       | One or more units failed                           |
+| `cancelled`   | Yes       | Aborted by the user (Ctrl+C)                       |
+| `interrupted` | Yes       | Interrupted by session shutdown or process death   |
 
 `cancelled` means the user explicitly aborted (Ctrl+C). `interrupted` means the session shut down or the owning process died. Both are resumable.
 
@@ -80,35 +80,37 @@ Resume through the same `agent` tool. Stored workflow configuration (mode, agent
 ```
 agent({ runId: "run-abc123..." })
 agent({ runId: "run-abc123...", task: "Also verify the migration path." })
-agent({ runId: "run-abc123...", task: "Retry safely.", allowReplay: true })
 ```
 
-Optional `task` is a continuation instruction appended for incomplete units only. Completed units and their stored results remain immutable. Continuation prompts are durable run data and may contain sensitive information.
+Optional `task` is a continuation instruction appended for units that still run. On a partially finished run, completed sibling units stay immutable and are not re-dispatched. A fully `completed` run can be resumed only when a non-empty `task` is supplied: finished units are then reopened so the continuation can continue from stored sessions. Resuming a completed run with `runId` alone is rejected (`completed_without_continuation`). Continuation prompts are durable run data and may contain sensitive information.
 
-### Pi vs Grok resume
+### Pi and Grok ACP resume
 
-| Runtime    | Capability | Resume behavior                                      | `allowReplay`                          |
-| ---------- | ---------- | ---------------------------------------------------- | -------------------------------------- |
-| `pi`       | `session`  | Reopen native Pi session file                        | Not required                           |
-| `grok-acp` | `session`  | `session/load` with protocol session ID              | Not required (and not an escape hatch) |
-| `grok`     | `replay`   | Fresh process with original task + all continuations | Required for incomplete units          |
+| Runtime    | Capability | Resume behavior                         |
+| ---------- | ---------- | --------------------------------------- |
+| `pi`       | `session`  | Reopen native Pi session file           |
+| `grok-acp` | `session`  | `session/load` with protocol session ID |
 
 - **Pi-runtime units with a stored session** reopen the native Pi session with a safety-oriented continuation prompt plus every **undelivered** continuation instruction for that unit. Already-delivered continuations are not resent. The original task is not resent.
 - **Grok ACP units with a stored `acpSessionId`** call ACP `session/load` with the original cwd/worktree, then send only the fixed continuation prompt plus undelivered instructions. The original task is never resent. Attempted units without a stored ID fail closed (`acp_session_unavailable`).
 - **Never-started units** (Pi or Grok ACP, queued/skipped with no attempt history) create their first session and receive the resolved original task plus every continuation instruction recorded on the run.
-- **Plain Grok units** (`resumeCapability: "replay"`) re-run from a fresh process with the original task plus all durable continuation instructions. Set `allowReplay: true` only after accepting that side effects (edits, commands, network writes) may be duplicated.
 - Continuation delivery is tracked per unit (`continuationDelivery`). Pi marks delivery after spawn/RPC activate accepts the prompt. **Grok ACP** marks delivery only after the matching `session/prompt` response (and awaits a strict durable write). Crash after claim, background-mode rejection, or partial dispatch leaves undelivered instructions for the next resume.
 - Grok ACP run records store the protocol session ID and original cwd/worktree only — never private paths under `~/.grok/sessions`. Cross-machine restore and recovery after deleting Grok storage are unsupported.
 
 ### Chain fanout resume
 
-When a chain step expands a structured array into parallel items, the expansion is frozen before any worker is scheduled. The ordered item list and one durable unit record per scheduled item are written to `run.json` under `workflowState.fanouts` and `units`. Resume never recomputes the expansion from mutable upstream output: it reuses the stored mapping, keeps completed item results, and retries only incomplete items in their original order.
+When a chain step expands a structured array into parallel items, the expansion is frozen before any worker is scheduled. The ordered item list and one durable unit record per scheduled item are written to `run.json` under `workflowState.fanouts` and `units`. Resume never recomputes the expansion from mutable upstream output; it reuses the stored mapping.
 
-Each item has a canonical unit id such as `chain-0002-fanout-0003` (one-based step, one-based display position). Items that never started remain `queued` with attempt `1`; items that already ran advance their attempt on resume. Incomplete fanout runs that lack a valid stored mapping are refused rather than reconstructed — start a fresh chain instead. See [How-to: Resume an interrupted fanout](./docs/how-to.md#resume-an-interrupted-fanout) and [Reference: Durable runs](./docs/reference.md#durable-runs).
+Two resume modes apply:
+
+- **Selective resume** (any incomplete unit, including skipped): completed fanout children keep their terminal results and are not re-dispatched; only incomplete children run, in original order.
+- **Fully completed continuation** (every unit completed and a non-empty `task` is supplied): every completed fanout child is reopened and redispatched with the continuation; frozen mappings are still required and validated before claim. Stale completed presentation slots do not skip reopened children.
+
+Each item has a canonical unit id such as `chain-0002-fanout-0003` (one-based step, one-based display position). Items that never started remain `queued` with attempt `1`; items that already ran advance their attempt on resume. Fanout runs that lack a valid stored mapping (including fully completed fanouts resumed with a continuation) are refused rather than reconstructed — start a fresh chain instead. See [How-to: Resume an interrupted fanout](./docs/how-to.md#resume-an-interrupted-fanout) and [Reference: Durable runs](./docs/reference.md#durable-runs).
 
 ### Interactive agent navigator (TUI)
 
-In interactive TUI mode, Pi-runtime units register a branch-scoped link and run over RPC so you can inspect them live:
+In interactive TUI mode, Pi and Grok ACP units register a branch-scoped link so you can inspect them live (Pi over RPC; Grok ACP over a long-lived ACP transport):
 
 ```
 /agent view              # open navigator (works while the host agent is busy)
@@ -128,22 +130,22 @@ List/widget status glyphs (Agent Nav uses the same mapping for every endpoint):
 | Interrupted (settled with `stopReason: aborted` or `interrupted`) | `⊘`   | `warning`   |
 | Error (`error` / `unavailable`)                                   | `●`   | `error`     |
 
-| Control (detail view) | Behavior                                                |
-| --------------------- | ------------------------------------------------------- |
-| Enter                 | Steer when running; new prompt when idle/detached/error |
-| Alt+Enter             | Queue follow-up when running; prompt otherwise          |
-| Ctrl+X                | Abort only the selected child's current turn            |
-| Ctrl+O                | Toggle last-15-line preview vs full transcript          |
-| Escape                | Return to the navigator list                            |
-| Up/Down / End         | Scroll transcript / resume tail-follow                  |
+| Control (detail view) | Behavior                                                                                        |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| Enter                 | Pi: steer when running, prompt when idle/detached/error. Grok ACP: prompt only when not running |
+| Alt+Enter             | Pi: queue follow-up when running; prompt otherwise. Grok ACP: prompt only when not running      |
+| Ctrl+X                | Abort/cancel only the selected child's current turn                                             |
+| Ctrl+O                | Toggle last-15-line preview vs full transcript                                                  |
+| Escape                | Return to the navigator list                                                                    |
+| Up/Down / End         | Scroll transcript / resume tail-follow                                                          |
 
-Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the full content; Ctrl+O again collapses to the last 15 lines and jumps back to the tail.
+Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the full content; Ctrl+O again collapses to the last 15 lines and jumps back to the tail. Grok ACP history hydrates lazily on first detail open via a hydrate-only ACP `session/load` (no model prompt).
 
 **Scope and limits (Version 1):**
 
-- Pi-runtime units only; Grok / Grok ACP are not in the navigator
+- Pi and Grok ACP units linked to the current host session (no cross-process attachment; one writer per session inside the current Pi process)
 - Links are host-session and active-branch scoped (forked/imported sessions do not inherit trusted links)
-- Up to four idle RPC children stay attached; others detach and reopen lazily
+- Up to four idle children stay attached; others detach and reopen lazily (Pi RPC or Grok ACP `session/load`)
 - Linked clean worktrees are retained (no automatic pruning) so interactive reattach keeps a valid cwd
 - Child slash commands and extension UI dialogs are cancelled/rejected
 - Post-completion interactive messages stay in the child session only — they do not rewrite the durable unit result or enter main-model context. The one exception is a continuation sent after the original tool-call activation was interrupted/cancelled: once that continuation settles, its final output is relayed back to the bound host model as a clearly-marked interactive continuation. Normal completed agents never relay.

@@ -2,7 +2,13 @@
 // ABOUTME: Uses an injected runStep stub so the engine is exercised without spawning real pi processes.
 
 import { describe, expect, it } from 'bun:test';
-import { runChainWorkflow, type ChainItemInput, type ChainStepRequest } from '../src/chain.ts';
+import {
+  buildRestoredLogicalSteps,
+  runChainWorkflow,
+  type ChainItemInput,
+  type ChainStepRequest,
+} from '../src/chain.ts';
+import { chainFanoutStepId, chainFanoutUnitId } from '../src/run-coordinator.ts';
 import type { ChainOutputEntry, SingleResult, SubagentDetails } from '../src/types.ts';
 
 const makeDetails = (
@@ -1314,5 +1320,994 @@ describe('runChainWorkflow title propagation', () => {
     });
     expect(res.details.chain?.steps[0].title).toBeUndefined();
     expect(res.details.results[0].title).toBeUndefined();
+  });
+});
+
+describe('buildRestoredLogicalSteps', () => {
+  it('builds a complete array from request topology when presentation is absent', () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed' },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+      { agent: 'finish', task: 'done {previous}' },
+    ];
+    const steps = buildRestoredLogicalSteps(chain, undefined, {});
+    expect(steps).toHaveLength(3);
+    expect(steps[0]).toMatchObject({
+      kind: 'sequential',
+      step: 1,
+      agent: 'seed',
+      status: 'queued',
+    });
+    expect(steps[1]).toMatchObject({
+      kind: 'fanout',
+      step: 2,
+      agent: 'worker',
+      status: 'queued',
+      collectName: 'out',
+    });
+    expect(steps[2]).toMatchObject({
+      kind: 'sequential',
+      step: 3,
+      agent: 'finish',
+      status: 'queued',
+    });
+  });
+
+  it('overlays shortened presentation by step and re-queues incomplete units', () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed' },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+      { agent: 'finish', task: 'done' },
+    ];
+    // Presentation only covers the first step (shortened / stale metadata).
+    const presentation = [
+      {
+        kind: 'sequential' as const,
+        step: 1,
+        agent: 'seed',
+        task: 'seed',
+        status: 'completed' as const,
+      },
+    ];
+    const units = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'completed' as const,
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+      'chain-0002-fanout-0001': {
+        unitId: 'chain-0002-fanout-0001',
+        agent: 'worker',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'interrupted' as const,
+        step: 2,
+        fanoutIndex: 0,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const steps = buildRestoredLogicalSteps(chain, presentation, units);
+    expect(steps).toHaveLength(3);
+    expect(steps[0]!.status).toBe('completed');
+    expect(steps[1]).toMatchObject({ kind: 'fanout', step: 2, agent: 'worker', status: 'queued' });
+    expect(steps[2]).toMatchObject({
+      kind: 'sequential',
+      step: 3,
+      agent: 'finish',
+      status: 'queued',
+    });
+  });
+
+  it('derives completed sequential status from durable units when presentation is absent', () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed' },
+      { agent: 'finish', task: 'finish {previous}' },
+    ];
+    const units = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'completed' as const,
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+      'chain-0002': {
+        unitId: 'chain-0002',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'interrupted' as const,
+        step: 2,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const steps = buildRestoredLogicalSteps(chain, undefined, units);
+    expect(steps).toHaveLength(2);
+    expect(steps[0]!.status).toBe('completed');
+    expect(steps[1]!.status).toBe('queued');
+  });
+
+  it('re-queues reopened completed units so all-completed continuation redispatches', () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed' },
+      { agent: 'finish', task: 'finish' },
+    ];
+    // After reopenCompletedUnitsForResume, completed units are interrupted.
+    const units = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'interrupted' as const,
+        step: 1,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+      'chain-0002': {
+        unitId: 'chain-0002',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'interrupted' as const,
+        step: 2,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const presentation = [
+      {
+        kind: 'sequential' as const,
+        step: 1,
+        agent: 'seed',
+        task: 'seed',
+        status: 'completed' as const,
+      },
+      {
+        kind: 'sequential' as const,
+        step: 2,
+        agent: 'finish',
+        task: 'finish',
+        status: 'completed' as const,
+      },
+    ];
+    const steps = buildRestoredLogicalSteps(chain, presentation, units);
+    expect(steps[0]!.status).toBe('queued');
+    expect(steps[1]!.status).toBe('queued');
+  });
+
+  it('skips completed seed and dispatches incomplete later step when presentation is absent', async () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed work', name: 'seed' },
+      { agent: 'finish', task: 'finish {previous}' },
+    ];
+    const seedOutput = 'seed-done';
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: makeAssistantResult('seed', seedOutput, 1),
+      },
+      'chain-0002': {
+        unitId: 'chain-0002',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 2,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const calls: Array<{ agent: string; step: number; task: string }> = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req: ChainStepRequest) => {
+        calls.push({ agent: req.agent, step: req.step, task: req.task });
+        return makeAssistantResult(req.agent, `${req.agent}-out`, req.step);
+      },
+      restored: {
+        results: [makeAssistantResult('seed', seedOutput, 1)],
+        outputs: {
+          seed: {
+            text: seedOutput,
+            structured: undefined,
+            agent: 'seed',
+            step: 1,
+          },
+        },
+        // No presentation steps — status must come from durable units.
+        logicalSteps: [],
+        units,
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(calls).toEqual([{ agent: 'finish', step: 2, task: 'finish seed-done' }]);
+    expect(res.details.chain?.steps[0]?.status).toBe('completed');
+    expect(res.details.chain?.steps[1]?.status).toBe('completed');
+  });
+
+  it('uses durable sequential unit result for previous output when presentation results lag', async () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed work', name: 'seed' },
+      { agent: 'finish', task: 'finish {previous} / {outputs.seed}' },
+    ];
+    const seedOutput = 'durable-seed-text';
+    const durableSeed = makeAssistantResult('seed', seedOutput, 1);
+    durableSeed.finalOutput = seedOutput;
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: durableSeed,
+      },
+      'chain-0002': {
+        unitId: 'chain-0002',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 2,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const calls: Array<{ agent: string; task: string }> = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req: ChainStepRequest) => {
+        calls.push({ agent: req.agent, task: req.task });
+        return makeAssistantResult(req.agent, `${req.agent}-out`, req.step);
+      },
+      restored: {
+        // Presentation results and named outputs intentionally empty/stale.
+        results: [],
+        outputs: {},
+        logicalSteps: [],
+        units,
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(calls).toEqual([{ agent: 'finish', task: `finish ${seedOutput} / ${seedOutput}` }]);
+    // Durable unit.result must not be mutated by rehydrate (clone on insert).
+    expect(durableSeed.messages).toHaveLength(1);
+    expect(units['chain-0001']!.result).toBe(durableSeed);
+  });
+
+  it('rehydrates named structured outputs from durable unit for fanout expansion', async () => {
+    const items = ['alpha', 'beta'];
+    const structured = { items };
+    const seedText = JSON.stringify(structured);
+    const durableSeed = makeAssistantResult('seed', seedText, 1);
+    durableSeed.finalOutput = seedText;
+    durableSeed.structuredOutput = structured;
+    // Only sequential seed unit exists — fanout never expanded; no frozen mapping.
+    // Expansion must read rehydrated `{outputs.seed}` structured data.
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: durableSeed,
+      },
+    };
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'seed',
+        task: 'seed',
+        name: 'seed',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+    ];
+    const fanoutTasks: string[] = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.fanoutIndex !== undefined) {
+          fanoutTasks.push(req.task);
+          return makeAssistantResult(req.agent, `item-${req.fanoutIndex}`, req.step);
+        }
+        throw new Error(`unexpected redispatch of ${req.agent}`);
+      },
+      restored: {
+        // Presentation outputs/results intentionally lag; durable unit has structuredOutput.
+        results: [],
+        outputs: {},
+        logicalSteps: [],
+        units,
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(fanoutTasks).toEqual(['Process alpha', 'Process beta']);
+    // Rehydrate must clone structuredOutput so presentation mutations stay local.
+    expect(res.details.outputs?.seed?.structured).not.toBe(durableSeed.structuredOutput);
+    expect(res.details.outputs?.seed?.structured).toEqual({ items: ['alpha', 'beta'] });
+    (res.details.outputs!.seed!.structured as { items: string[] }).items.push('mutated');
+    expect(durableSeed.structuredOutput).toEqual({ items: ['alpha', 'beta'] });
+    expect(units['chain-0001']!.result).toBe(durableSeed);
+  });
+
+  it('prefers durable unit result over stale presentation sequential output', async () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed', name: 'seed' },
+      { agent: 'finish', task: 'use {previous}' },
+    ];
+    const durableSeed = makeAssistantResult('seed', 'durable-correct', 1);
+    durableSeed.finalOutput = 'durable-correct';
+    const stalePresentation = makeAssistantResult('seed', 'stale-wrong', 1);
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: durableSeed,
+      },
+      'chain-0002': {
+        unitId: 'chain-0002',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 2,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const calls: string[] = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        calls.push(req.task);
+        return makeAssistantResult(req.agent, 'done', req.step);
+      },
+      restored: {
+        results: [stalePresentation],
+        outputs: {
+          seed: { text: 'stale-wrong', structured: undefined, agent: 'seed', step: 1 },
+        },
+        logicalSteps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'seed',
+            task: 'seed',
+            status: 'completed',
+          },
+        ],
+        units,
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(calls).toEqual(['use durable-correct']);
+  });
+
+  it('preserves later fanout collect over earlier sequential same-name on rehydrate', async () => {
+    // Step 1 sequential name "shared" collides with step 2 fanout collect "shared".
+    // Normal later-step-wins must hold on restore: rehydrate must not clobber the fanout value.
+    const earlyText = 'early-sequential';
+    const laterFanoutText = '["later-fanout-a","later-fanout-b"]';
+    const durableSeed = makeAssistantResult('seed', earlyText, 1);
+    durableSeed.finalOutput = earlyText;
+    const fanoutChild0 = makeAssistantResult('worker', 'later-fanout-a', 2);
+    fanoutChild0.finalOutput = 'later-fanout-a';
+    const fanoutChild1 = makeAssistantResult('worker', 'later-fanout-b', 2);
+    fanoutChild1.finalOutput = 'later-fanout-b';
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: durableSeed,
+      },
+      [chainFanoutUnitId(2, 0)]: {
+        unitId: chainFanoutUnitId(2, 0),
+        agent: 'worker',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 2,
+        fanoutIndex: 0,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: fanoutChild0,
+      },
+      [chainFanoutUnitId(2, 1)]: {
+        unitId: chainFanoutUnitId(2, 1),
+        agent: 'worker',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 2,
+        fanoutIndex: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: fanoutChild1,
+      },
+      'chain-0003': {
+        unitId: 'chain-0003',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 3,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed', name: 'shared' },
+      {
+        expand: { from: { output: 'shared', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'shared' },
+      },
+      { agent: 'finish', task: 'downstream sees {outputs.shared}' },
+    ];
+    const fanoutStepId = chainFanoutStepId(2);
+    const calls: string[] = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        calls.push(req.task);
+        return makeAssistantResult(req.agent, 'done', req.step);
+      },
+      restored: {
+        // Presentation already has later fanout collect under the colliding name.
+        results: [durableSeed, fanoutChild0, fanoutChild1],
+        outputs: {
+          shared: {
+            text: laterFanoutText,
+            structured: ['later-fanout-a', 'later-fanout-b'],
+            agent: 'worker',
+            step: 2,
+          },
+        },
+        logicalSteps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'seed',
+            task: 'seed',
+            status: 'completed',
+          },
+          {
+            kind: 'fanout',
+            step: 2,
+            agent: 'worker',
+            taskTemplate: 'Process {item}',
+            status: 'completed',
+            sourceOutput: 'shared',
+            sourcePath: '/items',
+            collectName: 'shared',
+            executedCount: 2,
+            completedCount: 2,
+            failedCount: 0,
+            runningCount: 0,
+            queuedCount: 0,
+            skippedCount: 0,
+          },
+        ],
+        units,
+        fanouts: {
+          [fanoutStepId]: {
+            step: 2,
+            items: ['later-fanout-a', 'later-fanout-b'],
+            unitIds: [chainFanoutUnitId(2, 0), chainFanoutUnitId(2, 1)],
+          },
+        },
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    // Only the incomplete later sequential step dispatches; seed/fanout stay completed.
+    expect(calls).toEqual([`downstream sees ${laterFanoutText}`]);
+    expect(res.details.outputs?.shared?.text).toBe(laterFanoutText);
+    expect(res.details.outputs?.shared?.step).toBe(2);
+    expect(res.details.outputs?.shared?.structured).toEqual(['later-fanout-a', 'later-fanout-b']);
+    // Clone/immutability: presentation mutation must not touch durable unit result.
+    expect(units['chain-0001']!.result).toBe(durableSeed);
+    expect(durableSeed.finalOutput).toBe(earlyText);
+  });
+
+  it('pads short restored state and dispatches later steps from frozen fanout mapping', async () => {
+    const items = ['a'];
+    const unitIds = [chainFanoutUnitId(2, 0)];
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: makeAssistantResult('seed', JSON.stringify({ items }), 1),
+      },
+      [unitIds[0]!]: {
+        unitId: unitIds[0]!,
+        agent: 'worker',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 2,
+        fanoutIndex: 0,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'seed',
+        task: 'seed',
+        name: 'seed',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+    ];
+    const calls: number[] = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.fanoutIndex !== undefined) {
+          calls.push(req.fanoutIndex);
+          return makeAssistantResult(req.agent, `item-${req.fanoutIndex}`, req.step);
+        }
+        return makeAssistantResult(req.agent, JSON.stringify({ items }), req.step);
+      },
+      restored: {
+        results: [makeAssistantResult('seed', JSON.stringify({ items }), 1)],
+        outputs: {
+          seed: {
+            text: JSON.stringify({ items }),
+            structured: { items },
+            agent: 'seed',
+            step: 1,
+          },
+        },
+        // Intentionally short presentation — only seed step.
+        logicalSteps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'seed',
+            task: 'seed',
+            status: 'completed',
+          },
+        ],
+        units,
+        fanouts: {
+          [chainFanoutStepId(2)]: { step: 2, items, unitIds },
+        },
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(calls).toEqual([0]);
+    expect(res.details.chain?.steps).toHaveLength(2);
+    expect(res.details.chain?.steps[1]?.kind).toBe('fanout');
+  });
+
+  it('queues empty fanout mapping without presentation/output (crash window)', () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed' },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+      { agent: 'finish', task: 'done {previous}' },
+    ];
+    const units = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'completed' as const,
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const emptyFanouts = {
+      [chainFanoutStepId(2)]: { step: 2, items: [] as unknown[], unitIds: [] as string[] },
+    };
+    // Mapping alone, no presentation, no collect output → must queue.
+    const steps = buildRestoredLogicalSteps(chain, undefined, units, emptyFanouts);
+    expect(steps[1]).toMatchObject({ kind: 'fanout', step: 2, status: 'queued' });
+  });
+
+  it('keeps empty fanout completed when presentation status proves completion', () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'seed', task: 'seed' },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+    ];
+    const units = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session' as const,
+        status: 'completed' as const,
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const presentation = [
+      {
+        kind: 'sequential' as const,
+        step: 1,
+        agent: 'seed',
+        task: 'seed',
+        status: 'completed' as const,
+      },
+      {
+        kind: 'fanout' as const,
+        step: 2,
+        agent: 'worker',
+        taskTemplate: 'Process {item}',
+        status: 'completed' as const,
+        collectName: 'out',
+        executedCount: 0,
+        completedCount: 0,
+        failedCount: 0,
+        runningCount: 0,
+        queuedCount: 0,
+        skippedCount: 0,
+      },
+    ];
+    const emptyFanouts = {
+      [chainFanoutStepId(2)]: { step: 2, items: [] as unknown[], unitIds: [] as string[] },
+    };
+    const steps = buildRestoredLogicalSteps(chain, presentation, units, emptyFanouts);
+    expect(steps[1]).toMatchObject({ kind: 'fanout', step: 2, status: 'completed' });
+  });
+
+  it('re-runs empty fanout crash window to reconstruct [] collect and previous', async () => {
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'seed',
+        task: 'seed',
+        name: 'seed',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+      { agent: 'finish', task: 'after {previous}' },
+    ];
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: makeAssistantResult('seed', JSON.stringify({ items: [] }), 1),
+      },
+      'chain-0003': {
+        unitId: 'chain-0003',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 3,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const expandCalls: Array<{ step: number; items: unknown[] }> = [];
+    const calls: Array<{ agent: string; step: number; task: string }> = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req: ChainStepRequest) => {
+        calls.push({ agent: req.agent, step: req.step, task: req.task });
+        return makeAssistantResult(req.agent, `${req.agent}-out`, req.step);
+      },
+      onFanoutExpand: async (req) => {
+        expandCalls.push({ step: req.step, items: req.items });
+        return { step: req.step, items: req.items, unitIds: [] };
+      },
+      restored: {
+        results: [makeAssistantResult('seed', JSON.stringify({ items: [] }), 1)],
+        outputs: {
+          seed: {
+            text: JSON.stringify({ items: [] }),
+            structured: { items: [] },
+            agent: 'seed',
+            step: 1,
+          },
+          // Collect output missing — crash between expand persist and empty completion.
+        },
+        logicalSteps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'seed',
+            task: 'seed',
+            status: 'completed',
+          },
+          {
+            kind: 'fanout',
+            step: 2,
+            agent: 'worker',
+            taskTemplate: 'Process {item}',
+            // Presentation incomplete: expansion persisted, collect not written.
+            status: 'running',
+            collectName: 'out',
+            executedCount: 0,
+            completedCount: 0,
+            failedCount: 0,
+            runningCount: 0,
+            queuedCount: 0,
+            skippedCount: 0,
+          },
+        ],
+        units,
+        fanouts: {
+          [chainFanoutStepId(2)]: { step: 2, items: [], unitIds: [] },
+        },
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    // Zero-worker fanout re-ran via restored empty expansion (no workers dispatched).
+    expect(expandCalls).toEqual([{ step: 2, items: [] }]);
+    expect(calls).toEqual([{ agent: 'finish', step: 3, task: 'after []' }]);
+    expect(res.details.outputs?.out?.structured).toEqual([]);
+    expect(res.details.chain?.steps[1]?.status).toBe('completed');
+  });
+
+  it('preserves truly completed empty fanout and skips re-dispatch on selective resume', async () => {
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'seed',
+        task: 'seed',
+        name: 'seed',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+      { agent: 'finish', task: 'after {previous}' },
+    ];
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      'chain-0001': {
+        unitId: 'chain-0001',
+        agent: 'seed',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: makeAssistantResult('seed', JSON.stringify({ items: [] }), 1),
+      },
+      'chain-0003': {
+        unitId: 'chain-0003',
+        agent: 'finish',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'interrupted',
+        step: 3,
+        attempt: 2,
+        attempts: [],
+        effectiveCwd: '/tmp',
+      },
+    };
+    const expandCalls: unknown[] = [];
+    const calls: Array<{ agent: string; task: string }> = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req: ChainStepRequest) => {
+        calls.push({ agent: req.agent, task: req.task });
+        return makeAssistantResult(req.agent, `${req.agent}-out`, req.step);
+      },
+      onFanoutExpand: async (req) => {
+        expandCalls.push(req);
+        return { step: req.step, items: req.items, unitIds: [] };
+      },
+      restored: {
+        results: [makeAssistantResult('seed', JSON.stringify({ items: [] }), 1)],
+        outputs: {
+          seed: {
+            text: JSON.stringify({ items: [] }),
+            structured: { items: [] },
+            agent: 'seed',
+            step: 1,
+          },
+          out: {
+            text: '[]',
+            structured: [],
+            agent: 'worker',
+            step: 2,
+          },
+        },
+        logicalSteps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'seed',
+            task: 'seed',
+            status: 'completed',
+          },
+          {
+            kind: 'fanout',
+            step: 2,
+            agent: 'worker',
+            taskTemplate: 'Process {item}',
+            status: 'completed',
+            collectName: 'out',
+            executedCount: 0,
+            completedCount: 0,
+            failedCount: 0,
+            runningCount: 0,
+            queuedCount: 0,
+            skippedCount: 0,
+          },
+        ],
+        units,
+        fanouts: {
+          [chainFanoutStepId(2)]: { step: 2, items: [], unitIds: [] },
+        },
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(expandCalls).toEqual([]);
+    expect(calls).toEqual([{ agent: 'finish', task: 'after []' }]);
+    expect(res.details.outputs?.out?.structured).toEqual([]);
   });
 });

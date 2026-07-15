@@ -1,5 +1,5 @@
 // ABOUTME: Subprocess execution for the `agent` tool — concurrency limiter and single-agent run loop.
-// ABOUTME: Dispatches to pi, grok, or grok-acp runtime and accumulates messages and stop reason.
+// ABOUTME: Dispatches to pi or grok-acp runtime and accumulates messages and stop reason.
 
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
@@ -8,7 +8,7 @@ import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig, Runtime } from './agents.ts';
-import { GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
+import { GROK_ACP_RUNTIME } from './constants.ts';
 import { GrokAcpClientError, runGrokAcpClient } from './grok-acp-client.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
@@ -23,8 +23,7 @@ import {
   finalizeGrokAcpPrompt,
   handleGrokAcpSessionUpdate,
 } from './grok-acp-parser.ts';
-import { buildGrokArgs, getGrokInvocation } from './grok-invocation.ts';
-import { createGrokParserState, parseGrokEvent } from './grok-parser.ts';
+import { getGrokInvocation } from './grok-command.ts';
 import {
   appendContinuationTasks,
   buildPiArgs,
@@ -95,8 +94,8 @@ export interface RunSingleAgentOptions {
   endpointKey?: string;
   /**
    * When set, this invocation is part of a durable resume. Existing Pi sessions
-   * receive a session-continuation prompt; never-started/replay units receive
-   * original task + accumulated continuation tasks.
+   * receive a session-continuation prompt; never-started units receive the
+   * original task plus accumulated continuation tasks.
    */
   resumePrompt?: ResumePromptContext;
   /**
@@ -106,7 +105,7 @@ export interface RunSingleAgentOptions {
    * Required for correct never-started unit resume after prepareAgentContext.
    */
   resumeHadStoredSession?: boolean;
-  /** Called once the child has accepted the resume/fresh prompt (spawn or RPC activate). */
+  /** Called once the child has accepted the resume or original prompt (spawn or RPC activate). */
   onResumePromptAccepted?: () => void;
   /**
    * Awaited once Pi has accepted the unit's original (or fresh) prompt so durable
@@ -408,21 +407,6 @@ export async function runSingleAgent(
     );
   }
 
-  if (effectiveRuntime === GROK_RUNTIME) {
-    return runSingleAgentGrok(
-      defaultCwd,
-      agents,
-      agentName,
-      task,
-      cwd,
-      step,
-      signal,
-      onUpdate,
-      makeDetails,
-      options
-    );
-  }
-
   // TUI Pi units with a registered interactive endpoint run through RPC so they
   // remain steerable; JSON/print/RPC host modes keep the one-shot JSON path.
   if (
@@ -700,144 +684,6 @@ export async function runSingleAgent(
         /* ignore */
       }
   }
-}
-
-async function runSingleAgentGrok(
-  defaultCwd: string,
-  agents: AgentConfig[],
-  agentName: string,
-  task: string,
-  cwd: string | undefined,
-  step: number | undefined,
-  signal: AbortSignal | undefined,
-  onUpdate: OnUpdateCallback | undefined,
-  makeDetails: (results: SingleResult[]) => SubagentDetails,
-  options: RunSingleAgentOptions = {}
-): Promise<SingleResult> {
-  const agent = agents.find((a) => a.name === agentName)!;
-
-  const effectiveModel = options.modelOverride ?? agent.model;
-  const effectiveThinking = options.thinkingOverride ?? agent.thinking;
-  const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
-  const effectiveAgent: AgentConfig = {
-    ...agent,
-    model: effectiveModel,
-    thinking: effectiveThinking,
-    runtime: effectiveRuntime,
-  };
-
-  const currentResult: SingleResult = {
-    agent: agentName,
-    agentSource: agent.source,
-    task,
-    title: options.title,
-    exitCode: 0,
-    status: 'running',
-    messages: [],
-    stderr: '',
-    usage: emptyUsage(),
-    model: effectiveModel,
-    thinking: effectiveThinking,
-    step,
-  };
-  stampUnitContext(currentResult, options);
-
-  const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
-
-  // Replay-capable units always start fresh; append all durable continuations.
-  const invocationTask = options.resumePrompt
-    ? appendContinuationTasks(task, options.resumePrompt.continuationTasks)
-    : task;
-
-  const childEnv = buildChildAgentEnv(process.env, { agent: effectiveAgent });
-  const args = buildGrokArgs(effectiveAgent, invocationTask, {
-    resolvedSkillPaths: options.resolvedSkillPaths,
-  });
-
-  let wasAborted = false;
-
-  const exitCode = await new Promise<number>((resolve) => {
-    const invocation = getGrokInvocation(args);
-    const spawnFn = options.spawnFn ?? (spawn as unknown as SpawnFn);
-    const proc = spawnFn(invocation.command, invocation.args, {
-      cwd: cwd ?? defaultCwd,
-      env: childEnv,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    options.onResumePromptAccepted?.();
-    let buffer = '';
-    let hasClosed = false;
-    let settled = false;
-    const parserState = createGrokParserState();
-
-    const flushBuffer = () => {
-      if (buffer.trim()) {
-        const remaining = buffer;
-        buffer = '';
-        parseGrokEvent(remaining, currentResult, emitUpdate, parserState);
-      }
-    };
-
-    const settle = (code: number) => {
-      if (settled) return;
-      settled = true;
-      flushBuffer();
-      resolve(code);
-    };
-
-    proc.stdout.on('data', (data) => {
-      buffer += data.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) parseGrokEvent(line, currentResult, emitUpdate, parserState);
-    });
-
-    proc.stderr.on('data', (data) => {
-      currentResult.stderr += data.toString();
-    });
-
-    proc.on('close', (code) => {
-      hasClosed = true;
-      settle(code ?? 0);
-    });
-
-    proc.on('error', (err: Error) => {
-      hasClosed = true;
-      const message = err?.message || String(err);
-      currentResult.stderr = currentResult.stderr ? `${currentResult.stderr}\n${message}` : message;
-      currentResult.errorMessage = message;
-      currentResult.stopReason = 'error';
-      settle(1);
-    });
-
-    if (signal) {
-      const killProc = () => {
-        wasAborted = true;
-        proc.kill('SIGTERM');
-        setTimeout(() => {
-          if (!hasClosed) proc.kill('SIGKILL');
-        }, 5000);
-      };
-      if (signal.aborted) killProc();
-      else signal.addEventListener('abort', killProc, { once: true });
-    }
-  });
-
-  currentResult.exitCode = exitCode;
-  if (currentResult.stopReason === 'max_turns' && !currentResult.errorMessage) {
-    currentResult.errorMessage = agent.maxTurns
-      ? `Agent exceeded maxTurns=${agent.maxTurns}`
-      : 'Agent exceeded max turns';
-  }
-  if (wasAborted) {
-    const origin = resolveAbortOrigin(signal, options);
-    finalizeAborted(currentResult, origin);
-    emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
-    throw new AgentAbortError(currentResult, origin);
-  }
-  applyTerminalStatus(currentResult);
-  return currentResult;
 }
 
 async function runSingleAgentGrokAcp(

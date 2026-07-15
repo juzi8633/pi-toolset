@@ -12,25 +12,25 @@ Agents are markdown files with YAML frontmatter. Locations:
   `~/.pi/agent/settings.json` (user scope) or the nearest ancestor
   `.pi/settings.json` (project scope).
 
-| Field               | Type                         | Default      | Description                                                                                                                                                                                                                                                                    |
-| ------------------- | ---------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `name`              | string                       | (required)   | Agent identifier used by the `agent` tool.                                                                                                                                                                                                                                     |
-| `description`       | string                       | (required)   | Shown to the parent model in the agent catalogue.                                                                                                                                                                                                                              |
-| `tools`             | comma list                   | inherit all  | Allowlist passed to `pi --tools`.                                                                                                                                                                                                                                              |
-| `excludeTools`      | comma list                   | none         | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                                                                         |
-| `model`             | string                       | host default | Forwarded as `pi --model`.                                                                                                                                                                                                                                                     |
-| `thinking`          | string                       | host default | Forwarded as `pi --thinking`.                                                                                                                                                                                                                                                  |
-| `systemPromptMode`  | `append` \| `replace`        | `append`     | `replace` swaps the host system prompt via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                                                                                          |
-| `maxTurns`          | positive integer             | unbounded    | Max assistant turns for `pi` and `grok` (streaming-json); the child is `SIGTERM`'d when exceeded (`stopReason: "max_turns"`). Ignored entirely by `grok-acp`.                                                                                                                  |
-| `noContextFiles`    | boolean                      | `false`      | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                                                                         |
-| `noSkills`          | boolean                      | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                                |
-| `skills`            | comma list                   | none         | Skill names to allowlist. When set, the child runs with `--no-skills` plus one `--skill <path>` per resolved name. Unresolvable names fail with `stopReason: "skill_error"`.                                                                                                   |
-| `defaultContext`    | `fresh` \| `fork`            | `fresh`      | `fork` branches the parent session and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                                                                                      |
-| `isolation`         | `none` \| `worktree`         | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>-<rand>/` via `git worktree add --detach HEAD`. Clean worktrees are removed; dirty ones are kept and reported on `worktreePath`.                                                 |
-| `completionCheck`   | comma list                   | none         | Required final-message headings. Each configured heading must appear as an exact line; otherwise `stopReason: "completion_check"`, exit code `1`, `status: "failed"`. Parent-visible text is a failure warning (with missing headings) followed by the unchecked final output. |
-| `maxSubagentDepth`  | non-negative integer         | unset        | Caps further `agent` delegations from inside the spawned agent. `0` removes the `agent` tool and catalogue prompt for that child. When unset, the global `PI_AGENT_MAX_DEPTH` limit applies.                                                                                   |
-| `worktreeSetupHook` | non-empty string             | unset        | Shell command run inside the new worktree before the child runtime starts (only when `isolation: worktree`). Applies to `pi`, `grok`, and `grok-acp`. Failure produces `stopReason: "worktree_setup_error"`.                                                                   |
-| `runtime`           | `pi` \| `grok` \| `grok-acp` | `pi`         | Which CLI/protocol to spawn. `pi` -> `pi --mode json -p`; `grok` -> `grok -p --output-format streaming-json`; `grok-acp` -> `grok agent … stdio` (ACP).                                                                                                                        |
+| Field               | Type                  | Default      | Description                                                                                                                                                                                                                                                                    |
+| ------------------- | --------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`              | string                | (required)   | Agent identifier used by the `agent` tool.                                                                                                                                                                                                                                     |
+| `description`       | string                | (required)   | Shown to the parent model in the agent catalogue.                                                                                                                                                                                                                              |
+| `tools`             | comma list            | inherit all  | Allowlist passed to `pi --tools`.                                                                                                                                                                                                                                              |
+| `excludeTools`      | comma list            | none         | Denylist passed to `pi --exclude-tools` (applied after the allowlist).                                                                                                                                                                                                         |
+| `model`             | string                | host default | Forwarded as `pi --model`.                                                                                                                                                                                                                                                     |
+| `thinking`          | string                | host default | Forwarded as `pi --thinking`.                                                                                                                                                                                                                                                  |
+| `systemPromptMode`  | `append` \| `replace` | `append`     | `replace` swaps the host system prompt via `--system-prompt`; `append` uses `--append-system-prompt`.                                                                                                                                                                          |
+| `maxTurns`          | positive integer      | unbounded    | Max assistant turns for `pi`; the child is `SIGTERM`'d when exceeded (`stopReason: "max_turns"`). Ignored entirely by `grok-acp`.                                                                                                                                              |
+| `noContextFiles`    | boolean               | `false`      | When `true`, runs the child with `--no-context-files`.                                                                                                                                                                                                                         |
+| `noSkills`          | boolean               | `false`      | When `true`, runs the child with `--no-skills`.                                                                                                                                                                                                                                |
+| `skills`            | comma list            | none         | Skill names to allowlist. When set, the child runs with `--no-skills` plus one `--skill <path>` per resolved name. Unresolvable names fail with `stopReason: "skill_error"`.                                                                                                   |
+| `defaultContext`    | `fresh` \| `fork`     | `fresh`      | `fork` branches the parent session and runs the child with `--session <branched-file>`; `fresh` runs with `--no-session`. Requires a persisted parent session for `fork`.                                                                                                      |
+| `isolation`         | `none` \| `worktree`  | `none`       | When `worktree`, the child runs in `<repo>/.worktrees/pi-agent-<safe-name>-<timestamp>-<index>-<rand>/` via `git worktree add --detach HEAD`. Clean worktrees are removed; dirty ones are kept and reported on `worktreePath`.                                                 |
+| `completionCheck`   | comma list            | none         | Required final-message headings. Each configured heading must appear as an exact line; otherwise `stopReason: "completion_check"`, exit code `1`, `status: "failed"`. Parent-visible text is a failure warning (with missing headings) followed by the unchecked final output. |
+| `maxSubagentDepth`  | non-negative integer  | unset        | Caps further `agent` delegations from inside the spawned agent. `0` removes the `agent` tool and catalogue prompt for that child. When unset, the global `PI_AGENT_MAX_DEPTH` limit applies.                                                                                   |
+| `worktreeSetupHook` | non-empty string      | unset        | Shell command run inside the new worktree before the child runtime starts (only when `isolation: worktree`). Applies to `pi` and `grok-acp`. Failure produces `stopReason: "worktree_setup_error"`.                                                                            |
+| `runtime`           | `pi` \| `grok-acp`    | `pi`         | Which CLI/protocol to spawn. `pi` -> `pi --mode json -p`; `grok-acp` -> `grok agent … stdio` (ACP).                                                                                                                                                                            |
 
 Invalid values (unknown enums, non-positive `maxTurns`, negative/non-integer
 `maxSubagentDepth`, non-boolean strings) are ignored and fall back to the
@@ -54,23 +54,22 @@ dropped with the same rules as frontmatter parsing.
 
 ## Tool modes
 
-| Mode     | Parameter                        | Description                                             |
-| -------- | -------------------------------- | ------------------------------------------------------- |
-| Single   | `{ agent, task }`                | One agent, one task.                                    |
-| Parallel | `{ tasks: [...] }`               | Multiple agents concurrently (max 8, 4 at a time).      |
-| Chain    | `{ chain: [...] }`               | Sequential with `{previous}` and `{outputs.<name>}`.    |
-| Resume   | `{ runId, task?, allowReplay? }` | Resume a durable run from stored workflow and sessions. |
+| Mode     | Parameter          | Description                                             |
+| -------- | ------------------ | ------------------------------------------------------- |
+| Single   | `{ agent, task }`  | One agent, one task.                                    |
+| Parallel | `{ tasks: [...] }` | Multiple agents concurrently (max 8, 4 at a time).      |
+| Chain    | `{ chain: [...] }` | Sequential with `{previous}` and `{outputs.<name>}`.    |
+| Resume   | `{ runId, task? }` | Resume a durable run from stored workflow and sessions. |
 
 Any fresh mode can be wrapped with `runInBackground: true` to run asynchronously.
 On resume, background delivery is restored from the stored run and cannot be overridden.
 
 ### Resume parameters
 
-| Parameter     | Required | Description                                                                                                                                                                   |
-| ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `runId`       | yes      | Public durable run id (from a prior `agent` result or `/agent runs`).                                                                                                         |
-| `task`        | no       | Continuation instruction appended to incomplete units only. Trimmed; blank values are ignored.                                                                                |
-| `allowReplay` | no       | When `true`, allows plain Grok (`runtime: "grok"`) units to re-run. Required when any incomplete unit needs replay acknowledgement. Never applies to Grok ACP session resume. |
+| Parameter | Required | Description                                                                                                                                                                                                                                                     |
+| --------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `runId`   | yes      | Public durable run id (from a prior `agent` result or `/agent runs`).                                                                                                                                                                                           |
+| `task`    | no\*     | Continuation instruction for units that will run. On a partial run, completed siblings stay immutable. Required (non-empty after trim) to resume a fully completed run; otherwise resume fails with `completed_without_continuation`. Blank values are ignored. |
 
 When `runId` is present, reject these fresh-launch fields (error
 `resume_error: conflicting parameters for runId: <sorted fields>`):
@@ -85,7 +84,6 @@ When `runId` is present, reject these fresh-launch fields (error
 | Pi never started (no session) | Resolved original task + **all** durable `continuationTasks` (even if a new session file is created this call). |
 | Grok ACP existing session     | Fixed continuation prompt + **undelivered** continuations via `session/load` (original task not resent).        |
 | Grok ACP never-started        | Resolved original task + **all** durable `continuationTasks`, after first `session/new`.                        |
-| Plain Grok (replay)           | Resolved original task + **all** durable `continuationTasks`, from a fresh process.                             |
 
 Per-unit delivery progress is stored in `continuationDelivery[unitId].deliveredCount`
 (how many of `continuationTasks[0..n)` have been confirmed for that unit).
@@ -99,8 +97,7 @@ resolution so braces in the new instruction are not treated as templates.
 Appended continuation prompts are durable run data under `continuationTasks`
 and may contain sensitive information.
 
-`runId` must be a non-empty non-whitespace string. `allowReplay` without `runId`
-is rejected with `resume_error`.
+`runId` must be a non-empty non-whitespace string.
 
 ### Collapse titles
 
@@ -137,11 +134,8 @@ frontmatter and config overrides.
 }
 ```
 
-- `model` / `thinking` are forwarded as `pi --model` / `pi --thinking` (or
-  `grok --model` / `grok --effort` / `grok --reasoning-effort` depending on
-  runtime) and recorded on the result.
-- `runtime` selects the CLI: `"pi"` (default), `"grok"` (streaming-json), or
-  `"grok-acp"` (ACP over stdio).
+- `model` / `thinking` are forwarded to the selected runtime and recorded on the result. Pi uses `--model` / `--thinking`; Grok ACP uses `--model` / `--reasoning-effort`.
+- `runtime` selects the CLI: `"pi"` (default) or `"grok-acp"` (ACP over stdio).
 
 ## Background agents
 
@@ -256,23 +250,26 @@ entry means zero. Updated only after prompt acceptance (spawn / RPC activate).
 
 Blocking reasons and tool-level resume errors:
 
-| Prefix / code                      | When                                                            |
-| ---------------------------------- | --------------------------------------------------------------- |
-| `conflicting parameters for runId` | Fresh-launch fields supplied alongside `runId`                  |
-| `run_not_found`                    | Unknown or unreadable run id                                    |
-| `preflight_failed`                 | Inspection returned one or more blocking reasons                |
-| `run_active`                       | Coordinator already owns the run                                |
-| `resume_setup_failed`              | Post-claim persistence failed (claim released)                  |
-| `stored_fanout_state_unavailable`  | Incomplete fanout without a valid, canonical persisted mapping  |
-| `stored_output_invalid`            | Completed child unit missing a completed terminal result        |
-| `fanout_state_conflict`            | Expansion request conflicts with an existing mapping or unit id |
-| `session_unavailable`              | Pi unit that already started is missing its session file        |
-| fingerprint mismatch               | Current agent definition differs from the stored fingerprint    |
-| requires replay                    | Replay-capable unit and `allowReplay` was not set               |
+| Prefix / code                      | When                                                                                                             |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `conflicting parameters for runId` | Fresh-launch fields supplied alongside `runId`                                                                   |
+| `run_not_found`                    | Unknown or unreadable run id                                                                                     |
+| `completed_without_continuation`   | Fully completed run resumed without a non-empty `task`                                                           |
+| `preflight_failed`                 | Inspection returned one or more blocking reasons                                                                 |
+| `run_active`                       | Coordinator already owns the run                                                                                 |
+| `resume_setup_failed`              | Post-claim persistence failed (claim released)                                                                   |
+| `stored_fanout_state_unavailable`  | Fanout without a valid, canonical persisted mapping (selective incomplete work, or fully completed continuation) |
+| `stored_output_invalid`            | Completed child unit missing a completed terminal result                                                         |
+| `fanout_state_conflict`            | Expansion request conflicts with an existing mapping or unit id                                                  |
+| `session_unavailable`              | Pi unit that already started is missing its session file                                                         |
+| fingerprint mismatch               | Current agent definition differs from the stored fingerprint                                                     |
 
-Completed historical runs remain listable via `/agent runs` and
-`/agent status` even when they predate per-item fanout records. Incomplete
-legacy fanouts without a mapping cannot be resumed safely — start a new
+**Selective fanout resume** keeps completed children terminal and dispatches only
+incomplete ones. **Fully completed fanout continuation** reopens every child and
+requires a frozen mapping (derived from durable units even when presentation
+`details.chain.steps` is missing). Completed historical runs remain listable via
+`/agent runs` and `/agent status` even when they predate per-item fanout records.
+Legacy fanouts without a mapping cannot be resumed safely — start a new
 invocation.
 
 ## Bundled agents
@@ -353,24 +350,24 @@ time; run `pi reload` (or restart) after adding/removing agent files.
 
 ## Interactive agent view
 
-TUI-only navigator for Pi-runtime durable units linked to the active main-session branch.
+TUI-only navigator for Pi and Grok ACP durable units linked to the active main-session branch. Pi units run over RPC; Grok ACP units use a long-lived ACP transport. Opening a detached Grok ACP detail hydrates history lazily through a hydrate-only ACP `session/load` (no model prompt).
 
 ### Controls
 
-| Context   | Control         | Behavior                                        |
-| --------- | --------------- | ----------------------------------------------- |
-| Host TUI  | `/agent view`   | Open navigator immediately (no `waitForIdle`)   |
-| Host TUI  | `Ctrl+Alt+Down` | Same as `/agent view`                           |
-| Navigator | Up/Down         | Move between linked endpoints                   |
-| Navigator | Enter           | Open selected endpoint detail                   |
-| Navigator | Escape          | Close to host editor                            |
-| Detail    | Up/Down         | Scroll transcript viewport                      |
-| Detail    | End             | Resume tail-following                           |
-| Detail    | Enter           | `prompt` when not running; `steer` when running |
-| Detail    | Alt+Enter       | `follow_up` when running; `prompt` otherwise    |
-| Detail    | Ctrl+X          | Abort current child turn only                   |
-| Detail    | Ctrl+O          | Toggle last-15-line preview vs full transcript  |
-| Detail    | Escape          | Return to navigator                             |
+| Context   | Control         | Behavior                                                                                              |
+| --------- | --------------- | ----------------------------------------------------------------------------------------------------- |
+| Host TUI  | `/agent view`   | Open navigator immediately (no `waitForIdle`)                                                         |
+| Host TUI  | `Ctrl+Alt+Down` | Same as `/agent view`                                                                                 |
+| Navigator | Up/Down         | Move between linked endpoints                                                                         |
+| Navigator | Enter           | Open selected endpoint detail                                                                         |
+| Navigator | Escape          | Close to host editor                                                                                  |
+| Detail    | Up/Down         | Scroll transcript viewport                                                                            |
+| Detail    | End             | Resume tail-following                                                                                 |
+| Detail    | Enter           | Pi: `prompt` when idle, `steer` when running. Grok ACP: `prompt` when idle; rejected when running     |
+| Detail    | Alt+Enter       | Pi: `follow_up` when running; `prompt` otherwise. Grok ACP: `prompt` when idle; rejected when running |
+| Detail    | Ctrl+X          | Abort/cancel current child turn only (Pi abort RPC or Grok ACP `session/cancel`)                      |
+| Detail    | Ctrl+O          | Toggle last-15-line preview vs full transcript                                                        |
+| Detail    | Escape          | Return to navigator                                                                                   |
 
 ### Endpoint statuses
 
@@ -409,7 +406,7 @@ The durable unit stores the matching dual binding under `interactiveBindings[bin
 
 | Cap / error                | Value / meaning                                                |
 | -------------------------- | -------------------------------------------------------------- |
-| Idle transport cap         | 4 idle attached RPC children (LRU detach)                      |
+| Idle transport cap         | 4 idle attached children (LRU detach; Pi RPC or Grok ACP)      |
 | Tool result viewport       | 5 lines and 4 KB displayed (full result kept in child session) |
 | Detail default preview     | Last 15 content lines (fixed; not terminal-row dependent)      |
 | Detail expanded (Ctrl+O)   | Full transcript; collapse restores last 15 at the tail         |
@@ -422,7 +419,7 @@ The durable unit stores the matching dual binding under `interactiveBindings[bin
 
 ### Scope
 
-- Pi runtime only; Grok/Grok ACP deferred.
+- Pi and Grok ACP units linked to the current host session. Grok ACP history hydrates on first detail open via `session/load` (hydrate-only; no model prompt).
 - No cross-process attachment; one writer per session inside the current Pi process.
 - Pre-feature sessions have no links and are not retrofitted.
 - Linked clean worktrees are retained (no automatic pruning in Version 1).

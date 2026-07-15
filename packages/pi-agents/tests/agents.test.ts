@@ -47,7 +47,7 @@ defaultContext: fork
 isolation: worktree
 completionCheck: "## Completed, ## Files Changed, ## Validation"
 maxSubagentDepth: 0
-runtime: grok
+runtime: grok-acp
 ---
 System prompt body.`
       );
@@ -66,7 +66,7 @@ System prompt body.`
     expect(a!.isolation).toBe('worktree');
     expect(a!.completionCheck).toEqual(['## Completed', '## Files Changed', '## Validation']);
     expect(a!.maxSubagentDepth).toBe(0);
-    expect(a!.runtime).toBe('grok');
+    expect(a!.runtime).toBe('grok-acp');
   });
 
   it('leaves omitted optional fields undefined and applies enum defaults', () => {
@@ -341,7 +341,7 @@ describe('agent config overrides', () => {
     expect(a.isolation).toBe('none');
   });
 
-  it('config override can set runtime to grok', () => {
+  it('ignores the removed grok runtime in config overrides', () => {
     env = withAgentsDir((dir) => {
       writeAgent(dir, 'overridable', 'model: original-model');
     });
@@ -355,7 +355,7 @@ describe('agent config overrides', () => {
     );
     const { agents } = discoverAgents(env.cwd, 'project');
     const a = agents.find((x) => x.name === 'overridable')!;
-    expect(a.runtime).toBe('grok');
+    expect(a.runtime).toBeUndefined();
   });
 
   it('parses runtime: grok-acp from frontmatter', () => {

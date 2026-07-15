@@ -14,9 +14,9 @@ export const TitleSchema = Type.String({
     'Short label (max 30 chars) shown in the collapsed summary instead of the task preview (e.g. "fix lint"). Omit to use the task preview.',
 });
 
-export const RuntimeSchema = StringEnum(['pi', 'grok', 'grok-acp'] as const, {
+export const RuntimeSchema = StringEnum(['pi', 'grok-acp'] as const, {
   description:
-    "Override the agent config `runtime` for every agent in this call. `pi` (default) spawns the pi CLI; `grok` spawns Grok streaming-json; `grok-acp` spawns Grok ACP over stdio. Defaults to each agent's configured runtime.",
+    "Override the agent config `runtime` for every agent in this call. `pi` (default) spawns the pi CLI; `grok-acp` spawns Grok ACP over stdio. Defaults to each agent's configured runtime.",
 });
 
 export const TaskItem = Type.Object({
@@ -139,13 +139,7 @@ export const SubagentParams = Type.Object({
   runId: Type.Optional(
     Type.String({
       description:
-        'Resume an existing durable run by ID. Restores the stored workflow, sessions, and settings. Mutually exclusive with fresh launch fields (agent, tasks, chain, agentScope, cwd, isolation, runInBackground, model, thinking, runtime, title). Optional task appends a continuation instruction; allowReplay acknowledges replay risk for Grok units.',
-    })
-  ),
-  allowReplay: Type.Optional(
-    Type.Boolean({
-      description:
-        'For resume only: allow replay-capable units to re-run from the beginning. Only set after accepting duplicate-side-effect risk.',
+        'Resume an existing durable run by ID. Restores the stored workflow, sessions, and settings. Mutually exclusive with fresh launch fields (agent, tasks, chain, agentScope, cwd, isolation, runInBackground, model, thinking, runtime, title). Optional task appends a continuation instruction (required to resume a fully completed run).',
     })
   ),
 });

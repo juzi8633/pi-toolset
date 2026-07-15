@@ -3,7 +3,7 @@
 
 import * as crypto from 'node:crypto';
 import type { AgentConfig, Runtime } from './agents.ts';
-import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME, GROK_RUNTIME } from './constants.ts';
+import { DEFAULT_RUNTIME } from './constants.ts';
 import type { RunStore } from './run-store.ts';
 import type {
   AgentRunRecordV1,
@@ -55,8 +55,8 @@ export interface UnitExecutionContext {
   fanoutIndex?: number;
 }
 
-/** Aggregate resume capability across a run's units. */
-export type AggregateCapability = 'session' | 'replay' | 'mixed';
+/** Aggregate resume capability across a run's units (session-only). */
+export type AggregateCapability = 'session';
 
 const UNIT_ID_PATTERN = /^[a-z0-9-]+$/;
 
@@ -205,35 +205,14 @@ export function agentFingerprint(agent: AgentConfig): string {
   return crypto.createHash('sha256').update(canon).digest('hex');
 }
 
-/** Resolve the resume capability for a runtime. */
-export function resumeCapabilityForRuntime(runtime: Runtime | undefined): ResumeCapability {
-  // Plain Grok streaming-json is replay-only. Grok ACP uses native session/load.
-  return runtime === GROK_RUNTIME ? 'replay' : 'session';
-}
-
-/**
- * Whether a unit requires allowReplay acknowledgement for resume.
- * Uses the unit's effective runtime rather than a legacy stored capability label,
- * so a legacy Grok ACP unit stored as `capability: "replay"` cannot be replayed.
- */
-export function unitRequiresReplayAcknowledgement(unit: {
-  runtime?: Runtime;
-  capability?: ResumeCapability;
-}): boolean {
-  const runtime = unit.runtime;
-  if (runtime === GROK_RUNTIME) return true;
-  if (runtime === GROK_ACP_RUNTIME) return false;
-  // Unknown/legacy: honor stored capability only for non-ACP runtimes.
-  return unit.capability === 'replay';
+/** Resolve the resume capability for a supported runtime. */
+export function resumeCapabilityForRuntime(_runtime: Runtime | undefined): ResumeCapability {
+  return 'session';
 }
 
 /** Aggregate per-unit capabilities into a single run-level capability label. */
-export function aggregateCapability(caps: ResumeCapability[]): AggregateCapability {
-  if (caps.length === 0) return 'session';
-  const anySession = caps.some((c) => c === 'session');
-  const anyReplay = caps.some((c) => c === 'replay');
-  if (anySession && anyReplay) return 'mixed';
-  return anyReplay ? 'replay' : 'session';
+export function aggregateCapability(_caps: ResumeCapability[]): AggregateCapability {
+  return 'session';
 }
 
 /** Build a fresh run-unit record for a queued unit. */
@@ -424,8 +403,7 @@ export interface RunCoordinator {
    * Strict awaited write of a Grok ACP protocol session ID. Disk-first on the
    * shared durable queue; does not cancel pending coalesced timers so ordinary
    * live updates still flush afterward. Same-ID is idempotent; rejects a
-   * conflicting existing ID. On first successful write for a legacy never-started
-   * Grok ACP unit stored as `capability: "replay"`, normalizes capability to `session`.
+   * conflicting existing ID.
    */
   persistAcpSessionId(input: { runId: string; unitId: string; sessionId: string }): Promise<void>;
   /**
@@ -1475,10 +1453,25 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     const status: RunStatus = details.run?.status ?? deriveRunStatus(units, details);
     const caps = Object.values(units).map((u) => u.capability);
     const capability = aggregateCapability(caps);
-    const anyIncomplete = Object.values(units).some(
-      (u) => u.status === 'interrupted' || u.status === 'failed' || u.status === 'cancelled'
+    const unitList = Object.values(units);
+    // Failed/cancelled/interrupted, skipped, and queued units can be selectively
+    // resumed once the run is terminal. Queued work is included so a crashed
+    // terminal snapshot with never-started siblings reports resumable.
+    const hasResumableUnits = unitList.some(
+      (u) =>
+        u.status === 'interrupted' ||
+        u.status === 'failed' ||
+        u.status === 'cancelled' ||
+        u.status === 'skipped' ||
+        u.status === 'queued'
     );
-    const resumable = status !== 'completed' && anyIncomplete;
+    // Completed runs accept a non-empty continuation task. Active running/queued
+    // runs must not claim concurrent resume; only terminal incomplete states are
+    // resumable (including terminal snapshots that still carry queued units).
+    const resumable =
+      status === 'completed'
+        ? unitList.length > 0
+        : status !== 'running' && status !== 'queued' && hasResumableUnits;
     return { runId, status, resumable, capability };
   }
 
@@ -1679,8 +1672,6 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
   /**
    * Persist a Grok ACP session ID with disk-first strict flush. Same-ID is
    * idempotent; a different existing ID throws `acp_session_conflict`.
-   * Legacy never-started Grok ACP units stored as capability `replay` are
-   * normalized to `session` on the first successful ID write.
    *
    * Conflict check and field-level unit merge run only inside RunStore's serial
    * `updateRun` callback on the latest disk record — never from a stale live
@@ -1711,31 +1702,15 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
             `acp_session_conflict: unit ${unitId} already has session ${existing}, refusing ${sessionId}`
           );
         }
-        // Idempotent same-ID: still normalize capability when needed.
+        // Idempotent same-ID: leave stored identity unchanged.
       } else {
         unit.acpSessionId = sessionId;
-      }
-
-      // Legacy never-started Grok ACP units may still store capability "replay".
-      // First successful ID write normalizes them to session-capable.
-      const runtime = unit.runtime;
-      if (
-        runtime === GROK_ACP_RUNTIME &&
-        unit.capability === 'replay' &&
-        unit.acpSessionId === sessionId
-      ) {
-        unit.capability = 'session';
-        if (unit.result && unit.result.resumeCapability === 'replay') {
-          unit.result.resumeCapability = 'session';
-        }
       }
 
       // Keep nested result identity aligned when present.
       if (unit.result) {
         unit.result.acpSessionId = sessionId;
-        if (unit.capability === 'session') {
-          unit.result.resumeCapability = 'session';
-        }
+        unit.result.resumeCapability = unit.capability;
       }
 
       record.updatedAt = now();

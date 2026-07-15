@@ -417,6 +417,437 @@ describe('listRuns', () => {
     if (ok.ok) expect(ok.loaded.record.units[unitId]!.acpSessionId).toBe('sess-ok');
   });
 
+  it('returns corrupt_run for removed plain grok and unknown request/unit runtimes', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'grok' },
+      })
+    );
+    const removedRequest = store.getRun(runId);
+    expect(removedRequest.ok).toBe(false);
+    if (!removedRequest.ok) {
+      expect(removedRequest.error.code).toBe('corrupt_run');
+      expect(removedRequest.error.message).toContain('request.runtime');
+      expect(removedRequest.error.message).toContain('grok');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: 'grok' },
+        },
+      })
+    );
+    const removedUnit = store.getRun(runId);
+    expect(removedUnit.ok).toBe(false);
+    if (!removedUnit.ok) {
+      expect(removedUnit.error.code).toBe('corrupt_run');
+      expect(removedUnit.error.message).toContain(`unit ${unitId}`);
+      expect(removedUnit.error.message).toContain('unsupported runtime');
+      expect(removedUnit.error.message).toContain('grok');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'unknown-runtime' },
+      })
+    );
+    const unknownRequest = store.getRun(runId);
+    expect(unknownRequest.ok).toBe(false);
+    if (!unknownRequest.ok) {
+      expect(unknownRequest.error.code).toBe('corrupt_run');
+      expect(unknownRequest.error.message).toContain('request.runtime');
+      expect(unknownRequest.error.message).toContain('unknown-runtime');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: 'claude' },
+        },
+      })
+    );
+    const unknownUnit = store.getRun(runId);
+    expect(unknownUnit.ok).toBe(false);
+    if (!unknownUnit.ok) {
+      expect(unknownUnit.error.code).toBe('corrupt_run');
+      expect(unknownUnit.error.message).toContain(`unit ${unitId}`);
+      expect(unknownUnit.error.message).toContain('claude');
+    }
+
+    // Absent and allowed matching runtimes remain valid.
+    writeFileSync(file, JSON.stringify(record));
+    expect(store.getRun(runId).ok).toBe(true);
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'pi' },
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: 'pi' },
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        // Absent request.runtime allows per-agent unit runtimes.
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: 'grok-acp' },
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
+  it('returns corrupt_run for missing, replay, or unknown unit capabilities', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+    const baseUnit = record.units[unitId]!;
+
+    const { capability: _drop, ...withoutCapability } = baseUnit;
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: { ...record.units, [unitId]: withoutCapability },
+      })
+    );
+    const missing = store.getRun(runId);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) {
+      expect(missing.error.code).toBe('corrupt_run');
+      expect(missing.error.message).toContain(`unit ${unitId}`);
+      expect(missing.error.message).toContain('missing capability');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...baseUnit, capability: 'replay' },
+        },
+      })
+    );
+    const replay = store.getRun(runId);
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) {
+      expect(replay.error.code).toBe('corrupt_run');
+      expect(replay.error.message).toContain(`unit ${unitId}`);
+      expect(replay.error.message).toContain('unsupported capability');
+      expect(replay.error.message).toContain('replay');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: { ...baseUnit, capability: 'mixed' },
+        },
+      })
+    );
+    const unknown = store.getRun(runId);
+    expect(unknown.ok).toBe(false);
+    if (!unknown.ok) {
+      expect(unknown.error.code).toBe('corrupt_run');
+      expect(unknown.error.message).toContain('mixed');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          ...record.units,
+          [unitId]: {
+            ...baseUnit,
+            capability: 'session',
+            result: {
+              agent: 'noop',
+              agentSource: 'unknown',
+              task: 't',
+              exitCode: 0,
+              status: 'completed',
+              messages: [],
+              stderr: '',
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                contextTokens: 0,
+                turns: 0,
+              },
+              resumeCapability: 'replay',
+            },
+          },
+        },
+      })
+    );
+    const resultCap = store.getRun(runId);
+    expect(resultCap.ok).toBe(false);
+    if (!resultCap.ok) {
+      expect(resultCap.error.code).toBe('corrupt_run');
+      expect(resultCap.error.message).toContain('result.resumeCapability');
+      expect(resultCap.error.message).toContain('replay');
+    }
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        details: {
+          ...record.details,
+          run: {
+            runId,
+            status: 'completed',
+            resumable: true,
+            capability: 'replay',
+          },
+        },
+      })
+    );
+    const runMeta = store.getRun(runId);
+    expect(runMeta.ok).toBe(false);
+    if (!runMeta.ok) {
+      expect(runMeta.error.code).toBe('corrupt_run');
+      expect(runMeta.error.message).toContain('details.run.capability');
+    }
+
+    // Session-only metadata remains valid.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        details: {
+          ...record.details,
+          run: {
+            runId,
+            status: 'interrupted',
+            resumable: true,
+            capability: 'session',
+          },
+        },
+        units: {
+          ...record.units,
+          [unitId]: {
+            ...baseUnit,
+            capability: 'session',
+            result: {
+              agent: 'noop',
+              agentSource: 'unknown',
+              task: 't',
+              exitCode: 0,
+              status: 'completed',
+              messages: [],
+              stderr: '',
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                contextTokens: 0,
+                turns: 0,
+              },
+              resumeCapability: 'session',
+            },
+          },
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
+  it('returns corrupt_run when presentation results advertise unsupported resumeCapability', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+    // Canonical session units stay valid; only presentation metadata is poisoned.
+    const sessionUnits = {
+      ...record.units,
+      [unitId]: {
+        ...record.units[unitId],
+        capability: 'session' as const,
+      },
+    };
+    const basePresentationResult = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed' as const,
+      messages: [],
+      stderr: '',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 0,
+      },
+    };
+
+    for (const bad of ['replay', 'mixed', 'unknown', 42] as const) {
+      writeFileSync(
+        file,
+        JSON.stringify({
+          ...record,
+          units: sessionUnits,
+          details: {
+            ...record.details,
+            results: [{ ...basePresentationResult, resumeCapability: bad }],
+          },
+        })
+      );
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(false);
+      if (!loaded.ok) {
+        expect(loaded.error.code).toBe('corrupt_run');
+        expect(loaded.error.message).toContain('details.results[0].resumeCapability');
+        expect(loaded.error.message).toContain(String(bad));
+      }
+    }
+
+    // Absent presentation resumeCapability remains allowed.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: sessionUnits,
+        details: {
+          ...record.details,
+          results: [basePresentationResult],
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+
+    // Explicit session presentation capability remains valid.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: sessionUnits,
+        details: {
+          ...record.details,
+          results: [{ ...basePresentationResult, resumeCapability: 'session' }],
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
+  it('returns corrupt_run when explicit request.runtime conflicts with unit effective runtime', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'pi' },
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: 'grok-acp' },
+        },
+      })
+    );
+    const conflict = store.getRun(runId);
+    expect(conflict.ok).toBe(false);
+    if (!conflict.ok) {
+      expect(conflict.error.code).toBe('corrupt_run');
+      expect(conflict.error.message).toContain(`unit ${unitId}`);
+      expect(conflict.error.message).toContain('conflicts with request.runtime');
+      expect(conflict.error.message).toContain('grok-acp');
+      expect(conflict.error.message).toContain('pi');
+    }
+
+    // Explicit request.runtime=grok-acp vs absent unit (effective pi) conflicts.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'grok-acp' },
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: undefined },
+        },
+      })
+    );
+    const absentUnit = store.getRun(runId);
+    expect(absentUnit.ok).toBe(false);
+    if (!absentUnit.ok) {
+      expect(absentUnit.error.code).toBe('corrupt_run');
+      expect(absentUnit.error.message).toContain('conflicts with request.runtime');
+    }
+
+    // Matching explicit runtimes are accepted.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'grok-acp' },
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: 'grok-acp' },
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+
+    // Explicit pi + absent unit (effective pi) is accepted.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        request: { ...record.request, runtime: 'pi' },
+        units: {
+          ...record.units,
+          [unitId]: { ...record.units[unitId], runtime: undefined },
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
   it('returns corrupt_run for request mode/topology mismatches without throwing', async () => {
     const store = createRunStore({ rootDir: root, ...makeDeps() });
     const { runId } = await store.createRun(makeCreateInput());
@@ -451,6 +882,441 @@ describe('listRuns', () => {
     if (!badChain.ok) {
       expect(badChain.error.code).toBe('corrupt_run');
       expect(badChain.error.message).toContain('chain');
+    }
+  });
+
+  it('returns corrupt_run when unit.agent does not match request topology', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+
+    // Single mode: unit agent must match request.agent.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          single: { ...record.units.single, agent: 'other-agent' },
+        },
+      })
+    );
+    const singleMismatch = store.getRun(runId);
+    expect(singleMismatch.ok).toBe(false);
+    if (!singleMismatch.ok) {
+      expect(singleMismatch.error.code).toBe('corrupt_run');
+      expect(singleMismatch.error.message).toContain('does not match request topology agent');
+      expect(singleMismatch.error.message).toContain('other-agent');
+      expect(singleMismatch.error.message).toContain('noop');
+    }
+
+    // Parallel mode: each task unit agent must match request.tasks[i].agent.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'parallel',
+        request: {
+          mode: 'parallel',
+          agentScope: 'both',
+          tasks: [
+            { agent: 'alpha', task: 't1' },
+            { agent: 'beta', task: 't2' },
+          ],
+        },
+        units: {
+          'parallel-0001': {
+            unitId: 'parallel-0001',
+            agent: 'alpha',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            fanoutIndex: 0,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+          'parallel-0002': {
+            unitId: 'parallel-0002',
+            agent: 'wrong',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            fanoutIndex: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const parallelMismatch = store.getRun(runId);
+    expect(parallelMismatch.ok).toBe(false);
+    if (!parallelMismatch.ok) {
+      expect(parallelMismatch.error.code).toBe('corrupt_run');
+      expect(parallelMismatch.error.message).toContain('parallel-0002');
+      expect(parallelMismatch.error.message).toContain('wrong');
+      expect(parallelMismatch.error.message).toContain('beta');
+    }
+
+    // Sequential chain: unit agent must match request.chain[step].agent.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'chain',
+        request: {
+          mode: 'chain',
+          agentScope: 'both',
+          chain: [{ agent: 'seed', task: 'seed' }],
+        },
+        units: {
+          'chain-0001': {
+            unitId: 'chain-0001',
+            agent: 'not-seed',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            step: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const chainMismatch = store.getRun(runId);
+    expect(chainMismatch.ok).toBe(false);
+    if (!chainMismatch.ok) {
+      expect(chainMismatch.error.code).toBe('corrupt_run');
+      expect(chainMismatch.error.message).toContain('chain-0001');
+      expect(chainMismatch.error.message).toContain('not-seed');
+      expect(chainMismatch.error.message).toContain('seed');
+    }
+
+    // Fanout child: unit agent must match request.chain[step].parallel.agent.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'chain',
+        request: {
+          mode: 'chain',
+          agentScope: 'both',
+          chain: [
+            { agent: 'seed', task: 'seed' },
+            {
+              expand: { from: { output: 'seed', path: '/items' } },
+              parallel: { agent: 'worker', task: 'Process {item}' },
+              collect: { name: 'out' },
+            },
+          ],
+        },
+        units: {
+          'chain-0001': {
+            unitId: 'chain-0001',
+            agent: 'seed',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'completed',
+            step: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+          'chain-0002-fanout-0001': {
+            unitId: 'chain-0002-fanout-0001',
+            agent: 'not-worker',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            step: 2,
+            fanoutIndex: 0,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const fanoutMismatch = store.getRun(runId);
+    expect(fanoutMismatch.ok).toBe(false);
+    if (!fanoutMismatch.ok) {
+      expect(fanoutMismatch.error.code).toBe('corrupt_run');
+      expect(fanoutMismatch.error.message).toContain('chain-0002-fanout-0001');
+      expect(fanoutMismatch.error.message).toContain('not-worker');
+      expect(fanoutMismatch.error.message).toContain('worker');
+    }
+
+    // Matching topology agents remain valid (including default Pi runtime absent).
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'chain',
+        request: {
+          mode: 'chain',
+          agentScope: 'both',
+          chain: [
+            { agent: 'seed', task: 'seed' },
+            {
+              expand: { from: { output: 'seed', path: '/items' } },
+              parallel: { agent: 'worker', task: 'Process {item}' },
+              collect: { name: 'out' },
+            },
+          ],
+        },
+        units: {
+          'chain-0001': {
+            unitId: 'chain-0001',
+            agent: 'seed',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'completed',
+            step: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+          'chain-0002-fanout-0001': {
+            unitId: 'chain-0002-fanout-0001',
+            agent: 'worker',
+            agentFingerprint: 'fp',
+            runtime: 'grok-acp',
+            capability: 'session',
+            status: 'queued',
+            step: 2,
+            fanoutIndex: 0,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+            acpSessionId: 'sess-1',
+          },
+        },
+      })
+    );
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
+  it('returns corrupt_run for swapped parallel positions, noncanonical ids, and coverage gaps', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+
+    // Swapped fanoutIndex relative to parallel unit ids.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'parallel',
+        request: {
+          mode: 'parallel',
+          agentScope: 'both',
+          tasks: [
+            { agent: 'alpha', task: 't1' },
+            { agent: 'beta', task: 't2' },
+          ],
+        },
+        units: {
+          'parallel-0001': {
+            unitId: 'parallel-0001',
+            agent: 'alpha',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            fanoutIndex: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+          'parallel-0002': {
+            unitId: 'parallel-0002',
+            agent: 'beta',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            fanoutIndex: 0,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const swappedParallel = store.getRun(runId);
+    expect(swappedParallel.ok).toBe(false);
+    if (!swappedParallel.ok) {
+      expect(swappedParallel.error.code).toBe('corrupt_run');
+      expect(swappedParallel.error.message).toMatch(/fanoutIndex|canonical/);
+    }
+
+    // Swapped chain step fields.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'chain',
+        request: {
+          mode: 'chain',
+          agentScope: 'both',
+          chain: [
+            { agent: 'seed', task: 'seed' },
+            { agent: 'finish', task: 'finish' },
+          ],
+        },
+        units: {
+          'chain-0001': {
+            unitId: 'chain-0001',
+            agent: 'seed',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'completed',
+            step: 2,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+          'chain-0002': {
+            unitId: 'chain-0002',
+            agent: 'finish',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'interrupted',
+            step: 1,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const swappedChain = store.getRun(runId);
+    expect(swappedChain.ok).toBe(false);
+    if (!swappedChain.ok) {
+      expect(swappedChain.error.code).toBe('corrupt_run');
+      expect(swappedChain.error.message).toMatch(/step|canonical|topology/);
+    }
+
+    // Noncanonical unit id for single mode.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          'not-single': {
+            unitId: 'not-single',
+            agent: 'noop',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const noncanonical = store.getRun(runId);
+    expect(noncanonical.ok).toBe(false);
+    if (!noncanonical.ok) {
+      expect(noncanonical.error.code).toBe('corrupt_run');
+      expect(noncanonical.error.message).toMatch(/canonical|coverage|topology/);
+    }
+
+    // Missing static parallel unit.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        mode: 'parallel',
+        request: {
+          mode: 'parallel',
+          agentScope: 'both',
+          tasks: [
+            { agent: 'alpha', task: 't1' },
+            { agent: 'beta', task: 't2' },
+          ],
+        },
+        units: {
+          'parallel-0001': {
+            unitId: 'parallel-0001',
+            agent: 'alpha',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            fanoutIndex: 0,
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const missing = store.getRun(runId);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) {
+      expect(missing.error.code).toBe('corrupt_run');
+      expect(missing.error.message).toContain('static unit coverage');
+      expect(missing.error.message).toMatch(/parallel-0002|expected 2/);
+    }
+
+    // Extra static unit in single mode.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          single: record.units.single,
+          extra: {
+            unitId: 'extra',
+            agent: 'noop',
+            agentFingerprint: 'fp',
+            runtime: undefined,
+            capability: 'session',
+            status: 'queued',
+            attempt: 1,
+            attempts: [],
+            effectiveCwd: '/tmp',
+          },
+        },
+      })
+    );
+    const extra = store.getRun(runId);
+    expect(extra.ok).toBe(false);
+    if (!extra.ok) {
+      expect(extra.error.code).toBe('corrupt_run');
+      // Extra unit fails identity/coverage; either message fail-closes the record.
+      expect(extra.error.message).toMatch(/static unit coverage|canonical single-mode id/);
+    }
+
+    // unitId field disagrees with record key.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...record,
+        units: {
+          single: { ...record.units.single, unitId: 'other' },
+        },
+      })
+    );
+    const mismatchedKey = store.getRun(runId);
+    expect(mismatchedKey.ok).toBe(false);
+    if (!mismatchedKey.ok) {
+      expect(mismatchedKey.error.code).toBe('corrupt_run');
+      expect(mismatchedKey.error.message).toContain('does not match record key');
     }
   });
 });
