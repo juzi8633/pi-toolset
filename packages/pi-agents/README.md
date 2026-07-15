@@ -115,16 +115,16 @@ In interactive TUI mode, Pi-runtime units register a branch-scoped link and run 
 Ctrl+Alt+Down            # same shortcut
 ```
 
-`/agent view` opens in the input/editor area (non-overlay `ui.custom`, same surface as `/settings`) with a candidate list styled like the prompt autocomplete list. Pick `main` or Escape to restore the host editor; Enter on a child opens its detail transcript.
+`/agent view` opens in the input/editor area (non-overlay `ui.custom`, same surface as `/settings`) with a candidate list styled like the prompt autocomplete list. Escape restores the host editor; Enter on an endpoint opens its detail transcript.
 
-The below-editor agent list appears only while at least one visible agent is `starting` or `running`, and **lists only those running endpoints** (plus `main` and the open hint). Idle, detached, error, and other non-running endpoints are omitted from the chrome and remain reachable from `/agent view`. While the navigator is open, that list (including the open hint) is hidden so it does not duplicate the navigator rows; it is restored after the navigator closes if any agent is still active.
+The below-editor agent list appears only while at least one visible agent is `starting` or `running`, and **lists only those running endpoints** (plus the open hint). Idle, detached, error, and other non-running endpoints are omitted from the chrome and remain reachable from `/agent view`. While the navigator is open, that list (including the open hint) is hidden so it does not duplicate the navigator rows; it is restored after the navigator closes if any agent is still active.
 
 List/widget status glyphs (Agent Nav uses the same mapping for every endpoint):
 
 | State                                                             | Glyph | Theme color |
 | ----------------------------------------------------------------- | ----- | ----------- |
 | Running (`starting` / `running`)                                  | `◐`   | `warning`   |
-| Completed (idle / detached / registered)                          | `●`   | `success`   |
+| Completed (idle / detached / registered)                          | `●`   | `text`      |
 | Interrupted (settled with `stopReason: aborted` or `interrupted`) | `⊘`   | `warning`   |
 | Error (`error` / `unavailable`)                                   | `●`   | `error`     |
 

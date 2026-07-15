@@ -3,6 +3,8 @@
 
 import { describe, expect, it } from 'bun:test';
 import { getSelectListTheme, initTheme } from '@earendil-works/pi-coding-agent';
+// Real Theme singleton (not re-exported from package root); same instance initTheme mutates.
+import { theme as realTheme } from '../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js';
 import type {
   InteractiveEndpointSnapshot,
   InteractiveRegistryEvent,
@@ -46,6 +48,7 @@ function snap(
 function fakeTheme() {
   return {
     fg: (_c: string, t: string) => t,
+    getFgAnsi: () => '',
   };
 }
 
@@ -423,13 +426,63 @@ describe('interactive-view helpers', () => {
     const used = (nav as unknown as { listTheme: ReturnType<typeof getSelectListTheme> }).listTheme;
     const expected = getSelectListTheme();
     expect(used.selectedPrefix('>')).toBe(expected.selectedPrefix('>'));
-    expect(used.selectedText('main')).toBe(expected.selectedText('main'));
+    // selectedText is intentionally customized (see dedicated test below): strip nested
+    // SGR then wrap the whole row in accent so the selected highlight covers glyph too.
+    // With plain input (no SGR) it still equals plain accent wrap.
+    expect(used.selectedText('main')).toBe('main');
     expect(used.description('status')).toBe(expected.description('status'));
     expect(used.scrollInfo('1/2')).toBe(expected.scrollInfo('1/2'));
     expect(used.noMatch('none')).toBe(expected.noMatch('none'));
     // Public theme uses muted (not dim/warning) for secondary SelectList text.
     expect(used.description('x')).toBe(expected.description('x'));
     expect(used.noMatch('x')).toBe(expected.noMatch('x'));
+    nav.dispose();
+  });
+
+  it('stripSgr removes SGR sequences and keeps visible text', () => {
+    expect(__test.stripSgr('a\x1b[38;5;214m◐\x1b[39mb')).toBe('a◐b');
+    expect(__test.stripSgr('a\x1b[0m')).toBe('a');
+    expect(__test.stripSgr('a\x1b[39mb\x1b[0m')).toBe('ab');
+    expect(__test.stripSgr('\x1b[38;5;214m◐\x1b[39m researcher')).toBe('◐ researcher');
+  });
+
+  it('AgentNavigatorPanel selectedText applies uniform accent over whole row', () => {
+    // initTheme('dark') at module load; realTheme is that same singleton (Theme.fg /
+    // getFgAnsi produce truecolor SGR, not synthetic \x1b[accentm placeholders).
+    const nav = new AgentNavigatorPanel({
+      tui: { requestRender: () => undefined } as never,
+      theme: realTheme as never,
+      registry: {
+        listVisibleMeta: () => [],
+        subscribe: () => () => undefined,
+      } as never,
+      endpointLabel: (ep) => ep.agent,
+      statusText: (ep) => ep.status,
+      onClose: () => undefined,
+    });
+    const used = (nav as unknown as { listTheme: ReturnType<typeof getSelectListTheme> }).listTheme;
+    const accentAnsi = realTheme.getFgAnsi('accent');
+    const warningAnsi = realTheme.getFgAnsi('warning');
+    // Same path as list rows: formatEndpointListLabel -> theme.fg(color, glyph).
+    const label = __test.formatEndpointListLabel(
+      { status: 'running' },
+      'researcher',
+      'running',
+      'researcher'.length,
+      (color, text) => realTheme.fg(color, text)
+    );
+    // SelectList passes prefix + primary into selectedText.
+    const out = used.selectedText(`→ ${label}`);
+    expect(out.startsWith(accentAnsi)).toBe(true);
+    // Glyph status color must not survive selection; whole row is accent.
+    expect(out.includes(`${warningAnsi}◐`)).toBe(false);
+    // Single trailing Theme.fg reset closes the row; body has no nested SGR.
+    expect(out.endsWith('\x1b[39m')).toBe(true);
+    expect(out.slice(0, -'\x1b[39m'.length).includes('\x1b[39m')).toBe(false);
+    const body = out.slice(accentAnsi.length, -'\x1b[39m'.length);
+    expect(body.includes('\x1b[')).toBe(false);
+    // Visible text (prefix + glyph + name + status) is preserved.
+    expect(__test.stripSgr(out)).toBe('→ ◐ researcher running');
     nav.dispose();
   });
 
@@ -552,7 +605,6 @@ describe('interactive-view helpers', () => {
     const items = (
       nav as unknown as { buildItems: () => Array<{ value: string; label: string }> }
     ).buildItems();
-    expect(items[0]).toEqual({ value: 'main', label: '● main' });
 
     // Names pad to a shared column so status (detached/running/…) lines up.
     const names = [
@@ -565,32 +617,30 @@ describe('interactive-view helpers', () => {
     const statuses = ['detached', 'detached', 'running', 'idle', 'detached · 2 queued'];
     const nameCol = __test.maxVisibleWidth(names);
     for (let i = 0; i < names.length; i++) {
-      expect(items[i + 1]?.label).toBe(
+      expect(items[i]?.label).toBe(
         __test.formatEndpointListLabel(endpoints[i]!, names[i]!, statuses[i]!, nameCol)
       );
     }
     // Explicit fixtures (CJK-aware padding). Completed/detached → ●; running → ◐.
-    expect(items[1]?.label).toBe('● explore - 调查 agent nav       detached');
-    expect(items[2]?.label).toBe('● plan - 规划输入框导航          detached');
-    expect(items[3]?.label).toBe('◐ general - 确认 Pi nav 挂载能力 running');
+    expect(items[0]?.label).toBe('● explore - 调查 agent nav       detached');
+    expect(items[1]?.label).toBe('● plan - 规划输入框导航          detached');
+    expect(items[2]?.label).toBe('◐ general - 确认 Pi nav 挂载能力 running');
     // No title / title === agent: no duplicated name, no stray " - ".
-    expect(items[4]?.label).toBe('● worker                         idle');
-    expect(items[5]?.label).toBe('● review                         detached · 2 queued');
+    expect(items[3]?.label).toBe('● worker                         idle');
+    expect(items[4]?.label).toBe('● review                         detached · 2 queued');
+    expect(items[3]?.label).not.toContain(' - ');
     expect(items[4]?.label).not.toContain(' - ');
-    expect(items[5]?.label).not.toContain(' - ');
 
     const rows = nav.render(80);
     // Top/bottom borders use accent (full-width ─).
     expect(rows[0]).toBe('─'.repeat(80));
     expect(rows[rows.length - 1]).toBe('─'.repeat(80));
     expect(rows.some((r) => r.includes('Agent navigator'))).toBe(true);
-    // SelectList selected prefix + label → "→ ● main"
-    expect(rows.some((r) => r.includes('→ ● main'))).toBe(true);
+    expect(rows.some((r) => r.includes(items[0]!.label))).toBe(true);
     expect(rows.some((r) => r.includes(items[1]!.label))).toBe(true);
     expect(rows.some((r) => r.includes(items[2]!.label))).toBe(true);
     expect(rows.some((r) => r.includes(items[3]!.label))).toBe(true);
     expect(rows.some((r) => r.includes(items[4]!.label))).toBe(true);
-    expect(rows.some((r) => r.includes(items[5]!.label))).toBe(true);
     nav.dispose();
   });
 
@@ -807,7 +857,6 @@ describe('interactive-view openView lifecycle', () => {
     expect(view.isViewOpen()).toBe(false);
     // Active agent still present → restore chrome including open hint.
     expect(capture.last).toBeDefined();
-    expect(capture.last!.some((l) => l.includes('● main'))).toBe(true);
     expect(capture.last!.some((l) => l.includes('/agent view'))).toBe(true);
 
     view.clearWidget();
@@ -977,11 +1026,11 @@ describe('interactive-view openView lifecycle', () => {
     const items = (
       panel as unknown as { buildItems: () => Array<{ value: string; label: string }> }
     ).buildItems();
-    const child = items.find((i) => i.value !== 'main');
-    expect(child).toBeDefined();
+    expect(items.length).toBeGreaterThan(0);
+    const child = items[0]!;
     (
       panel as unknown as { handleListSelect: (item: { value: string; label: string }) => void }
-    ).handleListSelect(child!);
+    ).handleListSelect(child);
     expect(view.isViewOpen()).toBe(true);
     expect(capture.last).toBeUndefined();
     expect((panel as unknown as { mode: string }).mode).toBe('detail');
@@ -1379,7 +1428,7 @@ describe('interactive-view widget metadata refresh', () => {
       )
     ).toBe('⊘');
     expect(__test.formatEndpointStatusGlyph({ status: 'error' }, fg as never)).toBe('●');
-    expect(colored).toEqual(['warning:◐', 'success:●', 'warning:⊘', 'error:●']);
+    expect(colored).toEqual(['warning:◐', 'text:●', 'warning:⊘', 'error:●']);
 
     expect(__test.isEndpointRunning('starting')).toBe(true);
     expect(__test.isEndpointRunning('running')).toBe(true);
@@ -1946,6 +1995,100 @@ describe('interactive-view detail preview (last 15 + Ctrl+O)', () => {
     panel.handleInput(CTRL_O);
     expect(inputHandled()).toEqual(['a']);
     expect((panel as unknown as { contentExpanded: boolean }).contentExpanded).toBe(false);
+    panel.dispose();
+  });
+
+  type DetailScrollState = {
+    scrollOffset: number;
+    followTail: boolean;
+    finalizedLines: string[];
+    dynamicLines: string[];
+  };
+
+  function scrollState(panel: AgentDetailPanel): DetailScrollState {
+    return panel as unknown as DetailScrollState;
+  }
+
+  function maxScrollOffset(panel: AgentDetailPanel): number {
+    const s = scrollState(panel);
+    const total = s.finalizedLines.length + s.dynamicLines.length;
+    return Math.max(0, total - previewN);
+  }
+
+  it('clamps scrollOffset at maxOffset after repeated Up at top', () => {
+    const lineCount = 40;
+    const { panel } = makePanel(lineCount, 40);
+    // Prime caches / cachedWidth so clamp uses the same width as render.
+    panel.render(80);
+    const maxOffset = maxScrollOffset(panel);
+    expect(maxOffset).toBeGreaterThan(0);
+
+    // Far more Ups than needed to reach the top.
+    const extraUps = 8;
+    const upsToTop = Math.ceil(maxOffset / previewN) + extraUps;
+    for (let i = 0; i < upsToTop; i++) {
+      panel.handleInput('\x1b[A');
+    }
+
+    const s = scrollState(panel);
+    expect(s.followTail).toBe(false);
+    expect(s.scrollOffset).toBe(maxOffset);
+    expect(s.scrollOffset).toBeLessThanOrEqual(maxOffset);
+
+    // Further Up must not grow scrollOffset past the top.
+    panel.handleInput('\x1b[A');
+    panel.handleInput('\x1b[A');
+    expect(scrollState(panel).scrollOffset).toBe(maxOffset);
+
+    panel.dispose();
+  });
+
+  it('extra Up at top does not increase Downs needed to reach the tail', () => {
+    const { panel } = makePanel(40, 40);
+    panel.render(80);
+    const maxOffset = maxScrollOffset(panel);
+    expect(maxOffset).toBeGreaterThan(0);
+
+    const downsFromMax = Math.ceil(maxOffset / previewN);
+
+    // Overshoot the top heavily, then count Downs until followTail.
+    for (let i = 0; i < downsFromMax + 10; i++) {
+      panel.handleInput('\x1b[A');
+    }
+    expect(scrollState(panel).scrollOffset).toBe(maxOffset);
+
+    let downs = 0;
+    while (scrollState(panel).scrollOffset > 0) {
+      panel.handleInput('\x1b[B');
+      downs += 1;
+      // Guard against infinite loop if clamp regresses.
+      expect(downs).toBeLessThanOrEqual(downsFromMax);
+    }
+
+    expect(downs).toBe(downsFromMax);
+    expect(scrollState(panel).scrollOffset).toBe(0);
+    expect(scrollState(panel).followTail).toBe(true);
+
+    panel.dispose();
+  });
+
+  it('Down to offset 0 sets followTail true', () => {
+    const { panel } = makePanel(40, 40);
+    panel.render(80);
+
+    panel.handleInput('\x1b[A');
+    expect(scrollState(panel).followTail).toBe(false);
+    expect(scrollState(panel).scrollOffset).toBeGreaterThan(0);
+
+    // Page down until clamped at 0.
+    for (let i = 0; i < 20; i++) {
+      if (scrollState(panel).scrollOffset === 0) break;
+      panel.handleInput('\x1b[B');
+    }
+
+    expect(scrollState(panel).scrollOffset).toBe(0);
+    expect(scrollState(panel).followTail).toBe(true);
+
     panel.dispose();
   });
 });

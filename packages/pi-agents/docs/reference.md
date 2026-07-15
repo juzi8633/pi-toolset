@@ -361,8 +361,8 @@ TUI-only navigator for Pi-runtime durable units linked to the active main-sessio
 | --------- | --------------- | ----------------------------------------------- |
 | Host TUI  | `/agent view`   | Open navigator immediately (no `waitForIdle`)   |
 | Host TUI  | `Ctrl+Alt+Down` | Same as `/agent view`                           |
-| Navigator | Up/Down         | Move between `main` and linked endpoints        |
-| Navigator | Enter           | Close for `main`; open child detail otherwise   |
+| Navigator | Up/Down         | Move between linked endpoints                   |
+| Navigator | Enter           | Open selected endpoint detail                   |
 | Navigator | Escape          | Close to host editor                            |
 | Detail    | Up/Down         | Scroll transcript viewport                      |
 | Detail    | End             | Resume tail-following                           |
@@ -374,15 +374,17 @@ TUI-only navigator for Pi-runtime durable units linked to the active main-sessio
 
 ### Endpoint statuses
 
-| Status        | Meaning                                          | List glyph                                                                   |
-| ------------- | ------------------------------------------------ | ---------------------------------------------------------------------------- |
-| `registered`  | Link created; first activation about to start    | `●` success (completed-class)                                                |
-| `starting`    | RPC process spawning / handshake                 | `◐` warning (running)                                                        |
-| `running`     | Child agent turn in progress                     | `◐` warning                                                                  |
-| `idle`        | Settled; transport may remain attached           | `●` success; `⊘` warning if `usage.stopReason` is `aborted` or `interrupted` |
-| `detached`    | Transport disposed; session file retained        | `●` success; `⊘` warning if cancel left `stopReason: aborted`                |
-| `error`       | Process/protocol failure; new prompt may recover | `●` error                                                                    |
-| `unavailable` | Trust/validation failed; no spawn                | `●` error                                                                    |
+| Status        | Meaning                                          | List glyph                                                                |
+| ------------- | ------------------------------------------------ | ------------------------------------------------------------------------- |
+| `registered`  | Link created; first activation about to start    | `●` text (completed-class)                                                |
+| `starting`    | RPC process spawning / handshake                 | `◐` warning (running)                                                     |
+| `running`     | Child agent turn in progress                     | `◐` warning                                                               |
+| `idle`        | Settled; transport may remain attached           | `●` text; `⊘` warning if `usage.stopReason` is `aborted` or `interrupted` |
+| `detached`    | Transport disposed; session file retained        | `●` text; `⊘` warning if cancel left `stopReason: aborted`                |
+| `error`       | Process/protocol failure; new prompt may recover | `●` error                                                                 |
+| `unavailable` | Trust/validation failed; no spawn                | `●` error                                                                 |
+
+List/widget interrupted glyph (`⊘`): interactive cancel always stores `usage.stopReason = 'aborted'` (registry cancel settle). `interrupted` is accepted when formal settle paths (assistant / `prompt_completed`) pass it through; both values map to the same glyph. Nav cancel does not write `interrupted`.
 
 The below-editor widget shows only endpoints with status `starting` or `running`. Agent Nav (`/agent view`) lists every visible endpoint.
 

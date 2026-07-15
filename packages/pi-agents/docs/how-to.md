@@ -422,8 +422,8 @@ or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC 
 
 ### Select and inspect
 
-1. The list shows `main` first, then linked endpoints ordered by link creation time (full list: running, idle, detached, error, …).
-2. Enter on `main` closes the view; Enter on a child opens its detail transcript (last 15 lines by default).
+1. The list shows linked endpoints ordered by link creation time (full list: running, idle, detached, error, …).
+2. Enter on an endpoint opens its detail transcript (last 15 lines by default).
 3. In detail, Ctrl+O expands the full transcript; Ctrl+O again collapses to the last 15 lines at the tail.
 4. Escape returns from detail to the list, or closes the list.
 5. Grok ACP history hydrates lazily on first detail open via `session/load` replay (no model prompt).

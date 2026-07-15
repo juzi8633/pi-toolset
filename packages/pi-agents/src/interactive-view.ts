@@ -104,13 +104,13 @@ export function createInteractiveViewController(options: InteractiveViewControll
       // Labels use full visible set for collision suffixes so they match Agent Nav.
       const names = active.map((ep) => endpointLabel(ep, all));
       const nameCol = maxVisibleWidth(names);
-      // Component factory so status glyphs pick up theme colors (warning/success/error).
+      // Component factory so status glyphs pick up theme colors (warning/text/error).
       // Capture the snapshot at refresh time; host invokes the factory immediately.
       ui.setWidget(
         WIDGET_KEY,
         (_tui: TUI, theme: Theme) => {
           const themeFg: ThemeFg = (color, text) => theme.fg(color, text);
-          const lines: string[] = ['● main'];
+          const lines: string[] = [];
           for (let i = 0; i < active.length; i++) {
             lines.push(
               formatEndpointListLabel(
@@ -238,8 +238,13 @@ export class AgentNavigatorPanel implements Component, Focusable {
 
   constructor(opts: NavigatorOptions) {
     this.opts = opts;
-    // Same SelectList theme as prompt autocomplete /settings lists (public root export).
-    this.listTheme = getSelectListTheme();
+    // Labels embed a status-colored glyph via theme.fg(). For the selected row,
+    // strip nested SGR so the whole row (prefix + glyph + name + status) is
+    // uniformly accent — glyph status color applies only to non-selected rows.
+    this.listTheme = {
+      ...getSelectListTheme(),
+      selectedText: (text: string) => opts.theme.fg('accent', stripSgr(text)),
+    };
     this.list = new SelectList(this.buildItems(), 12, this.listTheme);
     this.list.onSelect = (item) => this.handleListSelect(item);
     this.list.onCancel = () => this.opts.onClose();
@@ -282,7 +287,7 @@ export class AgentNavigatorPanel implements Component, Focusable {
     const names = endpoints.map((ep) => this.opts.endpointLabel(ep, endpoints));
     const nameCol = maxVisibleWidth(names);
     const themeFg: ThemeFg = (color, text) => this.opts.theme.fg(color, text);
-    const items: SelectItem[] = [{ value: 'main', label: '● main' }];
+    const items: SelectItem[] = [];
     for (let i = 0; i < endpoints.length; i++) {
       items.push({
         value: endpoints[i]!.key,
@@ -299,10 +304,6 @@ export class AgentNavigatorPanel implements Component, Focusable {
   }
 
   private handleListSelect(item: SelectItem): void {
-    if (item.value === 'main') {
-      this.opts.onClose();
-      return;
-    }
     this.detail = new AgentDetailPanel({
       tui: this.opts.tui,
       theme: this.opts.theme,
@@ -460,6 +461,16 @@ export class AgentDetailPanel implements Component, Focusable {
   private contentViewportHeight(totalLines: number): number {
     if (!this.contentExpanded) return DETAIL_PREVIEW_LINES;
     return Math.max(1, totalLines);
+  }
+
+  /** Keep scrollOffset in [0, maxOffset] so extra Up at top does not accumulate. */
+  private clampScrollOffset(): void {
+    const width = this.cachedWidth > 0 ? this.cachedWidth : 80;
+    const { finalized, dynamic } = this.ensureSegmentCaches(width);
+    const total = finalized.length + dynamic.length;
+    const vh = this.contentViewportHeight(total);
+    const maxOffset = Math.max(0, total - vh);
+    this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxOffset);
   }
 
   /**
@@ -697,11 +708,13 @@ export class AgentDetailPanel implements Component, Focusable {
       this.followTail = false;
       // Page against the collapsed preview height; expanded shows all lines at once.
       this.scrollOffset += DETAIL_PREVIEW_LINES;
+      this.clampScrollOffset();
       this.opts.tui.requestRender();
       return;
     }
     if (matchesKey(data, 'down')) {
-      this.scrollOffset = Math.max(0, this.scrollOffset - DETAIL_PREVIEW_LINES);
+      this.scrollOffset -= DETAIL_PREVIEW_LINES;
+      this.clampScrollOffset();
       if (this.scrollOffset === 0) this.followTail = true;
       this.opts.tui.requestRender();
       return;
@@ -794,11 +807,15 @@ function isEndpointRunning(status: InteractiveEndpointListItem['status']): boole
  * Classify list/widget glyph kind from endpoint status + durable stopReason.
  * - running: starting | running
  * - error: error | unavailable
- * - interrupted: settled with stopReason aborted (user cancel) or interrupted (session/process)
+ * - interrupted: settled with stopReason aborted or interrupted (both → ⊘ warning)
  * - completed: idle | detached | registered (and other settled non-error)
  *
- * Cancel settle paths in the registry write usage.stopReason = 'aborted' so this
- * survives after activation is cleared (do not rely on transient terminalOverride).
+ * stopReason sources (glyph only; no behavior difference between the two):
+ * - `aborted`: interactive cancel is always this — registry markCancelledUsage
+ *   writes usage.stopReason = 'aborted' so the signal survives after activation clear
+ *   (do not rely on transient terminalOverride).
+ * - `interrupted`: pass-through from assistant / prompt_completed (and similar
+ *   formal settle paths); accepted for compatibility, not produced by nav cancel.
  */
 function endpointStatusKind(
   snap: Pick<InteractiveEndpointListItem, 'status' | 'usage'>
@@ -811,8 +828,18 @@ function endpointStatusKind(
 }
 
 /**
+ * Strip SGR color/style sequences (`\x1b[…m`) so selectedText can wrap the whole
+ * row in accent without nested glyph status colors bleeding through.
+ * Intentionally SGR-only (not OSC/APC).
+ */
+function stripSgr(text: string): string {
+  // CSI SGR: ESC [ params m — build via fromCharCode to avoid no-control-regex.
+  return text.replace(new RegExp(`${String.fromCharCode(0x1b)}\\[[0-9;]*m`, 'g'), '');
+}
+
+/**
  * Leading status glyph for agent list rows (widget + Agent Nav).
- * running: warning ◐ · completed: success ● · interrupted: warning ⊘ · error: error ●
+ * running: warning ◐ · completed: text ● · interrupted: warning ⊘ · error: error ●
  */
 function formatEndpointStatusGlyph(
   snap: Pick<InteractiveEndpointListItem, 'status' | 'usage'>,
@@ -837,7 +864,7 @@ function formatEndpointStatusGlyph(
     case 'completed':
     default:
       char = '●';
-      color = 'success';
+      color = 'text';
       break;
   }
   return themeFg ? themeFg(color, char) : char;
@@ -1128,6 +1155,7 @@ export const __test = {
   formatEndpointListLabel,
   formatEndpointStatusGlyph,
   endpointStatusKind,
+  stripSgr,
   isEndpointRunning,
   endpointOrdering: (snaps: InteractiveEndpointSnapshot[]) =>
     [...snaps].sort((a, b) => a.linkCreatedAt - b.linkCreatedAt),
