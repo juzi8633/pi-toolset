@@ -579,6 +579,179 @@ describe('createRunCoordinator persistence and attempts', () => {
     expect(unit.attempts[0]!.finishedAt).toBe(t);
   });
 
+  it('finishUnit stores a private compact shell and does not mutate the caller result', async () => {
+    const store = fakeStore({ now: () => 1 });
+    const record: AgentRunRecordV1 = {
+      version: 1,
+      runId: 'run-compact',
+      mode: 'single',
+      status: 'running',
+      request: { mode: 'single', agentScope: 'both', agent: 'noop', task: '' },
+      background: false,
+      agentScope: 'both',
+      createdAt: 0,
+      updatedAt: 0,
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: '',
+          runtime: undefined,
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'running', startedAt: 0 }],
+          effectiveCwd: '/cwd',
+        },
+      },
+      eventsFile: 'events.jsonl',
+    };
+    store.records.set('run-compact', record);
+    const coord = createRunCoordinator({ store, now: () => 1, coalesceMs: 1000 });
+    coord.registerRun('run-compact', record);
+
+    const bigBody = 'Z'.repeat(64 * 1024);
+    const result: SingleResult = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'final answer' }],
+        } as never,
+        {
+          role: 'toolResult',
+          toolCallId: 't1',
+          toolName: 'bash',
+          content: [{ type: 'text', text: bigBody }],
+          isError: false,
+        } as never,
+      ],
+      stderr: '',
+      usage: emptyUsage(),
+      finalOutput: 'final answer',
+    };
+    coord.finishUnit('run-compact', ctx({ runId: 'run-compact' }), result, 'completed');
+    await store.flushes();
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.runId).toBeUndefined();
+    const unitResult = store.records.get('run-compact')!.units['single']!.result!;
+    expect(unitResult).not.toBe(result);
+    expect(unitResult.messages).toEqual([]);
+    expect(unitResult.presentation).toBeDefined();
+    expect(unitResult.finalOutput).toBe('final answer');
+    expect(unitResult.runId).toBe('run-compact');
+    expect(JSON.stringify(unitResult)).not.toContain('Z'.repeat(32));
+  });
+
+  it('normalizing a 4 MiB tool-result duplicated in details and unit shrinks pretty JSON below 512 KiB', async () => {
+    const { snapshotSingleResult } = await import('../src/result-snapshot.ts');
+    const big = 'Q'.repeat(4 * 1024 * 1024);
+    const fat: SingleResult = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'done' }],
+        } as never,
+        {
+          role: 'toolResult',
+          toolCallId: 't1',
+          toolName: 'bash',
+          content: [{ type: 'text', text: big }],
+          isError: false,
+        } as never,
+      ],
+      stderr: '',
+      usage: emptyUsage(),
+      finalOutput: 'done',
+    };
+
+    // Coordinator-backed durable path: finishUnit stores compact shells, not raw messages.
+    const store = fakeStore({ now: () => 1 });
+    const record: AgentRunRecordV1 = {
+      version: 1,
+      runId: 'run-4mib',
+      mode: 'single',
+      agentScope: 'both',
+      status: 'running',
+      background: false,
+      createdAt: 1,
+      updatedAt: 1,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'noop',
+        task: 't',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [fat, fat],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'running', startedAt: 1 }],
+          effectiveCwd: '/tmp',
+          result: fat,
+        },
+      },
+      eventsFile: 'events.jsonl',
+    };
+    store.records.set('run-4mib', record);
+    const coord = createRunCoordinator({ store: store as never });
+    coord.registerRun('run-4mib', record);
+    coord.finishUnit(
+      'run-4mib',
+      {
+        runId: 'run-4mib',
+        unitId: 'single',
+        agent: 'noop',
+        runtime: undefined,
+        resumeCapability: 'session',
+        effectiveCwd: '/tmp',
+        attempt: 1,
+        sessionsDir: '/tmp',
+        neverStarted: false,
+      },
+      fat,
+      'completed'
+    );
+    await store.flushes();
+
+    const unitStored = store.records.get('run-4mib')!.units.single!.result!;
+    expect(unitStored.messages).toEqual([]);
+    expect(unitStored.finalOutput).toBe('done');
+    expect(JSON.stringify(unitStored)).not.toContain('Q'.repeat(64));
+
+    const normalizedDetails = [fat, fat].map((r) => snapshotSingleResult(r));
+    const pretty = JSON.stringify(
+      { details: { results: normalizedDetails }, units: { single: { result: unitStored } } },
+      null,
+      2
+    );
+    expect(Buffer.byteLength(pretty, 'utf8')).toBeLessThan(512 * 1024);
+    expect(pretty).not.toContain('Q'.repeat(64));
+  });
+
   it('coalesces persistence within coalesceMs, but flushes on flushNow', async () => {
     let t = 100;
     let realWrites = 0;
@@ -4455,7 +4628,8 @@ describe('persistSessionFile', () => {
         result,
         'completed'
       );
-      expect(result.sessionFile).toBe('/sessions/from-unit.jsonl');
+      // Caller result is not mutated; identity is stamped onto the private stored shell.
+      expect(result.sessionFile).toBeUndefined();
       await new Promise((r) => setTimeout(r, 40));
       const loaded = store.getRun(runId);
       expect(loaded.ok).toBe(true);
@@ -4583,9 +4757,9 @@ describe('persistSessionFile', () => {
       resumeCapability: 'session',
     };
     coord.finishUnit('run-stale-clear', ctx, result, 'completed');
-    expect(result.sessionFile).toBeUndefined();
-    expect(result.acpSessionId).toBeUndefined();
-    expect(result.resumeCapability).toBe('session');
+    // Caller object remains as supplied; private stored shell clears identity.
+    expect(result.sessionFile).toBe('/sessions/stale.jsonl');
+    expect(result.acpSessionId).toBe('stale-acp');
     expect(ctx.sessionFile).toBeUndefined();
     expect(ctx.acpSessionId).toBeUndefined();
     expect(ctx.resumeCapability).toBe('session');
@@ -4654,9 +4828,9 @@ describe('persistSessionFile', () => {
       resumeCapability: 'session',
     };
     coord.finishUnit('run-stale-replace', ctx, result, 'completed');
-    expect(result.sessionFile).toBe('/sessions/canonical.jsonl');
-    expect(result.acpSessionId).toBe('canonical-acp');
-    expect(result.resumeCapability).toBe('session');
+    // Caller object remains as supplied; private stored shell gets canonical identity.
+    expect(result.sessionFile).toBe('/sessions/stale.jsonl');
+    expect(result.acpSessionId).toBe('stale-acp');
     expect(ctx.sessionFile).toBe('/sessions/canonical.jsonl');
     expect(ctx.acpSessionId).toBe('canonical-acp');
     expect(ctx.resumeCapability).toBe('session');

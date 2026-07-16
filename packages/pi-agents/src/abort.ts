@@ -2,11 +2,12 @@
 // ABOUTME: Leaf module so pi-rpc-execution does not value-import execution (breaks jiti cycles).
 
 import type { RunAbortOrigin } from './run-types.ts';
-import { cloneSingleResult, type SingleResult } from './types.ts';
+import { snapshotSingleResult } from './result-snapshot.ts';
+import type { SingleResult } from './types.ts';
 
 export const ABORT_MESSAGE = 'Subagent was aborted';
 
-/** Abort error that carries a deep-cloned terminal SingleResult snapshot and the abort origin. */
+/** Abort error that carries a compact terminal SingleResult snapshot and the abort origin. */
 export class AgentAbortError extends Error {
   readonly result: SingleResult;
   readonly origin: RunAbortOrigin;
@@ -14,7 +15,8 @@ export class AgentAbortError extends Error {
   constructor(result: SingleResult, origin: RunAbortOrigin = 'unknown') {
     super(ABORT_MESSAGE);
     this.name = 'AgentAbortError';
-    this.result = cloneSingleResult(result);
+    // Provisional compact snapshot; runStepWithContext may re-stamp and replace this.
+    this.result = snapshotSingleResult(result);
     this.origin = origin;
   }
 }

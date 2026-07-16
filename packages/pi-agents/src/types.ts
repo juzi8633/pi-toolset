@@ -33,6 +33,30 @@ export interface FanoutIdentity {
   itemTask?: string;
 }
 
+export type DisplayItem =
+  | { type: 'text'; text: string }
+  | { type: 'toolCall'; name: string; args: Record<string, unknown> };
+
+/** Shared presentation fields for compact parent/durable results. */
+interface ResultPresentationBase {
+  /** Ordered assistant text/tool-call items except the text selected as final output. */
+  transcript: DisplayItem[];
+  /**
+   * Latest activity when it cannot be derived from `finalOutput`
+   * (e.g. a trailing tool call, or text that differs from final output).
+   */
+  latestActivity?: DisplayItem;
+}
+
+/**
+ * Compact assistant presentation for parent/durable results.
+ * Truncation is either absent (both `truncated` and `omittedItems` forbidden)
+ * or `truncated: true` with a required positive `omittedItems` count.
+ */
+export type ResultPresentation =
+  | (ResultPresentationBase & { truncated?: never; omittedItems?: never })
+  | (ResultPresentationBase & { truncated: true; omittedItems: number });
+
 export interface SingleResult {
   agent: string;
   agentSource: AgentSource | 'unknown';
@@ -43,6 +67,12 @@ export interface SingleResult {
   /** Explicit status; older sessions may omit this and renderers fall back. */
   status?: ExecutionStatus;
   messages: Message[];
+  /**
+   * Compact presentation for parent/durable snapshots.
+   * When present, rendering and result-aware helpers prefer this over `messages`.
+   * Legacy Version 1 records omit this field and keep full `messages`.
+   */
+  presentation?: ResultPresentation;
   stderr: string;
   usage: UsageStats;
   model?: string;
@@ -184,10 +214,6 @@ export interface SubagentDetails {
   };
 }
 
-export type DisplayItem =
-  | { type: 'text'; text: string }
-  | { type: 'toolCall'; name: string; args: Record<string, unknown> };
-
 /** Re-export leaf factory so tests/callers can keep importing from types. */
 export { emptyUsage } from './empty-usage.ts';
 
@@ -199,6 +225,7 @@ export function cloneSingleResult(result: SingleResult): SingleResult {
   return {
     ...result,
     messages: result.messages.map((message) => structuredClone(message)),
+    presentation: result.presentation ? structuredClone(result.presentation) : undefined,
     usage: { ...result.usage },
     fanout: result.fanout ? { ...result.fanout } : undefined,
     worktreeChangedFiles: result.worktreeChangedFiles

@@ -356,7 +356,8 @@ delegates the task to the `general` agent with `runtime: "grok-acp"`,
 2. If interrupted, resume with `agent({ runId })`. The client calls `session/load` with the stored ID and original cwd/worktree,
    then sends only the fixed continuation prompt plus undelivered instructions.
 3. In TUI, open `/agent view` (or `Ctrl+Alt+Down`). Restored Grok ACP endpoints
-   appear as detached metadata; open detail to lazy-hydrate full history via a
+   appear as detached metadata; open detail to lazy-hydrate the retained Agent View
+   presentation (and raw complete native history when reloadable) via a
    hydrate-only `session/load` (no model prompt).
 4. While idle, Enter sends a new prompt on the same ACP session. While starting
    or running, text input is disabled (no steer/follow-up). Ctrl+X cancels the
@@ -399,9 +400,9 @@ or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC 
 
 1. The list shows linked endpoints ordered by link creation time (full list: running, idle, detached, error, …).
 2. Enter on an endpoint opens its detail transcript (last 15 lines by default).
-3. In detail, Ctrl+O expands the full transcript; Ctrl+O again collapses to the last 15 lines at the tail.
+3. In detail, Ctrl+O expands the complete retained/bounded Agent View transcript; Ctrl+O again collapses to the last 15 lines at the tail.
 4. Escape returns from detail to the list, or closes the list.
-5. Grok ACP history hydrates lazily on first detail open via `session/load` replay (no model prompt).
+5. Grok ACP history hydrates lazily on first detail open via `session/load` replay (no model prompt). Raw complete native history is available only for reloadable sessions; non-reloadable omitted history is unrecoverable.
 
 The below-editor chrome (when any agent is `starting`/`running`) lists only those running endpoints; open `/agent view` for the full set.
 
@@ -415,7 +416,7 @@ The below-editor chrome (when any agent is `starting`/`running`) lists only thos
 | Grok ACP | Idle / detached / error | New prompt after `session/load` reopen when detached        | Same as Enter (prompt only)             |
 
 - Ctrl+X aborts/cancels only the selected child's current turn (Pi abort RPC or Grok ACP `session/cancel`).
-- Ctrl+O toggles between the last-15-line preview and the full transcript.
+- Ctrl+O toggles between the last-15-line preview and the complete retained/bounded Agent View transcript.
 - After idle, a new message continues the child session without replaying the original task prompt.
 - Detached idle children reopen lazily on the next prompt (same session artifact, cwd/worktree, and fingerprint).
 

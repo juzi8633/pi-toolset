@@ -2311,3 +2311,624 @@ describe('buildRestoredLogicalSteps', () => {
     expect(res.details.outputs?.out?.structured).toEqual([]);
   });
 });
+
+describe('copy-on-write fanout updates', () => {
+  it('keeps earlier emitted details stable when later worker slots update', async () => {
+    const chain = [
+      {
+        agent: 'seed',
+        task: 'seed',
+        name: 'seed',
+        outputSchema: {
+          type: 'object',
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+          required: ['items'],
+        },
+      },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+    ];
+    let retainedResults: SingleResult[] | undefined;
+    let retainedPresentation: SingleResult['presentation'];
+    let retainedFinal: string | undefined;
+
+    await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: (partial) => {
+        const fanoutItems = (partial.details?.results ?? []).filter((r) => r.fanout);
+        const partialA = fanoutItems.find(
+          (r) => r.fanout?.index === 0 && r.finalOutput === 'partial a'
+        );
+        if (partialA && !retainedResults) {
+          retainedResults = partial.details!.results;
+          retainedPresentation = partialA.presentation;
+          retainedFinal = partialA.finalOutput;
+        }
+      },
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'seed') {
+          return {
+            ...makeAssistantResult(req.agent, '{"items":["a","b"]}', req.step),
+            structuredOutput: { items: ['a', 'b'] },
+          };
+        }
+        const match = /Process ([ab])/.exec(req.task);
+        const letter = match?.[1] ?? 'a';
+        const index = letter === 'a' ? 0 : 1;
+        req.onUpdate?.({
+          content: [{ type: 'text', text: `partial ${letter}` }],
+          details: {
+            mode: 'single',
+            agentScope: 'user',
+            projectAgentsDir: null,
+            builtinAgentsDir: '/tmp',
+            results: [
+              {
+                ...makeRunningPartial(req.agent, `partial ${letter}`, req.step),
+                presentation: {
+                  transcript: [{ type: 'text', text: `partial ${letter}` }],
+                },
+                finalOutput: `partial ${letter}`,
+                fanout: { index, count: 2, itemTask: req.task },
+              },
+            ],
+          },
+        });
+        if (letter === 'b') {
+          await new Promise((r) => setTimeout(r, 5));
+          req.onUpdate?.({
+            content: [{ type: 'text', text: `later ${letter}` }],
+            details: {
+              mode: 'single',
+              agentScope: 'user',
+              projectAgentsDir: null,
+              builtinAgentsDir: '/tmp',
+              results: [
+                {
+                  ...makeRunningPartial(req.agent, `later ${letter}`, req.step),
+                  presentation: {
+                    transcript: [{ type: 'text', text: `later ${letter}` }],
+                  },
+                  finalOutput: `later ${letter}`,
+                  fanout: { index, count: 2, itemTask: req.task },
+                },
+              ],
+            },
+          });
+        }
+        return {
+          ...makeAssistantResult(req.agent, `done ${letter}`, req.step),
+          presentation: { transcript: [] },
+          fanout: { index, count: 2, itemTask: req.task },
+        };
+      },
+    });
+
+    expect(retainedResults).toBeDefined();
+    expect(retainedFinal).toBe('partial a');
+    const stillA = retainedResults!.find((r) => r.fanout?.index === 0);
+    // Retained aggregate array entries keep their original finalOutput/presentation identity
+    // after later sibling worker updates replace other slots only.
+    expect(stillA?.finalOutput).toBe('partial a');
+    expect(stillA?.presentation).toBe(retainedPresentation);
+    expect(
+      (stillA?.presentation as { transcript?: Array<{ text?: string }> } | undefined)
+        ?.transcript?.[0]?.text
+    ).toBe('partial a');
+  });
+
+  it('multi-item out-of-order fanout keeps ordered slots and shares unchanged presentations', async () => {
+    // Cap matches MAX_CONCURRENCY so all workers start under one gate wave.
+    const items = ['a', 'b', 'c', 'd'];
+    const chain = [
+      {
+        agent: 'seed',
+        task: 'seed',
+        name: 'seed',
+        outputSchema: {
+          type: 'object',
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+          required: ['items'],
+        },
+      },
+      {
+        expand: { from: { output: 'seed', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+        concurrency: 4,
+      },
+    ];
+    const resolvers: Array<() => void> = [];
+    const gates = items.map(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvers.push(resolve);
+        })
+    );
+    let started = 0;
+    let resolveAllStarted!: () => void;
+    const allStarted = new Promise<void>((resolve) => {
+      resolveAllStarted = resolve;
+    });
+    const presentationByIndex = new Map<number, object>();
+    let sharedAcrossEmissions = 0;
+
+    const runPromise = runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: (partial) => {
+        for (const r of partial.details?.results ?? []) {
+          if (r.fanout === undefined || !r.presentation) continue;
+          const prev = presentationByIndex.get(r.fanout.index);
+          if (prev && prev === r.presentation) sharedAcrossEmissions++;
+          presentationByIndex.set(r.fanout.index, r.presentation as object);
+        }
+      },
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'seed') {
+          return {
+            ...makeAssistantResult(req.agent, JSON.stringify({ items }), req.step),
+            structuredOutput: { items },
+          };
+        }
+        const match = /Process ([a-d])/.exec(req.task);
+        const letter = match?.[1] ?? 'a';
+        const index = letter.charCodeAt(0) - 97;
+        started++;
+        if (started === 4) resolveAllStarted();
+        const frozenPresentation = Object.freeze({
+          transcript: Object.freeze([
+            Object.freeze({
+              type: 'toolCall' as const,
+              name: 'read',
+              args: Object.freeze({ path: `${letter}.ts` }),
+            }),
+          ]),
+        });
+        req.onUpdate?.({
+          content: [{ type: 'text', text: `mid ${letter}` }],
+          details: {
+            mode: 'single',
+            agentScope: 'user',
+            projectAgentsDir: null,
+            builtinAgentsDir: '/tmp',
+            results: [
+              {
+                ...makeRunningPartial(req.agent, `mid ${letter}`, req.step),
+                presentation: frozenPresentation as unknown as SingleResult['presentation'],
+                finalOutput: `mid ${letter}`,
+                fanout: { index, count: 4, itemTask: req.task },
+              },
+            ],
+          },
+        });
+        await gates[index];
+        return {
+          ...makeAssistantResult(req.agent, `done ${letter}`, req.step),
+          presentation: frozenPresentation as unknown as SingleResult['presentation'],
+          fanout: { index, count: 4, itemTask: req.task },
+        };
+      },
+    });
+
+    await allStarted;
+    for (let i = 3; i >= 0; i--) resolvers[i]!();
+    const res = await runPromise;
+
+    const fanoutResults = res.details.results.filter((r) => r.fanout);
+    expect(fanoutResults.map((r) => r.fanout?.index)).toEqual([0, 1, 2, 3]);
+    expect(fanoutResults.every((r) => r.status === 'completed')).toBe(true);
+    expect(sharedAcrossEmissions).toBeGreaterThan(0);
+  });
+});
+
+it('restored results and outputs stay mutation-isolated across later emissions', async () => {
+  const restoredStructured = { secret: 'orig', nested: { v: 1 } };
+  const restoredResult: SingleResult = {
+    ...makeAssistantResult('explore', 'restored-final', 1),
+    messages: [],
+    finalOutput: 'restored-final',
+    presentation: {
+      transcript: [{ type: 'text', text: 'restored-final' }],
+    },
+    structuredOutput: restoredStructured,
+  };
+  const restoredOutputs: Record<string, ChainOutputEntry> = {
+    first: {
+      text: 'restored-final',
+      structured: restoredStructured,
+      agent: 'explore',
+      step: 1,
+    },
+  };
+
+  const earlyDetails: SubagentDetails[] = [];
+  const res = await runChainWorkflow({
+    chain: [
+      { agent: 'explore', task: 'first', name: 'first' },
+      { agent: 'explore', task: 'Use {{outputs.first}} then {{previous}}', name: 'second' },
+    ],
+    signal: undefined,
+    makeDetails,
+    restored: {
+      results: [restoredResult],
+      outputs: restoredOutputs,
+      logicalSteps: [
+        {
+          kind: 'sequential',
+          step: 1,
+          agent: 'explore',
+          task: 'first',
+          status: 'completed',
+        },
+        {
+          kind: 'sequential',
+          step: 2,
+          agent: 'explore',
+          task: 'second',
+          status: 'queued',
+        },
+      ],
+      units: {
+        'chain-0001': {
+          unitId: 'chain-0001',
+          agent: 'explore',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'completed',
+          step: 1,
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'completed', startedAt: 1, finishedAt: 2 }],
+          effectiveCwd: '/tmp',
+          result: restoredResult,
+        },
+      },
+      fanouts: {},
+    },
+    onUpdate: (partial) => {
+      earlyDetails.push(structuredClone(partial.details));
+    },
+    runStep: async (req) => {
+      // Mutate the retained restored details object mid-flight.
+      restoredStructured.secret = 'mutated';
+      restoredStructured.nested.v = 99;
+      if (restoredResult.structuredOutput && typeof restoredResult.structuredOutput === 'object') {
+        (restoredResult.structuredOutput as { secret: string }).secret = 'mutated-result';
+      }
+      if (
+        restoredOutputs.first?.structured &&
+        typeof restoredOutputs.first.structured === 'object'
+      ) {
+        (restoredOutputs.first.structured as { secret: string }).secret = 'mutated-output';
+      }
+      return {
+        ...makeAssistantResult(req.agent, `second-saw:${req.task}`, req.step ?? 2),
+        structuredOutput: { ok: true },
+      };
+    },
+  });
+
+  expect(res.isError).toBeUndefined();
+  // Early retained details must not observe mutations of restored sources.
+  expect(earlyDetails.length).toBeGreaterThan(0);
+  for (const d of earlyDetails) {
+    const out = d.outputs?.first?.structured as
+      { secret?: string; nested?: { v?: number } } | undefined;
+    if (out) {
+      expect(out.secret).toBe('orig');
+      expect(out.nested?.v).toBe(1);
+    }
+    const firstResult = d.results.find((r) => r.step === 1);
+    if (firstResult?.structuredOutput) {
+      expect((firstResult.structuredOutput as { secret?: string }).secret).toBe('orig');
+    }
+  }
+  // Final details also isolated.
+  const finalOut = res.details.outputs?.first?.structured as { secret?: string } | undefined;
+  expect(finalOut?.secret).toBe('orig');
+  const finalFirst = res.details.results.find((r) => r.step === 1);
+  expect((finalFirst?.structuredOutput as { secret?: string } | undefined)?.secret).toBe('orig');
+});
+
+it('cancels fanout content coalescer after non-abort worker exception', async () => {
+  let postExitEmissions = 0;
+  let exited = false;
+  let contentPending = false;
+  const chain: ChainItemInput[] = [
+    {
+      agent: 'explore',
+      task: 'find items',
+      name: 'context',
+      outputSchema: {
+        type: 'object',
+        required: ['items'],
+        properties: { items: { type: 'array', items: { type: 'string' } } },
+      },
+    },
+    {
+      expand: { from: { output: 'context', path: '/items' } },
+      parallel: { agent: 'worker', task: 'Process {item}' },
+      collect: { name: 'results' },
+      concurrency: 2,
+    },
+  ];
+
+  let caught: unknown;
+  const runPromise = runChainWorkflow({
+    chain,
+    signal: undefined,
+    makeDetails,
+    onUpdate: () => {
+      if (exited) postExitEmissions += 1;
+      contentPending = true;
+    },
+    runStep: async (req) => {
+      if (req.agent === 'explore') {
+        return makeAssistantResult(req.agent, '{"items":["a","b"]}', req.step ?? 1);
+      }
+      // Schedule a content partial so the coalescer has a pending timer.
+      if (req.onUpdate) {
+        req.onUpdate({
+          content: [{ type: 'text', text: 'partial' }],
+          details: {
+            mode: 'chain',
+            agentScope: 'user',
+            projectAgentsDir: null,
+            builtinAgentsDir: '/tmp',
+            results: [
+              {
+                ...makeRunningPartial(req.agent, 'partial', req.step ?? 2),
+                fanout: { index: req.fanoutIndex ?? 0, count: 2, itemTask: req.task },
+              },
+            ],
+          },
+        });
+      }
+      if ((req.fanoutIndex ?? 0) === 0) {
+        // Leave a coalesced content update pending, then fail.
+        await new Promise((r) => setTimeout(r, 5));
+        throw new Error('worker boom');
+      }
+      await new Promise((r) => setTimeout(r, 30));
+      return makeAssistantResult(req.agent, `done ${req.task}`, req.step ?? 2);
+    },
+  });
+
+  try {
+    await runPromise;
+  } catch (err) {
+    caught = err;
+  }
+  exited = true;
+  expect(contentPending).toBe(true);
+  expect(caught instanceof Error && (caught as Error).message.includes('worker boom')).toBe(true);
+
+  // After exceptional terminal exit, pending content timers must not emit.
+  await new Promise((r) => setTimeout(r, 300));
+  expect(postExitEmissions).toBe(0);
+});
+
+it('late fanout worker callback after exceptional exit cannot restart coalescer', async () => {
+  let postExitEmissions = 0;
+  let exited = false;
+  let capturedWorkerUpdate:
+    | ((partial: {
+        content: Array<{ type: string; text: string }>;
+        details: ReturnType<typeof makeDetails>;
+      }) => void)
+    | undefined;
+  const chain: ChainItemInput[] = [
+    {
+      agent: 'explore',
+      task: 'find items',
+      name: 'context',
+      outputSchema: {
+        type: 'object',
+        required: ['items'],
+        properties: { items: { type: 'array', items: { type: 'string' } } },
+      },
+    },
+    {
+      expand: { from: { output: 'context', path: '/items' } },
+      parallel: { agent: 'worker', task: 'Process {item}' },
+      collect: { name: 'results' },
+      concurrency: 1,
+    },
+  ];
+
+  let caught: unknown;
+  const runPromise = runChainWorkflow({
+    chain,
+    signal: undefined,
+    makeDetails,
+    onUpdate: () => {
+      if (exited) postExitEmissions += 1;
+    },
+    runStep: async (req) => {
+      if (req.agent === 'explore') {
+        return makeAssistantResult(req.agent, '{"items":["solo"]}', req.step ?? 1);
+      }
+      if (req.onUpdate) {
+        capturedWorkerUpdate = req.onUpdate as typeof capturedWorkerUpdate;
+      }
+      // Fail after capturing the callback so the fanout finally gate is set.
+      throw new Error('exceptional fanout boom');
+    },
+  });
+
+  try {
+    await runPromise;
+  } catch (err) {
+    caught = err;
+  }
+  exited = true;
+  expect(
+    caught instanceof Error && (caught as Error).message.includes('exceptional fanout boom')
+  ).toBe(true);
+  expect(typeof capturedWorkerUpdate).toBe('function');
+
+  // Late worker callback after exceptional terminal exit must be ignored.
+  capturedWorkerUpdate!({
+    content: [{ type: 'text', text: 'late-partial' }],
+    details: {
+      mode: 'chain',
+      agentScope: 'user',
+      projectAgentsDir: null,
+      builtinAgentsDir: '/tmp',
+      results: [
+        {
+          ...makeRunningPartial('worker', 'late-partial', 2),
+          fanout: { index: 0, count: 1, itemTask: 'Process solo' },
+        },
+      ],
+    },
+  });
+
+  // Advance past RESULT_UPDATE_INTERVAL_MS; no post-terminal emission.
+  await new Promise((r) => setTimeout(r, 300));
+  expect(postExitEmissions).toBe(0);
+});
+
+describe('terminal postprocess exactly-once', () => {
+  it('sequential production-like callback runs once; ignored stubs still get one fallback', async () => {
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'list',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['files'],
+          properties: { files: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+    ];
+
+    // Production-like: invoke postprocessTerminal once before returning a snapshotted result.
+    let productionCalls = 0;
+    const resProd = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        const live = makeAssistantResult(req.agent, '{"files":["a.ts"]}', req.step ?? 1);
+        if (req.postprocessTerminal) {
+          productionCalls += 1;
+          req.postprocessTerminal(live);
+        }
+        // Mimic runStepWithContext: snapshot after exactly one postprocess.
+        const { snapshotSingleResult } = await import('../src/result-snapshot.ts');
+        return snapshotSingleResult(live);
+      },
+    });
+    expect(productionCalls).toBe(1);
+    expect(resProd.isError).toBeUndefined();
+    expect(resProd.details.outputs?.context?.structured).toEqual({ files: ['a.ts'] });
+    expect(resProd.details.results[0]?.structuredOutput).toEqual({ files: ['a.ts'] });
+
+    // Stub that ignores the callback still receives exactly one fallback application.
+    let stubCalls = 0;
+    const resStub = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        // Deliberately ignore postprocessTerminal (legacy test stubs).
+        void req.postprocessTerminal;
+        stubCalls += 1;
+        return makeAssistantResult(req.agent, '{"files":["b.ts"]}', req.step ?? 1);
+      },
+    });
+    expect(stubCalls).toBe(1);
+    expect(resStub.isError).toBeUndefined();
+    expect(resStub.details.outputs?.context?.structured).toEqual({ files: ['b.ts'] });
+  });
+
+  it('fanout production-like callback runs once per worker; ignored stubs get one fallback', async () => {
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'find items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: {
+          agent: 'worker',
+          task: 'Process {item}',
+          outputSchema: {
+            type: 'object',
+            required: ['id'],
+            properties: { id: { type: 'string' } },
+          },
+        },
+        collect: { name: 'results' },
+        concurrency: 2,
+      },
+    ];
+
+    const { snapshotSingleResult } = await import('../src/result-snapshot.ts');
+    const postprocessInvocations: number[] = [];
+    const resProd = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'explore') {
+          const live = makeAssistantResult(req.agent, '{"items":["a","b"]}', req.step ?? 1);
+          req.postprocessTerminal?.(live);
+          return snapshotSingleResult(live);
+        }
+        const letter = (req.fanoutIndex ?? 0) === 0 ? 'a' : 'b';
+        const live = makeAssistantResult(req.agent, `{"id":"${letter}"}`, req.step ?? 2);
+        if (req.postprocessTerminal) {
+          postprocessInvocations.push(req.fanoutIndex ?? -1);
+          req.postprocessTerminal(live);
+        }
+        return snapshotSingleResult(live);
+      },
+    });
+    expect(postprocessInvocations.sort()).toEqual([0, 1]);
+    expect(resProd.isError).toBeUndefined();
+    const fanout = resProd.details.results.filter((r) => r.fanout);
+    expect(fanout).toHaveLength(2);
+    expect(fanout.map((r) => r.structuredOutput)).toEqual([{ id: 'a' }, { id: 'b' }]);
+
+    // Stubs that ignore the callback still get exactly one fallback per worker.
+    const stubStarts: number[] = [];
+    const resStub = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'explore') {
+          return makeAssistantResult(req.agent, '{"items":["a","b"]}', req.step ?? 1);
+        }
+        stubStarts.push(req.fanoutIndex ?? -1);
+        void req.postprocessTerminal;
+        const letter = (req.fanoutIndex ?? 0) === 0 ? 'a' : 'b';
+        return makeAssistantResult(req.agent, `{"id":"${letter}"}`, req.step ?? 2);
+      },
+    });
+    expect(stubStarts.sort()).toEqual([0, 1]);
+    expect(resStub.isError).toBeUndefined();
+    const fanoutStub = resStub.details.results.filter((r) => r.fanout);
+    expect(fanoutStub.map((r) => r.structuredOutput)).toEqual([{ id: 'a' }, { id: 'b' }]);
+  });
+});

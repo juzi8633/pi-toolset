@@ -1087,6 +1087,47 @@ describe('interactive-view finalized tool calls', () => {
   });
 });
 
+describe('interactive-view omission / compaction rendering', () => {
+  it('renders non-reloadable history omission markers and rehydrated assistant text', () => {
+    const fg = (_c: string, t: string) => t;
+    const lines = __test.formatTranscriptLines(
+      {
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: '[Earlier history omitted: non-reloadable endpoint exceeded retention budget]',
+              },
+            ],
+          } as never,
+          {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'REHYDRATED_ASSISTANT_TEXT' }],
+          } as never,
+          {
+            role: 'toolResult',
+            content: [
+              {
+                type: 'text',
+                text: 'tool body truncated: 99999 bytes omitted; inspect child session history',
+              },
+            ],
+          } as never,
+        ],
+        activeTools: [],
+      },
+      100,
+      fg as never
+    );
+    const joined = lines.join('\n');
+    expect(joined).toContain('Earlier history omitted');
+    expect(joined).toContain('REHYDRATED_ASSISTANT_TEXT');
+    expect(joined).toContain('bytes omitted');
+  });
+});
+
 describe('interactive-view widget metadata refresh', () => {
   function metaRow(
     overrides: Partial<{

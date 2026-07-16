@@ -10,11 +10,16 @@ import {
   formatUsageStats,
   getFinalOutput,
   getLatestActivity,
+  getResultFinalOutput,
+  getResultLatestActivity,
+  getResultOutput,
+  getResultTranscriptAndFinal,
   getTranscriptAndFinal,
   resolveExecutionStatus,
   truncateParallelOutput,
 } from '../src/output.ts';
-import type { SingleResult } from '../src/types.ts';
+import type { DisplayItem, SingleResult } from '../src/types.ts';
+import { emptyUsage } from '../src/types.ts';
 
 function assistantText(text: string): Message {
   return {
@@ -307,7 +312,7 @@ describe('truncateParallelOutput', () => {
 
 describe('cloneSingleResult deep snapshot', () => {
   it('isolates message content and tool arguments from later mutation', async () => {
-    const { cloneSingleResult, emptyUsage } = await import('../src/types.ts');
+    const { cloneSingleResult } = await import('../src/types.ts');
     const args = { path: 'original.ts' };
     const result: SingleResult = {
       agent: 'explore',
@@ -337,5 +342,277 @@ describe('cloneSingleResult deep snapshot', () => {
     };
     expect(snapPart.arguments.path).toBe('original.ts');
     expect(snap.usage.input).toBe(1);
+  });
+
+  it('deep-clones presentation transcript and latest activity', async () => {
+    const { cloneResults, cloneSingleResult } = await import('../src/types.ts');
+    const args = { path: 'original.ts' };
+    const result: SingleResult = {
+      agent: 'explore',
+      agentSource: 'user',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [],
+      presentation: {
+        transcript: [
+          { type: 'text', text: 'note' },
+          { type: 'toolCall', name: 'read', args },
+        ],
+        latestActivity: { type: 'toolCall', name: 'read', args },
+      },
+      finalOutput: 'done',
+      stderr: '',
+      usage: emptyUsage(),
+    };
+    const [snap] = cloneResults([result]);
+    const solo = cloneSingleResult(result);
+
+    // Mutate source presentation arrays, text, and tool args.
+    result.presentation!.transcript.push({ type: 'text', text: 'extra' });
+    (result.presentation!.transcript[0] as Extract<DisplayItem, { type: 'text' }>).text = 'mutated';
+    args.path = 'mutated.ts';
+    (result.presentation!.latestActivity as Extract<DisplayItem, { type: 'toolCall' }>).args.path =
+      'mutated.ts';
+
+    expect(result.presentation!.transcript).toHaveLength(3);
+    expect(snap.presentation!.transcript).toHaveLength(2);
+    expect((snap.presentation!.transcript[0] as Extract<DisplayItem, { type: 'text' }>).text).toBe(
+      'note'
+    );
+    expect(
+      (snap.presentation!.transcript[1] as Extract<DisplayItem, { type: 'toolCall' }>).args.path
+    ).toBe('original.ts');
+    expect(
+      (snap.presentation!.latestActivity as Extract<DisplayItem, { type: 'toolCall' }>).args.path
+    ).toBe('original.ts');
+
+    // Mutate clones and confirm source is unchanged.
+    snap.presentation!.transcript.pop();
+    (solo.presentation!.transcript[0] as Extract<DisplayItem, { type: 'text' }>).text = 'clone';
+    expect(snap.presentation!.transcript).toHaveLength(1);
+    expect(result.presentation!.transcript).toHaveLength(3);
+    expect(
+      (result.presentation!.transcript[0] as Extract<DisplayItem, { type: 'text' }>).text
+    ).toBe('mutated');
+    expect((solo.presentation!.transcript[0] as Extract<DisplayItem, { type: 'text' }>).text).toBe(
+      'clone'
+    );
+  });
+});
+
+function baseResult(overrides: Partial<SingleResult> = {}): SingleResult {
+  return {
+    agent: 'explore',
+    agentSource: 'user',
+    task: 'inspect',
+    exitCode: 0,
+    status: 'completed',
+    messages: [],
+    stderr: '',
+    usage: emptyUsage(),
+    ...overrides,
+  };
+}
+
+function legacyAndCompactPair() {
+  const messages: Message[] = [
+    assistantTool('read', { path: 'a.ts' }),
+    assistantText('thinking aloud'),
+    assistantMixed([
+      { type: 'toolCall', name: 'bash', args: { command: 'ls' } },
+      { type: 'text', text: 'done' },
+    ]),
+  ];
+  const transcript: DisplayItem[] = [
+    { type: 'toolCall', name: 'read', args: { path: 'a.ts' } },
+    { type: 'text', text: 'thinking aloud' },
+    { type: 'toolCall', name: 'bash', args: { command: 'ls' } },
+  ];
+  const legacy = baseResult({
+    messages,
+    finalOutput: 'done',
+  });
+  const compact = baseResult({
+    messages: [],
+    finalOutput: 'done',
+    presentation: {
+      transcript,
+      // latest activity is the final text, intentionally de-duplicated
+    },
+  });
+  return { legacy, compact, transcript };
+}
+
+describe('result-aware presentation helpers', () => {
+  it('matches final output between legacy and compact results', () => {
+    const { legacy, compact } = legacyAndCompactPair();
+    expect(getResultFinalOutput(legacy)).toBe('done');
+    expect(getResultFinalOutput(compact)).toBe('done');
+    expect(getResultOutput(legacy)).toBe('done');
+    expect(getResultOutput(compact)).toBe('done');
+  });
+
+  it('matches latest activity and synthesizes de-duplicated final text', () => {
+    const { legacy, compact } = legacyAndCompactPair();
+    expect(getResultLatestActivity(legacy)).toEqual({ type: 'text', text: 'done' });
+    expect(getResultLatestActivity(compact)).toEqual({ type: 'text', text: 'done' });
+  });
+
+  it('synthesizes empty finalOutput as latest activity instead of older transcript', () => {
+    const result = baseResult({
+      messages: [],
+      finalOutput: '',
+      presentation: {
+        transcript: [{ type: 'text', text: 'older retained note' }],
+      },
+    });
+    expect(getResultLatestActivity(result)).toEqual({ type: 'text', text: '' });
+  });
+
+  it('prefers explicit compact latestActivity over finalOutput synthesis', () => {
+    const result = baseResult({
+      messages: [],
+      finalOutput: 'done',
+      presentation: {
+        transcript: [{ type: 'toolCall', name: 'read', args: { path: 'a.ts' } }],
+        latestActivity: { type: 'toolCall', name: 'bash', args: { command: 'ls' } },
+      },
+    });
+    expect(getResultLatestActivity(result)).toEqual({
+      type: 'toolCall',
+      name: 'bash',
+      args: { command: 'ls' },
+    });
+  });
+
+  it('falls back to the last transcript item when compact data is incomplete', () => {
+    const result = baseResult({
+      messages: [],
+      presentation: {
+        transcript: [
+          { type: 'text', text: 'earlier' },
+          { type: 'toolCall', name: 'grep', args: { pattern: 'x' } },
+        ],
+      },
+    });
+    expect(getResultLatestActivity(result)).toEqual({
+      type: 'toolCall',
+      name: 'grep',
+      args: { pattern: 'x' },
+    });
+  });
+
+  it('matches transcript and final between legacy and compact results', () => {
+    const { legacy, compact, transcript } = legacyAndCompactPair();
+    expect(getResultTranscriptAndFinal(legacy)).toEqual({
+      transcript,
+      finalOutput: 'done',
+    });
+    expect(getResultTranscriptAndFinal(compact)).toEqual({
+      transcript,
+      finalOutput: 'done',
+    });
+  });
+
+  it('ignores conflicting legacy messages when presentation is present', () => {
+    const result = baseResult({
+      messages: [assistantText('stale message body'), assistantTool('read', { path: 'stale.ts' })],
+      finalOutput: 'compact final',
+      presentation: {
+        transcript: [{ type: 'toolCall', name: 'bash', args: { command: 'pwd' } }],
+        latestActivity: { type: 'toolCall', name: 'bash', args: { command: 'pwd' } },
+      },
+    });
+    expect(getResultFinalOutput(result)).toBe('compact final');
+    expect(getResultLatestActivity(result)).toEqual({
+      type: 'toolCall',
+      name: 'bash',
+      args: { command: 'pwd' },
+    });
+    expect(getResultTranscriptAndFinal(result)).toEqual({
+      transcript: [{ type: 'toolCall', name: 'bash', args: { command: 'pwd' } }],
+      finalOutput: 'compact final',
+    });
+  });
+
+  it('prefers explicit finalOutput over legacy messages when presentation is absent', () => {
+    const result = baseResult({
+      messages: [assistantText('from messages')],
+      finalOutput: 'from finalOutput field',
+    });
+    expect(getResultFinalOutput(result)).toBe('from finalOutput field');
+    // Expanded transcript still derives both sides from messages for legacy parity.
+    expect(getResultTranscriptAndFinal(result)).toEqual({
+      transcript: [],
+      finalOutput: 'from messages',
+    });
+  });
+
+  it('uses finalOutput for success and failure formatting when messages are empty', () => {
+    const success = baseResult({
+      messages: [],
+      finalOutput: 'compact success',
+      presentation: { transcript: [] },
+    });
+    expect(getResultOutput(success)).toBe('compact success');
+
+    const failed = baseResult({
+      messages: [],
+      exitCode: 1,
+      status: 'failed',
+      stopReason: 'error',
+      finalOutput: 'agent said this',
+      presentation: { transcript: [] },
+    });
+    expect(getResultOutput(failed)).toBe('agent said this');
+
+    const failedWithError = baseResult({
+      messages: [],
+      exitCode: 1,
+      status: 'failed',
+      stopReason: 'error',
+      errorMessage: 'boom',
+      stderr: 'noise',
+      finalOutput: 'ignored when errorMessage set',
+      presentation: { transcript: [] },
+    });
+    expect(getResultOutput(failedWithError)).toBe('boom');
+
+    const failedWithStderr = baseResult({
+      messages: [],
+      exitCode: 1,
+      status: 'failed',
+      stopReason: 'error',
+      stderr: 'stderr noise',
+      finalOutput: 'fallback body',
+      presentation: { transcript: [] },
+    });
+    expect(getResultOutput(failedWithStderr)).toBe('stderr noise');
+
+    const completionFailed = baseResult({
+      messages: [],
+      exitCode: 1,
+      status: 'failed',
+      stopReason: 'completion_check',
+      errorMessage: 'missing acceptance',
+      finalOutput: 'unchecked body',
+      presentation: { transcript: [] },
+    });
+    expect(getResultOutput(completionFailed)).toBe(
+      'missing acceptance\n\nUnchecked agent output:\nunchecked body'
+    );
+  });
+
+  it('falls back to message helpers when presentation is absent', () => {
+    const result = baseResult({
+      messages: [assistantText('from messages')],
+    });
+    expect(getResultFinalOutput(result)).toBe('from messages');
+    expect(getResultLatestActivity(result)).toEqual({ type: 'text', text: 'from messages' });
+    expect(getResultTranscriptAndFinal(result)).toEqual({
+      transcript: [],
+      finalOutput: 'from messages',
+    });
   });
 });

@@ -25,12 +25,19 @@ import {
 import { attachErrorStack, classifyEarlyFailureStopReason } from './early-failure.ts';
 import { emptyUsage } from './empty-usage.ts';
 import type { WorkflowFanoutState } from './run-types.ts';
-import { GROK_ACP_RUNTIME, MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
+import {
+  GROK_ACP_RUNTIME,
+  MAX_CONCURRENCY,
+  MAX_PARALLEL_TASKS,
+  RESULT_UPDATE_INTERVAL_MS,
+} from './constants.ts';
+import { createLatestValueCoalescer } from './update-coalescer.ts';
 import { enforceCompletionCheck } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
 import { listAvailableSkillNames, resolveSkillNames } from './skills.ts';
 import {
   ABORT_MESSAGE,
+  AgentAbortError,
   getAbortResult,
   isAbortError,
   mapWithConcurrencyLimit,
@@ -39,12 +46,13 @@ import {
 } from './execution.ts';
 import {
   applyTerminalStatus,
-  getFinalOutput,
+  getResultFinalOutput,
   getResultOutput,
   isFailedResult,
   resolveExecutionStatus,
   truncateParallelOutput,
 } from './output.ts';
+import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
   createRunLifecycle,
   bridgeIncomingSignal,
@@ -61,7 +69,6 @@ import type { RunCoordinator, UnitExecutionContext } from './run-coordinator.ts'
 import type { SubagentParams } from './schema.ts';
 import { assertAgentDelegationAllowed } from './security.ts';
 import {
-  cloneResults,
   cloneSingleResult,
   type ExecutionStatus,
   type IsolationMode,
@@ -188,14 +195,17 @@ async function finalizeDurable(
   result?: AgentResult
 ): Promise<void> {
   if (!durable) return;
-  const origin = durable.lifecycle.origin;
-  const lifecycleAborted = durable.lifecycle.signal.aborted;
-  // The foreground workflow catches aborts and surfaces them as isError results,
-  // so `err` is usually undefined on this path. The coordinator-owned lifecycle
-  // signal is the reliable indicator: when it aborted, classify the terminal as
-  // cancelled (user) or interrupted (shutdown/unknown) by the carried origin.
-  if (lifecycleAborted) {
-    const flags = originToFinalizeFlags(origin);
+  const abortOrigin =
+    err instanceof AgentAbortError
+      ? err.origin
+      : durable.lifecycle.signal.aborted
+        ? durable.lifecycle.origin
+        : undefined;
+  // Prefer original AgentAbortError.origin; otherwise lifecycle abort origin.
+  // The foreground workflow often catches aborts and surfaces them as isError
+  // results, so `err` may be undefined — lifecycle signal still classifies then.
+  if (abortOrigin !== undefined) {
+    const flags = originToFinalizeFlags(abortOrigin);
     await durable.started.finalize({
       details: result?.details ?? { ...durable.started.record.details },
       units: durable.started.units,
@@ -523,38 +533,49 @@ async function maybeResumeDurableRun(
   }
 
   const record = loaded.loaded.record;
-  // Shallow-copy units so we can stage attempt increments before write.
-  const units: typeof record.units = {};
-  for (const [id, unit] of Object.entries(record.units)) {
-    units[id] = { ...unit, attempts: [...unit.attempts] };
-  }
-
-  // Fully completed runs reopen finished units so continuation can continue
-  // from stored context; selective resume leaves completed siblings alone.
-  reopenCompletedUnitsForResume(units);
-  // Increment attempts only after post-claim eligibility succeeds.
-  incrementIncompleteAttempts(units);
-
-  // Drop planned-only session paths from never-started units. A pre-begin stamp
-  // crash window may have left a path without attempt history; those are not
-  // established sessions and must not block a fresh first-write or flip
-  // resumeHadStoredSession.
-  for (const unit of Object.values(units)) {
-    if (isNeverStartedUnit(unit) && unit.sessionFile) {
-      delete unit.sessionFile;
-      delete unit.sessionPromptEstablished;
-      if (unit.result) delete unit.result.sessionFile;
-    }
-  }
-
-  // Transition to running and append the current continuation task atomically.
-  // Guard the post-claim persistence so a write failure releases the claim.
   const priorContinuations = record.continuationTasks ?? [];
   const accumulatedContinuations = resume.currentContinuationTask
     ? [...priorContinuations, resume.currentContinuationTask]
     : [...priorContinuations];
   const priorDelivery = { ...(record.continuationDelivery ?? {}) };
+
+  // All post-claim setup (normalize, stage, write, register) shares one cleanup
+  // boundary so any failure releases the claim without leaving an active holder.
+  let units!: typeof record.units;
   try {
+    // Normalize legacy full-message results once after post-claim revalidation and
+    // before any resume write can reserialize raw transcripts.
+    if (Array.isArray(record.details.results)) {
+      record.details.results = record.details.results.map((r) => snapshotSingleResult(r));
+    }
+    for (const unit of Object.values(record.units)) {
+      if (unit.result) unit.result = snapshotSingleResult(unit.result);
+    }
+    // Shallow-copy units so we can stage attempt increments before write.
+    units = {};
+    for (const [id, unit] of Object.entries(record.units)) {
+      units[id] = { ...unit, attempts: [...unit.attempts] };
+    }
+
+    // Fully completed runs reopen finished units so continuation can continue
+    // from stored context; selective resume leaves completed siblings alone.
+    reopenCompletedUnitsForResume(units);
+    // Increment attempts only after post-claim eligibility succeeds.
+    incrementIncompleteAttempts(units);
+
+    // Drop planned-only session paths from never-started units. A pre-begin stamp
+    // crash window may have left a path without attempt history; those are not
+    // established sessions and must not block a fresh first-write or flip
+    // resumeHadStoredSession.
+    for (const unit of Object.values(units)) {
+      if (isNeverStartedUnit(unit) && unit.sessionFile) {
+        delete unit.sessionFile;
+        delete unit.sessionPromptEstablished;
+        if (unit.result) delete unit.result.sessionFile;
+      }
+    }
+
+    // Transition to running and append the current continuation task atomically.
     await store.appendEvent(resumeRunId, {
       version: 1,
       event: 'run_resumed',
@@ -567,6 +588,11 @@ async function maybeResumeDurableRun(
       r.status = 'running';
       delete r.finishedAt;
       r.units = units;
+      // Persist compact-normalized presentation results in the same post-claim write.
+      r.details = {
+        ...r.details,
+        results: record.details.results,
+      };
       r.updatedAt = Date.now();
       r.startedAt = r.startedAt ?? Date.now();
       if (resume.currentContinuationTask) {
@@ -577,26 +603,26 @@ async function maybeResumeDurableRun(
         r.continuationDelivery = { ...priorDelivery };
       }
     });
+
+    // Sync the in-memory record with the persisted running state before
+    // registering so the coordinator's live units stay aliased to the handle
+    // the workflow mutates via beginUnit/endUnit/stampUnitSessionFile.
+    // Clear finishedAt here too: disk already dropped it, and a stale terminal
+    // timestamp on the live record would re-persist on the next flush.
+    record.status = 'running';
+    delete record.finishedAt;
+    record.units = units;
+    record.continuationTasks = accumulatedContinuations;
+    record.continuationDelivery = { ...priorDelivery };
+    if (record.startedAt === undefined) record.startedAt = Date.now();
+    record.updatedAt = Date.now();
+    coordinator.registerRun(resumeRunId, record);
   } catch (err) {
     await store.releaseRun(resumeRunId, claim.claimId);
     return {
       error: `resume_setup_failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-
-  // Sync the in-memory record with the persisted running state before
-  // registering so the coordinator's live units stay aliased to the handle
-  // the workflow mutates via beginUnit/endUnit/stampUnitSessionFile.
-  // Clear finishedAt here too: disk already dropped it, and a stale terminal
-  // timestamp on the live record would re-persist on the next flush.
-  record.status = 'running';
-  delete record.finishedAt;
-  record.units = units;
-  record.continuationTasks = accumulatedContinuations;
-  record.continuationDelivery = { ...priorDelivery };
-  if (record.startedAt === undefined) record.startedAt = Date.now();
-  record.updatedAt = Date.now();
-  coordinator.registerRun(resumeRunId, record);
 
   const lifecycle = createRunLifecycle(resumeRunId);
   const sessionsDir = path.join(store.getRunDir(resumeRunId), 'sessions');
@@ -1477,10 +1503,10 @@ async function runParallel(
     const unitCtx = durable?.unitFor(undefined, index, t.agent);
     const unit = unitCtx ? durable?.started.units[unitCtx.unitId] : undefined;
     if (unit?.status === 'completed') {
-      if (unit.result) return { ...unit.result };
+      if (unit.result) return snapshotSingleResult(unit.result);
       const existing = restoredResults[index];
       if (existing && resolveExecutionStatus(existing) === 'completed') {
-        return { ...existing };
+        return snapshotSingleResult(existing);
       }
       // Completed unit without a usable result: keep a completed slot so we do
       // not re-dispatch (selective resume leaves completed siblings alone).
@@ -1510,154 +1536,176 @@ async function runParallel(
     };
   });
 
-  const emitParallelUpdate = () => {
-    if (onUpdate) {
-      const snapshot = cloneResults(allResults);
-      const running = snapshot.filter((r) => resolveExecutionStatus(r) === 'running').length;
-      const done = snapshot.filter((r) => {
-        const s = resolveExecutionStatus(r);
-        return s === 'completed' || s === 'failed' || s === 'cancelled';
-      }).length;
-      onUpdate({
-        content: [
-          {
-            type: 'text',
-            text: `Parallel: ${done}/${snapshot.length} done, ${running} running...`,
-          },
-        ],
-        details: makeDetails('parallel')(snapshot),
-      });
+  const emitParallelSnapshot = () => {
+    if (!onUpdate) return;
+    // Copy-on-write: new array + shell clones; share frozen presentation/structuredOutput.
+    const snapshot = allResults.map(copySnapshotShell);
+    const running = snapshot.filter((r) => resolveExecutionStatus(r) === 'running').length;
+    const done = snapshot.filter((r) => {
+      const s = resolveExecutionStatus(r);
+      return s === 'completed' || s === 'failed' || s === 'cancelled';
+    }).length;
+    onUpdate({
+      content: [
+        {
+          type: 'text',
+          text: `Parallel: ${done}/${snapshot.length} done, ${running} running...`,
+        },
+      ],
+      details: makeDetails('parallel')(snapshot),
+    });
+  };
+  // Structural transitions flush immediately; content/usage partials are coalesced.
+  const contentCoalescer = createLatestValueCoalescer<void>(() => {
+    emitParallelSnapshot();
+  }, RESULT_UPDATE_INTERVAL_MS);
+  const emitParallelUpdate = (mode: 'immediate' | 'content' = 'immediate') => {
+    if (mode === 'content') {
+      contentCoalescer.schedule(undefined);
+      return;
     }
+    contentCoalescer.cancel();
+    emitParallelSnapshot();
   };
 
-  emitParallelUpdate();
+  emitParallelUpdate('immediate');
 
   const makeCancelledSlot = (t: (typeof tasks)[number], index: number): SingleResult => {
-    const existing = allResults[index];
-    const cancelled: SingleResult = {
-      ...existing,
-      agent: t.agent,
-      task: t.task,
-      exitCode: 1,
-      status: 'cancelled',
-      stopReason: 'aborted',
-      errorMessage: existing.errorMessage || ABORT_MESSAGE,
-    };
+    const cancelled = copySnapshotShell(allResults[index]);
+    cancelled.agent = t.agent;
+    cancelled.task = t.task;
+    cancelled.exitCode = 1;
+    cancelled.status = 'cancelled';
+    cancelled.stopReason = 'aborted';
+    cancelled.errorMessage = cancelled.errorMessage || ABORT_MESSAGE;
     return cancelled;
   };
 
-  const results = await mapWithConcurrencyLimit(
-    tasks,
-    MAX_CONCURRENCY,
-    async (t, index) => {
-      // Skip by unit.status / restored completed slot (not lagging details alone).
-      if (resolveExecutionStatus(allResults[index]) === 'completed') {
-        emitParallelUpdate();
-        return allResults[index];
-      }
-      const unitCtx = durable?.unitFor(undefined, index, t.agent);
-      allResults[index] = {
-        ...allResults[index],
-        status: 'running',
-        exitCode: -1,
-      };
-      emitParallelUpdate();
-
-      try {
-        const result = await runStepWithContext(
-          ctx,
-          agents,
-          t.agent,
-          t.task,
-          t.cwd ?? unitCtx?.effectiveCwd,
-          t.isolation,
-          index,
-          undefined,
-          signal,
-          (partial) => {
-            if (partial.details?.results[0]) {
-              const partialResult = partial.details.results[0];
-              partialResult.status = partialResult.status ?? 'running';
-              allResults[index] = partialResult;
-              emitParallelUpdate();
-            }
-          },
-          makeDetails('parallel'),
-          {
-            modelOverride,
-            thinkingOverride,
-            runtimeOverride,
-            title: t.title,
-            ...(interactiveRegistry ? { interactiveRegistry } : {}),
-            ...(spawnFn ? { spawnFn } : {}),
-            ...(durable && unitCtx
-              ? {
-                  unitContext: unitCtx,
-                  getAbortOrigin: () => durable.lifecycle.origin,
-                  stampUnitSessionFile: (sf: string) =>
-                    durable.stampUnitSessionFile(unitCtx.unitId, sf),
-                  beginUnit: durable.beginUnit,
-                  endUnit: durable.endUnit,
-                  ...(durable.markSessionPromptEstablished
-                    ? {
-                        markSessionPromptEstablished: () =>
-                          durable.markSessionPromptEstablished!(unitCtx.unitId),
-                      }
-                    : {}),
-                  ...(durable.persistAcpSessionId
-                    ? {
-                        persistAcpSessionId: (id: string) =>
-                          durable.persistAcpSessionId!(unitCtx.unitId, id),
-                      }
-                    : {}),
-                  ...(durable.resumePromptForUnit
-                    ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
-                    : durable.resume
-                      ? { resumePrompt: durable.resume }
-                      : {}),
-                  ...(durable.markContinuationDelivered
-                    ? {
-                        markContinuationDelivered: durable.markContinuationDelivered,
-                      }
-                    : {}),
-                  ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
-                }
-              : {}),
-          }
-        );
-        if (!result.status || result.status === 'running') applyTerminalStatus(result);
-        allResults[index] = result;
-        emitParallelUpdate();
-        return result;
-      } catch (err) {
-        if (isAbortError(err)) {
-          const fromErr = getAbortResult(err);
-          const cancelled = fromErr
-            ? {
-                ...fromErr,
-                status: 'cancelled' as const,
-                stopReason: fromErr.stopReason ?? 'aborted',
-              }
-            : makeCancelledSlot(t, index);
-          if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
-          allResults[index] = cancelled;
-          emitParallelUpdate();
-          return cancelled;
+  let results: SingleResult[];
+  try {
+    results = await mapWithConcurrencyLimit(
+      tasks,
+      MAX_CONCURRENCY,
+      async (t, index) => {
+        // Skip by unit.status / restored completed slot (not lagging details alone).
+        if (resolveExecutionStatus(allResults[index]) === 'completed') {
+          emitParallelUpdate('immediate');
+          return allResults[index];
         }
-        throw err;
-      }
-    },
-    {
-      signal,
-      onUnstarted: (t, index) => {
-        const cancelled = makeCancelledSlot(t, index);
-        allResults[index] = cancelled;
-        return cancelled;
-      },
-    }
-  );
+        const unitCtx = durable?.unitFor(undefined, index, t.agent);
+        {
+          const runningShell = copySnapshotShell(allResults[index]);
+          runningShell.status = 'running';
+          runningShell.exitCode = -1;
+          allResults[index] = runningShell;
+        }
+        emitParallelUpdate();
 
-  emitParallelUpdate();
+        try {
+          const result = await runStepWithContext(
+            ctx,
+            agents,
+            t.agent,
+            t.task,
+            t.cwd ?? unitCtx?.effectiveCwd,
+            t.isolation,
+            index,
+            undefined,
+            signal,
+            (partial) => {
+              if (partial.details?.results[0]) {
+                const partialResult = partial.details.results[0];
+                const shell = copySnapshotShell(partialResult);
+                shell.status = shell.status ?? 'running';
+                allResults[index] = shell;
+                emitParallelUpdate('content');
+              }
+            },
+            makeDetails('parallel'),
+            {
+              modelOverride,
+              thinkingOverride,
+              runtimeOverride,
+              title: t.title,
+              ...(interactiveRegistry ? { interactiveRegistry } : {}),
+              ...(spawnFn ? { spawnFn } : {}),
+              ...(durable && unitCtx
+                ? {
+                    unitContext: unitCtx,
+                    getAbortOrigin: () => durable.lifecycle.origin,
+                    stampUnitSessionFile: (sf: string) =>
+                      durable.stampUnitSessionFile(unitCtx.unitId, sf),
+                    beginUnit: durable.beginUnit,
+                    endUnit: durable.endUnit,
+                    ...(durable.markSessionPromptEstablished
+                      ? {
+                          markSessionPromptEstablished: () =>
+                            durable.markSessionPromptEstablished!(unitCtx.unitId),
+                        }
+                      : {}),
+                    ...(durable.persistAcpSessionId
+                      ? {
+                          persistAcpSessionId: (id: string) =>
+                            durable.persistAcpSessionId!(unitCtx.unitId, id),
+                        }
+                      : {}),
+                    ...(durable.resumePromptForUnit
+                      ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
+                      : durable.resume
+                        ? { resumePrompt: durable.resume }
+                        : {}),
+                    ...(durable.markContinuationDelivered
+                      ? {
+                          markContinuationDelivered: durable.markContinuationDelivered,
+                        }
+                      : {}),
+                    ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
+                  }
+                : {}),
+            }
+          );
+          // Always store a private compact shell; never alias the returned endUnit object.
+          let stored = snapshotSingleResult(result);
+          if (!stored.status || stored.status === 'running') {
+            const working = cloneSingleResult(stored);
+            applyTerminalStatus(working);
+            stored = snapshotSingleResult(working);
+          }
+          allResults[index] = stored;
+          emitParallelUpdate();
+          return stored;
+        } catch (err) {
+          if (isAbortError(err)) {
+            const fromErr = getAbortResult(err);
+            let cancelled: SingleResult;
+            if (fromErr) {
+              cancelled = copySnapshotShell(fromErr);
+              cancelled.status = 'cancelled';
+              cancelled.stopReason = fromErr.stopReason ?? 'aborted';
+            } else {
+              cancelled = makeCancelledSlot(t, index);
+            }
+            if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
+            allResults[index] = cancelled;
+            emitParallelUpdate();
+            return cancelled;
+          }
+          throw err;
+        }
+      },
+      {
+        signal,
+        onUnstarted: (t, index) => {
+          const cancelled = makeCancelledSlot(t, index);
+          allResults[index] = cancelled;
+          return cancelled;
+        },
+      }
+    );
+  } finally {
+    contentCoalescer.cancel();
+  }
+  emitParallelUpdate('immediate');
 
   const successCount = results.filter((r) => !isFailedResult(r)).length;
   const cancelledCount = results.filter((r) => resolveExecutionStatus(r) === 'cancelled').length;
@@ -1681,7 +1729,7 @@ async function runParallel(
             : `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join('\n\n---\n\n')}`,
       },
     ],
-    details: makeDetails('parallel')(cloneResults(results)),
+    details: makeDetails('parallel')(results.map(copySnapshotShell)),
     ...(cancelledCount > 0 || successCount < results.length ? { isError: true } : {}),
   };
 }
@@ -1791,13 +1839,13 @@ async function runSingle(
             text: `Agent ${result.stopReason || resolveExecutionStatus(result)}: ${errorMsg}`,
           },
         ],
-        details: makeDetails('single')([cloneSingleResult(result)]),
+        details: makeDetails('single')([snapshotSingleResult(result)]),
         isError: true,
       };
     }
     return {
-      content: [{ type: 'text', text: getFinalOutput(result.messages) || '(no output)' }],
-      details: makeDetails('single')([cloneSingleResult(result)]),
+      content: [{ type: 'text', text: getResultFinalOutput(result) || '(no output)' }],
+      details: makeDetails('single')([snapshotSingleResult(result)]),
     };
   } catch (err) {
     if (isAbortError(err)) {
@@ -1818,7 +1866,7 @@ async function runSingle(
         } satisfies SingleResult);
       return {
         content: [{ type: 'text', text: `Agent cancelled: ${getResultOutput(result)}` }],
-        details: makeDetails('single')([cloneSingleResult(result)]),
+        details: makeDetails('single')([snapshotSingleResult(result)]),
         isError: true,
       };
     }
@@ -1886,13 +1934,49 @@ async function runStepWithContext(
         options.unitContext?.sessionPromptEstablished !== false));
   // Prefer explicit task cwd, then persisted unit effectiveCwd, then project cwd.
   const fallbackCwd = cwd ?? options.unitContext?.effectiveCwd ?? options.projectCwd ?? ctx.cwd;
-  const applyPostprocess = (result: SingleResult): void => {
-    if (options.postprocessTerminal) options.postprocessTerminal(result);
-  };
-  const markEnd = (result: SingleResult, status?: ExecutionStatus): void => {
-    if (options.unitContext && options.endUnit) {
-      options.endUnit(options.unitContext, result, status ?? resolveExecutionStatus(result));
+  // Declared early so the terminal finalizer can close over them. Populated when
+  // worktree isolation is active; success path requests finalization after postprocess.
+  let worktree: AgentWorktree | undefined;
+  let retainCleanWorktree = false;
+  let pendingWorktreeFinalization = false;
+  /**
+   * Terminal compaction boundary for every exit:
+   * 1. terminal postprocess/schema/status/identity exactly once
+   * 2. worktree finalization using the final terminal status (success path only)
+   * 3. compact snapshot
+   * 4. endUnit/durability
+   * 5. return authoritative compact result
+   * Abort/early-failure paths handle worktree retention themselves before calling this;
+   * they leave pendingWorktreeFinalization false so finalizeWorktree is not re-applied.
+   */
+  const finalizeTerminalResult = (
+    working: SingleResult,
+    status?: ExecutionStatus
+  ): SingleResult => {
+    if (options.postprocessTerminal) options.postprocessTerminal(working);
+    if (working.finalOutput === undefined && working.messages.length > 0) {
+      working.finalOutput = getResultFinalOutput(working);
     }
+    // Worktree finalization must observe the postprocess-final status (e.g. schema
+    // failure retains a clean tree instead of deleting it as completed).
+    if (pendingWorktreeFinalization && worktree) {
+      pendingWorktreeFinalization = false;
+      finalizeWorktree(worktree, working, { retainClean: retainCleanWorktree });
+    }
+    // Authoritative unit/result path agreement: only retained existing worktrees
+    // keep a durable path. Deleted clean trees must clear unit + result metadata.
+    if (options.unitContext) {
+      if (working.worktreePath) {
+        options.unitContext.worktreePath = working.worktreePath;
+      } else {
+        delete options.unitContext.worktreePath;
+      }
+    }
+    const snapshot = snapshotSingleResult(working);
+    if (options.unitContext && options.endUnit) {
+      options.endUnit(options.unitContext, snapshot, status ?? resolveExecutionStatus(snapshot));
+    }
+    return snapshot;
   };
   if (!agent) {
     const failed = await runSingleAgent(
@@ -1921,8 +2005,7 @@ async function runStepWithContext(
           : {}),
       }
     );
-    markEnd(failed, 'failed');
-    return failed;
+    return finalizeTerminalResult(failed, 'failed');
   }
 
   const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
@@ -1957,8 +2040,7 @@ async function runStepWithContext(
         `Cannot resolve skill name(s): ${missing.join(', ')}. Available skills: ${availableText}.`,
         options.title
       );
-      markEnd(failure, 'failed');
-      return failure;
+      return finalizeTerminalResult(failure, 'failed');
     }
     resolvedSkillPaths = resolved;
   }
@@ -1967,7 +2049,6 @@ async function runStepWithContext(
   // header cwd matches the actual child cwd. On resume, reopen the stored
   // worktree instead of creating a new one.
   const isolation = resolveIsolation(agent, taskIsolation);
-  let worktree: AgentWorktree | undefined;
   let effectiveCwd: string | undefined = cwd ?? options.unitContext?.effectiveCwd;
   const storedWorktreePath = options.unitContext?.worktreePath;
   const gitLookupCwd = options.unitContext?.effectiveCwd ?? options.projectCwd ?? cwd ?? ctx.cwd;
@@ -1987,8 +2068,7 @@ async function runStepWithContext(
           'Worktree isolation requires a git repository.',
           options.title
         );
-        markEnd(failure1, 'failed');
-        return failure1;
+        return finalizeTerminalResult(failure1, 'failed');
       }
       const opened = openAgentWorktree(repoRoot, storedWorktreePath);
       if (!opened.ok) {
@@ -2001,8 +2081,7 @@ async function runStepWithContext(
           opened.error,
           options.title
         );
-        markEnd(failure2, 'failed');
-        return failure2;
+        return finalizeTerminalResult(failure2, 'failed');
       }
       worktree = opened.worktree;
       effectiveCwd = worktree.path;
@@ -2018,8 +2097,7 @@ async function runStepWithContext(
           'Worktree isolation requires a git repository.',
           options.title
         );
-        markEnd(failure3, 'failed');
-        return failure3;
+        return finalizeTerminalResult(failure3, 'failed');
       }
       try {
         worktree = createAgentWorktree(repoRoot, agentName, taskIndex);
@@ -2035,8 +2113,7 @@ async function runStepWithContext(
           message,
           options.title
         );
-        markEnd(failure5, 'failed');
-        return failure5;
+        return finalizeTerminalResult(failure5, 'failed');
       }
 
       if (agent.worktreeSetupHook) {
@@ -2049,9 +2126,13 @@ async function runStepWithContext(
           options.title
         );
         if (failure) {
-          removeAgentWorktree(worktree);
-          markEnd(failure, 'failed');
-          return failure;
+          // runHookOrSynthesizeFailure already made the sole retain/remove decision.
+          // Retained (dirty/unknown/removal-failed) trees stay on disk with path metadata;
+          // only confirmed clean removals leave worktreePath unset.
+          if (!failure.worktreePath) {
+            worktree = undefined;
+          }
+          return finalizeTerminalResult(failure, 'failed');
         }
       }
     }
@@ -2099,24 +2180,38 @@ async function runStepWithContext(
     if (worktree && !storedWorktreePath) {
       const status = getWorktreeDirtyStatus(worktree.path);
       if (status.ok && status.output.trim().length === 0) {
-        removeAgentWorktree(worktree);
+        const removal = removeAgentWorktree(worktree);
+        if (removal.removed) {
+          worktree = undefined;
+        } else {
+          // Removal failed: retain path so durability/resume can inspect the orphan.
+          failure4.worktreePath = worktree.path;
+          failure4.worktreeDirty = false;
+          failure4.stderr += failure4.stderr ? '\n' : '';
+          failure4.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+        }
       } else {
         failure4.worktreePath = worktree.path;
         failure4.worktreeDirty = status.ok ? status.output.trim().length > 0 : true;
+        if (failure4.worktreeDirty) {
+          const diff = getWorktreeDiffSummary(worktree.path);
+          if (diff.ok) {
+            if (diff.stat) failure4.worktreeDiffStat = diff.stat;
+            if (diff.changedFiles) failure4.worktreeChangedFiles = diff.changedFiles;
+          }
+        }
       }
     } else if (storedWorktreePath) {
       failure4.worktreePath = storedWorktreePath;
       const dirty = getWorktreeDirtyStatus(storedWorktreePath);
       failure4.worktreeDirty = dirty.ok ? dirty.output.trim().length > 0 : true;
     }
-    markEnd(failure4, 'failed');
-    return failure4;
+    return finalizeTerminalResult(failure4, 'failed');
   }
 
   // Interactive TUI registration: Pi (pre-spawn with session file) or Grok ACP
   // (resume with stored acpSessionId). Fresh Grok ACP registers after session/new.
   let endpointKey: string | undefined;
-  let retainCleanWorktree = false;
   const isGrokAcp = effectiveRuntime === GROK_ACP_RUNTIME;
   const acpSessionId = options.unitContext?.acpSessionId?.trim();
   const canRegisterInteractivePi =
@@ -2175,7 +2270,33 @@ async function runStepWithContext(
       if (failure) stampWorktreeOnFailure(failure);
       return false;
     }
-    removeAgentWorktree(worktree);
+    const removal = removeAgentWorktree(worktree);
+    if (!removal.removed) {
+      // Keep durable path/dirty metadata when cleanup fails so the orphan is inspectable.
+      if (failure) {
+        failure.worktreePath = worktree.path;
+        failure.worktreeDirty = false;
+        delete failure.worktreeDiffStat;
+        delete failure.worktreeChangedFiles;
+        failure.stderr += failure.stderr ? '\n' : '';
+        failure.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+      }
+      if (options.unitContext) {
+        options.unitContext.worktreePath = worktree.path;
+      }
+      return false;
+    }
+    // Clear path only after confirmed removal so endUnit cannot persist a missing tree.
+    if (failure) {
+      delete failure.worktreePath;
+      delete failure.worktreeDirty;
+      delete failure.worktreeDiffStat;
+      delete failure.worktreeChangedFiles;
+    }
+    if (options.unitContext) {
+      delete options.unitContext.worktreePath;
+    }
+    worktree = undefined;
     return true;
   };
 
@@ -2303,8 +2424,7 @@ async function runStepWithContext(
         );
         if (formalCode) failure.errorCode = formalCode;
         maybeRemoveOwnedCleanWorktree(failure);
-        markEnd(failure, 'failed');
-        return failure;
+        return finalizeTerminalResult(failure, 'failed');
       }
     }
 
@@ -2325,8 +2445,7 @@ async function runStepWithContext(
       );
       failure.errorCode = 'session_prompt_unestablished';
       maybeRemoveOwnedCleanWorktree(failure);
-      markEnd(failure, 'failed');
-      return failure;
+      return finalizeTerminalResult(failure, 'failed');
     }
 
     executionStarted = true;
@@ -2484,23 +2603,23 @@ async function runStepWithContext(
     if (!options.skipCompletionCheck) {
       enforceCompletionCheck(agent, result);
     }
-    // Schema validation / identity stamping before worktree cleanup and endUnit
-    // so durable terminal state reflects the final validated result.
-    applyPostprocess(result);
-    if (worktree) {
-      finalizeWorktree(worktree, result, { retainClean: retainCleanWorktree });
-    }
-    markEnd(result);
-    return result;
+    // Request worktree finalization after postprocess so retention uses the final
+    // terminal status (schema/completion failure retains clean trees).
+    if (worktree) pendingWorktreeFinalization = true;
+    return finalizeTerminalResult(result);
   } catch (err) {
-    if (isAbortError(err) && options.unitContext && options.endUnit) {
-      const origin = options.getAbortOrigin?.() ?? 'unknown';
-      const abortResult = getAbortResult(err);
-      if (abortResult) {
-        // Retain worktree after execution/abort; stamp path/dirty when available.
-        if (worktree) stampWorktreeOnFailure(abortResult);
-        applyPostprocess(abortResult);
-        markEnd(abortResult, originToUnitStatus(origin));
+    if (isAbortError(err)) {
+      // Prefer the original abort origin; fall back to lifecycle/signal origin.
+      const originalOrigin = err instanceof AgentAbortError ? err.origin : undefined;
+      const origin = originalOrigin ?? options.getAbortOrigin?.() ?? 'unknown';
+      const provisional = getAbortResult(err);
+      if (provisional) {
+        // Mutable working state from the provisional compact/low-level snapshot.
+        const working = cloneSingleResult(provisional);
+        if (worktree) stampWorktreeOnFailure(working);
+        const snapshot = finalizeTerminalResult(working, originToUnitStatus(origin));
+        // Replacement abort error carries the authoritative compact terminal snapshot.
+        throw new AgentAbortError(snapshot, origin);
       }
       throw err;
     }
@@ -2530,11 +2649,11 @@ async function runStepWithContext(
     // Always terminalize when we own a unit context (including post-begin stamp
     // failure) so durable state is not left running without a finishUnit.
     if (options.unitContext && options.endUnit) {
-      markEnd(failure, 'failed');
-      return failure;
+      return finalizeTerminalResult(failure, 'failed');
     }
     if (beganUnit) throw err;
-    return failure;
+    // Compact even non-durable early failures so raw transcripts never escape.
+    return finalizeTerminalResult(failure, 'failed');
   } finally {
     await agentContext.cleanup();
   }
@@ -2569,10 +2688,21 @@ export function runHookOrSynthesizeFailure(
   failure.worktreeSetupError = failure.errorMessage;
   const cleanupStatus = getWorktreeDirtyStatus(worktree.path);
   if (cleanupStatus.ok && cleanupStatus.output.trim().length === 0) {
-    removeAgentWorktree(worktree);
+    const removal = removeAgentWorktree(worktree);
+    if (!removal.removed) {
+      failure.worktreePath = worktree.path;
+      failure.worktreeDirty = false;
+      failure.stderr += failure.stderr ? '\n' : '';
+      failure.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+    }
   } else {
     failure.worktreePath = worktree.path;
     failure.worktreeDirty = true;
+    const diff = getWorktreeDiffSummary(worktree.path);
+    if (diff.ok) {
+      if (diff.stat) failure.worktreeDiffStat = diff.stat;
+      if (diff.changedFiles) failure.worktreeChangedFiles = diff.changedFiles;
+    }
   }
   return failure;
 }

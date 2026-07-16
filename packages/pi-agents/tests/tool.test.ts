@@ -1,14 +1,23 @@
 // ABOUTME: Integration-style tests for executeAgentTool() background dispatch and argument compatibility.
 // ABOUTME: Uses an injected fake background manager and a fake workflow runner to avoid spawning real agents.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import type { AgentToolResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { discoverAgents } from '../src/agents.ts';
+import { AgentAbortError } from '../src/execution.ts';
 import { executeAgentTool, type ExecuteAgentToolOptions } from '../src/tool.ts';
 import type { BackgroundManager } from '../src/background.ts';
 import { clearDiscoveredSkills, setDiscoveredSkills } from '../src/skills.ts';
@@ -16,6 +25,7 @@ import { createRunStore } from '../src/run-store.ts';
 import { agentFingerprint, createRunCoordinator } from '../src/run-coordinator.ts';
 import type { ListRunsResult, AgentRunRecordV1, RunUnitRecord } from '../src/run-types.ts';
 import type { SubagentDetails } from '../src/types.ts';
+import * as worktreeMod from '../src/worktree.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 
@@ -1633,6 +1643,128 @@ describe('durable chain fanout item lifecycle', () => {
   });
 });
 
+describe('executeAgentTool terminal finalization', () => {
+  let tmpRoot: string;
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-term-'));
+  });
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('preserves AgentAbortError.origin through terminal replacement', async () => {
+    const store = createRunStore({ rootDir: tmpRoot });
+    const coordinator = createRunCoordinator({ store });
+    const agent = discoverAgents(process.cwd(), 'both').agents.find((a) => a.name === 'explore')!;
+    let thrown: unknown;
+    try {
+      await executeAgentTool(
+        { agent: 'explore', task: 'abort me' },
+        undefined,
+        undefined,
+        {
+          cwd: process.cwd(),
+          sessionManager: {
+            getSessionId: () => 'host-term',
+            getBranch: () => [],
+            appendCustomEntry: () => undefined,
+          },
+          ui: { notify: () => undefined },
+        } as never,
+        {
+          runWorkflow: async () => {
+            const provisional = {
+              agent: 'explore',
+              agentSource: agent.source,
+              task: 'abort me',
+              exitCode: 1,
+              status: 'cancelled' as const,
+              messages: [
+                {
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'partial before abort' }],
+                } as never,
+              ],
+              stderr: '',
+              usage: {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: 0,
+                contextTokens: 2,
+                turns: 1,
+              },
+              stopReason: 'aborted' as const,
+              errorMessage: 'Subagent was aborted',
+              sessionFile: path.join(tmpRoot, 's.jsonl'),
+            };
+            throw new AgentAbortError(provisional, 'user');
+          },
+          runStore: store,
+          runCoordinator: coordinator,
+        }
+      );
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(AgentAbortError);
+    expect((thrown as AgentAbortError).origin).toBe('user');
+    expect((thrown as AgentAbortError).result.messages).toEqual([]);
+    expect((thrown as AgentAbortError).result.finalOutput).toBe('partial before abort');
+    // Durable finalize from abort should classify as cancelled for user origin.
+    const runs = await store.listRuns();
+    const record = (runs.find((r) => 'record' in r) as { record: { status: string } } | undefined)
+      ?.record;
+    expect(record?.status).toBe('cancelled');
+  });
+
+  it('persists early unknown-agent failure with compact durable result identity', async () => {
+    const store = createRunStore({ rootDir: tmpRoot });
+    const coordinator = createRunCoordinator({ store });
+    const result = await executeAgentTool(
+      { agent: 'does-not-exist-xyz', task: 'fail early' },
+      undefined,
+      undefined,
+      {
+        cwd: process.cwd(),
+        sessionManager: {
+          getSessionId: () => 'host-early',
+          getBranch: () => [],
+          appendCustomEntry: () => undefined,
+        },
+        ui: { notify: () => undefined },
+      } as never,
+      {
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    expect(result.isError).toBe(true);
+    const runs = await store.listRuns();
+    const entry = runs.find((r) => 'record' in r) as
+      | {
+          record: {
+            status: string;
+            units: Record<
+              string,
+              { status: string; result?: { messages: unknown[]; agent: string; task: string } }
+            >;
+          };
+        }
+      | undefined;
+    expect(entry).toBeDefined();
+    if (!entry) return;
+    expect(entry.record.status).toBe('failed');
+    const unit = Object.values(entry.record.units)[0]!;
+    expect(unit.status).toBe('failed');
+    expect(unit.result).toBeDefined();
+    expect(unit.result!.messages).toEqual([]);
+    expect(unit.result!.agent).toBe('does-not-exist-xyz');
+    expect(unit.result!.task).toBe('fail early');
+  });
+});
+
 describe('executeAgentTool public runId resume', () => {
   let tmpRoot: string;
 
@@ -1745,6 +1877,181 @@ describe('executeAgentTool public runId resume', () => {
     });
     return created.runId;
   }
+
+  it('normalizes legacy full-message results on active resume and leaves read-only inspection unchanged', async () => {
+    const { store, coordinator } = makeStore();
+    const agent = exploreAgent();
+    const bigBody = 'L'.repeat(64 * 1024);
+    const legacyResult = {
+      agent: agent.name,
+      agentSource: agent.source,
+      task: 'Original stored task',
+      exitCode: 0,
+      status: 'completed',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'toolCall', name: 'bash', arguments: { cmd: 'cat' } }],
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'tc',
+          toolName: 'bash',
+          content: [{ type: 'text', text: bigBody }],
+          isError: false,
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'legacy-final' }],
+        },
+      ],
+      stderr: '',
+      usage: {
+        input: 1,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 3,
+        turns: 1,
+      },
+      finalOutput: 'legacy-final',
+    };
+    const created = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: agent.name,
+        task: 'Original stored task',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [legacyResult as never],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: agent.name,
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'interrupted',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'interrupted', startedAt: Date.now() - 1000 }],
+          effectiveCwd: tmpRoot,
+          sessionFile: (() => {
+            const sf = path.join(tmpRoot, 'legacy-session.jsonl');
+            writeFileSync(sf, '{}\n');
+            return sf;
+          })(),
+          sessionPromptEstablished: true,
+          result: legacyResult as never,
+        },
+      },
+    });
+    await store.updateRun(created.runId, (r) => {
+      r.status = 'interrupted';
+    });
+
+    // Read-only inspection must not rewrite the on-disk legacy payload.
+    const before = readFileSync(path.join(store.getRunDir(created.runId), 'run.json'), 'utf8');
+    const inspected = store.getRun(created.runId);
+    expect(inspected.ok).toBe(true);
+    const afterInspect = readFileSync(
+      path.join(store.getRunDir(created.runId), 'run.json'),
+      'utf8'
+    );
+    expect(afterInspect).toBe(before);
+    expect(afterInspect).toContain(bigBody.slice(0, 64));
+
+    const result = await executeAgentTool(
+      { runId: created.runId },
+      undefined,
+      undefined,
+      makeCtx(),
+      {
+        runWorkflow: async () => okResult('resumed'),
+        runStore: store,
+        runCoordinator: coordinator,
+      }
+    );
+    const resultText = Array.isArray(result.content)
+      ? result.content.map((c) => ('text' in c ? String(c.text) : '')).join('\n')
+      : String(result.content);
+    expect(resultText).not.toMatch(/resume_error|preflight_failed/);
+    expect(result.isError).toBeUndefined();
+
+    const loaded = store.getRun(created.runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    const unitResult = loaded.loaded.record.units.single!.result!;
+    expect(unitResult.messages).toEqual([]);
+    expect(unitResult.finalOutput).toBe('legacy-final');
+    expect(unitResult.presentation).toBeDefined();
+    // Active resume post-claim write must compact the stored details/unit shells.
+    // Workflow may replace details.results with its own terminal output; unit.result
+    // remains the normalized legacy shell until the workflow endUnit overwrites it.
+    // Either way, the raw 64 KiB tool body must not remain on disk after resume.
+    const disk = readFileSync(path.join(store.getRunDir(created.runId), 'run.json'), 'utf8');
+    expect(disk).not.toContain(bigBody.slice(0, 64));
+    // Capture mid-resume compact state by inspecting that presentation survived normalization path.
+    expect(
+      unitResult.presentation?.transcript.some((i) => i.type === 'toolCall') ||
+        unitResult.finalOutput === 'legacy-final'
+    ).toBe(true);
+  });
+
+  it('releases claim when post-claim setup fails so a later claim can succeed', async () => {
+    const { store, coordinator } = makeStore();
+    const runId = await seedInterruptedRun({ store });
+    let failNextUpdate = true;
+    const wrappedStore = {
+      ...store,
+      updateRun: async (id: string, mutator: Parameters<typeof store.updateRun>[1]) => {
+        if (failNextUpdate && id === runId) {
+          failNextUpdate = false;
+          throw new Error('injected post-claim write failure');
+        }
+        return store.updateRun(id, mutator);
+      },
+    };
+
+    const failed = await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async () => okResult('should-not-run'),
+      runStore: wrappedStore as never,
+      runCoordinator: coordinator,
+    });
+    expect(failed.isError).toBe(true);
+    const failedText = Array.isArray(failed.content)
+      ? failed.content.map((c) => ('text' in c ? String(c.text) : '')).join('\n')
+      : String(failed.content);
+    expect(failedText).toMatch(/resume_setup_failed|injected post-claim/i);
+
+    const claimsAfterFail = store.inspectClaims(runId);
+    expect(claimsAfterFail.ok).toBe(true);
+    if (claimsAfterFail.ok) {
+      const live = claimsAfterFail.claims.filter((c) => c.terminal === undefined && c.owner);
+      expect(live).toHaveLength(0);
+    }
+
+    // Later claim / resume can succeed after cleanup.
+    const ok = await executeAgentTool({ runId }, undefined, undefined, makeCtx(), {
+      runWorkflow: async () => okResult('recovered'),
+      runStore: store,
+      runCoordinator: coordinator,
+    });
+    expect(ok.isError).toBeUndefined();
+    const okText = Array.isArray(ok.content)
+      ? ok.content.map((c) => ('text' in c ? String(c.text) : '')).join('\n')
+      : String(ok.content);
+    expect(okText).toContain('recovered');
+  });
 
   it('resumes by runId alone and reuses the same durable run record', async () => {
     const { store, coordinator } = makeStore();
@@ -3423,11 +3730,16 @@ describe('executeAgentTool public runId resume', () => {
       expect(unit.sessionFile).toBeUndefined();
       expect(unit.result?.sessionFile).toBeUndefined();
 
-      // New worktree cleaned up on pre-execution stamp failure.
+      // New worktree cleaned up on pre-execution stamp failure after beginUnit.
+      // Must clear durable unit path so resume cannot block on a missing tree.
       const wtRoot = path.join(repo, '.worktrees');
       if (existsSync(wtRoot)) {
         expect(readdirSync(wtRoot).length).toBe(0);
       }
+      expect(unit.worktreePath).toBeUndefined();
+      expect(unit.result?.worktreePath).toBeUndefined();
+      expect(unit.result?.worktreeDirty).toBeUndefined();
+      expect(unit.result?.worktreeChangedFiles).toBeUndefined();
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -3879,6 +4191,551 @@ describe('executeAgentTool public runId resume', () => {
     }
   });
 
+  it('clean worktree retained when postprocess/schema fails after successful run', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-wt-schema-fail-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+
+      // Child succeeds with clean worktree but final output fails structured-output schema.
+      const spawnFn = ((_cmd: string, _args: string[], _opts?: { cwd?: string }) => {
+        const EventEmitter = require('node:events').EventEmitter;
+        const { Readable, Writable } = require('node:stream');
+        const child = new (class extends EventEmitter {
+          stdout = new Readable({ read() {} });
+          stderr = new Readable({ read() {} });
+          stdin = new Writable({ write: (_c: unknown, _e: unknown, cb: () => void) => cb() });
+          kill() {
+            this.stdout.push(null);
+            this.stderr.push(null);
+            setImmediate(() => this.emit('close', 0));
+            return true;
+          }
+        })();
+        setImmediate(() => {
+          child.stdout.push(
+            `${JSON.stringify({
+              type: 'message_end',
+              message: {
+                role: 'assistant',
+                content: [{ type: 'text', text: 'not-valid-json-for-schema' }],
+                usage: { input: 1, output: 1, totalTokens: 2 },
+              },
+            })}\n`
+          );
+          child.kill();
+        });
+        return child;
+      }) as unknown as import('../src/execution.ts').SpawnFn;
+
+      const result = await executeAgentTool(
+        {
+          chain: [
+            {
+              agent: 'explore',
+              task: 'emit invalid structured output',
+              isolation: 'worktree',
+              name: 'out',
+              outputSchema: {
+                type: 'object',
+                required: ['files'],
+                properties: { files: { type: 'array', items: { type: 'string' } } },
+              },
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        { runStore: store, runCoordinator: coordinator, spawnFn }
+      );
+
+      expect(result.isError).toBe(true);
+      const parent = result.details.results[0];
+      expect(parent?.status).toBe('failed');
+      expect(parent?.stopReason).toBe('structured_output_error');
+      // Clean worktree must be retained under the failed terminal status.
+      expect(parent?.worktreePath).toBeDefined();
+      expect(parent?.worktreeDirty).toBe(false);
+      expect(existsSync(parent!.worktreePath!)).toBe(true);
+
+      const runs = await store.listRuns();
+      expect(runs.length).toBe(1);
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      expect(unit.result?.status).toBe('failed');
+      expect(unit.result?.stopReason).toBe('structured_output_error');
+      // Durable and parent results agree on worktree retention.
+      expect(unit.result?.worktreePath).toBe(parent?.worktreePath);
+      expect(unit.result?.worktreeDirty).toBe(false);
+      expect(unit.worktreePath).toBe(parent?.worktreePath);
+      expect(existsSync(unit.worktreePath!)).toBe(true);
+      expect(existsSync(unit.result!.worktreePath!)).toBe(true);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('successful clean worktree is still removed after terminal completion', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-wt-clean-ok-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+
+      const spawnFn = ((_cmd: string) => {
+        const EventEmitter = require('node:events').EventEmitter;
+        const { Readable, Writable } = require('node:stream');
+        const child = new (class extends EventEmitter {
+          stdout = new Readable({ read() {} });
+          stderr = new Readable({ read() {} });
+          stdin = new Writable({ write: (_c: unknown, _e: unknown, cb: () => void) => cb() });
+          kill() {
+            this.stdout.push(null);
+            this.stderr.push(null);
+            setImmediate(() => this.emit('close', 0));
+            return true;
+          }
+        })();
+        setImmediate(() => {
+          child.stdout.push(
+            `${JSON.stringify({
+              type: 'message_end',
+              message: {
+                role: 'assistant',
+                content: [{ type: 'text', text: 'all good' }],
+                usage: { input: 1, output: 1, totalTokens: 2 },
+              },
+            })}\n`
+          );
+          child.kill();
+        });
+        return child;
+      }) as unknown as import('../src/execution.ts').SpawnFn;
+
+      const result = await executeAgentTool(
+        {
+          agent: 'explore',
+          task: 'succeed cleanly',
+          isolation: 'worktree',
+        },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        { runStore: store, runCoordinator: coordinator, spawnFn }
+      );
+
+      expect(result.isError).not.toBe(true);
+      const parent = result.details.results[0];
+      expect(parent?.status === 'completed' || parent?.exitCode === 0).toBe(true);
+      // Successful clean worktree is removed — no retained path on the result.
+      expect(parent?.worktreePath).toBeUndefined();
+      const wtRoot = path.join(repo, '.worktrees');
+      if (existsSync(wtRoot)) {
+        expect(readdirSync(wtRoot).length).toBe(0);
+      }
+
+      const runs = await store.listRuns();
+      expect(runs.length).toBe(1);
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('completed');
+      expect(unit.result?.worktreePath).toBeUndefined();
+      // Unit-level path must also be cleared so resume is not blocked.
+      expect(unit.worktreePath).toBeUndefined();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('early post-begin clean failure clears unit worktreePath and does not leave missing path', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-wt-early-fail-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+
+      // Fail after beginUnit by making session stamp throw (post-begin, pre-execution).
+      coordinator.persistSessionFile = async () => {
+        throw new Error('simulated stamp failure after beginUnit');
+      };
+
+      const result = await executeAgentTool(
+        {
+          agent: 'explore',
+          task: 'early fail after begin',
+          isolation: 'worktree',
+        },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          spawnFn: (() => {
+            throw new Error('spawn must not run');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      const parent = result.details.results[0];
+      expect(parent?.status).toBe('failed');
+      expect(parent?.worktreePath).toBeUndefined();
+
+      const wtRoot = path.join(repo, '.worktrees');
+      if (existsSync(wtRoot)) {
+        expect(readdirSync(wtRoot).length).toBe(0);
+      }
+
+      const runs = await store.listRuns();
+      expect(runs.length).toBe(1);
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      // Authoritative: deleted clean tree is not retained on unit or result.
+      expect(unit.worktreePath).toBeUndefined();
+      expect(unit.result?.worktreePath).toBeUndefined();
+      expect(unit.result?.worktreeDirty).toBeUndefined();
+
+      // Resume preflight must not block on a phantom missing worktree path.
+      const { inspectResume } = await import('../src/resume.ts');
+      const discovered = discoverAgents(repo, 'both');
+      const preflight = inspectResume(rec.runId, store, { agents: discovered.agents });
+      expect(preflight.ok).toBe(true);
+      if (preflight.ok) {
+        const worktreeMissing = preflight.blockingReasons.some((r) =>
+          r.includes('worktree missing')
+        );
+        expect(worktreeMissing).toBe(false);
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('dirty setup-hook failure retains worktree with modifications and durable path agreement', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-hook-dirty-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const agentsDir = path.join(repo, '.pi', 'agents');
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        path.join(agentsDir, 'hooky.md'),
+        `---
+name: hooky
+description: setup hook dirties then fails
+isolation: worktree
+worktreeSetupHook: "printf hook-mod > hook-mod.txt && exit 11"
+---
+Body.
+`
+      );
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+      let spawnCount = 0;
+      const result = await executeAgentTool(
+        { agent: 'hooky', task: 'never starts' },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          spawnFn: (() => {
+            spawnCount++;
+            throw new Error('spawn must not run after dirty setup hook failure');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      expect(spawnCount).toBe(0);
+      const parent = result.details.results[0];
+      expect(parent?.status).toBe('failed');
+      expect(parent?.stopReason).toBe('worktree_setup_error');
+      expect(parent?.worktreePath).toBeDefined();
+      expect(parent?.worktreeDirty).toBe(true);
+      expect(existsSync(parent!.worktreePath!)).toBe(true);
+      expect(existsSync(path.join(parent!.worktreePath!, 'hook-mod.txt'))).toBe(true);
+      expect(readFileSync(path.join(parent!.worktreePath!, 'hook-mod.txt'), 'utf-8')).toContain(
+        'hook-mod'
+      );
+
+      const runs = await store.listRuns();
+      expect(runs.length).toBe(1);
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      expect(unit.worktreePath).toBe(parent?.worktreePath);
+      expect(unit.result?.worktreePath).toBe(parent?.worktreePath);
+      expect(unit.result?.worktreeDirty).toBe(true);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('clean setup-hook failure removes worktree and clears durable path metadata', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-hook-clean-'));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const agentsDir = path.join(repo, '.pi', 'agents');
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        path.join(agentsDir, 'hooky.md'),
+        `---
+name: hooky
+description: clean setup hook fails
+isolation: worktree
+worktreeSetupHook: "exit 12"
+---
+Body.
+`
+      );
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+      const result = await executeAgentTool(
+        { agent: 'hooky', task: 'never starts' },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          spawnFn: (() => {
+            throw new Error('spawn must not run');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      const parent = result.details.results[0];
+      expect(parent?.status).toBe('failed');
+      expect(parent?.stopReason).toBe('worktree_setup_error');
+      expect(parent?.worktreePath).toBeUndefined();
+
+      const wtRoot = path.join(repo, '.worktrees');
+      if (existsSync(wtRoot)) {
+        expect(readdirSync(wtRoot).length).toBe(0);
+      }
+
+      const runs = await store.listRuns();
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      expect(unit.worktreePath).toBeUndefined();
+      expect(unit.result?.worktreePath).toBeUndefined();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('context-path clean removal failure retains worktree path metadata', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-ctx-remove-fail-'));
+    const removeSpy = spyOn(worktreeMod, 'removeAgentWorktree').mockImplementation((wt) => ({
+      removed: false,
+      error: `injected context-path removal failure for ${wt.path}`,
+    }));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      // Force prepareAgentContext to throw after the worktree is created by
+      // requesting fork context with a host that has no session (context_error).
+      const agentsDir = path.join(repo, '.pi', 'agents');
+      mkdirSync(agentsDir, { recursive: true });
+      writeFileSync(
+        path.join(agentsDir, 'forky.md'),
+        `---
+name: forky
+description: fork context fails pre-execution
+isolation: worktree
+defaultContext: fork
+---
+Body.
+`
+      );
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+      const result = await executeAgentTool(
+        { agent: 'forky', task: 'context should fail' },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo, sessionManager: undefined }),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          spawnFn: (() => {
+            throw new Error('spawn must not run');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      const parent = result.details.results[0];
+      // Either context_error with retained path (removal injected fail) or similar early fail.
+      expect(parent?.status).toBe('failed');
+      expect(parent?.worktreePath).toBeDefined();
+      expect(existsSync(parent!.worktreePath!)).toBe(true);
+      expect(parent?.stderr ?? '').toMatch(/injected context-path removal failure|context/i);
+
+      const runs = await store.listRuns();
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.worktreePath ?? unit.result?.worktreePath).toBe(parent?.worktreePath);
+      expect(removeSpy).toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('post-begin clean removal failure retains unit worktreePath', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const gitOk = spawnSync('git', ['--version'], { encoding: 'utf-8' }).status === 0;
+    if (!gitOk) return;
+
+    const repo = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-postbegin-remove-fail-'));
+    const removeSpy = spyOn(worktreeMod, 'removeAgentWorktree').mockImplementation((wt) => ({
+      removed: false,
+      error: `injected post-begin removal failure for ${wt.path}`,
+    }));
+    try {
+      spawnSync('git', ['-C', repo, 'init', '-q'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'user.email', 'pi@test.example'], {
+        encoding: 'utf-8',
+      });
+      spawnSync('git', ['-C', repo, 'config', 'user.name', 'Pi Test'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'config', 'commit.gpgsign', 'false'], { encoding: 'utf-8' });
+      writeFileSync(path.join(repo, 'README.md'), '# tmp\n');
+      spawnSync('git', ['-C', repo, 'add', '.'], { encoding: 'utf-8' });
+      spawnSync('git', ['-C', repo, 'commit', '-q', '-m', 'init'], { encoding: 'utf-8' });
+
+      const store = createRunStore({ rootDir: path.join(repo, '.pi-runs') });
+      const coordinator = createRunCoordinator({ store });
+      coordinator.persistSessionFile = async () => {
+        throw new Error('simulated stamp failure after beginUnit');
+      };
+
+      const result = await executeAgentTool(
+        {
+          agent: 'explore',
+          task: 'stamp fails after begin',
+          isolation: 'worktree',
+        },
+        undefined,
+        undefined,
+        makeCtx({ cwd: repo }),
+        {
+          runStore: store,
+          runCoordinator: coordinator,
+          spawnFn: (() => {
+            throw new Error('spawn must not run');
+          }) as unknown as import('../src/execution.ts').SpawnFn,
+        }
+      );
+
+      expect(result.isError).toBe(true);
+      const parent = result.details.results[0];
+      expect(parent?.status).toBe('failed');
+      expect(parent?.worktreePath).toBeDefined();
+      expect(existsSync(parent!.worktreePath!)).toBe(true);
+      expect(parent?.stderr ?? '').toContain('injected post-begin removal failure');
+
+      const runs = await store.listRuns();
+      const rec = loadedRecordOf(runs[0]!);
+      const unit = rec.units.single ?? Object.values(rec.units)[0]!;
+      expect(unit.status).toBe('failed');
+      expect(unit.worktreePath).toBe(parent?.worktreePath);
+      expect(unit.result?.worktreePath).toBe(parent?.worktreePath);
+      expect(removeSpy).toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   it('durable begin runs before session stamp so crash leaves attempted state', async () => {
     const { store, coordinator } = makeStore();
     const order: string[] = [];
@@ -3943,5 +4800,54 @@ describe('executeAgentTool public runId resume', () => {
     expect(order.indexOf('begin')).toBeGreaterThanOrEqual(0);
     expect(order.indexOf('stamp')).toBeGreaterThan(order.indexOf('begin'));
     expect(order.indexOf('spawn')).toBeGreaterThan(order.indexOf('stamp'));
+  });
+});
+
+describe('copy-on-write parallel updates', () => {
+  it('copySnapshotShell shares frozen presentation and isolates mutable shell fields', async () => {
+    const { copySnapshotShell, snapshotSingleResult } = await import('../src/result-snapshot.ts');
+    // Externally frozen presentation is not owned — reproject first to establish ownership.
+    const owned = snapshotSingleResult({
+      agent: 'a',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'note' }],
+        } as never,
+      ],
+      stderr: '',
+      usage: {
+        input: 1,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 1,
+      },
+      finalOutput: 'done',
+      structuredOutput: { ok: true },
+      worktreeChangedFiles: ['a.ts'],
+      fanout: { index: 0, count: 2 },
+    });
+    const shellA = copySnapshotShell(owned);
+    const shellB = copySnapshotShell(owned);
+    expect(shellA).not.toBe(shellB);
+    expect(shellA.presentation).toBe(owned.presentation);
+    expect(shellB.presentation).toBe(owned.presentation);
+    expect(shellA.structuredOutput).toBe(owned.structuredOutput);
+    shellA.usage.input = 99;
+    shellA.status = 'failed';
+    shellA.worktreeChangedFiles!.push('b.ts');
+    shellA.fanout!.index = 7;
+    expect(owned.usage.input).toBe(1);
+    expect(shellB.usage.input).toBe(1);
+    expect(shellB.status).toBe('completed');
+    expect(shellB.worktreeChangedFiles).toEqual(['a.ts']);
+    expect(shellB.fanout?.index).toBe(0);
   });
 });

@@ -1,11 +1,12 @@
 // ABOUTME: Tests for the git-worktree helpers — create, dirty status, and cleanup behavior.
 // ABOUTME: Uses a temporary git repository; skips when `git` is unavailable on the host.
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as worktreeMod from '../src/worktree.ts';
 import {
   createAgentWorktree,
   getGitRoot,
@@ -274,6 +275,65 @@ describe('worktree helpers (no git)', () => {
       expect(result).toBeUndefined();
       removeAgentWorktree(wt);
     } finally {
+      cleanup();
+    }
+  });
+
+  it('runHookOrSynthesizeFailure retains dirty hook-created changes without force-delete', () => {
+    const { repo, cleanup } = makeRepo();
+    try {
+      const wt = createAgentWorktree(repo, 'hook-dirty-retain', 12);
+      const marker = path.join(wt.path, 'hook-created.txt');
+      const failure = runHookOrSynthesizeFailure(
+        'tester',
+        makeAgent({
+          worktreeSetupHook: 'printf retained-by-hook > hook-created.txt && exit 7',
+        }),
+        'setup should fail dirty',
+        5,
+        wt
+      );
+      expect(failure).toBeDefined();
+      expect(failure!.stopReason).toBe('worktree_setup_error');
+      expect(failure!.status ?? 'failed').toBe('failed');
+      expect(failure!.worktreePath).toBe(wt.path);
+      expect(failure!.worktreeDirty).toBe(true);
+      expect(existsSync(wt.path)).toBe(true);
+      expect(existsSync(marker)).toBe(true);
+      expect(readFileSync(marker, 'utf-8')).toContain('retained-by-hook');
+      expect(failure!.worktreeChangedFiles ?? []).toContain('hook-created.txt');
+      removeAgentWorktree(wt);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('runHookOrSynthesizeFailure retains path when clean removal fails', () => {
+    const { repo, cleanup } = makeRepo();
+    let wt: ReturnType<typeof createAgentWorktree> | undefined;
+    const removeSpy = spyOn(worktreeMod, 'removeAgentWorktree').mockImplementation(() => ({
+      removed: false,
+      error: 'injected clean removal failure',
+    }));
+    try {
+      wt = createAgentWorktree(repo, 'hook-clean-remove-fail', 13);
+      const failure = runHookOrSynthesizeFailure(
+        'tester',
+        makeAgent({ worktreeSetupHook: 'exit 9' }),
+        'clean hook fail but remove fails',
+        6,
+        wt
+      );
+      expect(failure).toBeDefined();
+      expect(failure!.stopReason).toBe('worktree_setup_error');
+      expect(failure!.worktreePath).toBe(wt.path);
+      expect(failure!.worktreeDirty).toBe(false);
+      expect(failure!.stderr).toContain('injected clean removal failure');
+      expect(existsSync(wt.path)).toBe(true);
+      expect(removeSpy).toHaveBeenCalled();
+    } finally {
+      removeSpy.mockRestore();
+      if (wt) removeAgentWorktree(wt);
       cleanup();
     }
   });

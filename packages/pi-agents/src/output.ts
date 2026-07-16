@@ -112,16 +112,59 @@ export function applyTerminalStatus(result: SingleResult): void {
   }
 }
 
+/** Prefer explicit `finalOutput`, then legacy message scan. */
+export function getResultFinalOutput(result: SingleResult): string {
+  if (result.finalOutput !== undefined) return result.finalOutput;
+  return getFinalOutput(result.messages);
+}
+
+/**
+ * Latest display activity for collapsed rendering.
+ * Compact precedence: explicit `latestActivity`, then synthesized text from
+ * de-duplicated `finalOutput`, then the last retained transcript item as a
+ * defensive fallback. Legacy results fall back to message scanning.
+ */
+export function getResultLatestActivity(result: SingleResult): DisplayItem | undefined {
+  const presentation = result.presentation;
+  if (presentation) {
+    if (presentation.latestActivity) return presentation.latestActivity;
+    // De-duplicated latest text: synthesize even when finalOutput is ''.
+    if (result.finalOutput !== undefined) return { type: 'text', text: result.finalOutput };
+    // Defensive fallback for incomplete compact data without finalOutput.
+    const transcript = presentation.transcript;
+    if (transcript.length > 0) return transcript[transcript.length - 1];
+    return undefined;
+  }
+  return getLatestActivity(result.messages);
+}
+
+/**
+ * Ordered transcript plus final output for expanded rendering.
+ * Uses compact presentation when present; otherwise derives both from messages.
+ */
+export function getResultTranscriptAndFinal(result: SingleResult): {
+  transcript: DisplayItem[];
+  finalOutput: string;
+} {
+  if (result.presentation) {
+    return {
+      transcript: result.presentation.transcript,
+      finalOutput: getResultFinalOutput(result),
+    };
+  }
+  return getTranscriptAndFinal(result.messages);
+}
+
 export function getResultOutput(result: SingleResult): string {
   if (isFailedResult(result)) {
     if (result.stopReason === 'completion_check') {
       const reason = result.errorMessage || 'Completion check failed';
-      const agentOutput = (result.finalOutput ?? getFinalOutput(result.messages)) || '(no output)';
+      const agentOutput = getResultFinalOutput(result) || '(no output)';
       return `${reason}\n\nUnchecked agent output:\n${agentOutput}`;
     }
-    return result.errorMessage || result.stderr || getFinalOutput(result.messages) || '(no output)';
+    return result.errorMessage || result.stderr || getResultFinalOutput(result) || '(no output)';
   }
-  return getFinalOutput(result.messages) || '(no output)';
+  return getResultFinalOutput(result) || '(no output)';
 }
 
 export function truncateParallelOutput(output: string): string {

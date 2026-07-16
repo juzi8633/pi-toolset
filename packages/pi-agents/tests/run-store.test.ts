@@ -266,6 +266,814 @@ describe('listRuns', () => {
     if (!loaded.ok) expect(loaded.error.code).toBe('corrupt_run');
   });
 
+  it('accepts valid presentation and rejects malformed truncation state', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+    const validResult = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [],
+      stderr: '',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 0,
+      },
+      finalOutput: 'done',
+      presentation: {
+        transcript: [{ type: 'toolCall', name: 'read', args: { path: 'a.ts' } }],
+        truncated: true,
+        omittedItems: 2,
+      },
+    };
+    record.units[unitId] = { ...record.units[unitId]!, result: validResult as never };
+    record.details = {
+      ...record.details,
+      results: [validResult as never],
+    };
+    writeFileSync(file, JSON.stringify(record));
+    const ok = store.getRun(runId);
+    expect(ok.ok).toBe(true);
+
+    const bad = structuredClone(record);
+    (
+      bad.units[unitId]!.result as unknown as { presentation: Record<string, unknown> }
+    ).presentation = {
+      transcript: [],
+      truncated: true,
+      // omittedItems missing
+    };
+    writeFileSync(file, JSON.stringify(bad));
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(false);
+    if (!loaded.ok) {
+      expect(loaded.error.code).toBe('corrupt_run');
+      expect(loaded.error.message).toContain('omittedItems');
+    }
+  });
+
+  it('still accepts legacy results with messages and no presentation', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+    const legacy = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'legacy final' }],
+        },
+      ],
+      stderr: '',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 1,
+      },
+    };
+    record.units[unitId] = { ...record.units[unitId]!, result: legacy as never };
+    record.details = { ...record.details, results: [legacy as never] };
+    writeFileSync(file, JSON.stringify(record));
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+  });
+
+  it('returns corrupt_run for primitive, array, null messages, and non-array messages results', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const base: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(base.units)[0]!;
+
+    const cases: Array<{ label: string; unitResult: unknown; detailsResult?: unknown }> = [
+      { label: 'unit result primitive', unitResult: 'nope' },
+      { label: 'unit result array', unitResult: [] },
+      { label: 'unit result messages null', unitResult: { messages: null, status: 'completed' } },
+      {
+        label: 'unit result messages object',
+        unitResult: { messages: { role: 'assistant' }, status: 'completed' },
+      },
+      {
+        label: 'details.results primitive shell',
+        unitResult: undefined,
+        detailsResult: 42,
+      },
+      {
+        label: 'details.results messages null',
+        unitResult: undefined,
+        detailsResult: { agent: 'noop', messages: null },
+      },
+    ];
+
+    for (const c of cases) {
+      const record = structuredClone(base);
+      if (c.unitResult !== undefined) {
+        record.units[unitId] = { ...record.units[unitId]!, result: c.unitResult as never };
+      }
+      if (c.detailsResult !== undefined) {
+        record.details = { ...record.details, results: [c.detailsResult as never] };
+      } else if (c.unitResult !== undefined) {
+        // Keep details empty so only unit path is exercised when unit is set.
+        record.details = { ...record.details, results: [] };
+      }
+      writeFileSync(file, JSON.stringify(record));
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(false);
+      if (!loaded.ok) {
+        expect(loaded.error.code).toBe('corrupt_run');
+        if (c.detailsResult !== undefined) {
+          expect(loaded.error.message).toContain('details.results[0]');
+        } else {
+          expect(loaded.error.message).toContain(`unit ${unitId} result`);
+        }
+      }
+    }
+  });
+
+  it('returns corrupt_run for wrong details/results container shapes with precise paths', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const base: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+
+    const cases: Array<{ label: string; mutate: (r: AgentRunRecordV1) => void; message: string }> =
+      [
+        {
+          label: 'details primitive',
+          mutate: (r) => {
+            (r as { details: unknown }).details = 'nope';
+          },
+          message: 'invalid details',
+        },
+        {
+          label: 'details null',
+          mutate: (r) => {
+            (r as { details: unknown }).details = null;
+          },
+          message: 'invalid details',
+        },
+        {
+          label: 'details array',
+          mutate: (r) => {
+            (r as { details: unknown }).details = [];
+          },
+          message: 'invalid details',
+        },
+        {
+          label: 'details.results primitive',
+          mutate: (r) => {
+            (r.details as { results: unknown }).results = 'nope';
+          },
+          message: 'details.results must be an array',
+        },
+        {
+          label: 'details.results object',
+          mutate: (r) => {
+            (r.details as { results: unknown }).results = { agent: 'noop' };
+          },
+          message: 'details.results must be an array',
+        },
+        {
+          label: 'details.results null',
+          mutate: (r) => {
+            (r.details as { results: unknown }).results = null;
+          },
+          message: 'details.results must be an array',
+        },
+        {
+          label: 'details.results absent',
+          mutate: (r) => {
+            delete (r.details as { results?: unknown }).results;
+          },
+          message: 'details.results must be an array',
+        },
+      ];
+
+    for (const c of cases) {
+      const record = structuredClone(base);
+      c.mutate(record);
+      writeFileSync(file, JSON.stringify(record));
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(false);
+      if (!loaded.ok) {
+        expect(loaded.error.code).toBe('corrupt_run');
+        expect(loaded.error.message).toBe(c.message);
+      }
+    }
+
+    // Valid legacy record with empty results array still loads.
+    writeFileSync(file, JSON.stringify(base));
+    const ok = store.getRun(runId);
+    expect(ok.ok).toBe(true);
+  });
+
+  it('returns corrupt_run for invalid unit status/attempt/attempts/cwd/fingerprint without throwing', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const base: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(base.units)[0]!;
+
+    const cases: Array<{ label: string; mutate: (r: AgentRunRecordV1) => void; message: string }> =
+      [
+        {
+          label: 'bad status',
+          mutate: (r) => {
+            (r.units[unitId] as { status: unknown }).status = 'not-a-status';
+          },
+          message: `unit ${unitId} has unsupported status`,
+        },
+        {
+          label: 'negative attempt',
+          mutate: (r) => {
+            (r.units[unitId] as { attempt: unknown }).attempt = -1;
+          },
+          message: `unit ${unitId} attempt must be a non-negative integer`,
+        },
+        {
+          label: 'non-integer attempt',
+          mutate: (r) => {
+            (r.units[unitId] as { attempt: unknown }).attempt = 1.5;
+          },
+          message: `unit ${unitId} attempt must be a non-negative integer`,
+        },
+        {
+          label: 'attempts null',
+          mutate: (r) => {
+            (r.units[unitId] as { attempts: unknown }).attempts = null;
+          },
+          message: `unit ${unitId} attempts must be an array`,
+        },
+        {
+          label: 'malformed attempt record',
+          mutate: (r) => {
+            (r.units[unitId] as { attempts: unknown }).attempts = [
+              { attempt: 1, status: 'running' },
+            ];
+          },
+          message: `unit ${unitId} attempts[0].startedAt must be a number`,
+        },
+        {
+          label: 'bad attempt status',
+          mutate: (r) => {
+            (r.units[unitId] as { attempts: unknown }).attempts = [
+              { attempt: 1, status: 'weird', startedAt: 1 },
+            ];
+          },
+          message: `unit ${unitId} attempts[0] has unsupported status`,
+        },
+        {
+          label: 'bad effectiveCwd type',
+          mutate: (r) => {
+            (r.units[unitId] as { effectiveCwd: unknown }).effectiveCwd = 42;
+          },
+          message: `unit ${unitId} effectiveCwd must be a non-empty string`,
+        },
+        {
+          label: 'empty effectiveCwd',
+          mutate: (r) => {
+            (r.units[unitId] as { effectiveCwd: unknown }).effectiveCwd = '';
+          },
+          message: `unit ${unitId} effectiveCwd must be a non-empty string`,
+        },
+        {
+          label: 'missing effectiveCwd',
+          mutate: (r) => {
+            delete (r.units[unitId] as { effectiveCwd?: unknown }).effectiveCwd;
+          },
+          message: `unit ${unitId} effectiveCwd must be a non-empty string`,
+        },
+        {
+          label: 'bad sessionPromptEstablished type',
+          mutate: (r) => {
+            (r.units[unitId] as { sessionPromptEstablished: unknown }).sessionPromptEstablished =
+              'false';
+          },
+          message: `unit ${unitId} sessionPromptEstablished must be a boolean when present`,
+        },
+        {
+          label: 'bad agentFingerprint type',
+          mutate: (r) => {
+            (r.units[unitId] as { agentFingerprint: unknown }).agentFingerprint = {
+              hash: 'x',
+            };
+          },
+          message: `unit ${unitId} agentFingerprint must be a string when present`,
+        },
+      ];
+
+    for (const c of cases) {
+      const record = structuredClone(base);
+      c.mutate(record);
+      writeFileSync(file, JSON.stringify(record));
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(false);
+      if (!loaded.ok) {
+        expect(loaded.error.code).toBe('corrupt_run');
+        expect(loaded.error.message).toContain(c.message);
+      }
+    }
+
+    // Valid legacy V1 unit core fields (including attempt history) still load.
+    const legacy = structuredClone(base);
+    legacy.units[unitId] = {
+      ...legacy.units[unitId]!,
+      status: 'interrupted',
+      attempt: 2,
+      attempts: [
+        {
+          attempt: 1,
+          status: 'failed',
+          startedAt: 1_000,
+          finishedAt: 1_100,
+          stopReason: 'error',
+          errorMessage: 'boom',
+        },
+      ],
+      effectiveCwd: '/legacy/cwd',
+      agentFingerprint: 'legacy-fp',
+      sessionPromptEstablished: false,
+    };
+    writeFileSync(file, JSON.stringify(legacy));
+    const okLegacy = store.getRun(runId);
+    expect(okLegacy.ok).toBe(true);
+    if (okLegacy.ok) {
+      const unit = okLegacy.loaded.record.units[unitId]!;
+      expect(unit.status).toBe('interrupted');
+      expect(unit.attempt).toBe(2);
+      expect(unit.attempts).toHaveLength(1);
+      expect(unit.effectiveCwd).toBe('/legacy/cwd');
+      expect(unit.agentFingerprint).toBe('legacy-fp');
+      expect(unit.sessionPromptEstablished).toBe(false);
+    }
+
+    // Absent sessionPromptEstablished remains valid (legacy established-by-sessionFile).
+    const absentFlag = structuredClone(base);
+    delete absentFlag.units[unitId]!.sessionPromptEstablished;
+    writeFileSync(file, JSON.stringify(absentFlag));
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
+  it('returns corrupt_run for malformed details.chain/outputs and accepts valid legacy chain', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const base: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+
+    const cases: Array<{ label: string; mutate: (r: AgentRunRecordV1) => void; message: string }> =
+      [
+        {
+          label: 'outputs null',
+          mutate: (r) => {
+            (r.details as { outputs: unknown }).outputs = null;
+          },
+          message: 'details.outputs must be a non-null object',
+        },
+        {
+          label: 'outputs array',
+          mutate: (r) => {
+            (r.details as { outputs: unknown }).outputs = [];
+          },
+          message: 'details.outputs must be a non-null object',
+        },
+        {
+          label: 'outputs entry null',
+          mutate: (r) => {
+            (r.details as { outputs: unknown }).outputs = { prev: null };
+          },
+          message: 'details.outputs[prev] must be a non-null object',
+        },
+        {
+          label: 'outputs entry primitive',
+          mutate: (r) => {
+            (r.details as { outputs: unknown }).outputs = { prev: 'text only' };
+          },
+          message: 'details.outputs[prev] must be a non-null object',
+        },
+        {
+          label: 'outputs entry missing text',
+          mutate: (r) => {
+            (r.details as { outputs: unknown }).outputs = {
+              prev: { agent: 'noop', step: 1 },
+            };
+          },
+          message: 'details.outputs[prev].text must be a string',
+        },
+        {
+          label: 'outputs entry bad step',
+          mutate: (r) => {
+            (r.details as { outputs: unknown }).outputs = {
+              prev: { text: 'ok', agent: 'noop', step: 0 },
+            };
+          },
+          message: 'details.outputs[prev].step must be a positive integer',
+        },
+        {
+          label: 'chain null',
+          mutate: (r) => {
+            (r.details as { chain: unknown }).chain = null;
+          },
+          message: 'details.chain must be a non-null object',
+        },
+        {
+          label: 'chain steps not array',
+          mutate: (r) => {
+            (r.details as { chain: unknown }).chain = { totalSteps: 1, steps: { step: 1 } };
+          },
+          message: 'details.chain.steps must be an array',
+        },
+        {
+          label: 'chain step missing kind',
+          mutate: (r) => {
+            (r.details as { chain: unknown }).chain = {
+              totalSteps: 1,
+              steps: [{ step: 1, agent: 'noop', task: 't', status: 'queued' }],
+            };
+          },
+          message: 'details.chain.steps[0].kind must be sequential or fanout',
+        },
+        {
+          label: 'fanout step missing counts',
+          mutate: (r) => {
+            (r.details as { chain: unknown }).chain = {
+              totalSteps: 1,
+              steps: [
+                {
+                  kind: 'fanout',
+                  step: 1,
+                  agent: 'noop',
+                  taskTemplate: '{item}',
+                  status: 'running',
+                  collectName: 'items',
+                },
+              ],
+            };
+          },
+          message: 'details.chain.steps[0].executedCount must be a non-negative integer',
+        },
+      ];
+
+    for (const c of cases) {
+      const record = structuredClone(base);
+      c.mutate(record);
+      writeFileSync(file, JSON.stringify(record));
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(false);
+      if (!loaded.ok) {
+        expect(loaded.error.code).toBe('corrupt_run');
+        expect(loaded.error.message).toContain(c.message);
+      }
+    }
+
+    // Valid legacy chain presentation + outputs still load.
+    const legacyChain = structuredClone(base);
+    legacyChain.details = {
+      ...legacyChain.details,
+      mode: 'chain',
+      results: [],
+      outputs: {
+        step1: {
+          text: 'hello',
+          structured: { ok: true },
+          agent: 'noop',
+          step: 1,
+        },
+      },
+      chain: {
+        totalSteps: 2,
+        steps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'noop',
+            task: 'first',
+            status: 'completed',
+          },
+          {
+            kind: 'fanout',
+            step: 2,
+            agent: 'noop',
+            taskTemplate: 'item {item}',
+            status: 'queued',
+            collectName: 'items',
+            executedCount: 0,
+            completedCount: 0,
+            failedCount: 0,
+            runningCount: 0,
+            queuedCount: 0,
+            skippedCount: 0,
+          },
+        ],
+      },
+    };
+    writeFileSync(file, JSON.stringify(legacyChain));
+    const okChain = store.getRun(runId);
+    expect(okChain.ok).toBe(true);
+    if (okChain.ok) {
+      expect(okChain.loaded.record.details.chain?.totalSteps).toBe(2);
+      expect(okChain.loaded.record.details.outputs?.step1?.text).toBe('hello');
+    }
+
+    // Absent chain/outputs remain valid (presentation optional).
+    const noChain = structuredClone(base);
+    delete (noChain.details as { chain?: unknown }).chain;
+    delete (noChain.details as { outputs?: unknown }).outputs;
+    writeFileSync(file, JSON.stringify(noChain));
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
+  it('returns corrupt_run for completed unit with inconsistent result status/exitCode or malformed messages', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const base: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(base.units)[0]!;
+
+    const badCases: Array<{ label: string; result: unknown; message: string | RegExp }> = [
+      {
+        label: 'status running',
+        result: { messages: [], status: 'running', exitCode: -1 },
+        message: /status must be completed/,
+      },
+      {
+        label: 'status failed',
+        result: { messages: [], status: 'failed', exitCode: 1 },
+        message: /status must be completed/,
+      },
+      {
+        label: 'exitCode -1 with completed status',
+        result: { messages: [], status: 'completed', exitCode: -1 },
+        message: /exitCode must not be -1/,
+      },
+      {
+        label: 'status-less non-zero exitCode',
+        result: { messages: [], exitCode: 1 },
+        message: /exitCode must be 0 when status is absent/,
+      },
+      {
+        label: 'primitive message entry',
+        result: { messages: ['nope'], status: 'completed', exitCode: 0 },
+        message: /messages\[0\] must be a non-null object/,
+      },
+      {
+        label: 'null message entry',
+        result: { messages: [null], status: 'completed', exitCode: 0 },
+        message: /messages\[0\] must be a non-null object/,
+      },
+      {
+        label: 'array message entry',
+        result: { messages: [[{ role: 'assistant' }]], status: 'completed', exitCode: 0 },
+        message: /messages\[0\] must be a non-null object/,
+      },
+    ];
+
+    for (const c of badCases) {
+      const record = structuredClone(base);
+      record.units[unitId] = {
+        ...record.units[unitId]!,
+        status: 'completed',
+        result: c.result as never,
+      };
+      record.details = { ...record.details, results: [] };
+      writeFileSync(file, JSON.stringify(record));
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(false);
+      if (!loaded.ok) {
+        expect(loaded.error.code).toBe('corrupt_run');
+        expect(loaded.error.message).toContain(`unit ${unitId} result`);
+        expect(loaded.error.message).toMatch(c.message);
+      }
+    }
+
+    // Malformed details.results messages rejected pre-claim too.
+    const detailsBad = structuredClone(base);
+    detailsBad.details = {
+      ...detailsBad.details,
+      results: [{ agent: 'noop', messages: [42] } as never],
+    };
+    writeFileSync(file, JSON.stringify(detailsBad));
+    const detailsLoaded = store.getRun(runId);
+    expect(detailsLoaded.ok).toBe(false);
+    if (!detailsLoaded.ok) {
+      expect(detailsLoaded.error.code).toBe('corrupt_run');
+      expect(detailsLoaded.error.message).toContain('details.results[0].messages[0]');
+    }
+
+    // Valid legacy completed shells still load: empty messages + presentation, or populated messages.
+    const legacyOk: Array<{ label: string; result: unknown }> = [
+      {
+        label: 'empty messages + presentation',
+        result: {
+          agent: 'noop',
+          messages: [],
+          status: 'completed',
+          exitCode: 0,
+          presentation: { transcript: [{ type: 'text', text: 'done' }] },
+        },
+      },
+      {
+        label: 'populated messages terminal exitCode 1 with completed status',
+        result: {
+          agent: 'noop',
+          messages: [{ role: 'assistant', content: [{ type: 'text', text: 'x' }] }],
+          status: 'completed',
+          exitCode: 1,
+        },
+      },
+      {
+        label: 'status-less exitCode 0',
+        result: {
+          agent: 'noop',
+          messages: [],
+          exitCode: 0,
+        },
+      },
+    ];
+    for (const c of legacyOk) {
+      const record = structuredClone(base);
+      record.units[unitId] = {
+        ...record.units[unitId]!,
+        status: 'completed',
+        result: c.result as never,
+      };
+      record.details = { ...record.details, results: [] };
+      writeFileSync(file, JSON.stringify(record));
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+    }
+  });
+
+  it('returns corrupt_run for chain outputs with impossible step/agent; accepts valid chain topology', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const base: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+
+    const chainBase = {
+      ...base,
+      mode: 'chain' as const,
+      request: {
+        mode: 'chain' as const,
+        agentScope: 'both' as const,
+        chain: [
+          { agent: 'seed', task: 'seed work' },
+          { agent: 'impl', task: 'implement' },
+        ],
+      },
+      units: {
+        'chain-0001': {
+          unitId: 'chain-0001',
+          agent: 'seed',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session' as const,
+          status: 'queued' as const,
+          step: 1,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/tmp',
+        },
+        'chain-0002': {
+          unitId: 'chain-0002',
+          agent: 'impl',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session' as const,
+          status: 'queued' as const,
+          step: 2,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/tmp',
+        },
+      },
+      details: {
+        ...base.details,
+        mode: 'chain' as const,
+        results: [],
+      },
+    };
+
+    // Impossible high step poisons later-step-wins.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...chainBase,
+        details: {
+          ...chainBase.details,
+          outputs: {
+            poisoned: { text: 'bad', agent: 'seed', step: 99 },
+          },
+        },
+      })
+    );
+    const highStep = store.getRun(runId);
+    expect(highStep.ok).toBe(false);
+    if (!highStep.ok) {
+      expect(highStep.error.code).toBe('corrupt_run');
+      expect(highStep.error.message).toContain('details.outputs[poisoned].step');
+      expect(highStep.error.message).toContain('outside chain topology');
+    }
+
+    // Wrong agent at a valid step.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...chainBase,
+        details: {
+          ...chainBase.details,
+          outputs: {
+            step1: { text: 'ok', agent: 'wrong-agent', step: 1 },
+          },
+        },
+      })
+    );
+    const badAgent = store.getRun(runId);
+    expect(badAgent.ok).toBe(false);
+    if (!badAgent.ok) {
+      expect(badAgent.error.code).toBe('corrupt_run');
+      expect(badAgent.error.message).toContain('details.outputs[step1].agent');
+      expect(badAgent.error.message).toContain('wrong-agent');
+      expect(badAgent.error.message).toContain('seed');
+    }
+
+    // Valid chain outputs + chain presentation accepted.
+    writeFileSync(
+      file,
+      JSON.stringify({
+        ...chainBase,
+        details: {
+          ...chainBase.details,
+          outputs: {
+            step1: { text: 'hello', agent: 'seed', step: 1 },
+            step2: { text: 'world', agent: 'impl', step: 2, structured: null },
+          },
+          chain: {
+            totalSteps: 2,
+            steps: [
+              {
+                kind: 'sequential',
+                step: 1,
+                agent: 'seed',
+                task: 'seed work',
+                status: 'completed',
+              },
+              {
+                kind: 'sequential',
+                step: 2,
+                agent: 'impl',
+                task: 'implement',
+                status: 'queued',
+              },
+            ],
+          },
+        },
+      })
+    );
+    const ok = store.getRun(runId);
+    expect(ok.ok).toBe(true);
+
+    // Single-mode records may still carry ignored legacy chain presentation (not corrupt).
+    const singleLegacy = structuredClone(base);
+    singleLegacy.details = {
+      ...singleLegacy.details,
+      outputs: { orphan: { text: 'x', agent: 'noop', step: 9 } },
+      chain: {
+        totalSteps: 1,
+        steps: [
+          {
+            kind: 'sequential',
+            step: 1,
+            agent: 'noop',
+            task: 't',
+            status: 'completed',
+          },
+        ],
+      },
+    };
+    writeFileSync(file, JSON.stringify(singleLegacy));
+    expect(store.getRun(runId).ok).toBe(true);
+  });
+
   it('loads Version 1 records when continuationTasks is absent', async () => {
     const store = createRunStore({ rootDir: root, ...makeDeps() });
     const { runId } = await store.createRun(makeCreateInput());

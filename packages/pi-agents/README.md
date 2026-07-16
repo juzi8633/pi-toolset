@@ -21,6 +21,7 @@ Delegate tasks to specialized subagents from [Pi](https://github.com/earendil-wo
 - **Usage tracking** - turns, tokens, and context per execution unit; aggregates sum tokens/turns and use `ctx:max` (no aggregate model/thinking); partial stats stream live for `grok-acp`
 - **Abort support** - Ctrl+C propagates and kills active subprocesses
 - **Durable runs** - every invocation persists a run record, unit state, and native Pi sessions under `~/.pi/agent/@balaenis/pi-agents/runs/`; interrupted runs can be inspected and resumed without re-running completed work
+- **Compact parent/durable results** - newly written and actively resumed parent tool details and `run.json` store assistant presentation (text/tool-call summaries) plus final/structured output, not raw child tool-result bodies (inactive historical Version 1 records remain unchanged until active resume)
 - **Resume** - `agent({ runId })` resumes a durable run from its stored workflow and sessions; optional `task` appends a continuation instruction (required to resume a fully completed run); Pi and Grok ACP units reopen native sessions
 - **Reconciliation** - on session start, runs left running by a dead process are automatically marked interrupted
 
@@ -136,11 +137,11 @@ List/widget status glyphs (Agent Nav uses the same mapping for every endpoint):
 | Enter                 | Pi: steer when running, prompt when idle/detached/error. Grok ACP: prompt only when not running |
 | Alt+Enter             | Pi: queue follow-up when running; prompt otherwise. Grok ACP: prompt only when not running      |
 | Ctrl+X                | Abort/cancel only the selected child's current turn                                             |
-| Ctrl+O                | Toggle last-15-line preview vs full transcript                                                  |
+| Ctrl+O                | Toggle last-15-line preview vs complete retained/bounded Agent View transcript                  |
 | Escape                | Return to the navigator list                                                                    |
 | Up/Down / End         | Scroll transcript / resume tail-follow                                                          |
 
-Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the full content; Ctrl+O again collapses to the last 15 lines and jumps back to the tail. Grok ACP history hydrates lazily on first detail open via a hydrate-only ACP `session/load` (no model prompt).
+Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the complete retained/bounded Agent View transcript (assistant/tool-call presentation plus final output — not raw child tool-result bodies); Ctrl+O again collapses to the last 15 lines and jumps back to the tail. Raw/full native history is available only for reloadable native sessions (Pi `sessionFile` or Grok ACP `session/load`). Grok ACP history hydrates lazily on first detail open via a hydrate-only ACP `session/load` (no model prompt).
 
 **Scope and limits (Version 1):**
 
@@ -156,7 +157,7 @@ See [How-to: Interactive agent view](./docs/how-to.md#interactive-agent-view) an
 
 ### Privacy and disk growth
 
-Run records contain prompts, transcripts, outputs, cwd paths, and possibly sensitive tool results. Protect and manually remove them according to your retention policy. Version 1 performs no automatic pruning. To delete a run, remove its complete `<run-id>/` directory only when the run is not active. Linked interactive worktrees are also retained until you remove them manually.
+Run records contain prompts, compact assistant presentation, outputs, cwd paths, and related metadata. Newly written and actively resumed records store compact presentation (assistant text/tool-call summaries) plus final/structured output — not raw child tool-result bodies. Inactive historical Version 1 records may still hold legacy full-message results until they are actively resumed and rewritten. Raw child tool-result bodies remain only in reloadable native child sessions (Pi `sessionFile` or Grok ACP `acpSessionId` / `session/load`) when such an identity exists. When no reloadable native identity exists, raw tool-result bodies are intentionally released after terminal projection and cannot be recovered. Protect and manually remove run directories and native child sessions according to your retention policy. Version 1 performs no automatic pruning. To delete a run, remove its complete `<run-id>/` directory only when the run is not active. Linked interactive worktrees are also retained until you remove them manually.
 
 ## Documentation
 
@@ -164,6 +165,7 @@ Run records contain prompts, transcripts, outputs, cwd paths, and possibly sensi
 - [How-to guides](./docs/how-to.md) - parallel runs, chains, structured output, fanout, resume, worktree isolation, slash commands, background agents, Grok runtimes
 - [Reference](./docs/reference.md) - frontmatter fields, config overrides, tool modes, durable runs, bundled agents, `stopReason` values, environment variables
 - [Explanation](./docs/explanation.md) - security model, nesting control, durable fanout expansion, fork context, package-agent discovery, Grok runtimes
+- [中文测试说明：Reduced-heap soak](./docs/reduced-heap-soak-test.zh-cn.md) - 在 512 MiB V8 old-space 上限下验证混合 agent、fanout、interruption 和 resume
 
 ## Bundled agents
 

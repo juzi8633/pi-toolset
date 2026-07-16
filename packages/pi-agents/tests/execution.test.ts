@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import type { AgentConfig } from '../src/agents.ts';
+import { RESULT_UPDATE_INTERVAL_MS } from '../src/constants.ts';
 import type { SpawnFn, SpawnedChild } from '../src/execution.ts';
 import { AgentAbortError, mapWithConcurrencyLimit, runSingleAgent } from '../src/execution.ts';
 import type { SingleResult, SubagentDetails } from '../src/types.ts';
@@ -444,6 +445,7 @@ describe('runSingleAgentGrokAcp', () => {
     private readonly behavior: {
       multiCycle?: boolean;
       hang?: boolean;
+      highFrequency?: boolean;
       protocolVersion?: number;
       stopReason?: string;
       stderrText?: string;
@@ -573,6 +575,37 @@ describe('runSingleAgentGrokAcp', () => {
               },
             },
           });
+        }
+
+        if (this.behavior.highFrequency) {
+          for (let i = 0; i < 1000; i++) {
+            this.writeMsg({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: this.sessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: `tok${i} ` },
+                },
+              },
+            });
+            if (i % 50 === 0) {
+              this.writeMsg({
+                jsonrpc: '2.0',
+                method: 'session/update',
+                params: {
+                  sessionId: this.sessionId,
+                  update: {
+                    sessionUpdate: 'usage_update',
+                    used: i,
+                    size: 200000,
+                    cost: { amount: 0.01, currency: 'USD' },
+                  },
+                },
+              });
+            }
+          }
         }
 
         this.writeMsg({
@@ -737,11 +770,10 @@ describe('runSingleAgentGrokAcp', () => {
     expect(JSON.stringify(result)).not.toContain('maxTurns=1');
     expect(updates.some((u) => u.includes('preamble') || u.includes('Completed'))).toBe(true);
 
-    // Progressive usage: usage_update cost/ctx arrive mid-turn before token breakdown.
-    const midTurn = usageSnapshots.find(
-      (u) => u.cost === 0.01 && u.contextTokens === 42 && u.input === 0 && u.output === 0
-    );
-    expect(midTurn).toBeDefined();
+    // Content/usage chunks are coalesced: intermediate mid-turn snapshots may be dropped,
+    // but the final delivered usage (and authoritative result) remain complete.
+    expect(usageSnapshots.length).toBeGreaterThan(0);
+    expect(usageSnapshots.length).toBeLessThan(50);
     const finalSnap = usageSnapshots[usageSnapshots.length - 1];
     expect(finalSnap).toMatchObject({
       input: 11,
@@ -862,6 +894,90 @@ describe('runSingleAgentGrokAcp', () => {
     expect(result.stopReason).toBe('error');
     expect(result.errorMessage).toMatch(/ENOENT|failed/i);
   });
+
+  it('1000 high-frequency content/tool/usage updates coalesce and terminal is not overtaken', async () => {
+    const ctx = captureAcpSpawn({ highFrequency: true });
+    const agent = makeAgent({ name: 'g', runtime: 'grok-acp' });
+    const statuses: string[] = [];
+    let updateCount = 0;
+    const result = await runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'stream',
+      undefined,
+      undefined,
+      undefined,
+      (partial) => {
+        updateCount += 1;
+        const st = partial.details?.results[0]?.status;
+        if (st) statuses.push(st);
+      },
+      makeDetails,
+      { spawnFn: ctx.spawnFn }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stopReason).toBe('end');
+    expect(result.status === 'completed' || result.stopReason === 'end').toBe(true);
+    // Coalescing: parent update count must be far below raw 1000+ notifications.
+    expect(updateCount).toBeLessThan(1000);
+    expect(updateCount).toBeGreaterThan(0);
+    // After the promise settles, no further parent updates may arrive (terminal is final).
+    const countAtSettle = updateCount;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(updateCount).toBe(countAtSettle);
+    // Pending running updates must not appear after settlement.
+    expect(statuses.every((s) => s === 'running' || s === 'completed' || s === 'failed')).toBe(
+      true
+    );
+  }, 20_000);
+
+  it('successful Grok terminal discards pending running flush and emits authoritative terminal', async () => {
+    const ctx = captureAcpSpawn();
+    const agent = makeAgent({ name: 'g', runtime: 'grok-acp', model: 'grok-4.5' });
+    const statuses: Array<string | undefined> = [];
+    const texts: string[] = [];
+    let updateCount = 0;
+    const result = await runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'review this',
+      undefined,
+      undefined,
+      undefined,
+      (partial) => {
+        updateCount += 1;
+        statuses.push(partial.details?.results[0]?.status);
+        const text = partial.content.find((c) => c.type === 'text');
+        if (text && text.type === 'text') texts.push(text.text);
+      },
+      makeDetails,
+      { spawnFn: ctx.spawnFn }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stopReason).toBe('end');
+    expect(result.status).toBe('completed');
+    // Authoritative terminal is delivered via onUpdate (not a stale running flush)
+    // and also via the returned result.
+    expect(statuses.length).toBeGreaterThan(0);
+    expect(statuses[statuses.length - 1]).toBe('completed');
+    // No trailing running update after the terminal snapshot.
+    const lastRunning = statuses.lastIndexOf('running');
+    const lastCompleted = statuses.lastIndexOf('completed');
+    if (lastRunning >= 0) {
+      expect(lastCompleted).toBeGreaterThan(lastRunning);
+    }
+    // Final result remains complete.
+    expect(result.usage.input).toBe(11);
+    expect(result.usage.output).toBe(7);
+    expect(result.messages.length).toBeGreaterThanOrEqual(2);
+    const countAtSettle = updateCount;
+    await new Promise((r) => setTimeout(r, RESULT_UPDATE_INTERVAL_MS + 100));
+    expect(updateCount).toBe(countAtSettle);
+  }, 15_000);
 });
 
 describe('runSingleAgent execution status', () => {
@@ -1285,5 +1401,125 @@ describe('mapWithConcurrencyLimit cancel-safe scheduling', () => {
     resolvers[0]();
     await expect(run).rejects.toThrow('boom');
     expect(finished.sort()).toEqual([0, 1]);
+  });
+});
+
+describe('runSingleAgent compact parent projection', () => {
+  it('ignores tool_result_end and non-assistant message_end events', async () => {
+    const fake = new FakeChild();
+    const updates: SubagentDetails[] = [];
+    const promise = runSingleAgent(
+      process.cwd(),
+      [makeAgent()],
+      'maxie',
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      (partial) => {
+        if (partial.details) updates.push(partial.details);
+      },
+      makeDetails,
+      {
+        spawnFn: (() => fake as unknown as SpawnedChild) as SpawnFn,
+      }
+    );
+
+    setImmediate(() => {
+      fake.emitAssistant('thinking');
+      fake.stdout.push(
+        JSON.stringify({
+          type: 'message_end',
+          message: {
+            role: 'toolResult',
+            toolCallId: 't1',
+            toolName: 'bash',
+            content: [{ type: 'text', text: 'RAW_TOOL_BODY_' + 'x'.repeat(100) }],
+            isError: false,
+          },
+        }) + '\n'
+      );
+      fake.stdout.push(
+        JSON.stringify({
+          type: 'tool_result_end',
+          message: {
+            role: 'toolResult',
+            toolCallId: 't2',
+            toolName: 'bash',
+            content: [{ type: 'text', text: 'RAW_TOOL_BODY_END_' + 'y'.repeat(100) }],
+            isError: false,
+          },
+        }) + '\n'
+      );
+      fake.emitAssistant('final answer');
+      fake.stdout.push(null);
+      fake.stderr.push(null);
+      fake.emit('close', 0);
+    });
+
+    const result = await promise;
+    // Live private result retains assistant messages only.
+    expect(result.messages.every((m) => m.role === 'assistant')).toBe(true);
+    expect(result.messages).toHaveLength(2);
+    expect(result.usage.turns).toBe(2);
+    expect(JSON.stringify(result.messages)).not.toContain('RAW_TOOL_BODY_');
+
+    // Parent onUpdate details are compact snapshots without raw tool bodies.
+    expect(updates.length).toBeGreaterThan(0);
+    for (const details of updates) {
+      const json = JSON.stringify(details);
+      expect(json).not.toContain('RAW_TOOL_BODY_');
+      for (const r of details.results) {
+        expect(r.messages).toEqual([]);
+        expect(r.presentation).toBeDefined();
+      }
+    }
+    const last = updates[updates.length - 1]!.results[0]!;
+    expect(last.finalOutput).toBe('final answer');
+    expect(
+      last.presentation?.transcript.some((i) => i.type === 'text' && i.text === 'thinking')
+    ).toBe(true);
+  });
+
+  it('still updates usage and stopReason from assistant message_end events', async () => {
+    const fake = new FakeChild();
+    const promise = runSingleAgent(
+      process.cwd(),
+      [makeAgent()],
+      'maxie',
+      'do work',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeDetails,
+      {
+        spawnFn: (() => fake as unknown as SpawnedChild) as SpawnFn,
+      }
+    );
+
+    setImmediate(() => {
+      const message = {
+        role: 'assistant',
+        model: 'fake-model',
+        content: [{ type: 'text', text: 'done' }],
+        usage: { input: 11, output: 7, totalTokens: 18, cacheRead: 3, cacheWrite: 1 },
+        stopReason: 'end',
+      };
+      fake.stdout.push(JSON.stringify({ type: 'message_end', message }) + '\n');
+      fake.stdout.push(null);
+      fake.stderr.push(null);
+      fake.emit('close', 0);
+    });
+
+    const result = await promise;
+    expect(result.usage.turns).toBe(1);
+    expect(result.usage.input).toBe(11);
+    expect(result.usage.output).toBe(7);
+    expect(result.usage.cacheRead).toBe(3);
+    expect(result.usage.cacheWrite).toBe(1);
+    expect(result.usage.contextTokens).toBe(18);
+    expect(result.model).toBe('fake-model');
+    expect(result.stopReason === 'end' || result.status === 'completed').toBe(true);
   });
 });

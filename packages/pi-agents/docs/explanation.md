@@ -249,6 +249,16 @@ persisted ID fail closed rather than replaying the original task.
 
 ## Output display
 
+Three transcript ownership layers matter for memory and rendering:
+
+1. **Mutable/native runtime transcript** — the child's live messages (and
+   native Pi/Grok ACP session artifacts when a reloadable identity exists).
+2. **Compact parent/durable presentation** — parent tool details and
+   `run.json` store assistant text/tool-call presentation plus authoritative
+   `finalOutput`/`structuredOutput`, not raw child tool-result bodies.
+3. **Bounded Agent View history** — Interactive Agent View keeps per-message
+   projected history with lazy rehydration for reloadable sessions.
+
 Collapsed output is intentionally a compact live summary: status glyph
 (outline-fill spinner ▫▪□■ while a live partial result is collapsed and
 running; static ⧗ for expanded running views, background launch notices, and
@@ -258,7 +268,7 @@ while running. Animation advances every 100ms through a single shared ticker
 that invalidates all armed tool rows; it never starts from restored or
 non-partial renders even if details still say running. Completed Single
 results hide activity and final output until expanded. Use Ctrl+O for the
-full task, ordered transcript, final output (once), and
+full task, retained assistant/tool-call presentation, final output (once), and
 error/worktree/structured-output details. Tool-call formatting mimics Pi's
 built-in tools (`$ command` for bash, `read ~/path:1-10` for read,
 `grep /pattern/ in ~/path` for grep, etc.).

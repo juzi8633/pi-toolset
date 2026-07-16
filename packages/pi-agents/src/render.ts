@@ -21,8 +21,8 @@ import {
 import {
   formatAggregateUsageStats,
   formatUsageStats,
-  getLatestActivity,
-  getTranscriptAndFinal,
+  getResultLatestActivity,
+  getResultTranscriptAndFinal,
   resolveExecutionStatus,
 } from './output.ts';
 import type { SubagentParams } from './schema.ts';
@@ -322,7 +322,9 @@ const TITLE_MAX_COLUMNS = 30;
  */
 function truncateDisplayToWidth(text: string, maxColumns: number, ellipsis = '…'): string {
   if (maxColumns <= 0) return '';
-  return truncateToWidth(text, maxColumns, ellipsis).replace(/\x1b\[0m/g, '');
+  // Strip SGR full-reset only (string split avoids no-control-regex / char-class pitfalls).
+  const sgrFullReset = `${String.fromCharCode(0x1b)}[0m`;
+  return truncateToWidth(text, maxColumns, ellipsis).split(sgrFullReset).join('');
 }
 
 /** Clamp a value to at most `maxColumns` terminal columns, ellipsis included. */
@@ -512,18 +514,34 @@ function appendExpandedResultSections(
   mdTheme: ReturnType<typeof getMarkdownTheme>
 ): void {
   const status = resolveExecutionStatus(r);
-  const { transcript, finalOutput } = getTranscriptAndFinal(r.messages);
+  const { transcript, finalOutput } = getResultTranscriptAndFinal(r);
 
   container.addChild(new Text(theme.fg('muted', '─── Task ───'), 0, 0));
   container.addChild(new Text(theme.fg('dim', r.task), 0, 0));
   container.addChild(new Spacer(1));
 
   container.addChild(new Text(theme.fg('muted', '─── Output ───'), 0, 0));
-  if (transcript.length === 0 && !finalOutput) {
+  const truncatedPresentation =
+    r.presentation && 'truncated' in r.presentation && r.presentation.truncated
+      ? r.presentation
+      : undefined;
+  if (transcript.length === 0 && !finalOutput && !truncatedPresentation) {
     container.addChild(
       new Text(theme.fg('muted', status === 'running' ? '(running...)' : '(no output)'), 0, 0)
     );
   } else {
+    if (truncatedPresentation) {
+      container.addChild(
+        new Text(
+          theme.fg(
+            'muted',
+            `[Earlier transcript omitted: ${truncatedPresentation.omittedItems} items]`
+          ),
+          0,
+          0
+        )
+      );
+    }
     for (const item of transcript) {
       if (item.type === 'toolCall') {
         container.addChild(
@@ -645,7 +663,7 @@ function renderSingleCollapsed(
     );
 
     if (status === 'running') {
-      const latest = getLatestActivity(r.messages);
+      const latest = getResultLatestActivity(r);
       if (latest) text += `\n${formatActivityLine(latest, theme, themeFg, width)}`;
     } else if (status === 'failed' && r.errorMessage) {
       text += `\n${theme.fg('error', `  Error: ${r.errorMessage}`)}`;
@@ -681,7 +699,7 @@ function renderParallelCollapsed(
         formatSummaryLine(resultSummaryParts(r, theme, { animateContext: context }), width, theme)
       );
       if (status === 'running') {
-        const latest = getLatestActivity(r.messages);
+        const latest = getResultLatestActivity(r);
         if (latest) lines.push(formatActivityLine(latest, theme, themeFg, width));
       }
     }
@@ -842,7 +860,7 @@ function renderChainCollapsed(
         parts.glyph = statusGlyph(step.status, theme, context);
         lines.push(formatSummaryLine(parts, width, theme));
         if (step.status === 'running' && r) {
-          const latest = getLatestActivity(r.messages);
+          const latest = getResultLatestActivity(r);
           if (latest) lines.push(formatActivityLine(latest, theme, themeFg, width));
         }
       } else {
@@ -860,7 +878,7 @@ function renderChainCollapsed(
         if (step.status === 'running' && typeof step.latestIndex === 'number') {
           const latestItem = items.find((it) => it.fanout?.index === step.latestIndex);
           if (latestItem) {
-            const activity = getLatestActivity(latestItem.messages);
+            const activity = getResultLatestActivity(latestItem);
             if (activity) {
               const total = step.executedCount || latestItem.fanout?.count || items.length;
               const oneBased = (step.latestIndex ?? 0) + 1;

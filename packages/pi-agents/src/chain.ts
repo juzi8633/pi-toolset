@@ -4,7 +4,8 @@
 import type { Static } from '@earendil-works/pi-ai';
 import type { AgentToolResult, AgentToolUpdateCallback } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig, AgentSource } from './agents.ts';
-import { MAX_CONCURRENCY, MAX_FANOUT_ITEMS } from './constants.ts';
+import { MAX_CONCURRENCY, MAX_FANOUT_ITEMS, RESULT_UPDATE_INTERVAL_MS } from './constants.ts';
+import { createLatestValueCoalescer } from './update-coalescer.ts';
 import {
   ABORT_MESSAGE,
   getAbortResult,
@@ -15,7 +16,7 @@ import {
 import { readJsonPointer } from './json-pointer.ts';
 import {
   applyTerminalStatus,
-  getFinalOutput,
+  getResultFinalOutput,
   getResultOutput,
   isFailedResult,
   resolveExecutionStatus,
@@ -30,8 +31,8 @@ import {
 } from './structured-output.ts';
 import { emptyUsage } from './empty-usage.ts';
 import { renderTaskTemplate } from './template.ts';
+import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
-  cloneResults,
   cloneSingleResult,
   type ChainExecutionDetails,
   type ChainFanoutStep,
@@ -226,6 +227,16 @@ function hasEmptyFanoutCompletionEvidence(
   return entry !== undefined && entry.step === logical.step;
 }
 
+/** Copy an output entry and isolate structured payload from shared mutable sources. */
+function isolateOutputEntry(entry: ChainOutputEntry): ChainOutputEntry {
+  return {
+    text: entry.text,
+    structured: entry.structured !== undefined ? structuredClone(entry.structured) : undefined,
+    agent: entry.agent,
+    step: entry.step,
+  };
+}
+
 /**
  * Build a complete restored logical-step array from request topology.
  * Overlays trustworthy presentation state by step number (never by unchecked
@@ -344,7 +355,7 @@ function durableCompletedSequentialResult(
 }
 
 function resultText(result: SingleResult): string {
-  return result.finalOutput ?? getFinalOutput(result.messages);
+  return getResultFinalOutput(result);
 }
 
 /**
@@ -366,10 +377,14 @@ function rehydrateCompletedSequentialFromDurable(
     const durableResult = durableCompletedSequentialResult(units, stepNumber);
     if (!durableResult) continue;
 
-    // Clone before inserting into mutable presentation results.
-    const cloned = cloneSingleResult(durableResult);
-    if (cloned.step === undefined) cloned.step = stepNumber;
-    upsertSequentialResult(results, cloned);
+    // Compact into snapshot-owned immutable results before aggregate sharing.
+    let snap = snapshotSingleResult(durableResult);
+    if (snap.step === undefined) {
+      const shell = copySnapshotShell(snap);
+      shell.step = stepNumber;
+      snap = snapshotSingleResult(shell);
+    }
+    upsertSequentialResult(results, snap);
 
     if (!sequential.name) continue;
     // Later-step-wins: never overwrite a same-named entry recorded by a later
@@ -377,15 +392,18 @@ function rehydrateCompletedSequentialFromDurable(
     // or earlier-step entries.
     const existing = outputs.get(sequential.name);
     if (existing !== undefined && existing.step > stepNumber) continue;
-    outputs.set(sequential.name, {
-      text: resultText(durableResult),
-      structured:
-        durableResult.structuredOutput !== undefined
-          ? structuredClone(durableResult.structuredOutput)
-          : undefined,
-      agent: sequential.agent,
-      step: stepNumber,
-    });
+    outputs.set(
+      sequential.name,
+      isolateOutputEntry({
+        text: resultText(durableResult),
+        structured:
+          durableResult.structuredOutput !== undefined
+            ? structuredClone(durableResult.structuredOutput)
+            : undefined,
+        agent: sequential.agent,
+        step: stepNumber,
+      })
+    );
   }
 }
 
@@ -424,10 +442,11 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
   let logicalSteps: ChainLogicalStep[];
 
   if (restored) {
-    results = cloneResults(restored.results);
+    // Normalize into snapshot-owned immutable results before workflow mutation/sharing.
+    results = restored.results.map((r) => snapshotSingleResult(r));
     for (const [name, entry] of Object.entries(restored.outputs)) {
-      // Shallow-copy entries so later rehydrate cannot mutate durable details.outputs.
-      outputs.set(name, { ...entry });
+      // Isolate structured payloads so mutation of restored details.outputs cannot leak.
+      outputs.set(name, isolateOutputEntry(entry));
     }
     // Prefer durable completed sequential unit results when presentation lags.
     rehydrateCompletedSequentialFromDurable(chain, results, outputs, restored.units);
@@ -454,10 +473,17 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
     logicalSteps = initLogicalSteps(chain);
   }
 
-  const outputsRecord = (): Record<string, ChainOutputEntry> => Object.fromEntries(outputs);
+  const outputsRecord = (): Record<string, ChainOutputEntry> => {
+    const out: Record<string, ChainOutputEntry> = {};
+    for (const [name, entry] of outputs) {
+      out[name] = isolateOutputEntry(entry);
+    }
+    return out;
+  };
 
   const buildDetails = (): SubagentDetails => {
-    const base = makeDetails(cloneResults(results), outputsRecord());
+    // Copy-on-write result shells; share frozen presentation/structuredOutput payloads.
+    const base = makeDetails(results.map(copySnapshotShell), outputsRecord());
     const chainDetails: ChainExecutionDetails = {
       totalSteps: chain.length,
       steps: cloneLogicalSteps(logicalSteps),
@@ -589,7 +615,9 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
           type: 'text',
           text:
             previousOutput ||
-            getFinalOutput(results[results.length - 1]?.messages ?? []) ||
+            (results[results.length - 1]
+              ? getResultFinalOutput(results[results.length - 1]!)
+              : '') ||
             '(no output)',
         },
       ],
@@ -607,12 +635,15 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
         }
         markLaterSkipped(logicalSteps, idx + 1);
       }
-      // Mark any in-flight sequential result cancelled
-      for (const r of results) {
+      // Mark any in-flight sequential result cancelled via slot replacement.
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i]!;
         if (resolveExecutionStatus(r) === 'running') {
-          r.status = 'cancelled';
-          r.stopReason = r.stopReason ?? 'aborted';
-          if (r.exitCode === 0 || r.exitCode === -1) r.exitCode = 1;
+          const cancelled = copySnapshotShell(r);
+          cancelled.status = 'cancelled';
+          cancelled.stopReason = r.stopReason ?? 'aborted';
+          if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
+          results[i] = cancelled;
         }
       }
       return {
@@ -664,7 +695,7 @@ function applyStructuredOutputValidation(
   stepNumber: number
 ): void {
   if (result.messages.length > 0) {
-    result.finalOutput = getFinalOutput(result.messages);
+    result.finalOutput = getResultFinalOutput(result);
   }
   if (isFailedResult(result) || !schema) return;
 
@@ -783,6 +814,15 @@ async function runSequentialStep(
 
   const chainUpdate = makeSequentialUpdate(results, stepNumber, opts.onUpdate, buildDetails);
 
+  // Exactly-once: production runStep invokes the callback; stubs that ignore it get one fallback.
+  let terminalPostprocessed = false;
+  const postprocessTerminal = (result: SingleResult): void => {
+    terminalPostprocessed = true;
+    applyStructuredOutputValidation(result, outputSchema, stepNumber);
+    if (!result.status || result.status === 'running') applyTerminalStatus(result);
+    result.step = stepNumber;
+  };
+
   let result: SingleResult;
   try {
     result = await opts.runStep({
@@ -796,7 +836,17 @@ async function runSequentialStep(
       signal,
       onUpdate: chainUpdate,
       skipCompletionCheck: outputSchema !== undefined,
+      postprocessTerminal,
     });
+    if (!terminalPostprocessed) {
+      // Injected runStep stubs that ignore postprocessTerminal get exactly one fallback.
+      const working = cloneSingleResult(result);
+      postprocessTerminal(working);
+      result = snapshotSingleResult(working);
+    } else {
+      // Production already postprocessed + snapshotted; re-snapshot is an owned fast path.
+      result = snapshotSingleResult(result);
+    }
   } catch (err) {
     if (isAbortError(err)) {
       const cancelled: SingleResult = {
@@ -813,12 +863,14 @@ async function runSequentialStep(
         errorMessage: ABORT_MESSAGE,
         step: stepNumber,
       };
-      // Prefer any partial that was upserted
-      const existing = results.find((r) => r.step === stepNumber && r.fanout === undefined);
-      if (existing) {
-        existing.status = 'cancelled';
-        existing.stopReason = existing.stopReason ?? 'aborted';
-        if (existing.exitCode === 0 || existing.exitCode === -1) existing.exitCode = 1;
+      // Prefer any partial that was upserted — replace the slot, never mutate it.
+      const existingIdx = results.findIndex((r) => r.step === stepNumber && r.fanout === undefined);
+      if (existingIdx >= 0) {
+        const shell = copySnapshotShell(results[existingIdx]!);
+        shell.status = 'cancelled';
+        shell.stopReason = shell.stopReason ?? 'aborted';
+        if (shell.exitCode === 0 || shell.exitCode === -1) shell.exitCode = 1;
+        results[existingIdx] = shell;
       } else {
         upsertSequentialResult(results, cancelled);
       }
@@ -829,9 +881,8 @@ async function runSequentialStep(
     throw err;
   }
 
-  applyStructuredOutputValidation(result, outputSchema, stepNumber);
-  if (!result.status || result.status === 'running') applyTerminalStatus(result);
-  result.step = stepNumber;
+  // postprocessTerminal already ran (production runStep and/or stub fallback above).
+  // Do not mutate the compact snapshot — only store it.
   upsertSequentialResult(results, result);
 
   if (isFailedResult(result) || resolveExecutionStatus(result) === 'failed') {
@@ -872,14 +923,17 @@ async function runSequentialStep(
   }
 
   logicalSteps[stepIndex].status = 'completed';
-  const nextPreviousOutput = result.finalOutput ?? getFinalOutput(result.messages);
+  const nextPreviousOutput = getResultFinalOutput(result);
   if (step.name) {
-    outputs.set(step.name, {
-      text: nextPreviousOutput,
-      structured: result.structuredOutput,
-      agent: step.agent,
-      step: stepNumber,
-    });
+    outputs.set(
+      step.name,
+      isolateOutputEntry({
+        text: nextPreviousOutput,
+        structured: result.structuredOutput,
+        agent: step.agent,
+        step: stepNumber,
+      })
+    );
   }
   return { done: false, previousOutput: nextPreviousOutput };
 }
@@ -1019,12 +1073,15 @@ async function runFanoutStep(
     fanoutMeta.skippedCount = skipped;
     fanoutMeta.status = 'completed';
     const text = '[]';
-    outputs.set(step.collect.name, {
-      text,
-      structured: [],
-      agent: step.parallel.agent,
-      step: stepNumber,
-    });
+    outputs.set(
+      step.collect.name,
+      isolateOutputEntry({
+        text,
+        structured: [],
+        agent: step.parallel.agent,
+        step: stepNumber,
+      })
+    );
     emit(`Fanout: 0/0 done`);
     return { done: false, previousOutput: text };
   }
@@ -1057,7 +1114,7 @@ async function runFanoutStep(
       const unitId = restoredFanout?.unitIds[index];
       const unit = unitId ? opts.restored.units[unitId] : undefined;
       if (unit?.status === 'completed' && unit.result) {
-        return { ...unit.result };
+        return snapshotSingleResult(unit.result);
       }
       // Mapped unit that is not completed: skip presentation fallback and queue.
       if (!unit || unit.status === 'completed') {
@@ -1065,7 +1122,7 @@ async function runFanoutStep(
           (r) => r.step === stepNumber && r.fanout?.index === index
         );
         if (existing && resolveExecutionStatus(existing) === 'completed') {
-          return { ...existing };
+          return snapshotSingleResult(existing);
         }
       }
     }
@@ -1104,49 +1161,65 @@ async function runFanoutStep(
     }
   };
 
-  const emitFanout = () => {
+  const emitFanoutSnapshot = () => {
     recount();
     syncSlotsToResults();
-    if (onUpdate) {
-      const done = fanoutMeta.completedCount + fanoutMeta.failedCount;
-      onUpdate({
-        content: [
-          {
-            type: 'text',
-            text: `Fanout: ${done}/${slots.length} done, ${fanoutMeta.runningCount} running, ${fanoutMeta.queuedCount} queued...`,
-          },
-        ],
-        details: buildDetails(),
-      });
+    if (!onUpdate) return;
+    const done = fanoutMeta.completedCount + fanoutMeta.failedCount;
+    onUpdate({
+      content: [
+        {
+          type: 'text',
+          text: `Fanout: ${done}/${slots.length} done, ${fanoutMeta.runningCount} running, ${fanoutMeta.queuedCount} queued...`,
+        },
+      ],
+      details: buildDetails(),
+    });
+  };
+  // Structural fanout transitions are immediate; worker content partials are coalesced.
+  const fanoutContentCoalescer = createLatestValueCoalescer<void>(() => {
+    emitFanoutSnapshot();
+  }, RESULT_UPDATE_INTERVAL_MS);
+  const emitFanout = (mode: 'immediate' | 'content' = 'immediate') => {
+    if (mode === 'content') {
+      fanoutContentCoalescer.schedule(undefined);
+      return;
     }
+    fanoutContentCoalescer.cancel();
+    emitFanoutSnapshot();
   };
 
   recount();
-  emitFanout();
+  emitFanout('immediate');
 
   /** After terminal, ignore late worker onUpdate callbacks. */
   let fanoutTerminal = false;
 
   const markSlotCancelled = (index: number, fromErr?: unknown): SingleResult => {
     const fromAbort = fromErr ? getAbortResult(fromErr) : undefined;
-    const existing = fromAbort ?? slots[index];
-    existing.status = 'cancelled';
-    existing.stopReason = existing.stopReason ?? 'aborted';
-    if (existing.exitCode === 0 || existing.exitCode === -1) existing.exitCode = 1;
-    if (!existing.errorMessage) existing.errorMessage = ABORT_MESSAGE;
-    existing.step = stepNumber;
-    existing.fanout = {
+    const base = fromAbort ?? slots[index];
+    // CoW shell — never mutate the abort error's result or a prior snapshot in place.
+    const cancelled = copySnapshotShell(base);
+    cancelled.status = 'cancelled';
+    cancelled.stopReason = base.stopReason ?? 'aborted';
+    if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
+    cancelled.errorMessage = cancelled.errorMessage ?? ABORT_MESSAGE;
+    cancelled.step = stepNumber;
+    cancelled.fanout = {
       index,
       count: renderedTasks.length,
       itemTask: renderedTasks[index],
     };
-    slots[index] = existing;
+    slots[index] = cancelled;
     fanoutMeta.latestIndex = index;
-    return existing;
+    return cancelled;
   };
 
   const makeTerminalPostprocess = (index: number, task: string) => {
-    return (result: SingleResult): void => {
+    // Per-invocation flag: production runStep sets it; stubs that ignore get one fallback.
+    let invoked = false;
+    const postprocessTerminal = (result: SingleResult): void => {
+      invoked = true;
       applyStructuredOutputValidation(result, outputSchema, stepNumber);
       if (!result.status || result.status === 'running') applyTerminalStatus(result);
       result.step = stepNumber;
@@ -1155,6 +1228,10 @@ async function runFanoutStep(
         count: renderedTasks.length,
         itemTask: task,
       };
+    };
+    return {
+      postprocessTerminal,
+      wasInvoked: () => invoked,
     };
   };
 
@@ -1175,11 +1252,12 @@ async function runFanoutStep(
             return slots[index];
           }
         }
-        slots[index] = {
-          ...slots[index],
-          status: 'running',
-          exitCode: -1,
-        };
+        {
+          const runningShell = copySnapshotShell(slots[index]);
+          runningShell.status = 'running';
+          runningShell.exitCode = -1;
+          slots[index] = runningShell;
+        }
         fanoutMeta.latestIndex = index;
         if (!fanoutTerminal) emitFanout();
 
@@ -1189,20 +1267,22 @@ async function runFanoutStep(
               if (fanoutTerminal || signal?.aborted) return;
               const current = partial.details?.results[0];
               if (!current) return;
-              current.status = current.status ?? 'running';
-              current.step = stepNumber;
-              current.fanout = {
+              // Replace the slot with a new shell — never mutate the partial snapshot.
+              const shell = copySnapshotShell(current);
+              shell.status = shell.status ?? 'running';
+              shell.step = stepNumber;
+              shell.fanout = {
                 index,
                 count: renderedTasks.length,
                 itemTask: task,
               };
-              slots[index] = current;
+              slots[index] = shell;
               fanoutMeta.latestIndex = index;
-              emitFanout();
+              emitFanout('content');
             }
           : undefined;
 
-        const postprocessTerminal = makeTerminalPostprocess(index, task);
+        const { postprocessTerminal, wasInvoked } = makeTerminalPostprocess(index, task);
 
         try {
           const result = await opts.runStep({
@@ -1223,12 +1303,20 @@ async function runFanoutStep(
             // Worker finished after cancel: keep cancelled if we already marked it.
             if (resolveExecutionStatus(slots[index]) === 'cancelled') return slots[index];
           }
-          // Idempotent: re-apply so stubs that ignore postprocessTerminal still match.
-          postprocessTerminal(result);
-          slots[index] = result;
+          let compact: SingleResult;
+          if (!wasInvoked()) {
+            // Injected stubs that ignore the callback get exactly one fallback.
+            const working = cloneSingleResult(result);
+            postprocessTerminal(working);
+            compact = snapshotSingleResult(working);
+          } else {
+            // Production already postprocessed + snapshotted; share owned payloads only.
+            compact = snapshotSingleResult(result);
+          }
+          slots[index] = compact;
           fanoutMeta.latestIndex = index;
           if (!fanoutTerminal && !signal?.aborted) emitFanout();
-          return result;
+          return compact;
         } catch (err) {
           if (isAbortError(err)) {
             markSlotCancelled(index, err);
@@ -1242,7 +1330,7 @@ async function runFanoutStep(
         signal,
         onUnstarted: (_task, index) => {
           // Presentation may mark skipped; durable state keeps the unit queued.
-          const skippedSlot = slots[index];
+          const skippedSlot = copySnapshotShell(slots[index]);
           skippedSlot.status = 'skipped';
           skippedSlot.exitCode = 1;
           skippedSlot.stopReason = skippedSlot.stopReason ?? 'aborted';
@@ -1254,6 +1342,11 @@ async function runFanoutStep(
   } catch (err) {
     // Non-abort worker failures still settle via mapWithConcurrencyLimit; rethrow if unexpected.
     if (!isAbortError(err)) throw err;
+  } finally {
+    // Permanent terminal gate first so late worker callbacks cannot reschedule the
+    // coalescer after cancel (including unexpected non-abort exceptional exits).
+    fanoutTerminal = true;
+    fanoutContentCoalescer.cancel();
   }
 
   recount();
@@ -1265,18 +1358,20 @@ async function runFanoutStep(
   const abortedFanout = signal?.aborted || cancelledCount > 0 || skippedCount > 0;
 
   if (abortedFanout && successCount !== slots.length) {
-    for (const slot of slots) {
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i]!;
       const st = resolveExecutionStatus(slot);
       if (st === 'queued' || st === 'running') {
-        slot.status = st === 'running' ? 'cancelled' : 'skipped';
-        if (slot.status === 'cancelled') {
-          slot.stopReason = slot.stopReason ?? 'aborted';
-          if (slot.exitCode === 0 || slot.exitCode === -1) slot.exitCode = 1;
+        const shell = copySnapshotShell(slot);
+        shell.status = st === 'running' ? 'cancelled' : 'skipped';
+        if (shell.status === 'cancelled') {
+          shell.stopReason = shell.stopReason ?? 'aborted';
+          if (shell.exitCode === 0 || shell.exitCode === -1) shell.exitCode = 1;
         }
+        slots[i] = shell;
       }
     }
     fanoutMeta.status = 'cancelled';
-    fanoutTerminal = true;
     recount();
     syncSlotsToResults();
     markLaterSkipped(logicalSteps, stepIndex + 1);
@@ -1291,8 +1386,6 @@ async function runFanoutStep(
       },
     };
   }
-
-  fanoutTerminal = true;
 
   if (successCount !== slots.length) {
     fanoutMeta.status = 'failed';
@@ -1314,10 +1407,7 @@ async function runFanoutStep(
 
   fanoutMeta.status = 'completed';
   const collected = slots.map(
-    (result) =>
-      (result.structuredOutput ??
-        result.finalOutput ??
-        getFinalOutput(result.messages)) as JsonValue
+    (result) => (result.structuredOutput ?? getResultFinalOutput(result)) as JsonValue
   );
   const maxItemsNote =
     typeof step.expand.maxItems === 'number' ? Math.floor(step.expand.maxItems) : undefined;
@@ -1328,12 +1418,15 @@ async function runFanoutStep(
         }]`
       : ''
   }`;
-  outputs.set(step.collect.name, {
-    text,
-    structured: collected,
-    agent: step.parallel.agent,
-    step: stepNumber,
-  });
+  outputs.set(
+    step.collect.name,
+    isolateOutputEntry({
+      text,
+      structured: collected,
+      agent: step.parallel.agent,
+      step: stepNumber,
+    })
+  );
   return { done: false, previousOutput: text };
 }
 
@@ -1374,9 +1467,11 @@ function makeSequentialUpdate(
     ? (partial) => {
         const currentResult = partial.details?.results[0];
         if (currentResult) {
-          currentResult.status = currentResult.status ?? 'running';
-          currentResult.step = stepNumber;
-          upsertSequentialResult(results, currentResult);
+          // CoW: never mutate the inbound partial snapshot in place.
+          const shell = copySnapshotShell(currentResult);
+          shell.status = shell.status ?? 'running';
+          shell.step = stepNumber;
+          upsertSequentialResult(results, shell);
           onUpdate({
             content: partial.content,
             details: buildDetails(),

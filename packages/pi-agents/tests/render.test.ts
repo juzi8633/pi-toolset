@@ -405,6 +405,205 @@ describe('renderResult single', () => {
     expect(finalCount).toBe(1);
   });
 
+  it('renders equivalent collapsed content for legacy and compact results', () => {
+    const { context: legacyContext } = makeContext();
+    const { context: compactContext } = makeContext();
+    const legacy = singleResult({
+      status: 'running',
+      exitCode: -1,
+      task: 'pair task',
+      model: 'grok-4.5',
+      thinking: 'high',
+      usage: { ...emptyUsage(), turns: 2, input: 10, output: 4 },
+      messages: assistantMessages([
+        { type: 'toolCall', name: 'read', path: 'a.ts' },
+        { type: 'toolCall', name: 'bash', path: 'cmd' },
+      ]),
+    });
+    // Override the bash args to match command-style activity text.
+    (
+      legacy.messages[1].content[0] as unknown as {
+        arguments: { command: string };
+      }
+    ).arguments = { command: 'ls -la' };
+
+    const compact = singleResult({
+      status: 'running',
+      exitCode: -1,
+      task: 'pair task',
+      model: 'grok-4.5',
+      thinking: 'high',
+      usage: { ...emptyUsage(), turns: 2, input: 10, output: 4 },
+      messages: [],
+      presentation: {
+        transcript: [
+          { type: 'toolCall', name: 'read', args: { path: 'a.ts' } },
+          { type: 'toolCall', name: 'bash', args: { command: 'ls -la' } },
+        ],
+        latestActivity: { type: 'toolCall', name: 'bash', args: { command: 'ls -la' } },
+      },
+    });
+
+    const legacyText = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'running' }], details: singleDetails(legacy) },
+        { expanded: false, isPartial: true },
+        theme,
+        legacyContext
+      )
+    );
+    const compactText = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'running' }], details: singleDetails(compact) },
+        { expanded: false, isPartial: true },
+        theme,
+        compactContext
+      )
+    );
+    // Strip spinner frames so wall-clock frame selection cannot diverge the comparison.
+    const normalize = (text: string) => {
+      let out = text;
+      for (const frame of SPINNER_FRAMES) out = out.split(frame).join(RUNNING_STATUS_GLYPH);
+      return out;
+    };
+    expect(normalize(compactText)).toBe(normalize(legacyText));
+    expect(compactText).toContain('ls -la');
+    expect(compactText).not.toContain('a.ts');
+  });
+
+  it('renders equivalent expanded content for legacy and compact results', () => {
+    const { context } = makeContext();
+    const legacy = singleResult({
+      status: 'completed',
+      task: 'pair expanded task',
+      finalOutput: 'final answer',
+      messages: assistantMessages([
+        { type: 'toolCall', name: 'read', path: 'a.ts' },
+        { type: 'text', text: 'earlier note' },
+        { type: 'text', text: 'final answer' },
+      ]),
+    });
+    const compact = singleResult({
+      status: 'completed',
+      task: 'pair expanded task',
+      finalOutput: 'final answer',
+      messages: [],
+      presentation: {
+        transcript: [
+          { type: 'toolCall', name: 'read', args: { path: 'a.ts' } },
+          { type: 'text', text: 'earlier note' },
+        ],
+      },
+    });
+
+    const legacyText = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(legacy) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    const compactText = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(compact) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    expect(compactText).toBe(legacyText);
+    expect(compactText).toContain('─── Output ───');
+    expect(compactText).toContain('earlier note');
+    expect(compactText).toContain('─── Final ───');
+    expect(compactText).toContain('final answer');
+    expect(compactText).not.toContain('[Earlier transcript omitted:');
+  });
+
+  it('prepends one omission marker for truncated compact presentation', () => {
+    const { context } = makeContext();
+    const legacy = singleResult({
+      status: 'completed',
+      task: 'truncated task',
+      finalOutput: 'final answer',
+      // Conflicting legacy messages must not affect compact rendering.
+      messages: assistantMessages([{ type: 'text', text: 'stale legacy body' }]),
+      presentation: {
+        transcript: [
+          { type: 'toolCall', name: 'read', args: { path: 'kept.ts' } },
+          { type: 'text', text: 'kept note' },
+        ],
+        truncated: true,
+        omittedItems: 3,
+      },
+    });
+    const compact = singleResult({
+      status: 'completed',
+      task: 'truncated task',
+      finalOutput: 'final answer',
+      messages: [],
+      presentation: {
+        transcript: [
+          { type: 'toolCall', name: 'read', args: { path: 'kept.ts' } },
+          { type: 'text', text: 'kept note' },
+        ],
+        truncated: true,
+        omittedItems: 3,
+      },
+    });
+    const text = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(compact) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    const conflictingLegacyText = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(legacy) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    expect(text).toBe(conflictingLegacyText);
+    expect(text).toContain('[Earlier transcript omitted: 3 items]');
+    expect(text.split('[Earlier transcript omitted: 3 items]').length - 1).toBe(1);
+    expect(text).not.toContain('stale legacy body');
+    expect(text).toContain('kept.ts');
+    expect(text).toContain('kept note');
+    expect(text).toContain('─── Final ───');
+    expect(text).toContain('final answer');
+  });
+
+  it('shows only the omission marker when truncated presentation retains no items', () => {
+    const { context } = makeContext();
+    const compact = singleResult({
+      status: 'completed',
+      task: 'empty retained',
+      finalOutput: 'final only',
+      messages: [],
+      presentation: {
+        transcript: [],
+        truncated: true,
+        omittedItems: 12,
+      },
+    });
+    const text = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(compact) },
+        { expanded: true },
+        theme,
+        context
+      )
+    );
+    expect(text).toContain('[Earlier transcript omitted: 12 items]');
+    expect(text).not.toContain('(no output)');
+    expect(text).toContain('─── Final ───');
+    expect(text).toContain('final only');
+  });
+
   it('truncates long task preview before dropping usage on narrow width', () => {
     const { context } = makeContext();
     const longTask =
@@ -1380,6 +1579,31 @@ describe('renderResult title', () => {
     expect(firstLine).toContain('…');
     expect(firstLine).not.toContain('\u001b[0m');
     expect(firstLine).toContain('34 turns');
+  });
+
+  it('does not inject SGR full-reset when truncating a colored activity line', () => {
+    const { context } = makeContext();
+    const longPath =
+      '/data/repos/my/pi-toolset/packages/pi-agents/very/deeply/nested/long/path/to/a/source/file.ts';
+    const r = singleResult({
+      status: 'running',
+      exitCode: -1,
+      messages: assistantMessages([{ type: 'toolCall', name: 'read', path: longPath }]),
+    });
+    const text = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'run' }], details: singleDetails(r) },
+        { expanded: false, isPartial: true },
+        theme,
+        context
+      ),
+      50
+    );
+    const activityLines = text.split('\n').filter((l) => l.includes('└─'));
+    expect(activityLines).toHaveLength(1);
+    const line = activityLines[0]!;
+    expect(line).toContain('…');
+    expect(line).not.toContain('\u001b[0m');
   });
 
   it('clamps a CJK title to at most 30 terminal columns', async () => {

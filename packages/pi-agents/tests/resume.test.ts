@@ -2,7 +2,7 @@
 // ABOUTME: Uses injected runStep stubs and temp git repos; no real Pi processes are spawned.
 
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -1123,6 +1123,238 @@ describe('inspectResume', () => {
       expect(staged['parallel-0002']!.status).toBe('queued');
       expect(staged['parallel-0002']!.attempt).toBe(1);
       expect(staged['parallel-0002']!.attempts).toHaveLength(0);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Round 8 durable validation preflight safety', () => {
+  async function seedInterruptedRun(tmpRoot: string): Promise<{
+    store: ReturnType<typeof createRunStore>;
+    coordinator: ReturnType<typeof createRunCoordinator>;
+    agent: AgentConfig;
+    runId: string;
+    file: string;
+  }> {
+    const store = createRunStore({ rootDir: tmpRoot });
+    const coordinator = createRunCoordinator({ store });
+    const agent: AgentConfig = {
+      name: 'pi-agent',
+      description: 'pi',
+      systemPrompt: '',
+      source: 'builtin',
+      filePath: '/tmp/pi.md',
+    };
+    const { runId } = await startDurableRunSync(store, coordinator, 'single', 'interrupted', agent);
+    const sessionFile = path.join(tmpRoot, 'session.jsonl');
+    writeFileSync(sessionFile, '{}\n');
+    await store.updateRun(runId, (r) => {
+      r.units.single!.sessionFile = sessionFile;
+      r.units.single!.effectiveCwd = tmpRoot;
+      r.units.single!.attempts = [
+        { attempt: 1, status: 'interrupted', startedAt: 1, finishedAt: 2 },
+      ];
+    });
+    return {
+      store,
+      coordinator,
+      agent,
+      runId,
+      file: path.join(tmpRoot, runId, 'run.json'),
+    };
+  }
+
+  function readRecord(file: string): AgentRunRecordV1 {
+    return JSON.parse(readFileSync(file, 'utf-8')) as AgentRunRecordV1;
+  }
+
+  function writeRecord(file: string, record: AgentRunRecordV1): void {
+    writeFileSync(file, JSON.stringify(record));
+  }
+
+  it('getRun/inspect/preflight reject absent results and malformed chain/outputs without throwing or claiming', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-r8-'));
+    try {
+      const { store, coordinator, agent, runId, file } = await seedInterruptedRun(tmpRoot);
+      const base = readRecord(file);
+
+      const cases: Array<{ label: string; mutate: (r: AgentRunRecordV1) => void; needle: string }> =
+        [
+          {
+            label: 'absent results',
+            mutate: (r) => {
+              delete (r.details as { results?: unknown }).results;
+            },
+            needle: 'details.results must be an array',
+          },
+          {
+            label: 'malformed chain steps',
+            mutate: (r) => {
+              (r.details as { chain: unknown }).chain = { totalSteps: 1, steps: 'nope' };
+            },
+            needle: 'details.chain.steps must be an array',
+          },
+          {
+            label: 'null outputs entry',
+            mutate: (r) => {
+              (r.details as { outputs: unknown }).outputs = { prev: null };
+            },
+            needle: 'details.outputs[prev] must be a non-null object',
+          },
+        ];
+
+      for (const c of cases) {
+        const record = structuredClone(base);
+        c.mutate(record);
+        writeRecord(file, record);
+
+        const loaded = store.getRun(runId);
+        expect(loaded.ok).toBe(false);
+        if (!loaded.ok) {
+          expect(loaded.error.code).toBe('corrupt_run');
+          expect(loaded.error.message).toContain(c.needle);
+        }
+
+        expect(() => inspectResume(runId, store, { agents: [agent] })).not.toThrow();
+        const inspected = inspectResume(runId, store, { agents: [agent] });
+        expect(inspected.ok).toBe(false);
+        if (!inspected.ok) {
+          expect(inspected.reason).toContain(c.needle);
+        }
+
+        const claimed = await preflightAndClaim(runId, {
+          store,
+          coordinator,
+          ctx: {} as never,
+          agents: [agent],
+        });
+        expect(claimed.ok).toBe(false);
+        if (!claimed.ok) {
+          expect(claimed.reason).toContain(c.needle);
+        }
+        const claims = store.inspectClaims(runId);
+        expect(claims.ok).toBe(true);
+        if (claims.ok) {
+          const live = claims.claims.filter((c) => c.terminal === undefined && c.owner);
+          expect(live).toHaveLength(0);
+        }
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects missing/empty/bad effectiveCwd and non-boolean sessionPromptEstablished before fs access', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-r8-cwd-'));
+    try {
+      const { store, coordinator, agent, runId, file } = await seedInterruptedRun(tmpRoot);
+      const base = readRecord(file);
+
+      const cases: Array<{ label: string; mutate: (r: AgentRunRecordV1) => void; needle: string }> =
+        [
+          {
+            label: 'missing effectiveCwd',
+            mutate: (r) => {
+              delete (r.units.single as { effectiveCwd?: unknown }).effectiveCwd;
+            },
+            needle: 'effectiveCwd must be a non-empty string',
+          },
+          {
+            label: 'empty effectiveCwd',
+            mutate: (r) => {
+              r.units.single!.effectiveCwd = '';
+            },
+            needle: 'effectiveCwd must be a non-empty string',
+          },
+          {
+            label: 'numeric effectiveCwd',
+            mutate: (r) => {
+              (r.units.single as { effectiveCwd: unknown }).effectiveCwd = 42;
+            },
+            needle: 'effectiveCwd must be a non-empty string',
+          },
+          {
+            label: 'string sessionPromptEstablished',
+            mutate: (r) => {
+              (r.units.single as { sessionPromptEstablished: unknown }).sessionPromptEstablished =
+                'false';
+            },
+            needle: 'sessionPromptEstablished must be a boolean when present',
+          },
+        ];
+
+      for (const c of cases) {
+        const record = structuredClone(base);
+        c.mutate(record);
+        writeRecord(file, record);
+
+        const loaded = store.getRun(runId);
+        expect(loaded.ok).toBe(false);
+        if (!loaded.ok) {
+          expect(loaded.error.code).toBe('corrupt_run');
+          expect(loaded.error.message).toContain(c.needle);
+        }
+
+        const inspected = inspectResume(runId, store, { agents: [agent] });
+        expect(inspected.ok).toBe(false);
+        if (!inspected.ok) expect(inspected.reason).toContain(c.needle);
+
+        const claimed = await preflightAndClaim(runId, {
+          store,
+          coordinator,
+          ctx: {} as never,
+          agents: [agent],
+        });
+        expect(claimed.ok).toBe(false);
+        if (!claimed.ok) expect(claimed.reason).toContain(c.needle);
+      }
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps explicit false crash-window blocking and accepts valid legacy chain presentation', async () => {
+    const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-r8-ok-'));
+    try {
+      const { store, agent, runId, file } = await seedInterruptedRun(tmpRoot);
+
+      await store.updateRun(runId, (r) => {
+        r.units.single!.sessionPromptEstablished = false;
+      });
+      const crashWindow = inspectResume(runId, store, { agents: [agent] });
+      expect(crashWindow.ok).toBe(true);
+      if (crashWindow.ok) {
+        expect(
+          crashWindow.blockingReasons.some((b) => b.includes('session_prompt_unestablished'))
+        ).toBe(true);
+      }
+
+      const record = readRecord(file);
+      record.details = {
+        ...record.details,
+        mode: 'chain',
+        results: [],
+        outputs: {
+          step1: { text: 'ok', agent: 'pi-agent', step: 1, structured: null },
+        },
+        chain: {
+          totalSteps: 1,
+          steps: [
+            {
+              kind: 'sequential',
+              step: 1,
+              agent: 'pi-agent',
+              task: 'stored task',
+              status: 'interrupted',
+            },
+          ],
+        },
+      };
+      writeRecord(file, record);
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+      expect(() => inspectResume(runId, store, { agents: [agent] })).not.toThrow();
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }

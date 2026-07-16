@@ -14,11 +14,12 @@ import {
   type InteractiveRegistryEvent,
 } from './interactive-agent.ts';
 import { appendContinuationTasks, buildSessionContinuationPrompt } from './invocation.ts';
-import { applyTerminalStatus, getFinalOutput } from './output.ts';
+import { applyTerminalStatus, getResultFinalOutput } from './output.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { emptyUsage } from './empty-usage.ts';
-import { cloneSingleResult, type SingleResult, type SubagentDetails } from './types.ts';
+import { snapshotSingleResult } from './result-snapshot.ts';
+import type { SingleResult, SubagentDetails } from './types.ts';
 
 /** Structured error codes from InteractiveAgentError / GrokAcpClientError / plain {code}. */
 function structuredErrorCode(err: unknown): string | undefined {
@@ -86,13 +87,14 @@ function emitRunningSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  const snapshot = cloneSingleResult(currentResult);
+  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
+  const snapshot = snapshotSingleResult(currentResult);
   snapshot.status = 'running';
   onUpdate({
     content: [
       {
         type: 'text',
-        text: getFinalOutput(snapshot.messages) || '(running...)',
+        text: getResultFinalOutput(snapshot) || '(running...)',
       },
     ],
     details: makeDetails([snapshot]),
@@ -105,13 +107,14 @@ function emitTerminalSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  const snapshot = cloneSingleResult(currentResult);
+  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
+  const snapshot = snapshotSingleResult(currentResult);
   onUpdate({
     content: [
       {
         type: 'text',
         text:
-          getFinalOutput(snapshot.messages) ||
+          getResultFinalOutput(snapshot) ||
           snapshot.errorMessage ||
           snapshot.stderr ||
           (snapshot.status === 'cancelled' ? '(cancelled)' : '(done)'),
@@ -129,10 +132,8 @@ function projectSnapshot(
   // Always copy into a caller-owned mutable array — never alias the registry readonly view,
   // even when baseline is 0. Transcript-only paths skip projectSnapshot entirely.
   const post = snap.messages.slice(baseline) as Message[];
-  currentResult.messages = post;
-  // Count only post-baseline assistant messages for usage/turns.
-  // Derive stopReason only from this snapshot's messages — never seed from currentResult
-  // so a prior activation's terminal state cannot stick across projections.
+  // Count usage/model/stop from the complete post-baseline view first (including tool results),
+  // then retain only assistant messages in the parent live result.
   let turns = 0;
   let input = 0;
   let output = 0;
@@ -142,8 +143,10 @@ function projectSnapshot(
   let contextTokens = 0;
   let model = currentResult.model;
   let stopReason: string | undefined;
+  const assistantOnly: Message[] = [];
   for (const msg of post) {
     if ((msg as { role?: string }).role !== 'assistant') continue;
+    assistantOnly.push(msg);
     turns += 1;
     const usage = (msg as { usage?: Record<string, number> & { cost?: { total?: number } } }).usage;
     if (usage) {
@@ -159,6 +162,7 @@ function projectSnapshot(
       stopReason = (msg as { stopReason?: string }).stopReason;
     }
   }
+  currentResult.messages = assistantOnly;
   currentResult.usage = {
     turns,
     input,

@@ -173,6 +173,36 @@ bypassed for that step (the contract requires JSON-only output).
 | `MAX_FANOUT_ITEMS`   | 8     | Max items expanded from a structured array.   |
 | `MAX_CONCURRENCY`    | 4     | Max concurrent workers (parallel and fanout). |
 
+### Compact result presentation
+
+Parent/durable `SingleResult` values may include additive `presentation`:
+
+| Field                                     | Shape                                                                      |
+| ----------------------------------------- | -------------------------------------------------------------------------- |
+| `presentation.transcript`                 | Ordered assistant text/tool-call display items (excludes final text)       |
+| `presentation.latestActivity`             | Optional explicit latest item when it cannot be derived from `finalOutput` |
+| `presentation.truncated` / `omittedItems` | Either both absent, or `truncated: true` with positive `omittedItems`      |
+
+| Constant                                       | Value   | Meaning                                                                  |
+| ---------------------------------------------- | ------- | ------------------------------------------------------------------------ |
+| `RESULT_PRESENTATION_MAX_BYTES`                | 512 KiB | Total UTF-8 JSON budget for a `presentation` object                      |
+| `RESULT_PRESENTATION_ITEM_MAX_BYTES`           | 64 KiB  | Per display-item budget                                                  |
+| `RESULT_DIAGNOSTIC_MAX_BYTES`                  | 64 KiB  | Bound for `stderr` / `errorMessage` / `errorStack` snapshots             |
+| `RESULT_UPDATE_INTERVAL_MS`                    | 150     | Content-update coalescing interval                                       |
+| `INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES` | 64 KiB  | Agent View per-item bound for non-authoritative payloads                 |
+| `INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES`        | 512 KiB | Warm idle endpoint transcript budget before deferred eviction/compaction |
+
+Expanded rendering prefers `presentation` when present and falls back to legacy
+`messages`. Truncated presentations prepend
+`[Earlier transcript omitted: N items]`. Newly written and actively resumed
+parent/durable results do not store raw child tool-result bodies; inactive
+historical Version 1 records may still hold full legacy messages until active
+resume rewrites them compactly. Reloadable native child sessions may still hold
+raw history, while non-reloadable interactive history is intentionally
+unrecoverable after release. Snapshot ownership is module-private: only payloads
+created by the snapshot/projection helpers are reused via freeze sharing;
+externally frozen values are reprojected and bounded.
+
 `expand.from.output` names a prior step; `path` is a JSON Pointer into its
 structured output. `parallel.task` is rendered with `{item}`. Collected results
 go under `collect.name`; the `structured` value is an array of each worker's
@@ -325,7 +355,7 @@ time; run `pi reload` (or restart) after adding/removing agent files.
 | `error`                   | LLM error propagated with an error message.                                                                                                               |
 | `aborted`                 | User abort (Ctrl+C) killed the subprocess.                                                                                                                |
 | `max_turns`               | Agent exceeded its `maxTurns` budget; child was `SIGTERM`'d. (`grok-acp` does not enforce this.)                                                          |
-| `context_error`           | Context preparation failed before the child started (`prepareAgentContext` / fork or fresh session materialization). Generic throws use `error` instead. |
+| `context_error`           | Context preparation failed before the child started (`prepareAgentContext` / fork or fresh session materialization). Generic throws use `error` instead.  |
 | `cwd_error`               | The requested working directory is missing, inaccessible, or not a directory.                                                                             |
 | `isolation_error`         | Worktree isolation failed before the child started (e.g. not in a git repo).                                                                              |
 | `completion_check`        | Final message is missing a configured `completionCheck` heading. Result stays failed; parent-visible text is the warning plus the unchecked final output. |
@@ -338,9 +368,12 @@ time; run `pi reload` (or restart) after adding/removing agent files.
 ## Limitations
 
 - Collapsed view shows a compact status summary with at most one latest activity
-  per running unit; expand (Ctrl+O) for the full transcript.
-- Parallel model-visible output is capped at 50 KB per task; full results stay
-  in tool details.
+  per running unit; expand (Ctrl+O) for the complete retained/bounded Agent View
+  presentation.
+- Parallel model-visible output is capped at 50 KB per task; full compact results
+  stay in tool details. Raw child-session history is available only for reloadable
+  native sessions (Pi session file or Grok ACP session id); non-reloadable omitted
+  raw history cannot be recovered.
 - Agents are discovered fresh on each invocation (editable mid-session).
 - Parallel mode: max 8 tasks, 4 concurrent.
 - Fanout: max `MAX_FANOUT_ITEMS` (8) items, same concurrency cap as parallel.
@@ -367,7 +400,7 @@ TUI-only navigator for Pi and Grok ACP durable units linked to the active main-s
 | Detail    | Enter           | Pi: `prompt` when idle, `steer` when running. Grok ACP: `prompt` when idle; rejected when running     |
 | Detail    | Alt+Enter       | Pi: `follow_up` when running; `prompt` otherwise. Grok ACP: `prompt` when idle; rejected when running |
 | Detail    | Ctrl+X          | Abort/cancel current child turn only (Pi abort RPC or Grok ACP `session/cancel`)                      |
-| Detail    | Ctrl+O          | Toggle last-15-line preview vs full transcript                                                        |
+| Detail    | Ctrl+O          | Toggle last-15-line preview vs complete retained/bounded Agent View transcript                        |
 | Detail    | Escape          | Return to navigator                                                                                   |
 
 ### Endpoint statuses
@@ -405,18 +438,18 @@ The durable unit stores the matching dual binding under `interactiveBindings[bin
 
 ### Caps and errors
 
-| Cap / error                | Value / meaning                                                |
-| -------------------------- | -------------------------------------------------------------- |
-| Idle transport cap         | 4 idle attached children (LRU detach; Pi RPC or Grok ACP)      |
-| Tool result viewport       | 5 lines and 4 KB displayed (full result kept in child session) |
-| Detail default preview     | Last 15 content lines (fixed; not terminal-row dependent)      |
-| Detail expanded (Ctrl+O)   | Full transcript; collapse restores last 15 at the tail         |
-| Transcript viewport height | Collapsed: 15; expanded: all content lines                     |
-| `blank_message`            | Empty send rejected                                            |
-| `slash_message`            | Child slash commands rejected                                  |
-| `session_busy`             | Another in-process endpoint owns the session file              |
-| `unavailable`              | Binding/host/path/fingerprint/cwd validation failed            |
-| `host_session_mismatch`    | Link host session id ≠ current main session                    |
+| Cap / error                | Value / meaning                                                                                                                    |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Idle transport cap         | 4 idle attached children (LRU detach; Pi RPC or Grok ACP)                                                                          |
+| Tool result viewport       | 5 lines and 4 KB displayed (complete retained/bounded result in Agent View; raw child history only when the session is reloadable) |
+| Detail default preview     | Last 15 content lines (fixed; not terminal-row dependent)                                                                          |
+| Detail expanded (Ctrl+O)   | Complete retained/bounded Agent View transcript; collapse restores last 15 at the tail                                             |
+| Transcript viewport height | Collapsed: 15; expanded: all content lines                                                                                         |
+| `blank_message`            | Empty send rejected                                                                                                                |
+| `slash_message`            | Child slash commands rejected                                                                                                      |
+| `session_busy`             | Another in-process endpoint owns the session file                                                                                  |
+| `unavailable`              | Binding/host/path/fingerprint/cwd validation failed                                                                                |
+| `host_session_mismatch`    | Link host session id ≠ current main session                                                                                        |
 
 ### Scope
 

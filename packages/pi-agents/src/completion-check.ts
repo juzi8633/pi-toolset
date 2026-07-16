@@ -2,7 +2,7 @@
 // ABOUTME: Enforces frontmatter-configured heading checks against final assistant messages.
 
 import type { AgentConfig } from './agents.ts';
-import { getFinalOutput, isFailedResult } from './output.ts';
+import { getResultFinalOutput, isFailedResult } from './output.ts';
 import type { SingleResult } from './types.ts';
 
 export interface CompletionValidation {
@@ -35,7 +35,7 @@ export function validateCompletionOutput(agent: AgentConfig, output: string): Co
  */
 export function enforceCompletionCheck(agent: AgentConfig, result: SingleResult): void {
   if (isFailedResult(result)) return;
-  const finalOutput = result.finalOutput ?? getFinalOutput(result.messages);
+  const finalOutput = getResultFinalOutput(result);
   const validation = validateCompletionOutput(agent, finalOutput);
   if (validation.ok) return;
   const missing = validation.missing.join(', ');

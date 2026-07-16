@@ -14,6 +14,7 @@ import type {
   ResumeCapability,
   WorkflowFanoutState,
 } from './run-types.ts';
+import { snapshotSingleResult } from './result-snapshot.ts';
 import type { ExecutionStatus, SingleResult, SubagentDetails } from './types.ts';
 import { emptyUsage } from './empty-usage.ts';
 
@@ -1309,8 +1310,10 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     result: SingleResult,
     finalStatus: ExecutionStatus | 'interrupted'
   ): void {
-    stampResultMetadata(result, ctx);
-    result.status = finalStatus;
+    // Private compact shell — never mutate the caller-supplied result object.
+    const stored = snapshotSingleResult(result);
+    stampResultMetadata(stored, ctx);
+    stored.status = finalStatus;
     const live = ensureLiveRecord(runId);
     if (!live) return;
     const unit = live.units[ctx.unitId];
@@ -1320,17 +1323,17 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
         // Finalize the running attempt recorded by startUnit with real timestamps.
         last.status = finalStatus;
         last.finishedAt = now();
-        if (result.stopReason !== undefined) last.stopReason = result.stopReason;
-        if (result.errorMessage !== undefined) last.errorMessage = result.errorMessage;
+        if (stored.stopReason !== undefined) last.stopReason = stored.stopReason;
+        if (stored.errorMessage !== undefined) last.errorMessage = stored.errorMessage;
       } else {
         // No running attempt (pre-execution failure or crash recovery).
         recordAttempt(unit, finalStatus, last?.startedAt ?? now(), now(), {
-          stopReason: result.stopReason,
-          errorMessage: result.errorMessage,
+          stopReason: stored.stopReason,
+          errorMessage: stored.errorMessage,
         });
       }
       // Canonical session identity is unit.sessionFile / unit.acpSessionId after
-      // strict first-write. Exact set-or-delete onto result + ctx so a stale ctx
+      // strict first-write. Exact set-or-delete onto stored + ctx so a stale ctx
       // identity cannot survive when the unit has none or a different value.
       // Never first-write identity onto the unit from ctx here.
       const unitSession =
@@ -1338,26 +1341,36 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
           ? unit.sessionFile
           : undefined;
       if (unitSession !== undefined) {
-        result.sessionFile = unitSession;
+        stored.sessionFile = unitSession;
         ctx.sessionFile = unitSession;
       } else {
-        delete result.sessionFile;
+        delete stored.sessionFile;
         delete ctx.sessionFile;
       }
       const unitAcp =
         unit.acpSessionId !== undefined && unit.acpSessionId !== '' ? unit.acpSessionId : undefined;
       if (unitAcp !== undefined) {
-        result.acpSessionId = unitAcp;
+        stored.acpSessionId = unitAcp;
         ctx.acpSessionId = unitAcp;
       } else {
-        delete result.acpSessionId;
+        delete stored.acpSessionId;
         delete ctx.acpSessionId;
       }
       // Canonical unit capability is authoritative for nested/live resume labels.
-      result.resumeCapability = unit.capability;
+      stored.resumeCapability = unit.capability;
       ctx.resumeCapability = unit.capability;
+      // Worktree path is authoritative from the terminal result only. A deleted
+      // clean worktree must clear unit/ctx metadata so resume cannot point at a
+      // missing path persisted earlier by startUnit.
+      if (stored.worktreePath !== undefined && stored.worktreePath.trim() !== '') {
+        unit.worktreePath = stored.worktreePath;
+        ctx.worktreePath = stored.worktreePath;
+      } else {
+        delete unit.worktreePath;
+        delete ctx.worktreePath;
+      }
       unit.status = finalStatus;
-      unit.result = result;
+      unit.result = stored;
     }
     void store
       .appendEvent(runId, {

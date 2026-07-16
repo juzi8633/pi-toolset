@@ -53,10 +53,13 @@ parallel task, chain step, or fanout step to label it in the collapsed summary; 
   concurrent agent tool calls and stops when the result is final, expanded, or
   the session/tree tears down. Completed runs hide activity and final output
   until you expand.
-- **Expanded view** (Ctrl+O): full task text, complete tool/transcript output,
-  final response once, error/worktree/structured-output details when present,
-  and usage. Running expanded rows use the static `⧗` glyph (no continuous
-  invalidate).
+- **Expanded view** (Ctrl+O): complete retained compact presentation plus final
+  output — full task text, bounded assistant/tool-call presentation, final
+  response once, error/worktree/structured-output details when present, and
+  usage. The Agent View transcript is bounded retained history, not a raw dump.
+  Raw/full native child history is available only for reloadable native sessions
+  (Pi `sessionFile` or Grok ACP `session/load`). Running expanded rows use the
+  static `⧗` glyph (no continuous invalidate).
 
 When the agent finishes, its final output is returned to the parent model so it
 can act on the findings.
@@ -71,8 +74,9 @@ Run 2 explores in parallel: one to find models, one to find providers
 
 The parallel collapsed view shows one summary line per task (latest activity
 only under running tasks) and a `Total: n/m completed` footer with aggregate
-usage. Expand with Ctrl+O for full per-task transcripts. Each completed task's
-final output is returned to the parent, capped at 50 KB per task.
+usage. Expand with Ctrl+O for each task's complete retained/bounded Agent View
+presentation plus final output. Each completed task's final output is returned
+to the parent, capped at 50 KB per task.
 
 ## 5. Chain agents together
 

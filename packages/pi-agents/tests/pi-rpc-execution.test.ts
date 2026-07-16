@@ -320,7 +320,9 @@ describe('runSingleAgentPiRpc', () => {
       }
     );
 
-    expect(result.messages.length).toBe(2);
+    // Parent live result retains only post-baseline assistant messages (not user/tool-result).
+    expect(result.messages.length).toBe(1);
+    expect(result.messages[0]?.role).toBe('assistant');
     expect(result.usage.turns).toBe(1);
     expect(result.status === 'completed' || result.exitCode === 0).toBe(true);
   });

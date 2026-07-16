@@ -8,7 +8,7 @@ import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig, Runtime } from './agents.ts';
-import { GROK_ACP_RUNTIME } from './constants.ts';
+import { GROK_ACP_RUNTIME, RESULT_UPDATE_INTERVAL_MS } from './constants.ts';
 import { GrokAcpClientError, runGrokAcpClient } from './grok-acp-client.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
@@ -31,7 +31,7 @@ import {
   getPiInvocation,
   writePromptToTempFile,
 } from './invocation.ts';
-import { applyTerminalStatus, getFinalOutput } from './output.ts';
+import { applyTerminalStatus, getResultFinalOutput } from './output.ts';
 import type { UnitExecutionContext } from './run-coordinator.ts';
 import { buildChildAgentEnv, isAgentDelegationAllowed } from './security.ts';
 import {
@@ -44,7 +44,9 @@ import { ABORT_MESSAGE, AgentAbortError, isAbortError } from './abort.ts';
 import { emptyUsage } from './empty-usage.ts';
 import { runSingleAgentInteractive } from './interactive-execution.ts';
 import { runSingleAgentPiRpc } from './pi-rpc-execution.ts';
-import { cloneSingleResult, type SingleResult, type SubagentDetails } from './types.ts';
+import { snapshotSingleResult } from './result-snapshot.ts';
+import type { SingleResult, SubagentDetails } from './types.ts';
+import { createLatestValueCoalescer } from './update-coalescer.ts';
 
 export { ABORT_MESSAGE, AgentAbortError, getAbortResult, isAbortError } from './abort.ts';
 
@@ -232,13 +234,14 @@ function emitRunningSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  const snapshot = cloneSingleResult(currentResult);
+  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
+  const snapshot = snapshotSingleResult(currentResult);
   snapshot.status = 'running';
   onUpdate({
     content: [
       {
         type: 'text',
-        text: getFinalOutput(snapshot.messages) || '(running...)',
+        text: getResultFinalOutput(snapshot) || '(running...)',
       },
     ],
     details: makeDetails([snapshot]),
@@ -251,13 +254,14 @@ function emitTerminalSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  const snapshot = cloneSingleResult(currentResult);
+  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
+  const snapshot = snapshotSingleResult(currentResult);
   onUpdate({
     content: [
       {
         type: 'text',
         text:
-          getFinalOutput(snapshot.messages) ||
+          getResultFinalOutput(snapshot) ||
           snapshot.errorMessage ||
           snapshot.stderr ||
           (snapshot.status === 'cancelled' ? '(cancelled)' : '(done)'),
@@ -542,41 +546,36 @@ export async function runSingleAgent(
 
         if (evt.type === 'message_end' && evt.message) {
           const msg = evt.message;
-          currentResult.messages.push(msg);
+          // Parent live result retains only assistant messages. Raw tool-result bodies
+          // stay in the child session when a reloadable identity exists; otherwise they
+          // are intentionally released after execution.
+          if (msg.role !== 'assistant') return;
 
-          if (msg.role === 'assistant') {
-            currentResult.usage.turns++;
-            const usage = msg.usage;
-            if (usage) {
-              currentResult.usage.input += usage.input || 0;
-              currentResult.usage.output += usage.output || 0;
-              currentResult.usage.cacheRead += usage.cacheRead || 0;
-              currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-              currentResult.usage.cost += usage.cost?.total || 0;
-              currentResult.usage.contextTokens = usage.totalTokens || 0;
-            }
-            if (!currentResult.model && msg.model) currentResult.model = msg.model;
-            if (!maxTurnsExceeded) {
-              if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-              if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-            }
+          currentResult.messages.push(msg);
+          currentResult.usage.turns++;
+          const usage = msg.usage;
+          if (usage) {
+            currentResult.usage.input += usage.input || 0;
+            currentResult.usage.output += usage.output || 0;
+            currentResult.usage.cacheRead += usage.cacheRead || 0;
+            currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+            currentResult.usage.cost += usage.cost?.total || 0;
+            currentResult.usage.contextTokens = usage.totalTokens || 0;
+          }
+          if (!currentResult.model && msg.model) currentResult.model = msg.model;
+          if (!maxTurnsExceeded) {
+            if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+            if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
           }
           emitUpdate();
 
-          if (
-            msg.role === 'assistant' &&
-            agent.maxTurns &&
-            currentResult.usage.turns >= agent.maxTurns &&
-            !maxTurnsExceeded
-          ) {
+          if (agent.maxTurns && currentResult.usage.turns >= agent.maxTurns && !maxTurnsExceeded) {
             triggerMaxTurns();
           }
         }
 
-        if (evt.type === 'tool_result_end' && evt.message) {
-          currentResult.messages.push(evt.message);
-          emitUpdate();
-        }
+        // tool_result_end is intentionally ignored: raw tool-result bodies are not
+        // retained in the parent live result (see message_end assistant-only path).
       };
 
       proc.stdout.on('data', (data) => {
@@ -706,7 +705,24 @@ async function runSingleAgentGrokAcp(
   };
   stampUnitContext(currentResult, options);
 
-  const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
+  // Initial running update is immediate; subsequent chunk updates are coalesced.
+  // Terminal paths cancel pending content and emit one authoritative snapshot.
+  let sentInitialRunning = false;
+  const contentCoalescer = createLatestValueCoalescer<void>(() => {
+    emitRunningSnapshot(onUpdate, currentResult, makeDetails);
+  }, RESULT_UPDATE_INTERVAL_MS);
+  const emitUpdate = () => {
+    if (!sentInitialRunning) {
+      sentInitialRunning = true;
+      emitRunningSnapshot(onUpdate, currentResult, makeDetails);
+      return;
+    }
+    contentCoalescer.schedule(undefined);
+  };
+  const emitTerminal = () => {
+    contentCoalescer.cancel();
+    emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+  };
 
   // Prefer explicit resumeHadStoredSession so a session ID created during this
   // invocation is not mistaken for a prior stored ACP session.
@@ -861,7 +877,7 @@ async function runSingleAgentGrokAcp(
           }
           const origin = resolveAbortOrigin(signal, options);
           finalizeAborted(currentResult, origin);
-          emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+          emitTerminal();
           throw new AgentAbortError(currentResult, origin);
         }
         if (currentResult.stopReason === 'end') {
@@ -879,6 +895,9 @@ async function runSingleAgentGrokAcp(
         } else if (currentResult.exitCode === 0 && exitCode !== 0) {
           currentResult.exitCode = exitCode;
         }
+        // Discard pending running content; emit one authoritative terminal snapshot.
+        // Terminal state is also returned via the result for durable/parent finalization.
+        emitTerminal();
         return currentResult;
       } catch (err) {
         let certainty: DisposalCertainty;
@@ -967,7 +986,7 @@ async function runSingleAgentGrokAcp(
         }
         const origin = resolveAbortOrigin(signal, options);
         finalizeAborted(currentResult, origin);
-        emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+        emitTerminal();
         throw new AgentAbortError(currentResult, origin);
       }
       applyTerminalStatus(currentResult);
@@ -983,6 +1002,9 @@ async function runSingleAgentGrokAcp(
         heldLease.release();
         heldLease = undefined;
       }
+      // Discard pending running content; emit one authoritative terminal snapshot.
+      // Terminal state is also returned via the result for durable/parent finalization.
+      emitTerminal();
       return currentResult;
     } catch (err) {
       if (heldLease) {
@@ -997,7 +1019,7 @@ async function runSingleAgentGrokAcp(
       if (!(err instanceof AgentAbortError)) {
         const origin = resolveAbortOrigin(signal, options);
         finalizeAborted(currentResult, origin);
-        emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+        emitTerminal();
         throw new AgentAbortError(currentResult, origin);
       }
       throw err;
@@ -1030,7 +1052,7 @@ async function runSingleAgentGrokAcp(
       currentResult.stderr = message;
     }
     applyTerminalStatus(currentResult);
-    emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+    emitTerminal();
     return currentResult;
   }
 }
