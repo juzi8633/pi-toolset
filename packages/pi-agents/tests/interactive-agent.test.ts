@@ -6838,7 +6838,7 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
       intentional: false,
       code: null,
       signal: null,
-      error: { message: 'RPC stdout record exceeded 2 MiB', code: 'stdout_overflow' },
+      error: { message: 'RPC stdout record exceeded 8 MiB', code: 'stdout_overflow' },
     });
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setTimeout(r, 20));

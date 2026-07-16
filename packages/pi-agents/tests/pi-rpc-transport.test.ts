@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import {
   buildUiCancelResponse,
+  PI_RPC_TRANSPORT_EXIT,
   PiRpcTransport,
   PiRpcTransportError,
 } from '../src/pi-rpc-transport.ts';
@@ -101,6 +102,9 @@ async function spawnTransport(
   });
 }
 
+const STDOUT_RECORD_LIMIT_BYTES = 8 * 1024 * 1024;
+const STDOUT_OVERFLOW_MESSAGE = 'RPC stdout record exceeded 8 MiB';
+
 describe('PiRpcTransport framing', () => {
   it('parses multiple LF-delimited records and strips trailing CR', async () => {
     const child = new FakeChild();
@@ -145,31 +149,89 @@ describe('PiRpcTransport framing', () => {
     await transport.dispose();
   });
 
-  it('fails closed when an unterminated record exceeds 2 MiB', async () => {
-    const child = new FakeChild();
-    const transport = await spawnTransport(child);
-    const big = Buffer.alloc(2 * 1024 * 1024 + 100, 0x41);
-    child.pushStdout(big);
-    await new Promise((r) => setImmediate(r));
-    await expect(transport.getState()).rejects.toBeInstanceOf(PiRpcTransportError);
-    await transport.dispose();
-  });
-
-  it('fails closed on a same-chunk terminated oversized record before JSON.parse', async () => {
+  it('accepts a complete record above the former 2 MiB limit', async () => {
     const child = new FakeChild();
     const transport = await spawnTransport(child);
     const events: unknown[] = [];
     transport.subscribe((e) => events.push(e));
 
-    // Complete LF-terminated line larger than 2 MiB in a single chunk must not
-    // reach JSON.parse / event listeners.
-    const oversized = Buffer.alloc(2 * 1024 * 1024 + 50, 0x42);
-    const line = Buffer.concat([Buffer.from('{"type":"x","p":"'), oversized, Buffer.from('"}\n')]);
-    child.pushStdout(line);
+    const payload = 'A'.repeat(2 * 1024 * 1024 + 100);
+    child.pushStdout(`${JSON.stringify({ type: 'large', payload })}\n`);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events).toHaveLength(1);
+    expect((events[0] as { type: string; payload: string }).type).toBe('large');
+    expect((events[0] as { type: string; payload: string }).payload).toHaveLength(payload.length);
+    await transport.dispose();
+  });
+
+  it('accepts a complete record exactly at the 8 MiB limit', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const prefix = '{"type":"boundary","payload":"';
+    const suffix = '"}';
+    const payloadLength = STDOUT_RECORD_LIMIT_BYTES - Buffer.byteLength(prefix + suffix);
+    const line = `${prefix}${'A'.repeat(payloadLength)}${suffix}`;
+    expect(Buffer.byteLength(line)).toBe(STDOUT_RECORD_LIMIT_BYTES);
+
+    child.pushStdout(`${line}\n`);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events).toHaveLength(1);
+    expect((events[0] as { type: string }).type).toBe('boundary');
+    await transport.dispose();
+  });
+
+  it('fails closed when an unterminated record exceeds 8 MiB', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const big = Buffer.alloc(STDOUT_RECORD_LIMIT_BYTES + 1, 0x41);
+    child.pushStdout(big);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: PI_RPC_TRANSPORT_EXIT,
+        error: expect.objectContaining({
+          code: 'stdout_overflow',
+          message: STDOUT_OVERFLOW_MESSAGE,
+        }),
+      })
+    );
+    await transport.dispose();
+  });
+
+  it('fails closed one byte above the 8 MiB limit before JSON.parse', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const prefix = '{"type":"x","payload":"';
+    const suffix = '"}';
+    const payloadLength = STDOUT_RECORD_LIMIT_BYTES + 1 - Buffer.byteLength(prefix + suffix);
+    const line = `${prefix}${'B'.repeat(payloadLength)}${suffix}`;
+    expect(Buffer.byteLength(line)).toBe(STDOUT_RECORD_LIMIT_BYTES + 1);
+
+    child.pushStdout(`${line}\n`);
     await new Promise((r) => setImmediate(r));
 
     expect(events.some((e) => (e as { type?: string }).type === 'x')).toBe(false);
-    await expect(transport.prompt('x')).rejects.toBeInstanceOf(PiRpcTransportError);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: PI_RPC_TRANSPORT_EXIT,
+        error: expect.objectContaining({
+          code: 'stdout_overflow',
+          message: STDOUT_OVERFLOW_MESSAGE,
+        }),
+      })
+    );
     await transport.dispose();
   });
 

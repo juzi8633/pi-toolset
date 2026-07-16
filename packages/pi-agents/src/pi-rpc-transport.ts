@@ -15,7 +15,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent } from '@earendil-works/pi-ai';
 import type { SpawnFn, SpawnedChild } from './execution.ts';
 
-const MAX_STDOUT_RECORD_BYTES = 2 * 1024 * 1024;
+const MAX_STDOUT_RECORD_BYTES = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES = 1 * 1024 * 1024;
 const DEFAULT_KILL_TIMEOUT_MS = 5000;
 const STDERR_TRUNCATION_MARKER = '[stderr truncated]\n';
@@ -287,7 +287,7 @@ export class PiRpcTransport {
       decoder: this.decoder,
       onLine: (line) => this.handleLine(line),
       onOverflow: () => {
-        this.failProtocol('stdout_overflow', 'RPC stdout record exceeded 2 MiB');
+        this.failProtocol('stdout_overflow', 'RPC stdout record exceeded 8 MiB');
       },
       getBuffer: () => this.stdoutBuffer,
       setBuffer: (v, bytes) => {
@@ -618,7 +618,7 @@ function attachStdoutReader(stream: Readable, state: StdoutReaderState): () => v
       if (newlineIndex === -1) break;
       let line = buffer.slice(0, newlineIndex);
       // Byte length of the complete record (before CR strip) — must enforce the
-      // 2 MiB limit before JSON.parse; a same-chunk terminated oversized line
+      // 8 MiB limit before JSON.parse; a same-chunk terminated oversized line
       // must not bypass the incomplete-buffer check below.
       const lineBytes = Buffer.byteLength(line, 'utf8');
       buffer = buffer.slice(newlineIndex + 1);
