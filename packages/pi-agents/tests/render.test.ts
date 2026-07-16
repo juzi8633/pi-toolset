@@ -1349,6 +1349,39 @@ describe('renderResult title', () => {
     expect(text).not.toContain(longTask);
   });
 
+  it('does not inject SGR full-reset when truncating a summary preview', () => {
+    // pi-tui truncateToWidth wraps ellipsis in \x1b[0m, which clears parent toolSuccessBg.
+    const { context } = makeContext();
+    const r = singleResult({
+      status: 'completed',
+      task: 'task',
+      title: 'Map pi-agents snapshot consumption for nested tool results',
+      usage: {
+        ...emptyUsage(),
+        turns: 34,
+        input: 73000,
+        output: 12000,
+        cacheRead: 1300000,
+        contextTokens: 83000,
+      },
+      model: 'deepseek-v4-flash',
+      thinking: 'high',
+    });
+    const text = renderText(
+      renderResult(
+        { content: [{ type: 'text', text: 'done' }], details: singleDetails(r) },
+        { expanded: false },
+        theme,
+        context
+      ),
+      120
+    );
+    const firstLine = text.split('\n')[0] ?? '';
+    expect(firstLine).toContain('…');
+    expect(firstLine).not.toContain('\u001b[0m');
+    expect(firstLine).toContain('34 turns');
+  });
+
   it('clamps a CJK title to at most 30 terminal columns', async () => {
     const { visibleWidth } = await import('@earendil-works/pi-tui');
     const { context } = makeContext();
