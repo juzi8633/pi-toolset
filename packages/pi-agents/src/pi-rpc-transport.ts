@@ -95,6 +95,7 @@ export class PiRpcTransport {
   private disposePromise: Promise<void> | null = null;
   private projector: PiRpcRecordProjector = createPiRpcRecordProjector();
   private stdoutFailed = false;
+  private stdoutFinished = false;
   private readonly options: Required<Pick<PiRpcTransportOptions, 'killTimeoutMs'>> &
     PiRpcTransportOptions;
   private stopStdout: (() => void) | null = null;
@@ -375,15 +376,24 @@ export class PiRpcTransport {
   }
 
   private flushProjector(): void {
-    if (this.stdoutFailed) return;
+    if (this.stdoutFailed || this.stdoutFinished) return;
+    this.stdoutFinished = true;
     try {
       this.handleProjectedRecords(this.projector.finish());
     } catch (err) {
-      this.stdoutFailed = true;
+      // Intentional dispose/kill may leave an incomplete trailing record; match the
+      // pre-projector close path that did not promote incomplete input to a protocol error.
+      if (this.intentionalClose) {
+        this.stdoutFailed = true;
+        return;
+      }
       if (err instanceof PiRpcProjectorError) {
+        if (err.priorRecords.length > 0) this.handleProjectedRecords(err.priorRecords);
+        this.stdoutFailed = true;
         this.failProtocol(err.code, err.message);
         return;
       }
+      this.stdoutFailed = true;
       this.failProtocol(
         'malformed_json',
         err instanceof Error ? err.message : 'Malformed RPC stdout'
@@ -488,6 +498,7 @@ export class PiRpcTransport {
 
   private failProtocol(code: string, message: string): void {
     if (this.exitError) return;
+    this.stdoutFailed = true;
     const error = new PiRpcTransportError(code, message, this.getStderr());
     this.handleProcessFailure(error, { code: null, signal: null });
     // Catch so protocol dispose failures never become unhandled rejections;
@@ -638,21 +649,30 @@ interface StdoutProjectorState {
 }
 
 function attachStdoutProjector(stream: Readable, state: StdoutProjectorState): () => void {
+  const deliverError = (err: unknown): void => {
+    // Deliver already-validated prior records before marking failed so the
+    // transport delivery path is not short-circuited by stdoutFailed.
+    if (err instanceof PiRpcProjectorError && err.priorRecords.length > 0) {
+      state.onRecords(err.priorRecords);
+    }
+    state.markFailed();
+    if (err instanceof PiRpcProjectorError) {
+      state.onProtocolError(err.code, err.message);
+      return;
+    }
+    state.onProtocolError(
+      'malformed_json',
+      err instanceof Error ? err.message : 'Malformed RPC stdout'
+    );
+  };
+
   const onData = (chunk: Buffer | string) => {
     if (state.isFailed()) return;
     try {
       const records = state.push(chunk);
       if (records.length > 0) state.onRecords(records);
     } catch (err) {
-      state.markFailed();
-      if (err instanceof PiRpcProjectorError) {
-        state.onProtocolError(err.code, err.message);
-        return;
-      }
-      state.onProtocolError(
-        'malformed_json',
-        err instanceof Error ? err.message : 'Malformed RPC stdout'
-      );
+      deliverError(err);
     }
   };
 
@@ -662,15 +682,7 @@ function attachStdoutProjector(stream: Readable, state: StdoutProjectorState): (
       const records = state.finish();
       if (records.length > 0) state.onRecords(records);
     } catch (err) {
-      state.markFailed();
-      if (err instanceof PiRpcProjectorError) {
-        state.onProtocolError(err.code, err.message);
-        return;
-      }
-      state.onProtocolError(
-        'malformed_json',
-        err instanceof Error ? err.message : 'Malformed RPC stdout'
-      );
+      deliverError(err);
     }
   };
 

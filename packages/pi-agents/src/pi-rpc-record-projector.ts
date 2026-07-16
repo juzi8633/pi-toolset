@@ -62,11 +62,18 @@ export interface PiRpcRecordProjector {
 
 export class PiRpcProjectorError extends Error {
   readonly code: 'stdout_overflow' | 'malformed_json';
+  /** Complete records already validated in the same push/finish before the failure. */
+  readonly priorRecords: PiRpcProjectedRecord[];
 
-  constructor(code: 'stdout_overflow' | 'malformed_json', message: string) {
+  constructor(
+    code: 'stdout_overflow' | 'malformed_json',
+    message: string,
+    priorRecords: PiRpcProjectedRecord[] = []
+  ) {
     super(message);
     this.name = 'PiRpcProjectorError';
     this.code = code;
+    this.priorRecords = priorRecords;
   }
 }
 
@@ -220,6 +227,14 @@ export function createPiRpcRecordProjector(
     }
   };
 
+  const rethrowWithPrior = (err: unknown, out: PiRpcProjectedRecord[]): never => {
+    failed = true;
+    if (err instanceof PiRpcProjectorError) {
+      throw new PiRpcProjectorError(err.code, err.message, out);
+    }
+    throw err;
+  };
+
   return {
     push(chunk: Buffer | string): PiRpcProjectedRecord[] {
       if (failed) return [];
@@ -228,8 +243,7 @@ export function createPiRpcRecordProjector(
         pushText(decodeChunk(chunk), out);
         return out;
       } catch (err) {
-        failed = true;
-        throw err;
+        throw rethrowWithPrior(err, out);
       }
     },
 
@@ -257,8 +271,7 @@ export function createPiRpcRecordProjector(
         }
         return out;
       } catch (err) {
-        failed = true;
-        throw err;
+        throw rethrowWithPrior(err, out);
       }
     },
   };

@@ -388,4 +388,21 @@ describe('PiRpcRecordProjector classification and projection', () => {
     const out = projectAll([`${line}\n`], smallLimits);
     expect(out[0]).toMatchObject({ kind: 'ordinary', line });
   });
+
+  it('preserves prior complete records when a later same-chunk record fails', () => {
+    const good = JSON.stringify({ type: 'error', message: 'model_context_overflow' });
+    const bad = '{"type":"x","payload":"' + 'P'.repeat(500);
+    const projector = createPiRpcRecordProjector(smallLimits);
+    try {
+      projector.push(`${good}\n${bad}`);
+      throw new Error('expected overflow');
+    } catch (err) {
+      expect(err).toBeInstanceOf(PiRpcProjectorError);
+      const pe = err as PiRpcProjectorError;
+      expect(pe.code).toBe('stdout_overflow');
+      expect(pe.priorRecords).toEqual([
+        { kind: 'ordinary', line: good, bytes: Buffer.byteLength(good) },
+      ]);
+    }
+  });
 });

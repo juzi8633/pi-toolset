@@ -480,6 +480,34 @@ describe('PiRpcTransport framing', () => {
     ]);
     await transport.dispose();
   });
+
+  it('delivers a prior same-chunk record before a later overflow failure', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const good = JSON.stringify({ type: 'error', message: 'model_context_overflow' });
+    const prefix = '{"type":"response","id":"1","payload":"';
+    const suffix = '"}';
+    const payloadLength = STDOUT_RECORD_LIMIT_BYTES + 1 - Buffer.byteLength(prefix + suffix);
+    const bad = `${prefix}${'Z'.repeat(payloadLength)}${suffix}`;
+
+    child.pushStdout(`${good}\n${bad}\n`);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events[0]).toEqual({ type: 'error', message: 'model_context_overflow' });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: PI_RPC_TRANSPORT_EXIT,
+        error: expect.objectContaining({
+          code: 'stdout_overflow',
+          message: STDOUT_OVERFLOW_MESSAGE,
+        }),
+      })
+    );
+    await transport.dispose();
+  });
 });
 
 describe('PiRpcTransport requests', () => {
