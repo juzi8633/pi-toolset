@@ -116,7 +116,10 @@ describe('PiRpcTransport framing', () => {
     child.pushStdout('{"type":"agent_start"}\r\n{"type":"agent_end"}\n');
     await new Promise((r) => setImmediate(r));
 
-    expect(events).toEqual([{ type: 'agent_start' }, { type: 'agent_end' }]);
+    expect(events).toEqual([
+      { type: 'agent_start' },
+      { type: 'agent_end', messages: [], messagesOmitted: true, willRetry: false },
+    ]);
     await transport.dispose();
   });
 
@@ -240,8 +243,13 @@ describe('PiRpcTransport framing', () => {
 
     expect(events).toHaveLength(2);
     expect(events[0]).toEqual(modelError);
-    expect((events[1] as { type: string }).type).toBe('agent_end');
-    expect((events[1] as { messages: unknown[] }).messages).toHaveLength(143);
+    // Transport compactly rewrites every agent_end regardless of size under 8 MiB.
+    expect(events[1]).toEqual({
+      type: 'agent_end',
+      messages: [],
+      messagesOmitted: true,
+      willRetry: false,
+    });
     await transport.dispose();
   });
 
@@ -271,7 +279,10 @@ describe('PiRpcTransport framing', () => {
     const events: unknown[] = [];
     transport.subscribe((e) => events.push(e));
 
-    const big = Buffer.alloc(STDOUT_RECORD_LIMIT_BYTES + 1, 0x41);
+    // Unterminated ordinary JSON (no closing quote/brace/LF) past the 8 MiB budget.
+    const prefix = '{"type":"x","payload":"';
+    const big = prefix + 'A'.repeat(STDOUT_RECORD_LIMIT_BYTES + 1 - Buffer.byteLength(prefix));
+    expect(Buffer.byteLength(big)).toBe(STDOUT_RECORD_LIMIT_BYTES + 1);
     child.pushStdout(big);
     await new Promise((r) => setImmediate(r));
 
@@ -321,6 +332,152 @@ describe('PiRpcTransport framing', () => {
     child.pushStdout('not-json\n');
     await new Promise((r) => setImmediate(r));
     await expect(transport.prompt('x')).rejects.toBeInstanceOf(PiRpcTransportError);
+    await transport.dispose();
+  });
+
+  it('projects a canonical agent_end between 8.2 and 8.3 MiB and stays synchronized', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const targetMin = Math.floor(8.2 * 1024 * 1024);
+    const targetMax = Math.floor(8.3 * 1024 * 1024);
+    const pad = 'P'.repeat(targetMin);
+    let line = JSON.stringify({
+      type: 'agent_end',
+      messages: [{ role: 'assistant', content: pad }],
+      willRetry: false,
+    });
+    // Grow until inside the 8.2–8.3 MiB window.
+    while (Buffer.byteLength(line, 'utf8') < targetMin) {
+      line = JSON.stringify({
+        type: 'agent_end',
+        messages: [
+          { role: 'assistant', content: pad + 'P'.repeat(Buffer.byteLength(line, 'utf8')) },
+        ],
+        willRetry: false,
+      });
+    }
+    // If overshoot, rebuild with exact padding from a measured base.
+    if (Buffer.byteLength(line, 'utf8') > targetMax) {
+      const base = JSON.stringify({
+        type: 'agent_end',
+        messages: [{ role: 'assistant', content: '' }],
+        willRetry: false,
+      });
+      const need = targetMin - Buffer.byteLength(base, 'utf8');
+      line = JSON.stringify({
+        type: 'agent_end',
+        messages: [{ role: 'assistant', content: 'P'.repeat(Math.max(need, 0)) }],
+        willRetry: false,
+      });
+    }
+    const bytes = Buffer.byteLength(line, 'utf8');
+    expect(bytes).toBeGreaterThan(STDOUT_RECORD_LIMIT_BYTES);
+    expect(bytes).toBeGreaterThanOrEqual(targetMin);
+    expect(bytes).toBeLessThanOrEqual(targetMax);
+
+    const follow = JSON.stringify({ type: 'agent_start' });
+    child.pushStdout(`${line}\n${follow}\n`);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events).toHaveLength(2);
+    expect(events[0]).toEqual({
+      type: 'agent_end',
+      messages: [],
+      messagesOmitted: true,
+      willRetry: false,
+    });
+    expect(events[1]).toEqual({ type: 'agent_start' });
+    await transport.dispose();
+  });
+
+  it('projects oversized canonical message/tool/turn shells', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const big = 'X'.repeat(8 * 1024 * 1024 + 1000);
+    const messageEnd = JSON.stringify({
+      type: 'message_end',
+      message: { role: 'assistant', content: big },
+    });
+    const turnEnd = JSON.stringify({
+      type: 'turn_end',
+      message: { role: 'assistant', content: big },
+      toolResults: [],
+    });
+    const toolEnd = JSON.stringify({
+      type: 'tool_execution_end',
+      toolCallId: 'call_9',
+      toolName: 'bash',
+      result: big,
+      isError: false,
+    });
+    expect(Buffer.byteLength(messageEnd, 'utf8')).toBeGreaterThan(STDOUT_RECORD_LIMIT_BYTES);
+
+    child.pushStdout(`${messageEnd}\n${turnEnd}\n${toolEnd}\n`);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events).toEqual([
+      { type: 'message_end', payloadOmitted: true, role: 'assistant' },
+      { type: 'turn_end', payloadOmitted: true },
+      {
+        type: 'tool_execution_end',
+        payloadOmitted: true,
+        toolCallId: 'call_9',
+        toolName: 'bash',
+        isError: false,
+      },
+    ]);
+    await transport.dispose();
+  });
+
+  it('fails ordinary unknown records one byte above 8 MiB', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    const prefix = '{"type":"response","id":"1","payload":"';
+    const suffix = '"}';
+    const payloadLength = STDOUT_RECORD_LIMIT_BYTES + 1 - Buffer.byteLength(prefix + suffix);
+    const line = `${prefix}${'Z'.repeat(payloadLength)}${suffix}`;
+    expect(Buffer.byteLength(line)).toBe(STDOUT_RECORD_LIMIT_BYTES + 1);
+
+    child.pushStdout(`${line}\n`);
+    await new Promise((r) => setImmediate(r));
+
+    expect(events.some((e) => (e as { type?: string }).type === 'response')).toBe(false);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: PI_RPC_TRANSPORT_EXIT,
+        error: expect.objectContaining({
+          code: 'stdout_overflow',
+          message: STDOUT_OVERFLOW_MESSAGE,
+        }),
+      })
+    );
+    await transport.dispose();
+  });
+
+  it('compacts small agent_end regardless of key order', async () => {
+    const child = new FakeChild();
+    const transport = await spawnTransport(child);
+    const events: unknown[] = [];
+    transport.subscribe((e) => events.push(e));
+
+    // Non-canonical key order still delivers a compact shell under 8 MiB.
+    child.pushStdout(
+      '{"willRetry":true,"messages":[{"role":"user","content":"hi"}],"type":"agent_end"}\n'
+    );
+    await new Promise((r) => setImmediate(r));
+
+    expect(events).toEqual([
+      { type: 'agent_end', messages: [], messagesOmitted: true, willRetry: true },
+    ]);
     await transport.dispose();
   });
 });
