@@ -8,7 +8,7 @@ import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig, Runtime } from './agents.ts';
-import { GROK_ACP_RUNTIME } from './constants.ts';
+import { GROK_ACP_RUNTIME, RESULT_UPDATE_INTERVAL_MS } from './constants.ts';
 import { GrokAcpClientError, runGrokAcpClient } from './grok-acp-client.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
@@ -46,6 +46,7 @@ import { runSingleAgentInteractive } from './interactive-execution.ts';
 import { runSingleAgentPiRpc } from './pi-rpc-execution.ts';
 import { snapshotSingleResult } from './result-snapshot.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
+import { createLatestValueCoalescer } from './update-coalescer.ts';
 
 export { ABORT_MESSAGE, AgentAbortError, getAbortResult, isAbortError } from './abort.ts';
 
@@ -704,7 +705,24 @@ async function runSingleAgentGrokAcp(
   };
   stampUnitContext(currentResult, options);
 
-  const emitUpdate = () => emitRunningSnapshot(onUpdate, currentResult, makeDetails);
+  // Initial running update is immediate; subsequent chunk updates are coalesced.
+  // Terminal paths cancel pending content and emit one authoritative snapshot.
+  let sentInitialRunning = false;
+  const contentCoalescer = createLatestValueCoalescer<void>(() => {
+    emitRunningSnapshot(onUpdate, currentResult, makeDetails);
+  }, RESULT_UPDATE_INTERVAL_MS);
+  const emitUpdate = () => {
+    if (!sentInitialRunning) {
+      sentInitialRunning = true;
+      emitRunningSnapshot(onUpdate, currentResult, makeDetails);
+      return;
+    }
+    contentCoalescer.schedule(undefined);
+  };
+  const emitTerminal = () => {
+    contentCoalescer.cancel();
+    emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+  };
 
   // Prefer explicit resumeHadStoredSession so a session ID created during this
   // invocation is not mistaken for a prior stored ACP session.
@@ -859,7 +877,7 @@ async function runSingleAgentGrokAcp(
           }
           const origin = resolveAbortOrigin(signal, options);
           finalizeAborted(currentResult, origin);
-          emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+          emitTerminal();
           throw new AgentAbortError(currentResult, origin);
         }
         if (currentResult.stopReason === 'end') {
@@ -877,6 +895,8 @@ async function runSingleAgentGrokAcp(
         } else if (currentResult.exitCode === 0 && exitCode !== 0) {
           currentResult.exitCode = exitCode;
         }
+        // Deliver any pending content/usage before returning the live result.
+        contentCoalescer.flush();
         return currentResult;
       } catch (err) {
         let certainty: DisposalCertainty;
@@ -965,7 +985,7 @@ async function runSingleAgentGrokAcp(
         }
         const origin = resolveAbortOrigin(signal, options);
         finalizeAborted(currentResult, origin);
-        emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+        emitTerminal();
         throw new AgentAbortError(currentResult, origin);
       }
       applyTerminalStatus(currentResult);
@@ -981,6 +1001,8 @@ async function runSingleAgentGrokAcp(
         heldLease.release();
         heldLease = undefined;
       }
+      // Deliver any pending content/usage before returning the live result.
+      contentCoalescer.flush();
       return currentResult;
     } catch (err) {
       if (heldLease) {
@@ -995,7 +1017,7 @@ async function runSingleAgentGrokAcp(
       if (!(err instanceof AgentAbortError)) {
         const origin = resolveAbortOrigin(signal, options);
         finalizeAborted(currentResult, origin);
-        emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+        emitTerminal();
         throw new AgentAbortError(currentResult, origin);
       }
       throw err;
@@ -1028,7 +1050,7 @@ async function runSingleAgentGrokAcp(
       currentResult.stderr = message;
     }
     applyTerminalStatus(currentResult);
-    emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
+    emitTerminal();
     return currentResult;
   }
 }

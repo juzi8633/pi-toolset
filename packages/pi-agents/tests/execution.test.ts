@@ -737,11 +737,10 @@ describe('runSingleAgentGrokAcp', () => {
     expect(JSON.stringify(result)).not.toContain('maxTurns=1');
     expect(updates.some((u) => u.includes('preamble') || u.includes('Completed'))).toBe(true);
 
-    // Progressive usage: usage_update cost/ctx arrive mid-turn before token breakdown.
-    const midTurn = usageSnapshots.find(
-      (u) => u.cost === 0.01 && u.contextTokens === 42 && u.input === 0 && u.output === 0
-    );
-    expect(midTurn).toBeDefined();
+    // Content/usage chunks are coalesced: intermediate mid-turn snapshots may be dropped,
+    // but the final delivered usage (and authoritative result) remain complete.
+    expect(usageSnapshots.length).toBeGreaterThan(0);
+    expect(usageSnapshots.length).toBeLessThan(50);
     const finalSnap = usageSnapshots[usageSnapshots.length - 1];
     expect(finalSnap).toMatchObject({
       input: 11,

@@ -4,7 +4,8 @@
 import type { Static } from '@earendil-works/pi-ai';
 import type { AgentToolResult, AgentToolUpdateCallback } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig, AgentSource } from './agents.ts';
-import { MAX_CONCURRENCY, MAX_FANOUT_ITEMS } from './constants.ts';
+import { MAX_CONCURRENCY, MAX_FANOUT_ITEMS, RESULT_UPDATE_INTERVAL_MS } from './constants.ts';
+import { createLatestValueCoalescer } from './update-coalescer.ts';
 import {
   ABORT_MESSAGE,
   getAbortResult,
@@ -1125,25 +1126,36 @@ async function runFanoutStep(
     }
   };
 
-  const emitFanout = () => {
+  const emitFanoutSnapshot = () => {
     recount();
     syncSlotsToResults();
-    if (onUpdate) {
-      const done = fanoutMeta.completedCount + fanoutMeta.failedCount;
-      onUpdate({
-        content: [
-          {
-            type: 'text',
-            text: `Fanout: ${done}/${slots.length} done, ${fanoutMeta.runningCount} running, ${fanoutMeta.queuedCount} queued...`,
-          },
-        ],
-        details: buildDetails(),
-      });
+    if (!onUpdate) return;
+    const done = fanoutMeta.completedCount + fanoutMeta.failedCount;
+    onUpdate({
+      content: [
+        {
+          type: 'text',
+          text: `Fanout: ${done}/${slots.length} done, ${fanoutMeta.runningCount} running, ${fanoutMeta.queuedCount} queued...`,
+        },
+      ],
+      details: buildDetails(),
+    });
+  };
+  // Structural fanout transitions are immediate; worker content partials are coalesced.
+  const fanoutContentCoalescer = createLatestValueCoalescer<void>(() => {
+    emitFanoutSnapshot();
+  }, RESULT_UPDATE_INTERVAL_MS);
+  const emitFanout = (mode: 'immediate' | 'content' = 'immediate') => {
+    if (mode === 'content') {
+      fanoutContentCoalescer.schedule(undefined);
+      return;
     }
+    fanoutContentCoalescer.cancel();
+    emitFanoutSnapshot();
   };
 
   recount();
-  emitFanout();
+  emitFanout('immediate');
 
   /** After terminal, ignore late worker onUpdate callbacks. */
   let fanoutTerminal = false;
@@ -1224,7 +1236,7 @@ async function runFanoutStep(
               };
               slots[index] = shell;
               fanoutMeta.latestIndex = index;
-              emitFanout();
+              emitFanout('content');
             }
           : undefined;
 
@@ -1286,6 +1298,8 @@ async function runFanoutStep(
 
   recount();
   syncSlotsToResults();
+  // Never let a stale content timer fire after fanout terminalizes.
+  fanoutContentCoalescer.cancel();
 
   const successCount = slots.filter((r) => resolveExecutionStatus(r) === 'completed').length;
   const cancelledCount = slots.filter((r) => resolveExecutionStatus(r) === 'cancelled').length;

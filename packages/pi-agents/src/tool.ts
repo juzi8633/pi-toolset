@@ -25,7 +25,13 @@ import {
 import { attachErrorStack, classifyEarlyFailureStopReason } from './early-failure.ts';
 import { emptyUsage } from './empty-usage.ts';
 import type { WorkflowFanoutState } from './run-types.ts';
-import { GROK_ACP_RUNTIME, MAX_CONCURRENCY, MAX_PARALLEL_TASKS } from './constants.ts';
+import {
+  GROK_ACP_RUNTIME,
+  MAX_CONCURRENCY,
+  MAX_PARALLEL_TASKS,
+  RESULT_UPDATE_INTERVAL_MS,
+} from './constants.ts';
+import { createLatestValueCoalescer } from './update-coalescer.ts';
 import { enforceCompletionCheck } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
 import { listAvailableSkillNames, resolveSkillNames } from './skills.ts';
@@ -1524,28 +1530,39 @@ async function runParallel(
     };
   });
 
-  const emitParallelUpdate = () => {
-    if (onUpdate) {
-      // Copy-on-write: new array + shell clones; share frozen presentation/structuredOutput.
-      const snapshot = allResults.map(copySnapshotShell);
-      const running = snapshot.filter((r) => resolveExecutionStatus(r) === 'running').length;
-      const done = snapshot.filter((r) => {
-        const s = resolveExecutionStatus(r);
-        return s === 'completed' || s === 'failed' || s === 'cancelled';
-      }).length;
-      onUpdate({
-        content: [
-          {
-            type: 'text',
-            text: `Parallel: ${done}/${snapshot.length} done, ${running} running...`,
-          },
-        ],
-        details: makeDetails('parallel')(snapshot),
-      });
+  const emitParallelSnapshot = () => {
+    if (!onUpdate) return;
+    // Copy-on-write: new array + shell clones; share frozen presentation/structuredOutput.
+    const snapshot = allResults.map(copySnapshotShell);
+    const running = snapshot.filter((r) => resolveExecutionStatus(r) === 'running').length;
+    const done = snapshot.filter((r) => {
+      const s = resolveExecutionStatus(r);
+      return s === 'completed' || s === 'failed' || s === 'cancelled';
+    }).length;
+    onUpdate({
+      content: [
+        {
+          type: 'text',
+          text: `Parallel: ${done}/${snapshot.length} done, ${running} running...`,
+        },
+      ],
+      details: makeDetails('parallel')(snapshot),
+    });
+  };
+  // Structural transitions flush immediately; content/usage partials are coalesced.
+  const contentCoalescer = createLatestValueCoalescer<void>(() => {
+    emitParallelSnapshot();
+  }, RESULT_UPDATE_INTERVAL_MS);
+  const emitParallelUpdate = (mode: 'immediate' | 'content' = 'immediate') => {
+    if (mode === 'content') {
+      contentCoalescer.schedule(undefined);
+      return;
     }
+    contentCoalescer.cancel();
+    emitParallelSnapshot();
   };
 
-  emitParallelUpdate();
+  emitParallelUpdate('immediate');
 
   const makeCancelledSlot = (t: (typeof tasks)[number], index: number): SingleResult => {
     const cancelled = copySnapshotShell(allResults[index]);
@@ -1558,127 +1575,131 @@ async function runParallel(
     return cancelled;
   };
 
-  const results = await mapWithConcurrencyLimit(
-    tasks,
-    MAX_CONCURRENCY,
-    async (t, index) => {
-      // Skip by unit.status / restored completed slot (not lagging details alone).
-      if (resolveExecutionStatus(allResults[index]) === 'completed') {
+  let results: SingleResult[];
+  try {
+    results = await mapWithConcurrencyLimit(
+      tasks,
+      MAX_CONCURRENCY,
+      async (t, index) => {
+        // Skip by unit.status / restored completed slot (not lagging details alone).
+        if (resolveExecutionStatus(allResults[index]) === 'completed') {
+          emitParallelUpdate('immediate');
+          return allResults[index];
+        }
+        const unitCtx = durable?.unitFor(undefined, index, t.agent);
+        {
+          const runningShell = copySnapshotShell(allResults[index]);
+          runningShell.status = 'running';
+          runningShell.exitCode = -1;
+          allResults[index] = runningShell;
+        }
         emitParallelUpdate();
-        return allResults[index];
-      }
-      const unitCtx = durable?.unitFor(undefined, index, t.agent);
-      {
-        const runningShell = copySnapshotShell(allResults[index]);
-        runningShell.status = 'running';
-        runningShell.exitCode = -1;
-        allResults[index] = runningShell;
-      }
-      emitParallelUpdate();
 
-      try {
-        const result = await runStepWithContext(
-          ctx,
-          agents,
-          t.agent,
-          t.task,
-          t.cwd ?? unitCtx?.effectiveCwd,
-          t.isolation,
-          index,
-          undefined,
-          signal,
-          (partial) => {
-            if (partial.details?.results[0]) {
-              const partialResult = partial.details.results[0];
-              const shell = copySnapshotShell(partialResult);
-              shell.status = shell.status ?? 'running';
-              allResults[index] = shell;
-              emitParallelUpdate();
-            }
-          },
-          makeDetails('parallel'),
-          {
-            modelOverride,
-            thinkingOverride,
-            runtimeOverride,
-            title: t.title,
-            ...(interactiveRegistry ? { interactiveRegistry } : {}),
-            ...(spawnFn ? { spawnFn } : {}),
-            ...(durable && unitCtx
-              ? {
-                  unitContext: unitCtx,
-                  getAbortOrigin: () => durable.lifecycle.origin,
-                  stampUnitSessionFile: (sf: string) =>
-                    durable.stampUnitSessionFile(unitCtx.unitId, sf),
-                  beginUnit: durable.beginUnit,
-                  endUnit: durable.endUnit,
-                  ...(durable.markSessionPromptEstablished
-                    ? {
-                        markSessionPromptEstablished: () =>
-                          durable.markSessionPromptEstablished!(unitCtx.unitId),
-                      }
-                    : {}),
-                  ...(durable.persistAcpSessionId
-                    ? {
-                        persistAcpSessionId: (id: string) =>
-                          durable.persistAcpSessionId!(unitCtx.unitId, id),
-                      }
-                    : {}),
-                  ...(durable.resumePromptForUnit
-                    ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
-                    : durable.resume
-                      ? { resumePrompt: durable.resume }
+        try {
+          const result = await runStepWithContext(
+            ctx,
+            agents,
+            t.agent,
+            t.task,
+            t.cwd ?? unitCtx?.effectiveCwd,
+            t.isolation,
+            index,
+            undefined,
+            signal,
+            (partial) => {
+              if (partial.details?.results[0]) {
+                const partialResult = partial.details.results[0];
+                const shell = copySnapshotShell(partialResult);
+                shell.status = shell.status ?? 'running';
+                allResults[index] = shell;
+                emitParallelUpdate('content');
+              }
+            },
+            makeDetails('parallel'),
+            {
+              modelOverride,
+              thinkingOverride,
+              runtimeOverride,
+              title: t.title,
+              ...(interactiveRegistry ? { interactiveRegistry } : {}),
+              ...(spawnFn ? { spawnFn } : {}),
+              ...(durable && unitCtx
+                ? {
+                    unitContext: unitCtx,
+                    getAbortOrigin: () => durable.lifecycle.origin,
+                    stampUnitSessionFile: (sf: string) =>
+                      durable.stampUnitSessionFile(unitCtx.unitId, sf),
+                    beginUnit: durable.beginUnit,
+                    endUnit: durable.endUnit,
+                    ...(durable.markSessionPromptEstablished
+                      ? {
+                          markSessionPromptEstablished: () =>
+                            durable.markSessionPromptEstablished!(unitCtx.unitId),
+                        }
                       : {}),
-                  ...(durable.markContinuationDelivered
-                    ? {
-                        markContinuationDelivered: durable.markContinuationDelivered,
-                      }
-                    : {}),
-                  ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
-                }
-              : {}),
+                    ...(durable.persistAcpSessionId
+                      ? {
+                          persistAcpSessionId: (id: string) =>
+                            durable.persistAcpSessionId!(unitCtx.unitId, id),
+                        }
+                      : {}),
+                    ...(durable.resumePromptForUnit
+                      ? { resumePrompt: durable.resumePromptForUnit(unitCtx.unitId) }
+                      : durable.resume
+                        ? { resumePrompt: durable.resume }
+                        : {}),
+                    ...(durable.markContinuationDelivered
+                      ? {
+                          markContinuationDelivered: durable.markContinuationDelivered,
+                        }
+                      : {}),
+                    ...(durable.projectCwd ? { projectCwd: durable.projectCwd } : {}),
+                  }
+                : {}),
+            }
+          );
+          // Always store a private compact shell; never alias the returned endUnit object.
+          let stored = snapshotSingleResult(result);
+          if (!stored.status || stored.status === 'running') {
+            const working = cloneSingleResult(stored);
+            applyTerminalStatus(working);
+            stored = snapshotSingleResult(working);
           }
-        );
-        // Always store a private compact shell; never alias the returned endUnit object.
-        let stored = snapshotSingleResult(result);
-        if (!stored.status || stored.status === 'running') {
-          const working = cloneSingleResult(stored);
-          applyTerminalStatus(working);
-          stored = snapshotSingleResult(working);
-        }
-        allResults[index] = stored;
-        emitParallelUpdate();
-        return stored;
-      } catch (err) {
-        if (isAbortError(err)) {
-          const fromErr = getAbortResult(err);
-          let cancelled: SingleResult;
-          if (fromErr) {
-            cancelled = copySnapshotShell(fromErr);
-            cancelled.status = 'cancelled';
-            cancelled.stopReason = fromErr.stopReason ?? 'aborted';
-          } else {
-            cancelled = makeCancelledSlot(t, index);
-          }
-          if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
-          allResults[index] = cancelled;
+          allResults[index] = stored;
           emitParallelUpdate();
-          return cancelled;
+          return stored;
+        } catch (err) {
+          if (isAbortError(err)) {
+            const fromErr = getAbortResult(err);
+            let cancelled: SingleResult;
+            if (fromErr) {
+              cancelled = copySnapshotShell(fromErr);
+              cancelled.status = 'cancelled';
+              cancelled.stopReason = fromErr.stopReason ?? 'aborted';
+            } else {
+              cancelled = makeCancelledSlot(t, index);
+            }
+            if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
+            allResults[index] = cancelled;
+            emitParallelUpdate();
+            return cancelled;
+          }
+          throw err;
         }
-        throw err;
-      }
-    },
-    {
-      signal,
-      onUnstarted: (t, index) => {
-        const cancelled = makeCancelledSlot(t, index);
-        allResults[index] = cancelled;
-        return cancelled;
       },
-    }
-  );
-
-  emitParallelUpdate();
+      {
+        signal,
+        onUnstarted: (t, index) => {
+          const cancelled = makeCancelledSlot(t, index);
+          allResults[index] = cancelled;
+          return cancelled;
+        },
+      }
+    );
+  } finally {
+    contentCoalescer.cancel();
+  }
+  emitParallelUpdate('immediate');
 
   const successCount = results.filter((r) => !isFailedResult(r)).length;
   const cancelledCount = results.filter((r) => resolveExecutionStatus(r) === 'cancelled').length;
