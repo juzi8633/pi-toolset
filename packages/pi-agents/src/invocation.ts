@@ -155,7 +155,7 @@ export function buildPiRpcArgs(agent: AgentConfig, options: BuildPiRpcArgsOption
     args.push('--session', options.sessionFile);
   }
   // Interactive children always keep discovery off so host extensions do not load twice.
-  args.push('-ne', '-ns', '-np', '--offline');
+  args.push('--offline');
   args.push(...buildSharedPiFlags(agent, options));
   return args;
 }

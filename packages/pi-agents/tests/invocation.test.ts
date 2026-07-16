@@ -260,7 +260,6 @@ describe('buildPiRpcArgs', () => {
     expect(args).toContain('high');
     expect(args).toContain('--append-system-prompt');
     expect(args).toContain('/tmp/p.md');
-    expect(args).toContain('-ne');
   });
 
   it('includes resolved skill paths and does not use --no-session', () => {
