@@ -165,6 +165,7 @@ Run records contain prompts, compact assistant presentation, outputs, cwd paths,
 - [How-to guides](./docs/how-to.md) - parallel runs, chains, structured output, fanout, resume, worktree isolation, slash commands, background agents, Grok runtimes
 - [Reference](./docs/reference.md) - frontmatter fields, config overrides, tool modes, durable runs, bundled agents, `stopReason` values, environment variables
 - [Explanation](./docs/explanation.md) - security model, nesting control, durable fanout expansion, fork context, package-agent discovery, Grok runtimes
+- [中文测试说明：Reduced-heap soak](./docs/reduced-heap-soak-test.zh-cn.md) - 在 512 MiB V8 old-space 上限下验证混合 agent、fanout、interruption 和 resume
 
 ## Bundled agents
 
