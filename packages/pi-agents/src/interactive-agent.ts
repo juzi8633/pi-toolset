@@ -9,7 +9,12 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig, AgentScope, Runtime } from './agents.ts';
 import { discoverAgents } from './agents.ts';
-import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
+import {
+  DEFAULT_RUNTIME,
+  GROK_ACP_RUNTIME,
+  INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES,
+  INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES,
+} from './constants.ts';
 import { getPiInvocation, buildPiRpcArgs, writePromptToTempFile } from './invocation.ts';
 import {
   isPiRpcTransportExitEvent,
@@ -195,6 +200,13 @@ export interface InteractiveAgentEndpoint {
    */
   transcriptHydrated: boolean;
   /**
+   * Internal per-message UTF-8 JSON sizes for finalizedMessagesView accounting.
+   * Not exposed on public snapshots.
+   */
+  finalizedMessageBytes?: number[];
+  /** Cached sum of finalizedMessageBytes (JSON array body without brackets/commas). */
+  finalizedMessagesBytes?: number;
+  /**
    * Live-process-only: initial registration accepted a planned session path that
    * did not exist yet. Reopen revalidation may re-accept that missing path.
    * Cleared once the file appears. Never set for trusted restore links.
@@ -230,6 +242,8 @@ export type InteractiveEndpointSnapshot = Omit<
   | 'transportGeneration'
   | 'transcriptHydrated'
   | 'allowPlannedMissingSession'
+  | 'finalizedMessageBytes'
+  | 'finalizedMessagesBytes'
 > & {
   /** Read-only finalized messages; consumers must not push or mutate nested content. */
   messages: readonly AgentMessage[];
@@ -388,12 +402,105 @@ function freezeDeep<T>(value: T): T {
   return Object.freeze(value);
 }
 
+function utf8JsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let end = Math.min(value.length, maxBytes);
+  let slice = value.slice(0, end);
+  while (end > 0 && Buffer.byteLength(slice, 'utf8') > maxBytes) {
+    end -= 1;
+    slice = value.slice(0, end);
+  }
+  return slice;
+}
+
+function boundStringField(value: string, label: string): string {
+  const original = Buffer.byteLength(value, 'utf8');
+  if (original <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return value;
+  const marker = `\n\n[${label} truncated: ${original} bytes omitted; inspect child session history]`;
+  const budget = Math.max(
+    0,
+    INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES - Buffer.byteLength(marker, 'utf8')
+  );
+  return `${truncateUtf8(value, budget)}${marker}`;
+}
+
+function boundUnknownPayload(value: unknown, label: string): unknown {
+  const size = utf8JsonBytes(value);
+  if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return value;
+  return {
+    _omitted: true,
+    omittedBytes: size,
+    message: `${label} exceeded interactive budget; inspect child session history.`,
+  };
+}
+
 /**
- * Isolate one message for the shared finalized view: clone once then deep-freeze.
+ * Project a native message for in-memory Agent View retention.
+ * Clones first so the native session/event object remains raw and untouched.
+ * Authoritative assistant text is preserved; non-authoritative payloads are bounded.
+ */
+function projectFinalizedMessage(msg: AgentMessage): AgentMessage {
+  const projected = structuredClone(msg) as AgentMessage & Record<string, unknown>;
+  const role = (projected as { role?: string }).role;
+  if (role === 'assistant') {
+    const content = (projected as { content?: unknown }).content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!part || typeof part !== 'object') continue;
+        const p = part as Record<string, unknown>;
+        if (p.type === 'thinking' && typeof p.thinking === 'string') {
+          p.thinking = boundStringField(p.thinking, 'thinking');
+        } else if (p.type === 'toolCall' && p.arguments !== undefined) {
+          p.arguments = boundUnknownPayload(p.arguments, 'tool-call arguments');
+        }
+        // text parts are authoritative — keep complete.
+      }
+    }
+  } else if (role === 'toolResult' || role === 'user' || role === 'custom') {
+    const content = (projected as { content?: unknown }).content;
+    if (typeof content === 'string') {
+      (projected as { content: string }).content = boundStringField(content, `${role} content`);
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!part || typeof part !== 'object') continue;
+        const p = part as Record<string, unknown>;
+        if (typeof p.text === 'string') p.text = boundStringField(p.text, `${role} text`);
+        if (p.type === 'text' && typeof p.text === 'string') {
+          p.text = boundStringField(p.text, `${role} text`);
+        }
+      }
+    }
+    if ((projected as { details?: unknown }).details !== undefined) {
+      (projected as { details: unknown }).details = boundUnknownPayload(
+        (projected as { details: unknown }).details,
+        `${role} details`
+      );
+    }
+  }
+  return projected;
+}
+
+/** Exact UTF-8 JSON-array size including brackets and commas. */
+function finalizedTranscriptArrayBytes(messageBytes: number[]): number {
+  const n = messageBytes.length;
+  return 2 + messageBytes.reduce((a, b) => a + b, 0) + Math.max(0, n - 1);
+}
+
+function recomputeFinalizedBytes(ep: InteractiveAgentEndpoint): void {
+  ep.finalizedMessageBytes = ep.finalizedMessagesView.map((m) => utf8JsonBytes(m));
+  ep.finalizedMessagesBytes = (ep.finalizedMessageBytes ?? []).reduce((a, b) => a + b, 0);
+}
+
+/**
+ * Isolate one message for the shared finalized view: project, clone, freeze.
  * Call only on message_end / hydrate / restore — never per delta.
  */
 function isolateFinalizedMessage(msg: AgentMessage): AgentMessage {
-  return freezeDeep(structuredClone(msg));
+  return freezeDeep(projectFinalizedMessage(msg));
 }
 
 /** Build a frozen readonly array of isolated finalized messages. */
@@ -414,15 +521,95 @@ function replaceFinalizedMessages(
   ep.messages = view;
   ep.finalizedMessagesView = view;
   ep.messagesRevision += 1;
+  recomputeFinalizedBytes(ep);
 }
 
-/** Append one finalized message (clone+freeze once) and publish a new readonly array. */
+/** Append one finalized message (project+clone+freeze once) and publish a new readonly array. */
 function appendFinalizedMessage(ep: InteractiveAgentEndpoint, msg: AgentMessage): void {
   const frozen = isolateFinalizedMessage(msg);
+  const bytes = utf8JsonBytes(frozen);
   const view = Object.freeze([...ep.finalizedMessagesView, frozen]);
   ep.messages = view;
   ep.finalizedMessagesView = view;
   ep.messagesRevision += 1;
+  ep.finalizedMessageBytes = [...(ep.finalizedMessageBytes ?? []), bytes];
+  ep.finalizedMessagesBytes = (ep.finalizedMessagesBytes ?? 0) + bytes;
+}
+
+/** Drop in-memory transcript after settled subscribers have observed it. */
+function evictFinalizedTranscript(ep: InteractiveAgentEndpoint): void {
+  ep.messages = EMPTY_FINALIZED;
+  ep.finalizedMessagesView = EMPTY_FINALIZED;
+  ep.finalizedMessageBytes = [];
+  ep.finalizedMessagesBytes = 0;
+  ep.messagesRevision += 1;
+  ep.streamingMessage = undefined;
+  ep.activeTools = new Map();
+  ep.streamRevision += 1;
+  ep.transcriptHydrated = false;
+}
+
+function endpointHasReloadableIdentity(ep: InteractiveAgentEndpoint): boolean {
+  if (ep.sessionFile && ep.sessionFile.trim() !== '') return true;
+  const art = ep.sessionArtifact;
+  if (!art) return false;
+  if (art.runtime === 'pi' && art.sessionFile.trim() !== '') return true;
+  if (art.runtime === 'grok-acp' && art.sessionId.trim() !== '') return true;
+  return false;
+}
+
+function maybeScheduleIdleTranscriptEviction(
+  ep: InteractiveAgentEndpoint,
+  detachFn: (key: string, opts?: { evictTranscript?: boolean }) => Promise<void>
+): void {
+  if (ep.status === 'starting' || ep.status === 'running') return;
+  if (ep.activation && !ep.activation.settled) return;
+  const total = finalizedTranscriptArrayBytes(ep.finalizedMessageBytes ?? []);
+  if (total <= INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES) return;
+  // Defer so activation_settled consumers observe the pre-eviction snapshot first.
+  queueMicrotask(() => {
+    if (ep.status === 'starting' || ep.status === 'running') return;
+    if (ep.activation && !ep.activation.settled) return;
+    if (endpointHasReloadableIdentity(ep)) {
+      void detachFn(ep.key, { evictTranscript: true }).catch(() => undefined);
+      return;
+    }
+    // Non-reloadable: compact in place rather than full eviction.
+    compactNonReloadableTranscript(ep);
+  });
+}
+
+function compactNonReloadableTranscript(ep: InteractiveAgentEndpoint): void {
+  const msgs = [...ep.finalizedMessagesView];
+  if (msgs.length === 0) return;
+  let latestAssistantIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if ((msgs[i] as { role?: string }).role === 'assistant') {
+      latestAssistantIdx = i;
+      break;
+    }
+  }
+  const marker = (role: string) =>
+    freezeDeep({
+      role,
+      content: [
+        {
+          type: 'text',
+          text: '[Earlier history omitted: non-reloadable endpoint exceeded retention budget]',
+        },
+      ],
+    }) as AgentMessage;
+  for (let i = 0; i < msgs.length; i++) {
+    if (i === latestAssistantIdx) continue;
+    const role = ((msgs[i] as { role?: string }).role ?? 'user') as string;
+    msgs[i] = marker(role);
+  }
+  const view = Object.freeze(msgs);
+  ep.messages = view;
+  ep.finalizedMessagesView = view;
+  ep.messagesRevision += 1;
+  recomputeFinalizedBytes(ep);
+  ep.transcriptHydrated = true;
 }
 
 /**
@@ -1787,6 +1974,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         // Only mark hydrated when memory is authoritative. Non-empty fork/resume
         // session history must hydrate on get/detail/activate, not stay empty forever.
         transcriptHydrated: false,
+        finalizedMessageBytes: [],
+        finalizedMessagesBytes: 0,
         lastUsedAt: createdAt,
         createdAt,
         linkCreatedAt: createdAt,
@@ -2286,6 +2475,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       transportGeneration: 0,
       // Not authoritative empty — trusted restore may hydrate real history.
       transcriptHydrated: false,
+      finalizedMessageBytes: [],
+      finalizedMessagesBytes: 0,
       lastUsedAt: now(),
       createdAt: link.createdAt,
       linkCreatedAt: link.createdAt,
@@ -2482,6 +2673,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         followUpQueue: [],
         transportGeneration: 0,
         transcriptHydrated: false,
+        finalizedMessageBytes: [],
+        finalizedMessagesBytes: 0,
         lastUsedAt: now(),
         createdAt: link.createdAt,
         linkCreatedAt: link.createdAt,
@@ -2577,6 +2770,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       snapshot: snapshotOf(ep),
     });
     ep.activation = undefined;
+    maybeScheduleIdleTranscriptEviction(ep, detach);
   }
 
   function handleUnexpectedTransportExit(ep: InteractiveAgentEndpoint, message: string): void {
@@ -3833,7 +4027,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
    */
   async function detach(
     key: string,
-    options: { remove?: boolean; activationId?: string } = {}
+    options: { remove?: boolean; activationId?: string; evictTranscript?: boolean } = {}
   ): Promise<void> {
     const ep = endpoints.get(key);
     if (!ep) return;
@@ -3869,6 +4063,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         key,
         new InteractiveAgentError('rejected', 'Transport generation superseded')
       );
+      // Drop idle client / start dispose before clearing the transcript view.
       if (ready) {
         void noteReadyDispose(key, sessionFile, ready);
       }
@@ -3886,6 +4081,13 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       outboundPoisonByKey.delete(key);
       if (current.status !== 'unavailable' && current.status !== 'error') {
         current.status = 'detached';
+      }
+      if (options.evictTranscript !== false) {
+        // Default: detach also releases the in-memory transcript when oversized or requested.
+        const total = finalizedTranscriptArrayBytes(current.finalizedMessageBytes ?? []);
+        if (options.evictTranscript === true || total > INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES) {
+          evictFinalizedTranscript(current);
+        }
       }
       if (options.remove) {
         releaseSessionFile(key, current.sessionFile);
@@ -3906,7 +4108,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     while (idle.length > idleLimit) {
       const victim = idle.shift();
       if (!victim) break;
-      await detach(victim.key);
+      await detach(victim.key, { evictTranscript: true });
     }
   }
 

@@ -16,6 +16,11 @@ export const RESULT_DIAGNOSTIC_MAX_BYTES = 64 * 1024;
 /** Parent content-update coalescing interval (matches TUI spinner cadence). */
 export const RESULT_UPDATE_INTERVAL_MS = 150;
 
+/** Per non-authoritative interactive message payload cap (thinking/tool args/results). */
+export const INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES = 64 * 1024;
+/** Total warm idle endpoint transcript budget before eviction/rehydration. */
+export const INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES = 512 * 1024;
+
 export const PI_AGENT_CHILD = 'PI_AGENT_CHILD';
 export const PI_AGENT_DEPTH = 'PI_AGENT_DEPTH';
 export const PI_AGENT_MAX_DEPTH = 'PI_AGENT_MAX_DEPTH';
