@@ -315,12 +315,22 @@ interface RenderResultInput {
 /** Max terminal columns for collapsed-summary title / task preview. */
 const TITLE_MAX_COLUMNS = 30;
 
+/**
+ * Truncate display text without pi-tui's SGR full-reset (`\x1b[0m`) around the
+ * ellipsis. That reset also clears parent background colors from the tool-result
+ * box, so truncated summary lines would lose `toolSuccessBg` from `…` onward.
+ */
+function truncateDisplayToWidth(text: string, maxColumns: number, ellipsis = '…'): string {
+  if (maxColumns <= 0) return '';
+  return truncateToWidth(text, maxColumns, ellipsis).replace(/\x1b\[0m/g, '');
+}
+
 /** Clamp a value to at most `maxColumns` terminal columns, ellipsis included. */
 function clampToWidth(value: string | undefined, maxColumns: number): string {
   if (value === undefined) return '';
   const trimmed = value.trim();
   if (!trimmed) return '';
-  return truncateToWidth(trimmed, maxColumns, '…');
+  return truncateDisplayToWidth(trimmed, maxColumns);
 }
 
 /** Like clampToWidth but returns undefined when blank, so callers can fall back. */
@@ -416,7 +426,7 @@ function formatActivityLine(
 
 /** Truncate a collapsed activity line to the available width (ANSI-safe, single `…`). */
 function fitActivityLine(line: string, width: number): string {
-  return width > 0 ? truncateToWidth(line, width, '…') : line;
+  return width > 0 ? truncateDisplayToWidth(line, width) : line;
 }
 
 interface SummaryParts {
@@ -445,7 +455,7 @@ function formatSummaryLine(parts: SummaryParts, width: number, theme: Theme): st
       parts.titlePreview || clampToWidth(parts.task.replace(/\s+/g, ' '), TITLE_MAX_COLUMNS);
     if (!preview) return '';
     if (visibleWidth(preview) <= budget) return preview;
-    return truncateToWidth(preview, budget, '…');
+    return truncateDisplayToWidth(preview, budget);
   };
 
   const fixedWithoutTask = `${parts.glyph} ${parts.label}${progressPart}${usagePart}`;
