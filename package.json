@@ -27,7 +27,7 @@
   },
   "pi": {
     "extensions": [
-      "packages/*/dist/index.js"
+      "packages/*/src/index.ts"
     ],
     "prompts": [
       "packages/*/prompts"
