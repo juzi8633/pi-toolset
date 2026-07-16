@@ -279,8 +279,7 @@ Call the agent tool exactly once using this parallel request. Do not modify file
     {"agent":"explore","title":"inspect updates","task":"Read-only: inspect update coalescing and tests using several tools; summarize."},
     {"agent":"explore","title":"inspect interactive","task":"Read-only: inspect interactive transcript retention and tests using several tools; summarize."}
   ],
-  "title": "memory soak parallel",
-  "concurrency": 4
+  "title": "memory soak parallel"
 }
 ```
 

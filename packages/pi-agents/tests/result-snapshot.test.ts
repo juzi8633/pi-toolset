@@ -188,6 +188,23 @@ describe('snapshotSingleResult isolation and idempotence', () => {
     expect(second).not.toBe(first);
   });
 
+  it('is idempotent for primitive structuredOutput without WeakSet ownership', () => {
+    for (const structured of ['ok', 42, true, null, undefined] as const) {
+      const live = baseResult({
+        messages: [assistantText(`out-${String(structured)}`)],
+        ...(structured === undefined ? {} : { structuredOutput: structured }),
+      });
+      const first = snapshotSingleResult(live);
+      expect(first.structuredOutput).toBe(structured);
+      const second = snapshotSingleResult(first);
+      // Fast path: new shell, shared owned presentation, same primitive structuredOutput.
+      expect(second).not.toBe(first);
+      expect(second.presentation).toBe(first.presentation);
+      expect(second.structuredOutput).toBe(first.structuredOutput);
+      expect(second.finalOutput).toBe(first.finalOutput);
+    }
+  });
+
   it('copySnapshotShell shares frozen payloads and clones shell fields', () => {
     const snap = snapshotSingleResult(
       baseResult({
@@ -209,6 +226,94 @@ describe('snapshotSingleResult isolation and idempotence', () => {
     expect(snap.usage.turns).toBe(0);
     expect(snap.fanout?.index).toBe(1);
     expect(snap.worktreeChangedFiles).toEqual(['x.ts']);
+  });
+
+  it('copySnapshotShell reprojects externally frozen presentation and unowned structured payloads', () => {
+    const hugeText = 'H'.repeat(RESULT_PRESENTATION_ITEM_MAX_BYTES + 2048);
+    const externalPresentation = Object.freeze({
+      transcript: Object.freeze([
+        Object.freeze({ type: 'text' as const, text: hugeText }),
+        Object.freeze({
+          type: 'toolCall' as const,
+          name: 'bash',
+          args: Object.freeze({ blob: 'Q'.repeat(RESULT_PRESENTATION_ITEM_MAX_BYTES + 512) }),
+        }),
+      ]),
+    });
+    const externalStructured = Object.freeze({ nested: Object.freeze({ value: 'orig' }) });
+    const unowned = baseResult({
+      messages: [],
+      finalOutput: 'done',
+      presentation: externalPresentation as never,
+      structuredOutput: externalStructured as never,
+    });
+
+    const shell = copySnapshotShell(unowned);
+    expect(shell.presentation).not.toBe(externalPresentation);
+    expect(shell.structuredOutput).not.toBe(externalStructured);
+    expect(shell.structuredOutput).toEqual({ nested: { value: 'orig' } });
+    const textItem = shell.presentation!.transcript.find((i) => i.type === 'text') as Extract<
+      DisplayItem,
+      { type: 'text' }
+    >;
+    expect(textItem.text).toContain('bytes omitted');
+    expect(Buffer.byteLength(JSON.stringify(textItem), 'utf8')).toBeLessThanOrEqual(
+      RESULT_PRESENTATION_ITEM_MAX_BYTES
+    );
+
+    // Deep-frozen external presentation through copySnapshotShell must not share identity.
+    const deepFrozen = Object.freeze({
+      ...unowned,
+      presentation: externalPresentation,
+      structuredOutput: externalStructured,
+      usage: Object.freeze({ ...unowned.usage }),
+    }) as SingleResult;
+    const deepShell = copySnapshotShell(deepFrozen);
+    expect(deepShell.presentation).not.toBe(externalPresentation);
+    expect(deepShell.structuredOutput).not.toBe(externalStructured);
+  });
+
+  it('owned snapshot shell re-bounds oversized diagnostics on copy and resnapshot', () => {
+    const owned = snapshotSingleResult(
+      baseResult({
+        messages: [assistantText('ok')],
+        stderr: 'small',
+        errorMessage: 'small-msg',
+        errorStack: 'small-stack',
+      })
+    );
+    const huge = 'D'.repeat(RESULT_DIAGNOSTIC_MAX_BYTES + 4096);
+    // Mutate top-level diagnostic strings on the owned shell (shell fields are not frozen).
+    owned.stderr = `HEAD-${huge}-TAIL`;
+    owned.errorMessage = `MSG-${huge}`;
+    owned.errorStack = `STACK-${huge}`;
+
+    const copied = copySnapshotShell(owned);
+    expect(copied.presentation).toBe(owned.presentation);
+    expect(Buffer.byteLength(copied.stderr, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
+    expect(copied.stderr).toContain('TAIL');
+    expect(copied.stderr).toContain('bytes omitted');
+    expect(Buffer.byteLength(copied.errorMessage!, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
+    expect(copied.errorMessage).toContain('MSG-');
+    expect(Buffer.byteLength(copied.errorStack!, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
+
+    const resnap = snapshotSingleResult(owned);
+    expect(resnap.presentation).toBe(owned.presentation);
+    expect(Buffer.byteLength(resnap.stderr, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
+    expect(Buffer.byteLength(resnap.errorMessage!, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
+    expect(Buffer.byteLength(resnap.errorStack!, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
   });
 
   it('snapshotResults preserves order', () => {
@@ -386,6 +491,64 @@ describe('snapshotSingleResult size and caps', () => {
     if (snap.presentation && 'truncated' in snap.presentation) {
       expect(snap.presentation.omittedItems).toBeGreaterThanOrEqual(5);
     }
+  });
+
+  it('does not treat externally frozen oversized compact-looking data as owned', () => {
+    const hugeText = 'H'.repeat(RESULT_PRESENTATION_ITEM_MAX_BYTES + 4096);
+    const hugeDiag = 'D'.repeat(RESULT_DIAGNOSTIC_MAX_BYTES + 2048);
+    const structured = Object.freeze({ nested: Object.freeze({ value: 'orig' }) });
+    const presentation = Object.freeze({
+      transcript: Object.freeze([
+        Object.freeze({ type: 'text' as const, text: hugeText }),
+        Object.freeze({
+          type: 'toolCall' as const,
+          name: 'bash',
+          args: Object.freeze({ blob: 'Q'.repeat(RESULT_PRESENTATION_ITEM_MAX_BYTES + 1024) }),
+        }),
+      ]),
+    });
+    const result = baseResult({
+      messages: [],
+      finalOutput: 'done',
+      presentation: presentation as never,
+      structuredOutput: structured as never,
+      stderr: hugeDiag,
+      errorMessage: hugeDiag,
+    });
+
+    const snap = snapshotSingleResult(result);
+    // Must reproject: not share the externally frozen presentation/structured payloads.
+    expect(snap.presentation).not.toBe(presentation);
+    expect(snap.structuredOutput).not.toBe(structured);
+    expect(snap.structuredOutput).toEqual({ nested: { value: 'orig' } });
+
+    const textItem = snap.presentation!.transcript.find((i) => i.type === 'text') as Extract<
+      DisplayItem,
+      { type: 'text' }
+    >;
+    expect(textItem.text).toContain('bytes omitted');
+    expect(Buffer.byteLength(JSON.stringify(textItem), 'utf8')).toBeLessThanOrEqual(
+      RESULT_PRESENTATION_ITEM_MAX_BYTES
+    );
+    const tool = snap.presentation!.transcript.find((i) => i.type === 'toolCall') as Extract<
+      DisplayItem,
+      { type: 'toolCall' }
+    >;
+    expect(tool.args._omitted).toBe(true);
+    expect(Buffer.byteLength(snap.stderr, 'utf8')).toBeLessThanOrEqual(RESULT_DIAGNOSTIC_MAX_BYTES);
+    expect(snap.errorMessage).toBeDefined();
+    expect(Buffer.byteLength(snap.errorMessage!, 'utf8')).toBeLessThanOrEqual(
+      RESULT_DIAGNOSTIC_MAX_BYTES
+    );
+
+    // Externally frozen structured payload is cloned into owned freeze; identity differs.
+    expect(Object.isFrozen(snap.structuredOutput)).toBe(true);
+
+    // Owned snapshot remains idempotent and shares frozen owned payloads.
+    const again = snapshotSingleResult(snap);
+    expect(again.presentation).toBe(snap.presentation);
+    expect(again.structuredOutput).toBe(snap.structuredOutput);
+    expect(again).not.toBe(snap);
   });
 
   it('truncates multi-byte emoji text without splitting code points', () => {

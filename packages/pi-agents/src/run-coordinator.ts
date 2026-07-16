@@ -1359,6 +1359,16 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
       // Canonical unit capability is authoritative for nested/live resume labels.
       stored.resumeCapability = unit.capability;
       ctx.resumeCapability = unit.capability;
+      // Worktree path is authoritative from the terminal result only. A deleted
+      // clean worktree must clear unit/ctx metadata so resume cannot point at a
+      // missing path persisted earlier by startUnit.
+      if (stored.worktreePath !== undefined && stored.worktreePath.trim() !== '') {
+        unit.worktreePath = stored.worktreePath;
+        ctx.worktreePath = stored.worktreePath;
+      } else {
+        delete unit.worktreePath;
+        delete ctx.worktreePath;
+      }
       unit.status = finalStatus;
       unit.result = stored;
     }

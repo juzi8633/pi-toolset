@@ -388,6 +388,21 @@ function isLinkData(data: unknown): data is InteractiveAgentLinkV1 {
 /** Shared empty finalized view — frozen so consumers cannot push/mutate. */
 const EMPTY_FINALIZED: readonly AgentMessage[] = Object.freeze([]);
 
+/**
+ * Module-private ownership of messages projected by this file.
+ * External freeze does not establish ownership; only post-project freezes do.
+ */
+const projectedMessageOwnership = new WeakSet<object>();
+
+function isProjectedMessage(msg: unknown): msg is AgentMessage {
+  return typeof msg === 'object' && msg !== null && projectedMessageOwnership.has(msg);
+}
+
+function markProjectedMessage<T extends object>(value: T): T {
+  projectedMessageOwnership.add(value);
+  return value;
+}
+
 /** Deep-freeze a value in place (post-clone). Arrays and plain objects only. */
 function freezeDeep<T>(value: T): T {
   if (value === null || typeof value !== 'object') return value;
@@ -417,25 +432,211 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return slice;
 }
 
-function boundStringField(value: string, label: string): string {
+function boundStringToBudget(value: string, label: string, maxBytes: number): string {
   const original = Buffer.byteLength(value, 'utf8');
-  if (original <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return value;
+  if (original <= maxBytes) return value;
+  if (maxBytes <= 0) return '';
   const marker = `\n\n[${label} truncated: ${original} bytes omitted; inspect child session history]`;
-  const budget = Math.max(
-    0,
-    INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES - Buffer.byteLength(marker, 'utf8')
-  );
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  if (markerBytes >= maxBytes) {
+    const short = `[truncated: ${original} bytes]`;
+    if (Buffer.byteLength(short, 'utf8') <= maxBytes) return short;
+    return truncateUtf8(short, maxBytes);
+  }
+  const budget = Math.max(0, maxBytes - markerBytes);
   return `${truncateUtf8(value, budget)}${marker}`;
+}
+
+function boundStringField(value: string, label: string): string {
+  return boundStringToBudget(value, label, INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES);
 }
 
 function boundUnknownPayload(value: unknown, label: string): unknown {
   const size = utf8JsonBytes(value);
-  if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return value;
+  if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    // Always clone under-budget objects/arrays so freeze never mutates transport-owned data.
+    if (value !== null && typeof value === 'object') return structuredClone(value);
+    return value;
+  }
   return {
     _omitted: true,
     omittedBytes: size,
     message: `${label} exceeded interactive budget; inspect child session history.`,
   };
+}
+
+/** Force an omission marker regardless of payload size (used when complete entry exceeds budget). */
+function omitPayloadMarker(value: unknown, label: string): Record<string, unknown> {
+  return {
+    _omitted: true,
+    omittedBytes: utf8JsonBytes(value),
+    message: `${label} exceeded interactive budget; inspect child session history.`,
+  };
+}
+
+/** Identity-ish keys kept on content parts; everything else is size-bounded. */
+const CONTENT_PART_IDENTITY_KEYS = new Set([
+  'type',
+  'id',
+  'name',
+  'toolCallId',
+  'mimeType',
+  'toolName',
+  'isError',
+]);
+
+/** Assistant top-level keys that remain authoritative (text/content + required metadata). */
+const ASSISTANT_AUTHORITATIVE_TOP_KEYS = new Set([
+  'role',
+  'content',
+  'usage',
+  'model',
+  'stopReason',
+]);
+
+function boundRecordFields(
+  record: Record<string, unknown>,
+  label: string,
+  preserveKeys: ReadonlySet<string> = CONTENT_PART_IDENTITY_KEYS
+): void {
+  for (const key of Object.keys(record)) {
+    if (preserveKeys.has(key)) continue;
+    const val = record[key];
+    if (typeof val === 'string') {
+      record[key] = boundStringField(val, `${label} ${key}`);
+    } else if (val !== null && typeof val === 'object') {
+      record[key] = boundUnknownPayload(val, `${label} ${key}`);
+    }
+  }
+}
+
+/**
+ * Replace an oversized non-authoritative object with a marker that fits the
+ * complete-item budget, retaining small identity keys when possible.
+ */
+function omitOversizedItem(part: Record<string, unknown>, label: string): Record<string, unknown> {
+  const originalSize = utf8JsonBytes(part);
+  const base: Record<string, unknown> = {
+    _omitted: true,
+    omittedBytes: originalSize,
+    message: `${label} exceeded interactive budget; inspect child session history.`,
+  };
+  const out: Record<string, unknown> = { ...base };
+  for (const key of CONTENT_PART_IDENTITY_KEYS) {
+    const val = part[key];
+    if (val === undefined || val === null || typeof val === 'object') continue;
+    const trial = { ...out, [key]: val };
+    if (utf8JsonBytes(trial) <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+      out[key] = val;
+    }
+  }
+  if (utf8JsonBytes(out) <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return out;
+  return {
+    _omitted: true,
+    omittedBytes: originalSize,
+    message: 'exceeded interactive budget',
+  };
+}
+
+/**
+ * Enforce the complete retained non-authoritative item budget, including JSON
+ * object overhead and every field (not just independently bounded payloads).
+ * Prefers shrinking non-identity string fields so truncated content is retained
+ * when possible; falls back to a compact omission marker only when needed.
+ */
+function enforceNonAuthoritativeItemBudget(part: unknown, label: string): unknown {
+  if (part === null || typeof part !== 'object') {
+    if (typeof part === 'string') return boundStringField(part, label);
+    return part;
+  }
+  const p = part as Record<string, unknown>;
+  if (utf8JsonBytes(p) <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return p;
+
+  for (let round = 0; round < 16; round++) {
+    const size = utf8JsonBytes(p);
+    if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return p;
+    const overshoot = size - INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES;
+    let victim: string | undefined;
+    let victimBytes = 0;
+    for (const [key, val] of Object.entries(p)) {
+      if (CONTENT_PART_IDENTITY_KEYS.has(key)) continue;
+      if (typeof val !== 'string') continue;
+      const bytes = Buffer.byteLength(val, 'utf8');
+      if (bytes > victimBytes) {
+        victimBytes = bytes;
+        victim = key;
+      }
+    }
+    if (!victim || victimBytes === 0) break;
+    // Leave slack for marker growth and JSON encoding overhead on the next check.
+    const target = Math.max(0, victimBytes - overshoot - 128);
+    const next = boundStringToBudget(p[victim] as string, `${label} ${victim}`, target);
+    if (Buffer.byteLength(next, 'utf8') >= victimBytes) break;
+    p[victim] = next;
+  }
+
+  if (utf8JsonBytes(p) <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) return p;
+  return omitOversizedItem(p, label);
+}
+
+function boundAssistantContentPart(part: unknown): unknown {
+  if (!part || typeof part !== 'object') return part;
+  const p = part as Record<string, unknown>;
+  if (p.type === 'text') {
+    // Authoritative assistant text remains exact (even when > 64 KiB).
+    // All non-authoritative sibling fields are projected/bounded independently.
+    boundRecordFields(
+      p,
+      'assistant text content',
+      new Set([...CONTENT_PART_IDENTITY_KEYS, 'text'])
+    );
+    return p;
+  }
+  if (p.type === 'thinking' && typeof p.thinking === 'string') {
+    p.thinking = boundStringField(p.thinking, 'thinking');
+    boundRecordFields(p, 'thinking content', new Set([...CONTENT_PART_IDENTITY_KEYS, 'thinking']));
+    return enforceNonAuthoritativeItemBudget(p, 'thinking content');
+  }
+  if (p.type === 'toolCall') {
+    if (typeof p.id === 'string') p.id = boundStringField(p.id, 'tool-call id');
+    if (typeof p.name === 'string') p.name = boundStringField(p.name, 'tool-call name');
+    if (p.arguments !== undefined) {
+      p.arguments = boundUnknownPayload(p.arguments, 'tool-call arguments');
+    }
+    boundRecordFields(
+      p,
+      'tool-call content',
+      new Set([...CONTENT_PART_IDENTITY_KEYS, 'arguments'])
+    );
+    return enforceNonAuthoritativeItemBudget(p, 'tool-call content');
+  }
+  if (p.type === 'image') {
+    if (typeof p.data === 'string') p.data = boundStringField(p.data, 'image data');
+    if (typeof p.base64 === 'string') p.base64 = boundStringField(p.base64, 'image base64');
+    boundRecordFields(
+      p,
+      'image content',
+      new Set([...CONTENT_PART_IDENTITY_KEYS, 'data', 'base64'])
+    );
+    return enforceNonAuthoritativeItemBudget(p, 'image content');
+  }
+  // Unknown / custom content variants: bound every non-identity field, then the item.
+  boundRecordFields(p, 'assistant content');
+  return enforceNonAuthoritativeItemBudget(p, 'assistant content');
+}
+
+function boundNonAuthoritativeContentPart(part: unknown, role: string): unknown {
+  if (!part || typeof part !== 'object') return part;
+  const p = part as Record<string, unknown>;
+  if (typeof p.text === 'string') p.text = boundStringField(p.text, `${role} text`);
+  if (typeof p.data === 'string') p.data = boundStringField(p.data, `${role} data`);
+  if (typeof p.base64 === 'string') p.base64 = boundStringField(p.base64, `${role} base64`);
+  boundRecordFields(
+    p,
+    `${role} content`,
+    new Set([...CONTENT_PART_IDENTITY_KEYS, 'text', 'data', 'base64'])
+  );
+  return enforceNonAuthoritativeItemBudget(p, `${role} content`);
 }
 
 /**
@@ -449,15 +650,40 @@ function projectFinalizedMessage(msg: AgentMessage): AgentMessage {
   if (role === 'assistant') {
     const content = (projected as { content?: unknown }).content;
     if (Array.isArray(content)) {
-      for (const part of content) {
-        if (!part || typeof part !== 'object') continue;
-        const p = part as Record<string, unknown>;
-        if (p.type === 'thinking' && typeof p.thinking === 'string') {
-          p.thinking = boundStringField(p.thinking, 'thinking');
-        } else if (p.type === 'toolCall' && p.arguments !== undefined) {
-          p.arguments = boundUnknownPayload(p.arguments, 'tool-call arguments');
-        }
-        // text parts are authoritative — keep complete.
+      for (let i = 0; i < content.length; i++) {
+        content[i] = boundAssistantContentPart(content[i]);
+      }
+    }
+    // Only role/content/usage/model/stopReason are authoritative; all other top-level
+    // extras (errorMessage, responseId, api, provider, timestamp, custom…) are bounded
+    // as complete non-authoritative items.
+    const assistantRec = projected as Record<string, unknown>;
+    for (const key of Object.keys(assistantRec)) {
+      if (ASSISTANT_AUTHORITATIVE_TOP_KEYS.has(key)) continue;
+      const val = assistantRec[key];
+      if (typeof val === 'string') {
+        assistantRec[key] = boundStringField(val, `assistant ${key}`);
+      } else if (val !== null && typeof val === 'object') {
+        assistantRec[key] = enforceNonAuthoritativeItemBudget(
+          structuredClone(val),
+          `assistant ${key}`
+        );
+      } else {
+        assistantRec[key] = enforceNonAuthoritativeItemBudget(val, `assistant ${key}`);
+      }
+      // Drop extras that still cannot fit a complete-item budget after bounding.
+      if (
+        typeof assistantRec[key] === 'object' &&
+        assistantRec[key] !== null &&
+        utf8JsonBytes(assistantRec[key]) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      ) {
+        delete assistantRec[key];
+      } else if (
+        typeof assistantRec[key] === 'string' &&
+        Buffer.byteLength(assistantRec[key] as string, 'utf8') >
+          INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      ) {
+        delete assistantRec[key];
       }
     }
   } else if (role === 'toolResult' || role === 'user' || role === 'custom') {
@@ -465,13 +691,8 @@ function projectFinalizedMessage(msg: AgentMessage): AgentMessage {
     if (typeof content === 'string') {
       (projected as { content: string }).content = boundStringField(content, `${role} content`);
     } else if (Array.isArray(content)) {
-      for (const part of content) {
-        if (!part || typeof part !== 'object') continue;
-        const p = part as Record<string, unknown>;
-        if (typeof p.text === 'string') p.text = boundStringField(p.text, `${role} text`);
-        if (p.type === 'text' && typeof p.text === 'string') {
-          p.text = boundStringField(p.text, `${role} text`);
-        }
+      for (let i = 0; i < content.length; i++) {
+        content[i] = boundNonAuthoritativeContentPart(content[i], role);
       }
     }
     if ((projected as { details?: unknown }).details !== undefined) {
@@ -480,8 +701,193 @@ function projectFinalizedMessage(msg: AgentMessage): AgentMessage {
         `${role} details`
       );
     }
+    // Display/identity scalars are non-authoritative and must not bypass the item budget.
+    const rec = projected as Record<string, unknown>;
+    for (const key of ['toolCallId', 'toolName', 'customType'] as const) {
+      const val = rec[key];
+      if (typeof val === 'string') {
+        rec[key] = boundStringField(val, `${role} ${key}`);
+      } else if (val !== undefined && val !== null && typeof val === 'object') {
+        rec[key] = enforceNonAuthoritativeItemBudget(structuredClone(val), `${role} ${key}`);
+      } else if (val !== undefined && typeof val !== 'number' && typeof val !== 'boolean') {
+        rec[key] = enforceNonAuthoritativeItemBudget(val, `${role} ${key}`);
+      }
+    }
+    const ts = rec.timestamp;
+    if (typeof ts === 'string') {
+      rec.timestamp = boundStringField(ts, `${role} timestamp`);
+    } else if (ts !== undefined && ts !== null && typeof ts === 'object') {
+      rec.timestamp = enforceNonAuthoritativeItemBudget(structuredClone(ts), `${role} timestamp`);
+    } else if (ts !== undefined && typeof ts !== 'number' && typeof ts !== 'boolean') {
+      rec.timestamp = enforceNonAuthoritativeItemBudget(ts, `${role} timestamp`);
+    }
+    // Bound other top-level non-identity payload fields (custom message bodies, etc.).
+    // Identity keys above are already budgeted; preserve them from double-processing.
+    const preserveTop = new Set([
+      'role',
+      'content',
+      'details',
+      'toolCallId',
+      'toolName',
+      'isError',
+      'timestamp',
+      'customType',
+    ]);
+    boundRecordFields(projected as Record<string, unknown>, role, preserveTop);
   }
   return projected;
+}
+
+/** Project a transient display payload (streaming message / live tool row). */
+function projectTransientDisplayMessage(msg: AgentMessage): AgentMessage {
+  return projectFinalizedMessage(msg);
+}
+
+function projectToolArgs(args: unknown): Record<string, unknown> {
+  if (args === null || args === undefined) return {};
+  if (typeof args !== 'object' || Array.isArray(args)) {
+    // Clone under-budget arrays/primitives into a private shell before freeze.
+    const size = utf8JsonBytes(args);
+    if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+      const cloned = args !== null && typeof args === 'object' ? structuredClone(args) : args;
+      return Array.isArray(cloned) || (cloned !== null && typeof cloned === 'object')
+        ? { value: cloned }
+        : { value: cloned };
+    }
+    const bounded = boundUnknownPayload(args, 'tool-call arguments');
+    return typeof bounded === 'object' && bounded !== null && !Array.isArray(bounded)
+      ? (bounded as Record<string, unknown>)
+      : { value: bounded };
+  }
+  const size = utf8JsonBytes(args);
+  if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    return structuredClone(args) as Record<string, unknown>;
+  }
+  return boundUnknownPayload(args, 'tool-call arguments') as Record<string, unknown>;
+}
+
+function projectToolPartialResult(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  const size = utf8JsonBytes(value);
+  if (size <= INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    return value !== null && typeof value === 'object' ? structuredClone(value) : value;
+  }
+  return boundUnknownPayload(value, 'tool result');
+}
+
+/** Bound one queue display string as a complete non-authoritative item. */
+function projectQueueEntry(value: unknown, label: string): string {
+  if (typeof value === 'string') return boundStringField(value, label);
+  if (value === null || value === undefined) return '';
+  const serialized = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  return boundStringField(serialized, label);
+}
+
+function projectQueueEntries(entries: unknown): string[] {
+  if (!Array.isArray(entries)) return [];
+  return entries.map((entry, i) => projectQueueEntry(entry, `queue[${i}]`));
+}
+
+/** Max UTF-8 bytes retained as a raw activeTools Map key before hashing. */
+const ACTIVE_TOOL_MAP_KEY_MAX_BYTES = 256;
+
+/**
+ * Deterministic bounded Map key for active tool rows. Huge toolCallIds are hashed
+ * so the Map never retains an unbounded key string; short IDs pass through.
+ */
+function activeToolMapKey(toolCallId: string): string {
+  if (Buffer.byteLength(toolCallId, 'utf8') <= ACTIVE_TOOL_MAP_KEY_MAX_BYTES) {
+    return toolCallId;
+  }
+  return crypto.createHash('sha256').update(toolCallId, 'utf8').digest('hex');
+}
+
+/**
+ * Project a complete active-tool entry: bound id/name/args/result and freeze so
+ * snapshot publication never shares mutable transport-owned nested objects.
+ * Enforces an exact complete-entry serialized cap including all fields + JSON overhead.
+ */
+function projectActiveToolEntry(input: {
+  toolCallId: unknown;
+  toolName: unknown;
+  args: unknown;
+  partialResult?: unknown;
+  isError?: boolean;
+  ended?: boolean;
+}): InteractiveToolActivity {
+  // Bound identity first so nested field budgets have room inside the complete entry.
+  let toolCallId = boundStringField(String(input.toolCallId ?? ''), 'toolCallId');
+  let toolName = boundStringField(String(input.toolName ?? 'tool'), 'toolName');
+  let args = projectToolArgs(input.args);
+  let partialResult =
+    input.partialResult !== undefined ? projectToolPartialResult(input.partialResult) : undefined;
+
+  const build = (): InteractiveToolActivity => {
+    const entry: InteractiveToolActivity = { toolCallId, toolName, args };
+    if (partialResult !== undefined) entry.partialResult = partialResult;
+    if (input.isError !== undefined) entry.isError = Boolean(input.isError);
+    if (input.ended !== undefined) entry.ended = Boolean(input.ended);
+    return entry;
+  };
+
+  let entry = build();
+  // Deterministically shrink until the entire serialized entry fits the cap.
+  // Order: omit partialResult → bound oversized identity → omit args → drop
+  // partialResult → minimal args → further identity shrink. Identity is bounded
+  // before args are dropped so small nested payloads survive when only id/name
+  // made the complete entry exceed the budget.
+  if (utf8JsonBytes(entry) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    if (partialResult !== undefined) {
+      partialResult = omitPayloadMarker(partialResult, 'tool result');
+      entry = build();
+    }
+  }
+  if (utf8JsonBytes(entry) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    toolCallId = boundStringToBudget(toolCallId, 'toolCallId', 256);
+    toolName = boundStringToBudget(toolName, 'toolName', 256);
+    entry = build();
+  }
+  if (utf8JsonBytes(entry) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    args = omitPayloadMarker(args, 'tool-call arguments');
+    entry = build();
+  }
+  if (utf8JsonBytes(entry) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    partialResult = undefined;
+    entry = build();
+  }
+  if (utf8JsonBytes(entry) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    args = { _omitted: true, message: 'exceeded interactive budget' };
+    entry = build();
+  }
+  // Last resort: shrink identity until the complete entry fits (always terminates).
+  while (utf8JsonBytes(entry) > INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES) {
+    const idBytes = Buffer.byteLength(toolCallId, 'utf8');
+    const nameBytes = Buffer.byteLength(toolName, 'utf8');
+    if (idBytes > 1) {
+      toolCallId = truncateUtf8(toolCallId, Math.max(1, idBytes >> 1));
+    } else if (nameBytes > 1) {
+      toolName = truncateUtf8(toolName, Math.max(1, nameBytes >> 1));
+    } else {
+      entry = { toolCallId: '', toolName: '', args: {} };
+      if (input.isError !== undefined) entry.isError = Boolean(input.isError);
+      if (input.ended !== undefined) entry.ended = Boolean(input.ended);
+      break;
+    }
+    entry = build();
+  }
+  return freezeDeep(entry);
+}
+
+/** Clone+freeze an active-tool row for public snapshot isolation. */
+function isolateActiveToolForSnapshot(t: InteractiveToolActivity): InteractiveToolActivity {
+  return projectActiveToolEntry({
+    toolCallId: t.toolCallId,
+    toolName: t.toolName,
+    args: t.args,
+    partialResult: t.partialResult,
+    isError: t.isError,
+    ended: t.ended,
+  });
 }
 
 /** Exact UTF-8 JSON-array size including brackets and commas. */
@@ -496,17 +902,19 @@ function recomputeFinalizedBytes(ep: InteractiveAgentEndpoint): void {
 }
 
 /**
- * Isolate one message for the shared finalized view: project, clone, freeze.
+ * Isolate one message for the shared finalized view: project, clone, freeze, mark owned.
  * Call only on message_end / hydrate / restore — never per delta.
+ * Externally frozen native messages are reprojected; only module-owned messages are reused.
  */
 function isolateFinalizedMessage(msg: AgentMessage): AgentMessage {
-  return freezeDeep(projectFinalizedMessage(msg));
+  if (isProjectedMessage(msg)) return msg;
+  return markProjectedMessage(freezeDeep(projectFinalizedMessage(msg)));
 }
 
 /** Build a frozen readonly array of isolated finalized messages. */
 function isolateFinalizedMessages(messages: readonly AgentMessage[]): readonly AgentMessage[] {
   if (messages.length === 0) return EMPTY_FINALIZED;
-  return Object.freeze(messages.map((m) => (Object.isFrozen(m) ? m : isolateFinalizedMessage(m))));
+  return Object.freeze(messages.map((m) => isolateFinalizedMessage(m)));
 }
 
 /**
@@ -558,30 +966,62 @@ function endpointHasReloadableIdentity(ep: InteractiveAgentEndpoint): boolean {
   return false;
 }
 
+/**
+ * After a settled full publish + activation_settled emission, schedule deferred
+ * idle retention work so settled consumers observe the complete pre-eviction snapshot.
+ * Success, error, and cancellation all share this path.
+ *
+ * Cleanup is activation/epoch-scoped and runs only inside the endpoint transition
+ * queue. A newer activation (or any epoch bump) makes a stale schedule no-op.
+ */
 function maybeScheduleIdleTranscriptEviction(
   ep: InteractiveAgentEndpoint,
-  detachFn: (key: string, opts?: { evictTranscript?: boolean }) => Promise<void>
+  epoch: number,
+  enqueue: (key: string, fn: () => void | Promise<void>) => Promise<unknown>,
+  resolve: (key: string) => InteractiveAgentEndpoint | undefined,
+  getEpoch: (key: string) => number,
+  detachFn: (
+    key: string,
+    opts?: { evictTranscript?: boolean; retentionEpoch?: number }
+  ) => Promise<void>,
+  publishFn: (ep: InteractiveAgentEndpoint, kind?: InteractiveEndpointUpdateKind) => void
 ): void {
   if (ep.status === 'starting' || ep.status === 'running') return;
   if (ep.activation && !ep.activation.settled) return;
   const total = finalizedTranscriptArrayBytes(ep.finalizedMessageBytes ?? []);
   if (total <= INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES) return;
+  const key = ep.key;
   // Defer so activation_settled consumers observe the pre-eviction snapshot first.
+  // Then serialize through the endpoint transition queue and revalidate epoch.
   queueMicrotask(() => {
-    if (ep.status === 'starting' || ep.status === 'running') return;
-    if (ep.activation && !ep.activation.settled) return;
-    if (endpointHasReloadableIdentity(ep)) {
-      void detachFn(ep.key, { evictTranscript: true }).catch(() => undefined);
-      return;
-    }
-    // Non-reloadable: compact in place rather than full eviction.
-    compactNonReloadableTranscript(ep);
+    void enqueue(key, () => {
+      if (getEpoch(key) !== epoch) return;
+      const current = resolve(key);
+      if (!current) return;
+      if (current.status === 'starting' || current.status === 'running') return;
+      if (current.activation && !current.activation.settled) return;
+      const still = finalizedTranscriptArrayBytes(current.finalizedMessageBytes ?? []);
+      if (still <= INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES) return;
+      if (endpointHasReloadableIdentity(current)) {
+        // Pass epoch into detach so a later chained detach transition cannot
+        // force-settle a newer activation that starts after this check.
+        void detachFn(key, { evictTranscript: true, retentionEpoch: epoch }).catch(() => undefined);
+        return;
+      }
+      if (compactNonReloadableTranscript(current)) {
+        publishFn(current, 'full');
+      }
+    }).catch(() => undefined);
   });
 }
 
-function compactNonReloadableTranscript(ep: InteractiveAgentEndpoint): void {
+/**
+ * Replace oldest entries with role-preserving omission markers; keep latest assistant.
+ * Returns true when the view changed.
+ */
+function compactNonReloadableTranscript(ep: InteractiveAgentEndpoint): boolean {
   const msgs = [...ep.finalizedMessagesView];
-  if (msgs.length === 0) return;
+  if (msgs.length === 0) return false;
   let latestAssistantIdx = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
     if ((msgs[i] as { role?: string }).role === 'assistant') {
@@ -590,35 +1030,69 @@ function compactNonReloadableTranscript(ep: InteractiveAgentEndpoint): void {
     }
   }
   const marker = (role: string) =>
-    freezeDeep({
-      role,
-      content: [
-        {
-          type: 'text',
-          text: '[Earlier history omitted: non-reloadable endpoint exceeded retention budget]',
-        },
-      ],
-    }) as AgentMessage;
+    markProjectedMessage(
+      freezeDeep({
+        role,
+        content: [
+          {
+            type: 'text',
+            text: '[Earlier history omitted: non-reloadable endpoint exceeded retention budget]',
+          },
+        ],
+      }) as AgentMessage
+    );
+  let changed = false;
   for (let i = 0; i < msgs.length; i++) {
     if (i === latestAssistantIdx) continue;
     const role = ((msgs[i] as { role?: string }).role ?? 'user') as string;
-    msgs[i] = marker(role);
+    const next = marker(role);
+    if (msgs[i] !== next) {
+      msgs[i] = next;
+      changed = true;
+    }
   }
+  if (!changed) return false;
   const view = Object.freeze(msgs);
   ep.messages = view;
   ep.finalizedMessagesView = view;
   ep.messagesRevision += 1;
   recomputeFinalizedBytes(ep);
   ep.transcriptHydrated = true;
+  return true;
+}
+
+/** Isolate session identity so public consumers cannot mutate endpoint state. */
+function isolateSessionArtifact(
+  art: InteractiveSessionArtifact | undefined
+): InteractiveSessionArtifact | undefined {
+  if (!art) return undefined;
+  return freezeDeep(structuredClone(art));
+}
+
+/** Isolate activation (incl. nested policy) for public snapshot publication. */
+function isolateActivation(activation: InteractiveActivation): InteractiveActivation {
+  return freezeDeep({
+    ...activation,
+    policy: activation.policy ? { ...activation.policy } : undefined,
+  });
+}
+
+/** Isolate usage aggregate for public snapshot/list publication. */
+function isolateUsage(usage: InteractiveAgentEndpoint['usage']): InteractiveAgentEndpoint['usage'] {
+  if (!usage) return undefined;
+  return freezeDeep({ ...usage });
 }
 
 /**
  * Build a read-only endpoint snapshot with structure sharing.
  * Finalized messages use the stable view (no slice on transcript publishes).
- * Streaming payloads are replaced wholesale by the transport, so the current
- * streamingMessage ref is shared without structuredClone.
+ * Streaming and active-tool payloads are projected/bounded before retention.
+ * Nested metadata (sessionArtifact, activation.policy, usage) is cloned/frozen
+ * so consumer mutation cannot alter endpoint identity or later snapshots.
  */
 function snapshotOf(ep: InteractiveAgentEndpoint): InteractiveEndpointSnapshot {
+  // Isolate transient nested payloads: never share mutable transport-owned objects.
+  // Finalized messages are already module-owned frozen views (structure-shared).
   return {
     key: ep.key,
     hostSessionId: ep.hostSessionId,
@@ -628,24 +1102,26 @@ function snapshotOf(ep: InteractiveAgentEndpoint): InteractiveEndpointSnapshot {
     agent: ep.agent,
     title: ep.title,
     sessionFile: ep.sessionFile,
-    sessionArtifact: ep.sessionArtifact,
+    sessionArtifact: isolateSessionArtifact(ep.sessionArtifact),
     effectiveCwd: ep.effectiveCwd,
     worktreePath: ep.worktreePath,
     status: ep.status,
     messages: ep.finalizedMessagesView,
     messagesRevision: ep.messagesRevision,
     streamRevision: ep.streamRevision,
-    streamingMessage: ep.streamingMessage,
-    activeTools: [...ep.activeTools.values()].map((t) => ({ ...t })),
-    steeringQueue: ep.steeringQueue.slice(),
-    followUpQueue: ep.followUpQueue.slice(),
-    activation: ep.activation ? { ...ep.activation } : undefined,
+    streamingMessage: ep.streamingMessage
+      ? freezeDeep(structuredClone(ep.streamingMessage))
+      : undefined,
+    activeTools: [...ep.activeTools.values()].map(isolateActiveToolForSnapshot),
+    steeringQueue: projectQueueEntries(ep.steeringQueue),
+    followUpQueue: projectQueueEntries(ep.followUpQueue),
+    activation: ep.activation ? isolateActivation(ep.activation) : undefined,
     lastError: ep.lastError,
     errorCode: ep.errorCode,
     lastUsedAt: ep.lastUsedAt,
     createdAt: ep.createdAt,
     linkCreatedAt: ep.linkCreatedAt,
-    usage: ep.usage ? { ...ep.usage } : undefined,
+    usage: isolateUsage(ep.usage),
     isCompacting: ep.isCompacting,
     isRetrying: ep.isRetrying,
     hasTransport: !!ep.client,
@@ -663,7 +1139,7 @@ function listItemOf(ep: InteractiveAgentEndpoint): InteractiveEndpointListItem {
     agent: ep.agent,
     title: ep.title,
     sessionFile: ep.sessionFile,
-    sessionArtifact: ep.sessionArtifact,
+    sessionArtifact: isolateSessionArtifact(ep.sessionArtifact),
     effectiveCwd: ep.effectiveCwd,
     worktreePath: ep.worktreePath,
     status: ep.status,
@@ -672,7 +1148,7 @@ function listItemOf(ep: InteractiveAgentEndpoint): InteractiveEndpointListItem {
     lastUsedAt: ep.lastUsedAt,
     createdAt: ep.createdAt,
     linkCreatedAt: ep.linkCreatedAt,
-    usage: ep.usage ? { ...ep.usage } : undefined,
+    usage: isolateUsage(ep.usage),
     isCompacting: ep.isCompacting,
     isRetrying: ep.isRetrying,
     hasTransport: !!ep.client,
@@ -776,6 +1252,25 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
   const registrationSerial = new Map<string, Promise<void>>();
   type RegistrationHandle = { key: string; generation: number; leave: () => void };
   const idleLimit = options.idleLimit ?? MAX_IDLE_TRANSPORTS;
+  /** Bumped on every new activation so deferred idle retention cannot touch a newer turn. */
+  const idleRetentionEpoch = new Map<string, number>();
+  const bumpIdleRetentionEpoch = (key: string): number => {
+    const next = (idleRetentionEpoch.get(key) ?? 0) + 1;
+    idleRetentionEpoch.set(key, next);
+    return next;
+  };
+  const getIdleRetentionEpoch = (key: string): number => idleRetentionEpoch.get(key) ?? 0;
+  const scheduleIdleTranscriptEviction = (ep: InteractiveAgentEndpoint): void => {
+    maybeScheduleIdleTranscriptEviction(
+      ep,
+      getIdleRetentionEpoch(ep.key),
+      enqueueTransition,
+      (key) => endpoints.get(key),
+      getIdleRetentionEpoch,
+      detach,
+      publish
+    );
+  };
   const abortSettleTimeoutMs = options.abortSettleTimeoutMs ?? DEFAULT_ABORT_SETTLE_TIMEOUT_MS;
   /** Unified absolute budget for the whole shutdown path (not N × killTimeout). */
   const shutdownDisposeBudgetMs = options.shutdownDisposeBudgetMs ?? 5_500;
@@ -1185,9 +1680,15 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     coalesceCellSeq.delete(ep.key);
     outboundPoisonByKey.delete(ep.key);
     if (ep.activation && !ep.activation.settled) {
+      // Terminal non-running status is established inside settleActivationError.
       settleActivationError(ep, reason, 'error');
     } else if (ep.activation) {
       ep.activation = undefined;
+      if (ep.status === 'starting' || ep.status === 'running' || ep.status === 'registered') {
+        ep.status = 'error';
+        ep.lastError = reason;
+        if (!ep.errorCode) ep.errorCode = 'transport_error';
+      }
     }
   }
 
@@ -2419,6 +2920,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         !!existing.activation ||
         !!existing.client ||
         !!existing.transportReady;
+      // Capture before invalidateLiveTransport force-settles and clears activation.
+      const hadOpenActivation = !!(existing.activation && !existing.activation.settled);
       if (live) {
         // Atomic invalidation: bump generation, drop transports, force-settle,
         // clear transient, release session ownership — no late T1 can install.
@@ -2440,17 +2943,43 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       existing.hostSessionId = link.hostSessionId;
       existing.linkCreatedAt = link.createdAt;
       // unavailable→ later trusted restore must rehydrate, not trust empty view.
-      // Bump messagesRevision so detail caches never reuse the prior history.
       existing.transcriptHydrated = false;
-      if (existing.messages.length > 0 || existing.finalizedMessagesView.length > 0) {
+      Object.assign(existing, extra);
+      const hasTranscript =
+        existing.messages.length > 0 || existing.finalizedMessagesView.length > 0;
+      // Settled consumers and the internal endpoint retain the complete bounded
+      // transcript through the synchronous settled turn. Evict only later.
+      if (hasTranscript && live && hadOpenActivation) {
+        const snap = publish(existing, 'full');
+        const keyToClear = key;
+        queueMicrotask(() => {
+          void enqueueTransition(keyToClear, () => {
+            const ep = endpoints.get(keyToClear);
+            if (!ep) return;
+            if (ep.status !== 'unavailable') return;
+            if (ep.activation && !ep.activation.settled) return;
+            if (ep.finalizedMessagesView.length === 0 && ep.messages.length === 0) return;
+            ep.messages = EMPTY_FINALIZED;
+            ep.finalizedMessagesView = EMPTY_FINALIZED;
+            ep.finalizedMessageBytes = [];
+            ep.finalizedMessagesBytes = 0;
+            ep.messagesRevision += 1;
+            publish(ep, 'full');
+          });
+        });
+        return snap;
+      }
+      // Bump messagesRevision so detail caches never reuse the prior history.
+      if (hasTranscript) {
         existing.messages = EMPTY_FINALIZED;
         existing.finalizedMessagesView = EMPTY_FINALIZED;
+        existing.finalizedMessageBytes = [];
+        existing.finalizedMessagesBytes = 0;
         existing.messagesRevision += 1;
       } else {
         existing.messages = EMPTY_FINALIZED;
         existing.finalizedMessagesView = EMPTY_FINALIZED;
       }
-      Object.assign(existing, extra);
       return publish(existing, 'full');
     }
     const ep: InteractiveAgentEndpoint = {
@@ -2750,6 +3279,19 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     message: string,
     terminal: InteractiveTerminalOverride = 'error'
   ): void {
+    // Establish final non-running terminal status first so retention scheduling is not
+    // skipped (running-state guard) and settled consumers observe a terminal snapshot.
+    if (ep.status === 'starting' || ep.status === 'running' || ep.status === 'registered') {
+      if (terminal === 'max_turns') {
+        ep.status = 'idle';
+      } else if (terminal === 'cancelled') {
+        ep.status = 'detached';
+      } else {
+        ep.status = 'error';
+        ep.lastError = message;
+        if (!ep.errorCode) ep.errorCode = 'transport_error';
+      }
+    }
     clearTransientActivity(ep);
     if (!ep.activation || ep.activation.settled) {
       publish(ep, 'full');
@@ -2762,6 +3304,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       markCancelledUsage(ep);
     }
     const activationId = ep.activation.id;
+    // Synchronous full publish + settle with the complete pre-eviction snapshot.
     publish(ep, 'full');
     emit({
       type: 'activation_settled',
@@ -2770,7 +3313,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       snapshot: snapshotOf(ep),
     });
     ep.activation = undefined;
-    maybeScheduleIdleTranscriptEviction(ep, detach);
+    // Queue eviction/compaction only after settled consumers observed the snapshot.
+    scheduleIdleTranscriptEviction(ep);
   }
 
   function handleUnexpectedTransportExit(ep: InteractiveAgentEndpoint, message: string): void {
@@ -2994,6 +3538,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             snapshot: settledSnap,
           });
           ep.activation = undefined;
+          // Deferred idle retention after settled consumers observe the full snapshot.
+          scheduleIdleTranscriptEviction(ep);
           void enforceIdleLru();
           return;
         }
@@ -3005,8 +3551,10 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       case 'message_start':
       case 'message_update':
         if (evt.message) {
-          // Share the transport-owned message object; replaced wholesale each delta.
-          ep.streamingMessage = evt.message as AgentMessage;
+          // Project + bound non-authoritative payloads; freeze so snapshots cannot share mutables.
+          ep.streamingMessage = freezeDeep(
+            projectTransientDisplayMessage(evt.message as AgentMessage)
+          );
         }
         ep.streamRevision += 1;
         kind = 'transcript';
@@ -3073,42 +3621,69 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         kind = 'full';
         break;
       case 'tool_execution_start': {
-        const id = String(evt.toolCallId ?? '');
-        ep.activeTools.set(id, {
-          toolCallId: id,
-          toolName: String(evt.toolName ?? 'tool'),
-          args: (evt.args as Record<string, unknown>) ?? {},
-        });
+        const rawId = String(evt.toolCallId ?? '');
+        const mapKey = activeToolMapKey(rawId);
+        // Bound complete entry (id/name/args) and freeze nested payloads at ingest.
+        // Map key is independently bounded (hash of huge IDs) so retention stays finite.
+        ep.activeTools.set(
+          mapKey,
+          projectActiveToolEntry({
+            toolCallId: rawId,
+            toolName: evt.toolName,
+            args: evt.args,
+          })
+        );
         ep.streamRevision += 1;
         // Detail transcript only; list/widget do not show live tools.
         kind = 'transcript';
         break;
       }
       case 'tool_execution_update': {
-        const id = String(evt.toolCallId ?? '');
-        const existing = ep.activeTools.get(id);
+        const rawId = String(evt.toolCallId ?? '');
+        const mapKey = activeToolMapKey(rawId);
+        const existing = ep.activeTools.get(mapKey);
         if (existing) {
-          existing.partialResult = evt.partialResult;
+          // Replace frozen entry — never mutate nested args/results in place.
+          ep.activeTools.set(
+            mapKey,
+            projectActiveToolEntry({
+              toolCallId: existing.toolCallId,
+              toolName: existing.toolName,
+              args: existing.args,
+              partialResult: evt.partialResult,
+              isError: existing.isError,
+              ended: existing.ended,
+            })
+          );
         }
         ep.streamRevision += 1;
         kind = 'transcript';
         break;
       }
       case 'tool_execution_end': {
-        const id = String(evt.toolCallId ?? '');
-        const existing = ep.activeTools.get(id);
+        const rawId = String(evt.toolCallId ?? '');
+        const mapKey = activeToolMapKey(rawId);
+        const existing = ep.activeTools.get(mapKey);
         if (existing) {
-          existing.ended = true;
-          existing.isError = Boolean(evt.isError);
-          existing.partialResult = evt.result ?? existing.partialResult;
+          ep.activeTools.set(
+            mapKey,
+            projectActiveToolEntry({
+              toolCallId: existing.toolCallId,
+              toolName: existing.toolName,
+              args: existing.args,
+              partialResult: evt.result !== undefined ? evt.result : existing.partialResult,
+              isError: Boolean(evt.isError),
+              ended: true,
+            })
+          );
         }
         ep.streamRevision += 1;
         kind = 'transcript';
         break;
       }
       case 'queue_update':
-        ep.steeringQueue = Array.isArray(evt.steering) ? (evt.steering as string[]) : [];
-        ep.followUpQueue = Array.isArray(evt.followUp) ? (evt.followUp as string[]) : [];
+        ep.steeringQueue = projectQueueEntries(evt.steering);
+        ep.followUpQueue = projectQueueEntries(evt.followUp);
         // Same queueCount with different content must invalidate detail cache.
         ep.streamRevision += 1;
         break;
@@ -3680,6 +4255,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
 
       const activationId = `act_${++sequenceCounter}_${now()}`;
       if (!ep.activation) {
+        // Invalidate any deferred idle retention scheduled for the prior settle.
+        bumpIdleRetentionEpoch(key);
         ep.activation = {
           id: activationId,
           endpointKey: key,
@@ -3941,6 +4518,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             snapshot: snapshotOf(current),
           });
           current.activation = undefined;
+          // After final non-running status + settled publish, schedule idle retention.
+          scheduleIdleTranscriptEviction(current);
         }
       });
       throw err;
@@ -4008,11 +4587,11 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           void disposeTracked(key, client, sessionFile);
         }
         clearAbortSettleTimer(key);
-        settleActivationError(ep, 'Activation cancelled', 'cancelled');
+        // Final non-running status before settle so retention scheduling is not skipped.
         if (ep.status === 'starting' || ep.status === 'registered') {
           ep.status = 'detached';
-          publish(ep);
         }
+        settleActivationError(ep, 'Activation cancelled', 'cancelled');
         return snapshotOf(ep);
       }
 
@@ -4027,13 +4606,33 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
    */
   async function detach(
     key: string,
-    options: { remove?: boolean; activationId?: string; evictTranscript?: boolean } = {}
+    options: {
+      remove?: boolean;
+      activationId?: string;
+      evictTranscript?: boolean;
+      /** When set, no-op if a newer activation bumped the idle retention epoch. */
+      retentionEpoch?: number;
+      /** When set, only detach endpoints that are still idle with no open activation. */
+      requireIdle?: boolean;
+    } = {}
   ): Promise<void> {
     const ep = endpoints.get(key);
     if (!ep) return;
     await enqueueTransition(key, async () => {
       const current = endpoints.get(key);
       if (!current) return;
+      // Retention-scoped: stale oversized/LRU cleanup must not touch a newer turn.
+      if (options.retentionEpoch !== undefined) {
+        if (getIdleRetentionEpoch(key) !== options.retentionEpoch) return;
+        // Never force-settle an in-flight activation from deferred retention work.
+        if (current.activation && !current.activation.settled) return;
+        if (current.status === 'starting' || current.status === 'running') return;
+      }
+      // LRU-scoped: a victim selected while idle must not be torn down after a new turn starts.
+      if (options.requireIdle) {
+        if (current.activation && !current.activation.settled) return;
+        if (current.status !== 'idle') return;
+      }
       // Activation-scoped: timer for A must not detach B.
       if (options.activationId !== undefined) {
         if (!current.activation || current.activation.id !== options.activationId) {
@@ -4042,6 +4641,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       }
       // Force-settle any open activation so timeout/detach never leaves zombies
       // that subsequent send/activate would reuse.
+      let settledOpenActivation = false;
       if (current.activation && !current.activation.settled) {
         const terminal = current.activation.terminalOverride ?? 'error';
         const reason =
@@ -4050,7 +4650,19 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             : terminal === 'cancelled'
               ? 'Endpoint detached'
               : 'Endpoint detached';
+        // Detach's terminal status is detached (non-running) before settle so the
+        // activation_settled snapshot is terminal and retention scheduling is not skipped.
+        if (
+          current.status === 'starting' ||
+          current.status === 'running' ||
+          current.status === 'registered'
+        ) {
+          current.status = 'detached';
+        }
+        // Publishes the complete pre-eviction snapshot, emits activation_settled, clears
+        // activation, then queues retention. Never clear the transcript synchronously here.
         settleActivationError(current, reason, terminal);
+        settledOpenActivation = true;
       } else if (current.activation) {
         current.activation = undefined;
       }
@@ -4079,14 +4691,41 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       streamCoalesceScheduled.delete(key);
       coalesceCellSeq.delete(key);
       outboundPoisonByKey.delete(key);
-      if (current.status !== 'unavailable' && current.status !== 'error') {
+      // Detach always ends non-unavailable endpoints as detached (even when force-settle
+      // temporarily used error/idle to leave the running state before activation_settled).
+      if (current.status !== 'unavailable') {
         current.status = 'detached';
       }
       if (options.evictTranscript !== false) {
         // Default: detach also releases the in-memory transcript when oversized or requested.
         const total = finalizedTranscriptArrayBytes(current.finalizedMessageBytes ?? []);
-        if (options.evictTranscript === true || total > INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES) {
-          evictFinalizedTranscript(current);
+        const shouldEvict =
+          options.evictTranscript === true || total > INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES;
+        if (shouldEvict) {
+          if (settledOpenActivation) {
+            // Defer eviction to a later microtask/transition so activation_settled
+            // consumers always observe the immutable pre-eviction snapshot first.
+            // Capture epoch so a newer activation makes this stale eviction no-op.
+            const keyToEvict = key;
+            const epoch = getIdleRetentionEpoch(keyToEvict);
+            queueMicrotask(() => {
+              void enqueueTransition(keyToEvict, () => {
+                if (getIdleRetentionEpoch(keyToEvict) !== epoch) return;
+                const ep = endpoints.get(keyToEvict);
+                if (!ep) return;
+                if (ep.status === 'starting' || ep.status === 'running') return;
+                if (ep.activation && !ep.activation.settled) return;
+                if (ep.finalizedMessagesView.length === 0) return;
+                evictFinalizedTranscript(ep);
+                publish(ep, 'full');
+              });
+            });
+          } else {
+            // Still revalidate: never clear a transcript that a newer activation owns.
+            if (!current.activation || current.activation.settled) {
+              evictFinalizedTranscript(current);
+            }
+          }
         }
       }
       if (options.remove) {
@@ -4095,7 +4734,9 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         revokeTrustedBranch(key);
         endpoints.delete(key);
         emitEndpointsChanged();
-      } else {
+      } else if (!settledOpenActivation) {
+        // Settled path already published the pre-eviction snapshot; avoid a duplicate
+        // full publish in the same turn (deferred eviction publishes later).
         publish(current, 'full');
       }
     });
@@ -4108,7 +4749,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     while (idle.length > idleLimit) {
       const victim = idle.shift();
       if (!victim) break;
-      await detach(victim.key, { evictTranscript: true });
+      await detach(victim.key, { evictTranscript: true, requireIdle: true });
     }
   }
 

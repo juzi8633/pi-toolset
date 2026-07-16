@@ -6,6 +6,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES,
+  INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES,
+} from '../src/constants.ts';
+import {
   acquireSessionLease,
   awaitSessionLease,
   canonicalizeSessionLeaseKey,
@@ -2073,6 +2077,1689 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it('pre-frozen raw messages are reprojected; oversized non-authoritative payloads are bounded', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: bound', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const hugeThinking = 'T'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 4096);
+    const hugeArgsBlob = 'A'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    const hugeImage = 'B'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 1024);
+    const hugeToolBody = 'R'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 8192);
+    const hugeCustom = 'C'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 512);
+    const completeAssistantText = 'COMPLETE_FINAL_OUTPUT_PRESERVED';
+
+    // Externally frozen raw native messages must not establish projection ownership.
+    const frozenAssistant = Object.freeze({
+      role: 'assistant',
+      content: Object.freeze([
+        Object.freeze({ type: 'thinking', thinking: hugeThinking }),
+        Object.freeze({
+          type: 'toolCall',
+          id: 'tc-1',
+          name: 'bash',
+          arguments: Object.freeze({ blob: hugeArgsBlob }),
+        }),
+        Object.freeze({ type: 'image', data: hugeImage, mimeType: 'image/png' }),
+        Object.freeze({
+          type: 'unknownCustom',
+          payload: Object.freeze({ data: hugeCustom }),
+          note: hugeCustom,
+        }),
+        Object.freeze({ type: 'text', text: completeAssistantText }),
+      ]),
+      usage: Object.freeze({
+        input: 11,
+        output: 7,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 18,
+        cost: Object.freeze({ total: 0.01 }),
+      }),
+      model: 'test-model',
+      stopReason: 'stop',
+    });
+
+    const frozenToolResult = Object.freeze({
+      role: 'toolResult',
+      toolCallId: 'tc-1',
+      toolName: 'bash',
+      content: Object.freeze([
+        Object.freeze({ type: 'text', text: hugeToolBody }),
+        Object.freeze({ type: 'image', data: hugeImage, mimeType: 'image/png' }),
+      ]),
+      details: Object.freeze({ dump: hugeToolBody }),
+      isError: false,
+    });
+
+    eventListenerRef.current?.({ type: 'message_end', message: frozenAssistant });
+    eventListenerRef.current?.({ type: 'message_end', message: frozenToolResult });
+    await new Promise((r) => setImmediate(r));
+
+    const snap = registry.get(key)!;
+    expect(snap.messages.length).toBe(2);
+    // Must not share the externally frozen raw object.
+    expect(snap.messages[0]).not.toBe(frozenAssistant);
+    expect(snap.messages[1]).not.toBe(frozenToolResult);
+
+    const assistant = snap.messages[0] as unknown as {
+      content: Array<Record<string, unknown>>;
+      usage?: { input?: number; output?: number };
+      model?: string;
+      stopReason?: string;
+    };
+    const thinking = assistant.content.find((p) => p.type === 'thinking') as {
+      thinking: string;
+    };
+    expect(thinking.thinking).toContain('bytes omitted');
+    expect(Buffer.byteLength(thinking.thinking, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+
+    const toolCall = assistant.content.find((p) => p.type === 'toolCall') as {
+      arguments: Record<string, unknown>;
+    };
+    expect(toolCall.arguments._omitted).toBe(true);
+    expect(JSON.stringify(toolCall.arguments)).not.toContain(hugeArgsBlob);
+
+    const image = assistant.content.find((p) => p.type === 'image') as { data: string };
+    expect(image.data).toContain('bytes omitted');
+    expect(Buffer.byteLength(image.data, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+
+    const unknown = assistant.content.find((p) => p.type === 'unknownCustom') as {
+      note: string;
+      payload: Record<string, unknown>;
+    };
+    expect(unknown.note).toContain('bytes omitted');
+    expect(unknown.payload._omitted).toBe(true);
+
+    const text = assistant.content.find((p) => p.type === 'text') as { text: string };
+    expect(text.text).toBe(completeAssistantText);
+    expect(assistant.usage?.input).toBe(11);
+    expect(assistant.usage?.output).toBe(7);
+    expect(assistant.model).toBe('test-model');
+    expect(assistant.stopReason).toBe('stop');
+
+    const toolResult = snap.messages[1] as unknown as {
+      content: Array<Record<string, unknown>>;
+      details: Record<string, unknown>;
+    };
+    const toolText = toolResult.content.find((p) => p.type === 'text') as { text: string };
+    expect(toolText.text).toContain('bytes omitted');
+    expect(Buffer.byteLength(toolText.text, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    expect(toolResult.details._omitted).toBe(true);
+    // Full raw payloads must not be retained; only bounded prefixes/markers remain.
+    expect(JSON.stringify(snap.messages)).not.toContain(hugeThinking);
+    expect(JSON.stringify(snap.messages)).not.toContain(hugeToolBody);
+    expect(JSON.stringify(snap.messages)).not.toContain(hugeImage);
+    expect(JSON.stringify(snap.messages)).not.toContain(hugeArgsBlob);
+    expect(JSON.stringify(snap.messages)).not.toContain(hugeCustom);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('enforces complete multi-field non-authoritative item budget including top-level extras', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: multi-field', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    // Each field is under the per-field cap, but the complete item exceeds it.
+    const nearLimit = Math.floor(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES * 0.6);
+    const fieldA = 'A'.repeat(nearLimit);
+    const fieldB = 'B'.repeat(nearLimit);
+    const longName = 'N'.repeat(nearLimit);
+    const topLevelExtra = 'X'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    const completeText = 'AUTHORITATIVE_FINAL_TEXT';
+
+    eventListenerRef.current?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'image',
+            data: fieldA,
+            base64: fieldB,
+            mimeType: 'image/png',
+            extraMeta: fieldA,
+          },
+          {
+            type: 'toolCall',
+            id: 'tc-multi',
+            name: longName,
+            arguments: { blob: fieldA },
+            extraPayload: fieldB,
+          },
+          {
+            type: 'customPart',
+            alpha: fieldA,
+            beta: fieldB,
+          },
+          { type: 'text', text: completeText },
+        ],
+        usage: { input: 9, output: 3, totalTokens: 12, cost: { total: 0 } },
+        model: 'multi-model',
+        stopReason: 'stop',
+        // Unknown assistant top-level field — non-authoritative.
+        customBlob: topLevelExtra,
+        customObject: { dump: topLevelExtra },
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const snap = registry.get(key)!;
+    expect(snap.messages).toHaveLength(1);
+    const assistant = snap.messages[0] as unknown as {
+      content: Array<Record<string, unknown>>;
+      usage?: { input?: number; output?: number };
+      model?: string;
+      stopReason?: string;
+      customBlob?: string;
+      customObject?: Record<string, unknown>;
+    };
+
+    // Authoritative fields preserved completely.
+    const text = assistant.content.find((p) => p.type === 'text') as { text: string };
+    expect(text.text).toBe(completeText);
+    expect(assistant.usage?.input).toBe(9);
+    expect(assistant.usage?.output).toBe(3);
+    expect(assistant.model).toBe('multi-model');
+    expect(assistant.stopReason).toBe('stop');
+
+    // Every non-authoritative content item's complete serialized form fits the budget.
+    for (const part of assistant.content) {
+      if (part.type === 'text') continue;
+      expect(Buffer.byteLength(JSON.stringify(part), 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+    }
+
+    // Multi-field items must not retain the combined near-limit raw payload volume.
+    const image = assistant.content.find((p) => p.type === 'image' || p._omitted) as Record<
+      string,
+      unknown
+    >;
+    expect(image).toBeDefined();
+    const imageJson = JSON.stringify(image);
+    expect(Buffer.byteLength(imageJson, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    // Cannot keep both full near-limit fields (would exceed the complete-item budget).
+    expect(imageJson.includes(fieldA) && imageJson.includes(fieldB)).toBe(false);
+
+    const toolCall = assistant.content.find(
+      (p) => p.type === 'toolCall' || (p._omitted && p.id === 'tc-multi')
+    ) as Record<string, unknown>;
+    expect(toolCall).toBeDefined();
+    const toolJson = JSON.stringify(toolCall);
+    expect(Buffer.byteLength(toolJson, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    // Long tool name + full near-limit args/extra cannot all survive.
+    expect(
+      toolJson.includes(longName) && toolJson.includes(fieldA) && toolJson.includes(fieldB)
+    ).toBe(false);
+
+    const custom = assistant.content.find(
+      (p) => p.type === 'customPart' || (p._omitted && !p.id && p.type !== 'image')
+    ) as Record<string, unknown>;
+    expect(custom).toBeDefined();
+    const customJson = JSON.stringify(custom);
+    expect(Buffer.byteLength(customJson, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    expect(customJson.includes(fieldA) && customJson.includes(fieldB)).toBe(false);
+
+    // Top-level unknown fields are projected/bounded.
+    if (typeof assistant.customBlob === 'string') {
+      expect(Buffer.byteLength(assistant.customBlob, 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+      expect(assistant.customBlob).not.toBe(topLevelExtra);
+    } else {
+      expect(assistant.customBlob).toBeUndefined();
+    }
+    if (assistant.customObject) {
+      expect(Buffer.byteLength(JSON.stringify(assistant.customObject), 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+    }
+    expect(JSON.stringify(assistant)).not.toContain(topLevelExtra);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('bounds huge finalized-message identity fields on user/toolResult/custom without mutating source', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: identity-bound', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const hugeId = 'I'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 4096);
+    const hugeName = 'N'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    const hugeTs = 'T'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 1024);
+    const hugeCustomType = 'C'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 512);
+    const hugeBody = 'B'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 256);
+
+    const userSource = {
+      role: 'user' as const,
+      content: hugeBody,
+      timestamp: hugeTs,
+      customType: hugeCustomType,
+    };
+    const toolSource = {
+      role: 'toolResult' as const,
+      toolCallId: hugeId,
+      toolName: hugeName,
+      content: [{ type: 'text', text: 'tool-ok' }],
+      isError: false,
+      timestamp: hugeTs,
+    };
+    const customSource = {
+      role: 'custom' as const,
+      customType: hugeCustomType,
+      content: [{ type: 'text', text: 'custom-ok' }],
+      timestamp: hugeTs,
+      toolCallId: hugeId,
+      toolName: hugeName,
+    };
+
+    eventListenerRef.current?.({ type: 'message_end', message: userSource });
+    eventListenerRef.current?.({ type: 'message_end', message: toolSource });
+    eventListenerRef.current?.({ type: 'message_end', message: customSource });
+    await new Promise((r) => setImmediate(r));
+
+    const snap = registry.get(key)!;
+    expect(snap.messages).toHaveLength(3);
+
+    const assertBoundedIdentity = (msg: Record<string, unknown>, label: string) => {
+      for (const key of ['toolCallId', 'toolName', 'timestamp', 'customType'] as const) {
+        const val = msg[key];
+        if (typeof val === 'string') {
+          expect(Buffer.byteLength(val, 'utf8')).toBeLessThanOrEqual(
+            INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+          );
+          expect(val).not.toBe(hugeId);
+          expect(val).not.toBe(hugeName);
+          expect(val).not.toBe(hugeTs);
+          expect(val).not.toBe(hugeCustomType);
+        } else if (val !== undefined && val !== null && typeof val === 'object') {
+          expect(Buffer.byteLength(JSON.stringify(val), 'utf8')).toBeLessThanOrEqual(
+            INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+          );
+        }
+      }
+      // Complete retained message stays within a few complete-item budgets (content + identity).
+      expect(Buffer.byteLength(JSON.stringify(msg), 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES * 6
+      );
+      expect(JSON.stringify(msg)).not.toContain(hugeId);
+      expect(JSON.stringify(msg)).not.toContain(hugeName);
+      expect(JSON.stringify(msg)).not.toContain(hugeTs);
+      expect(JSON.stringify(msg)).not.toContain(hugeCustomType);
+      void label;
+    };
+
+    const userMsg = snap.messages[0] as unknown as Record<string, unknown>;
+    const toolMsg = snap.messages[1] as unknown as Record<string, unknown>;
+    const customMsg = snap.messages[2] as unknown as Record<string, unknown>;
+    assertBoundedIdentity(userMsg, 'user');
+    assertBoundedIdentity(toolMsg, 'toolResult');
+    assertBoundedIdentity(customMsg, 'custom');
+
+    // Source transport objects remain unbounded/unmutated.
+    expect(userSource.timestamp).toBe(hugeTs);
+    expect(userSource.customType).toBe(hugeCustomType);
+    expect(userSource.content).toBe(hugeBody);
+    expect(toolSource.toolCallId).toBe(hugeId);
+    expect(toolSource.toolName).toBe(hugeName);
+    expect(toolSource.timestamp).toBe(hugeTs);
+    expect(customSource.customType).toBe(hugeCustomType);
+    expect(customSource.toolCallId).toBe(hugeId);
+    expect(customSource.toolName).toBe(hugeName);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('bounds oversized streaming messages and active tool args/results', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: stream-bound', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const hugeThinking = 'S'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    const hugeArgs = { blob: 'X'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 1024) };
+    const hugeResult = { dump: 'Y'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 1024) };
+
+    eventListenerRef.current?.({
+      type: 'message_update',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: hugeThinking },
+          { type: 'text', text: 'partial-final' },
+        ],
+      },
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_start',
+      toolCallId: 'tc-stream',
+      toolName: 'bash',
+      args: hugeArgs,
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_update',
+      toolCallId: 'tc-stream',
+      partialResult: hugeResult,
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const mid = registry.get(key)!;
+    const streaming = mid.streamingMessage as unknown as {
+      content: Array<Record<string, unknown>>;
+    };
+    expect(streaming).toBeDefined();
+    const thinking = streaming.content.find((p) => p.type === 'thinking') as { thinking: string };
+    expect(thinking.thinking).toContain('bytes omitted');
+    expect(Buffer.byteLength(thinking.thinking, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    const text = streaming.content.find((p) => p.type === 'text') as { text: string };
+    expect(text.text).toBe('partial-final');
+
+    expect(mid.activeTools).toHaveLength(1);
+    expect(mid.activeTools[0]!.args._omitted).toBe(true);
+    expect(JSON.stringify(mid.activeTools[0]!.args)).not.toContain(hugeArgs.blob);
+    expect((mid.activeTools[0]!.partialResult as { _omitted?: boolean })._omitted).toBe(true);
+    expect(JSON.stringify(mid.activeTools[0]!.partialResult)).not.toContain(
+      hugeResult.dump as string
+    );
+    // Source objects remain raw (registry does not mutate caller payloads).
+    expect(hugeArgs.blob.startsWith('X')).toBe(true);
+    expect(hugeArgs.blob.length).toBeGreaterThan(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES);
+
+    eventListenerRef.current?.({
+      type: 'tool_execution_end',
+      toolCallId: 'tc-stream',
+      isError: false,
+      result: { dump: 'Z'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 512) },
+    });
+    await new Promise((r) => setImmediate(r));
+    const ended = registry.get(key)!;
+    expect(ended.activeTools[0]!.ended).toBe(true);
+    expect((ended.activeTools[0]!.partialResult as { _omitted?: boolean })._omitted).toBe(true);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('caps complete active-tool entry when args+partialResult each under budget but combined exceed', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: combined-entry', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    // Each payload ~40 KiB (under 64 KiB) but combined with id/name/object overhead > 64 KiB.
+    const half = Math.floor(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES * 0.62);
+    const sourceArgs = { blob: 'A'.repeat(half), nested: { keep: true } };
+    const sourcePartial = { dump: 'B'.repeat(half), nested: { keep: true } };
+    expect(Buffer.byteLength(JSON.stringify(sourceArgs), 'utf8')).toBeLessThan(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    expect(Buffer.byteLength(JSON.stringify(sourcePartial), 'utf8')).toBeLessThan(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    // Combined raw would exceed the complete-entry cap.
+    const rawCombined = {
+      toolCallId: 'tc-combined',
+      toolName: 'bash',
+      args: sourceArgs,
+      partialResult: sourcePartial,
+    };
+    expect(Buffer.byteLength(JSON.stringify(rawCombined), 'utf8')).toBeGreaterThan(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+
+    eventListenerRef.current?.({
+      type: 'tool_execution_start',
+      toolCallId: 'tc-combined',
+      toolName: 'bash',
+      args: sourceArgs,
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_update',
+      toolCallId: 'tc-combined',
+      partialResult: sourcePartial,
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const mid = registry.get(key)!;
+    expect(mid.activeTools).toHaveLength(1);
+    const entry = mid.activeTools[0]!;
+    const entryBytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+    expect(entryBytes).toBeLessThanOrEqual(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES);
+    // Lower-priority fields must have been shrunk/omitted so the complete entry fits.
+    const entryJson = JSON.stringify(entry);
+    expect(entryJson.includes(sourceArgs.blob) && entryJson.includes(sourcePartial.dump)).toBe(
+      false
+    );
+    // Source objects remain mutable and unfrozen (no transport mutation).
+    expect(Object.isFrozen(sourceArgs)).toBe(false);
+    expect(Object.isFrozen(sourcePartial)).toBe(false);
+    expect(Object.isFrozen(sourceArgs.nested)).toBe(false);
+    sourceArgs.nested.keep = false;
+    sourcePartial.nested.keep = false;
+    sourceArgs.blob = 'mutated';
+    // Published entry is isolated from source mutation.
+    const after = registry.get(key)!;
+    expect(JSON.stringify(after.activeTools[0])).not.toContain('mutated');
+    expect(Object.isFrozen(after.activeTools[0])).toBe(true);
+
+    // start/update/end lookup still works with the same id.
+    eventListenerRef.current?.({
+      type: 'tool_execution_end',
+      toolCallId: 'tc-combined',
+      isError: false,
+      result: { ok: true },
+    });
+    await new Promise((r) => setImmediate(r));
+    const ended = registry.get(key)!;
+    expect(ended.activeTools).toHaveLength(1);
+    expect(ended.activeTools[0]!.ended).toBe(true);
+    expect(ended.activeTools[0]!.toolCallId).toBe('tc-combined');
+    expect(Buffer.byteLength(JSON.stringify(ended.activeTools[0]), 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('clones under-budget array tool args before freeze (no transport mutation)', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: array-args', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const nested = { flag: true };
+    const sourceArray = ['item-a', nested, 'item-b'];
+    eventListenerRef.current?.({
+      type: 'tool_execution_start',
+      toolCallId: 'tc-arr',
+      toolName: 'list',
+      args: sourceArray,
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const mid = registry.get(key)!;
+    expect(mid.activeTools).toHaveLength(1);
+    const published = mid.activeTools[0]!.args as { value?: unknown[] };
+    expect(Array.isArray(published.value)).toBe(true);
+    // Must be a clone, not the transport-owned array.
+    expect(published.value).not.toBe(sourceArray);
+    expect(published.value![1]).not.toBe(nested);
+    expect(Object.isFrozen(mid.activeTools[0])).toBe(true);
+    // Freezing published state must not freeze the source array or its nested objects.
+    expect(Object.isFrozen(sourceArray)).toBe(false);
+    expect(Object.isFrozen(nested)).toBe(false);
+    // Source mutation must not affect the retained projection.
+    sourceArray.push('item-c');
+    nested.flag = false;
+    (sourceArray[1] as { flag: boolean }).flag = false;
+    const again = registry.get(key)!;
+    const againVal = (again.activeTools[0]!.args as { value: unknown[] }).value;
+    expect(againVal).toHaveLength(3);
+    expect((againVal[1] as { flag: boolean }).flag).toBe(true);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('bounds text-part siblings, top-level extras, tool id/name/queues; isolates snapshot mutables', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: r3-bound', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const hugeText = 'T'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 8192);
+    const hugeSibling = 'S'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 4096);
+    const hugeTop = 'X'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    const hugeId = 'I'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 512);
+    const hugeName = 'N'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 256);
+    const hugeQueue = 'Q'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 128);
+    const mutableArgs = {
+      blob: 'A'.repeat(1024),
+      nested: { v: 1 },
+    };
+    const mutableResult = { dump: 'R'.repeat(1024), nested: { v: 2 } };
+
+    eventListenerRef.current?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: hugeText,
+            note: hugeSibling,
+            meta: { blob: hugeSibling },
+          },
+        ],
+        usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+        model: 'r3-model',
+        stopReason: 'stop',
+        errorMessage: hugeTop,
+        responseId: hugeTop,
+        api: hugeTop,
+        provider: hugeTop,
+        timestamp: hugeTop,
+        customExtra: { dump: hugeTop },
+      },
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_start',
+      toolCallId: hugeId,
+      toolName: hugeName,
+      args: mutableArgs,
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_update',
+      toolCallId: hugeId,
+      partialResult: mutableResult,
+    });
+    eventListenerRef.current?.({
+      type: 'queue_update',
+      steering: [hugeQueue],
+      followUp: [hugeQueue, { nested: hugeQueue }],
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const snap = registry.get(key)!;
+    const assistant = snap.messages[0] as unknown as {
+      content: Array<Record<string, unknown>>;
+      usage?: { input?: number; output?: number };
+      model?: string;
+      stopReason?: string;
+      errorMessage?: string;
+      responseId?: string;
+      api?: string;
+      provider?: string;
+      timestamp?: string;
+      customExtra?: unknown;
+    };
+    const textPart = assistant.content[0]!;
+    // Authoritative text preserved exactly even when itself exceeds 64 KiB.
+    expect(textPart.text).toBe(hugeText);
+    expect(assistant.usage?.input).toBe(1);
+    expect(assistant.model).toBe('r3-model');
+    expect(assistant.stopReason).toBe('stop');
+    // Non-authoritative text siblings bounded.
+    if (typeof textPart.note === 'string') {
+      expect(Buffer.byteLength(textPart.note, 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+      expect(textPart.note).not.toBe(hugeSibling);
+    }
+    if (textPart.meta) {
+      expect(Buffer.byteLength(JSON.stringify(textPart.meta), 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+    }
+    // Top-level extras bounded or omitted as complete items.
+    for (const field of ['errorMessage', 'responseId', 'api', 'provider', 'timestamp'] as const) {
+      const val = assistant[field];
+      if (typeof val === 'string') {
+        expect(Buffer.byteLength(val, 'utf8')).toBeLessThanOrEqual(
+          INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+        );
+        expect(val).not.toBe(hugeTop);
+      }
+    }
+    if (assistant.customExtra !== undefined) {
+      expect(Buffer.byteLength(JSON.stringify(assistant.customExtra), 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+    }
+    expect(JSON.stringify(assistant)).not.toContain(hugeSibling);
+    expect(JSON.stringify(assistant)).not.toContain(hugeTop);
+
+    expect(snap.activeTools).toHaveLength(1);
+    const tool = snap.activeTools[0]!;
+    expect(Buffer.byteLength(tool.toolCallId, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    expect(Buffer.byteLength(tool.toolName, 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+    expect(tool.toolCallId).not.toBe(hugeId);
+    expect(tool.toolName).not.toBe(hugeName);
+    expect(Buffer.byteLength(JSON.stringify(tool), 'utf8')).toBeLessThanOrEqual(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+    );
+
+    for (const q of [...snap.steeringQueue, ...snap.followUpQueue]) {
+      expect(Buffer.byteLength(q, 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+      expect(q).not.toBe(hugeQueue);
+    }
+
+    // Snapshot isolation: published nested objects are frozen clones, not transport-owned refs.
+    const publishedArgs = tool.args as { blob?: string; nested?: { v?: number } };
+    const publishedResult = tool.partialResult as { dump?: string; nested?: { v?: number } };
+    expect(publishedArgs).not.toBe(mutableArgs);
+    expect(Object.isFrozen(tool)).toBe(true);
+    expect(Object.isFrozen(publishedArgs)).toBe(true);
+    expect(() => {
+      (publishedArgs as { blob?: string }).blob = 'MUTATED';
+    }).toThrow();
+    if (publishedResult && typeof publishedResult === 'object') {
+      expect(Object.isFrozen(publishedResult)).toBe(true);
+    }
+    // Mutating the original transport-owned payloads must not expand retained endpoint state.
+    mutableArgs.blob = 'Z'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    mutableArgs.nested.v = 42;
+    mutableResult.dump = 'Z'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 2048);
+    mutableResult.nested.v = 42;
+
+    const again = registry.get(key)!;
+    expect(JSON.stringify(again.activeTools)).not.toContain('Z'.repeat(64));
+    const againArgs = again.activeTools[0]!.args as { nested?: { v?: number }; blob?: string };
+    expect(againArgs.nested?.v).toBe(1);
+    expect(againArgs.blob).toBe('A'.repeat(1024));
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('bounds huge activeTools Map keys across start/update/end and keeps retained size finite', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    await registry.activate(key, 'Task: huge-tool-id', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const hugeId = 'H'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 8192);
+    const hugeId2 = 'G'.repeat(INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES + 4096);
+
+    eventListenerRef.current?.({
+      type: 'tool_execution_start',
+      toolCallId: hugeId,
+      toolName: 'search',
+      args: { q: 'one' },
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_start',
+      toolCallId: hugeId2,
+      toolName: 'read',
+      args: { path: '/tmp/a' },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const internal = registry._endpoints.get(key) as
+      { activeTools: Map<string, { toolCallId: string; ended?: boolean }> } | undefined;
+    expect(internal).toBeDefined();
+    expect(internal!.activeTools.size).toBe(2);
+    for (const mapKey of internal!.activeTools.keys()) {
+      expect(Buffer.byteLength(mapKey, 'utf8')).toBeLessThanOrEqual(256);
+      expect(mapKey).not.toBe(hugeId);
+      expect(mapKey).not.toBe(hugeId2);
+    }
+    // Map retained key storage must not keep the raw huge IDs.
+    const keyJoin = [...internal!.activeTools.keys()].join('');
+    expect(keyJoin.includes('H'.repeat(64))).toBe(false);
+    expect(keyJoin.includes('G'.repeat(64))).toBe(false);
+
+    const snapStart = registry.get(key)!;
+    expect(snapStart.activeTools).toHaveLength(2);
+    for (const tool of snapStart.activeTools) {
+      expect(Buffer.byteLength(tool.toolCallId, 'utf8')).toBeLessThanOrEqual(
+        INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES
+      );
+      expect(tool.toolCallId).not.toBe(hugeId);
+      expect(tool.toolCallId).not.toBe(hugeId2);
+    }
+    expect(Buffer.byteLength(JSON.stringify(snapStart.activeTools), 'utf8')).toBeLessThan(
+      INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES * 2
+    );
+
+    // Update/end still resolve via the deterministic bounded key.
+    eventListenerRef.current?.({
+      type: 'tool_execution_update',
+      toolCallId: hugeId,
+      partialResult: { progress: 50 },
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_end',
+      toolCallId: hugeId,
+      result: { ok: true },
+      isError: false,
+    });
+    eventListenerRef.current?.({
+      type: 'tool_execution_end',
+      toolCallId: hugeId2,
+      result: { ok: false },
+      isError: true,
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const snapEnd = registry.get(key)!;
+    expect(snapEnd.activeTools).toHaveLength(2);
+    expect(snapEnd.activeTools.every((t) => t.ended === true)).toBe(true);
+    const ended = snapEnd.activeTools.find((t) => t.isError === false);
+    const failed = snapEnd.activeTools.find((t) => t.isError === true);
+    expect(ended?.partialResult).toEqual({ ok: true });
+    expect(failed?.partialResult).toEqual({ ok: false });
+    expect(internal!.activeTools.size).toBe(2);
+    for (const mapKey of internal!.activeTools.keys()) {
+      expect(Buffer.byteLength(mapKey, 'utf8')).toBeLessThanOrEqual(256);
+    }
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('public snapshot and list item isolate sessionArtifact, activation.policy, and usage', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    const act = await registry.activate(
+      key,
+      'Task: isolate-meta',
+      'prompt',
+      { maxTurns: 3 },
+      'tool_call'
+    );
+    await new Promise((r) => setImmediate(r));
+
+    // Seed usage so the public projection includes nested metadata.
+    eventListenerRef.current?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'meta' }],
+        usage: { input: 2, output: 3, totalTokens: 5, cost: { total: 0.1 } },
+        model: 'meta-model',
+        stopReason: 'stop',
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const snap = registry.get(key)!;
+    const list = registry.listVisibleMeta().find((row) => row.key === key)!;
+    expect(snap.activation?.id).toBe(act.activationId);
+    expect(snap.activation?.policy?.maxTurns).toBe(3);
+    expect(snap.sessionArtifact).toBeDefined();
+    expect(list.sessionArtifact).toBeDefined();
+    expect(snap.usage).toBeDefined();
+    expect(list.usage).toBeDefined();
+
+    const internal = registry._endpoints.get(key) as
+      | {
+          sessionArtifact?: { runtime?: string; sessionFile?: string; sessionId?: string };
+          activation?: { policy?: { maxTurns?: number } };
+          usage?: { turns?: number; model?: string; input?: number };
+        }
+      | undefined;
+    expect(internal).toBeDefined();
+
+    // Consumer mutation of public nested metadata must not alter endpoint identity.
+    const publicArt = snap.sessionArtifact as { runtime?: string; sessionFile?: string };
+    const listArt = list.sessionArtifact as { runtime?: string; sessionFile?: string };
+    expect(publicArt).not.toBe(internal!.sessionArtifact);
+    expect(listArt).not.toBe(internal!.sessionArtifact);
+    expect(Object.isFrozen(publicArt)).toBe(true);
+    expect(Object.isFrozen(listArt)).toBe(true);
+    expect(() => {
+      publicArt.sessionFile = '/mutated/session.json';
+    }).toThrow();
+    expect(() => {
+      listArt.runtime = 'mutated' as never;
+    }).toThrow();
+
+    const publicPolicy = snap.activation!.policy as { maxTurns?: number };
+    expect(publicPolicy).not.toBe(internal!.activation?.policy);
+    expect(Object.isFrozen(publicPolicy)).toBe(true);
+    expect(() => {
+      publicPolicy.maxTurns = 99;
+    }).toThrow();
+    expect(internal!.activation?.policy?.maxTurns).toBe(3);
+
+    const publicUsage = snap.usage as { model?: string; turns?: number; input?: number };
+    const listUsage = list.usage as { model?: string; turns?: number; input?: number };
+    expect(publicUsage).not.toBe(internal!.usage);
+    expect(listUsage).not.toBe(internal!.usage);
+    expect(Object.isFrozen(publicUsage)).toBe(true);
+    expect(() => {
+      publicUsage.model = 'mutated-model';
+      publicUsage.turns = 999;
+    }).toThrow();
+
+    const later = registry.get(key)!;
+    expect(later.sessionArtifact).toEqual(snap.sessionArtifact);
+    expect(later.activation?.policy?.maxTurns).toBe(3);
+    expect(later.usage?.model).not.toBe('mutated-model');
+    if (internal!.sessionArtifact && 'sessionFile' in internal!.sessionArtifact) {
+      expect(internal!.sessionArtifact.sessionFile).not.toBe('/mutated/session.json');
+    }
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('detach during running activation settles terminal status, defers eviction, no duplicate settle', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key, sessionFile } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"test-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+
+    const settledEvents: Array<{
+      status: string;
+      messageCount: number;
+      activationId: string;
+    }> = [];
+    const order: string[] = [];
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        order.push('activation_settled');
+        settledEvents.push({
+          status: e.snapshot.status,
+          messageCount: e.snapshot.messages.length,
+          activationId: e.activationId,
+        });
+        // Pre-eviction transcript must still be visible on the settled snapshot.
+        expect(e.snapshot.messages.length).toBeGreaterThan(0);
+        expect(e.snapshot.status).not.toBe('running');
+        expect(e.snapshot.status).not.toBe('starting');
+      } else if (e.type === 'endpoint_updated' && e.key === key) {
+        order.push(`endpoint_updated:${e.snapshot.status}:${e.snapshot.messages.length}`);
+      }
+    });
+
+    const act = await registry.activate(
+      key,
+      'Task: detach-running',
+      'prompt',
+      undefined,
+      'tool_call'
+    );
+    await new Promise((r) => setImmediate(r));
+    eventListenerRef.current?.({ type: 'agent_start' });
+    const chunk = 'D'.repeat(40 * 1024);
+    for (let i = 0; i < 20; i++) {
+      eventListenerRef.current?.({
+        type: 'message_end',
+        message: {
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          content: i % 2 === 0 ? `u-${i}:${chunk}` : [{ type: 'text', text: `a-${i}:${chunk}` }],
+        },
+      });
+    }
+    await new Promise((r) => setImmediate(r));
+    expect(registry.get(key)?.status).toBe('running');
+    const preCount = registry.get(key)!.messages.length;
+    expect(preCount).toBeGreaterThan(2);
+
+    await registry.detach(key);
+    expect(settledEvents).toHaveLength(1);
+    expect(settledEvents[0]!.activationId).toBe(act.activationId);
+    expect(settledEvents[0]!.status).toBe('detached');
+    expect(settledEvents[0]!.messageCount).toBe(preCount);
+    // Settled before any post-settle empty transcript publication.
+    const settledIdx = order.indexOf('activation_settled');
+    expect(settledIdx).toBeGreaterThanOrEqual(0);
+    const laterEmpty = order
+      .slice(settledIdx + 1)
+      .some((s) => s.startsWith('endpoint_updated:detached:0'));
+    // Eviction is deferred; after microtasks the transcript may clear.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 30));
+    // No duplicate settle.
+    expect(settledEvents).toHaveLength(1);
+    const after = registry.get(key)!;
+    expect(after.activation).toBeUndefined();
+    expect(after.status).toBe('detached');
+    // Oversized idle/detached transcript is eventually released.
+    expect(after.messages.length).toBe(0);
+    expect(laterEmpty || after.messages.length === 0).toBe(true);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('transport invalidation during running activation settles non-running status without duplicate settle', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key, runId, sessionFile } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"test-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+
+    const settled: Array<{ status: string; messageCount: number; activationId: string }> = [];
+    let internalAtSettled: { status: string; messageCount: number } | undefined;
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled' && e.key === key) {
+        settled.push({
+          status: e.snapshot.status,
+          messageCount: e.snapshot.messages.length,
+          activationId: e.activationId,
+        });
+        expect(e.snapshot.status).not.toBe('running');
+        expect(e.snapshot.status).not.toBe('starting');
+        expect(e.snapshot.messages.length).toBeGreaterThan(0);
+        // Internal endpoint must retain the complete transcript through the settled turn.
+        const internalNow = registry._endpoints.get(key) as
+          { status: string; messages: readonly unknown[] } | undefined;
+        internalAtSettled = {
+          status: internalNow?.status ?? 'missing',
+          messageCount: internalNow?.messages.length ?? 0,
+        };
+      }
+    });
+
+    const act = await registry.activate(key, 'Task: invalidate', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+    eventListenerRef.current?.({ type: 'agent_start' });
+    eventListenerRef.current?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'keep-me-' + 'K'.repeat(1024) }],
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+    expect(registry.get(key)?.status).toBe('running');
+    const preCount = registry.get(key)!.messages.length;
+
+    // Forged host session → applyUnavailable → invalidateLiveTransport while running.
+    const ep = registry.get(key)!;
+    const forged: InteractiveAgentLinkV1 = {
+      version: 1,
+      runId,
+      unitId: 'single',
+      bindingId: ep.bindingId,
+      hostSessionId: 'forged-invalid-host',
+      createdAt: Date.now(),
+    };
+    registry.restoreActiveBranch({
+      sessionManager: {
+        getSessionId: () => 'forged-invalid-host',
+        getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
+      },
+      cwd: root,
+    } as never);
+
+    expect(settled).toHaveLength(1);
+    expect(settled[0]!.activationId).toBe(act.activationId);
+    expect(settled[0]!.status).not.toBe('running');
+    expect(settled[0]!.messageCount).toBe(preCount);
+    expect(internalAtSettled?.messageCount).toBe(preCount);
+    // Immediately after the synchronous settled call stack, internal transcript is still complete.
+    const internalSync = registry._endpoints.get(key) as
+      { status: string; activation?: unknown; messages: readonly unknown[] } | undefined;
+    expect(internalSync?.activation).toBeUndefined();
+    expect(internalSync?.status).toBe('unavailable');
+    expect(internalSync?.messages.length).toBe(preCount);
+
+    // Deferred transition clears the transcript after the settled turn.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect(settled).toHaveLength(1);
+    const internalDeferred = registry._endpoints.get(key) as
+      { status: string; messages: readonly unknown[] } | undefined;
+    expect(internalDeferred?.status).toBe('unavailable');
+    expect(internalDeferred?.messages.length).toBe(0);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('successful settle publishes full snapshot before deferred reloadable eviction', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key, sessionFile } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"test-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+
+    const settledSnapshots: Array<{ messages: readonly unknown[]; activationId: string }> = [];
+    let settled = false;
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        settled = true;
+        settledSnapshots.push({
+          messages: e.snapshot.messages,
+          activationId: e.activationId,
+        });
+      }
+    });
+
+    const act = await registry.activate(key, 'Task: evict', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    const chunk = 'M'.repeat(32 * 1024);
+    let appended = 0;
+    while (true) {
+      eventListenerRef.current?.({
+        type: 'message_end',
+        message: {
+          role: appended % 2 === 0 ? 'user' : 'assistant',
+          content:
+            appended % 2 === 0
+              ? `user-${appended}:${chunk}`
+              : [{ type: 'text', text: `assistant-${appended}:${chunk}` }],
+        },
+      });
+      appended += 1;
+      const mid = registry.get(key)!;
+      const bytes = Buffer.byteLength(JSON.stringify(mid.messages), 'utf8');
+      if (bytes > INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES && appended >= 4) break;
+      if (appended > 40) break;
+    }
+    eventListenerRef.current?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'SETTLE_FINAL_OUTPUT' }],
+        usage: { input: 3, output: 5, totalTokens: 8, cost: { total: 0 } },
+        model: 'test-model',
+        stopReason: 'stop',
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const beforeSettle = registry.get(key)!;
+    expect(beforeSettle.messages.length).toBeGreaterThan(2);
+    const preBytes = Buffer.byteLength(JSON.stringify(beforeSettle.messages), 'utf8');
+    expect(preBytes).toBeGreaterThan(INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES);
+    const elementBytes = beforeSettle.messages.map((m) =>
+      Buffer.byteLength(JSON.stringify(m), 'utf8')
+    );
+    const exact =
+      2 + elementBytes.reduce((a, b) => a + b, 0) + Math.max(0, elementBytes.length - 1);
+    expect(exact).toBe(preBytes);
+
+    eventListenerRef.current?.({ type: 'agent_start' });
+    eventListenerRef.current?.({ type: 'agent_end', messages: [], willRetry: false });
+    eventListenerRef.current?.({ type: 'agent_settled' });
+    // Drain transition queue so agent_settled reduces synchronously for subscribers.
+    await new Promise((r) => setImmediate(r));
+
+    // Settled consumer observed the complete pre-eviction snapshot before deferred retention.
+    expect(settled).toBe(true);
+    expect(settledSnapshots).toHaveLength(1);
+    expect(settledSnapshots[0]!.activationId).toBe(act.activationId);
+    expect(settledSnapshots[0]!.messages.length).toBe(beforeSettle.messages.length);
+    const last = settledSnapshots[0]!.messages[settledSnapshots[0]!.messages.length - 1] as {
+      content: Array<{ text: string }>;
+    };
+    expect(last.content[0]!.text).toBe('SETTLE_FINAL_OUTPUT');
+
+    // Deferred retention: reloadable oversized idle becomes empty/unhydrated.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const after = registry.get(key)!;
+    expect(after.messages).toEqual([]);
+    expect(['detached', 'idle', 'error']).toContain(after.status);
+    expect(after.sessionFile).toBe(sessionFile);
+    const epMap = (
+      registry as unknown as {
+        _endpoints: Map<string, { transcriptHydrated: boolean }>;
+      }
+    )._endpoints;
+    expect(epMap.get(key)?.transcriptHydrated).toBe(false);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('hydrated oversized transcript schedules eviction after prompt/spawn failure', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'look',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionsDir = path.join(store.getRunDir(runId), 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const sessionFile = path.join(sessionsDir, 'oversized-fail.jsonl');
+    const header = {
+      type: 'session',
+      version: 3,
+      id: 'sess-oversized-fail',
+      timestamp: new Date().toISOString(),
+      cwd: root,
+    };
+    const chunk = 'M'.repeat(40 * 1024);
+    const lines = [JSON.stringify(header)];
+    for (let i = 0; i < 20; i++) {
+      lines.push(
+        JSON.stringify({
+          type: 'message',
+          id: `m${i}`,
+          parentId: i === 0 ? null : `m${i - 1}`,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: i % 2 === 0 ? 'user' : 'assistant',
+            content:
+              i % 2 === 0
+                ? `user-${i}:${chunk}`
+                : [{ type: 'text', text: `assistant-${i}:${chunk}` }],
+            timestamp: Date.now(),
+          },
+        })
+      );
+    }
+    fs.writeFileSync(sessionFile, `${lines.join('\n')}\n`);
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      transportFactory: async () => {
+        throw new Error('spawn boom after hydrate');
+      },
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const settled: Array<{ activationId: string; messageCount: number }> = [];
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        settled.push({
+          activationId: e.activationId,
+          messageCount: e.snapshot.messages.length,
+        });
+      }
+    });
+
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-oversized-fail',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () => [],
+    });
+
+    expect(snap.messages.length).toBeGreaterThan(2);
+    const preBytes = Buffer.byteLength(JSON.stringify(snap.messages), 'utf8');
+    expect(preBytes).toBeGreaterThan(INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES);
+
+    let err: unknown;
+    try {
+      await registry.activate(snap.key, 'Task: fail', 'prompt', undefined, 'tool_call');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(String(err)).toMatch(/spawn boom/);
+
+    // Settled consumers observe the complete pre-eviction snapshot first.
+    expect(settled.length).toBeGreaterThanOrEqual(1);
+    expect(settled[0]!.messageCount).toBe(snap.messages.length);
+
+    // Deferred reloadable eviction after final error status.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 30));
+
+    const after = registry.get(snap.key)!;
+    expect(after.messages).toEqual([]);
+    expect(['error', 'detached', 'idle']).toContain(after.status);
+    const epMap = (
+      registry as unknown as {
+        _endpoints: Map<string, { transcriptHydrated: boolean }>;
+      }
+    )._endpoints;
+    expect(epMap.get(snap.key)?.transcriptHydrated).toBe(false);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('hydrated oversized transcript schedules eviction after starting cancellation', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'look',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionsDir = path.join(store.getRunDir(runId), 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const sessionFile = path.join(sessionsDir, 'oversized-cancel.jsonl');
+    const header = {
+      type: 'session',
+      version: 3,
+      id: 'sess-oversized-cancel',
+      timestamp: new Date().toISOString(),
+      cwd: root,
+    };
+    const chunk = 'C'.repeat(40 * 1024);
+    const lines = [JSON.stringify(header)];
+    for (let i = 0; i < 20; i++) {
+      lines.push(
+        JSON.stringify({
+          type: 'message',
+          id: `c${i}`,
+          parentId: i === 0 ? null : `c${i - 1}`,
+          timestamp: new Date().toISOString(),
+          message: {
+            role: i % 2 === 0 ? 'user' : 'assistant',
+            content:
+              i % 2 === 0
+                ? `user-${i}:${chunk}`
+                : [{ type: 'text', text: `assistant-${i}:${chunk}` }],
+            timestamp: Date.now(),
+          },
+        })
+      );
+    }
+    fs.writeFileSync(sessionFile, `${lines.join('\n')}\n`);
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    let resolveState!: () => void;
+    const stateGate = new Promise<void>((r) => {
+      resolveState = r;
+    });
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      transportFactory: async () =>
+        ({
+          async getState() {
+            await stateGate;
+            return {
+              sessionId: 's',
+              thinkingLevel: 'off',
+              isStreaming: false,
+              isCompacting: false,
+              steeringMode: 'all',
+              followUpMode: 'one-at-a-time',
+              autoCompactionEnabled: true,
+              messageCount: 0,
+              pendingMessageCount: 0,
+            };
+          },
+          async prompt() {},
+          async steer() {},
+          async followUp() {},
+          async abort() {},
+          subscribe() {
+            return () => undefined;
+          },
+          async dispose() {},
+          getStderr() {
+            return '';
+          },
+        }) as unknown as PiRpcTransport,
+    });
+    registry.setHostLinkAppender(() => undefined);
+
+    const settled: Array<{ messageCount: number }> = [];
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        settled.push({ messageCount: e.snapshot.messages.length });
+      }
+    });
+
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-oversized-cancel',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () => [],
+    });
+
+    expect(snap.messages.length).toBeGreaterThan(2);
+    const preBytes = Buffer.byteLength(JSON.stringify(snap.messages), 'utf8');
+    expect(preBytes).toBeGreaterThan(INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES);
+
+    const actPromise = registry.activate(snap.key, 'Task: cancel', 'prompt', undefined, 'view');
+    // Wait until starting with an open activation, then cancel before handshake completes.
+    for (let i = 0; i < 50; i++) {
+      const mid = registry.get(snap.key);
+      if (mid?.status === 'starting' && mid.activation) break;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const starting = registry.get(snap.key)!;
+    expect(starting.status).toBe('starting');
+    expect(starting.activation).toBeTruthy();
+
+    await registry.abort(snap.key);
+    resolveState();
+    await Promise.allSettled([actPromise]);
+
+    expect(settled.length).toBeGreaterThanOrEqual(1);
+    expect(settled[0]!.messageCount).toBe(snap.messages.length);
+
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 30));
+
+    const after = registry.get(snap.key)!;
+    expect(after.messages).toEqual([]);
+    expect(['detached', 'idle', 'error', 'cancelled']).toContain(after.status);
+    const epMap = (
+      registry as unknown as {
+        _endpoints: Map<string, { transcriptHydrated: boolean }>;
+      }
+    )._endpoints;
+    expect(epMap.get(snap.key)?.transcriptHydrated).toBe(false);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('non-reloadable oversized settle compacts, publishes, and preserves latest assistant', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    const postSettleFull: Array<{ messageCount: number; texts: string[] }> = [];
+    let settled = false;
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') settled = true;
+      if (e.type === 'endpoint_updated' && settled && e.kind === 'full') {
+        postSettleFull.push({
+          messageCount: e.snapshot.messages.length,
+          texts: e.snapshot.messages.map((m) => {
+            const msg = m as { role?: string; content?: unknown };
+            if (typeof msg.content === 'string') return msg.content;
+            if (Array.isArray(msg.content)) {
+              const t = msg.content.find(
+                (p) => p && typeof p === 'object' && (p as { type?: string }).type === 'text'
+              ) as { text?: string } | undefined;
+              return t?.text ?? '';
+            }
+            return '';
+          }),
+        });
+      }
+    });
+
+    await registry.activate(key, 'Task: compact', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    // Strip reloadable identity after spawn so settle uses in-place compaction.
+    const epMap = (
+      registry as unknown as {
+        _endpoints: Map<
+          string,
+          {
+            sessionFile: string;
+            sessionArtifact?: unknown;
+            transcriptHydrated: boolean;
+          }
+        >;
+      }
+    )._endpoints;
+    const ep = epMap.get(key)!;
+    ep.sessionFile = '';
+    ep.sessionArtifact = undefined;
+
+    const chunk = 'N'.repeat(40 * 1024);
+    for (let i = 0; i < 20; i++) {
+      eventListenerRef.current?.({
+        type: 'message_end',
+        message: {
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          content: i % 2 === 0 ? `u-${i}:${chunk}` : [{ type: 'text', text: `a-${i}:${chunk}` }],
+        },
+      });
+    }
+    eventListenerRef.current?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'LATEST_ASSISTANT_KEPT' }],
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const before = registry.get(key)!;
+    const beforeCount = before.messages.length;
+    expect(Buffer.byteLength(JSON.stringify(before.messages), 'utf8')).toBeGreaterThan(
+      INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES
+    );
+
+    eventListenerRef.current?.({ type: 'agent_start' });
+    eventListenerRef.current?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const after = registry.get(key)!;
+    expect(after.messages.length).toBe(beforeCount);
+    const last = after.messages[after.messages.length - 1] as unknown as {
+      role: string;
+      content: Array<{ text: string }>;
+    };
+    expect(last.role).toBe('assistant');
+    expect(last.content[0]!.text).toBe('LATEST_ASSISTANT_KEPT');
+    const earlier = after.messages[0] as unknown as { content: Array<{ text: string }> | string };
+    const earlierText =
+      typeof earlier.content === 'string' ? earlier.content : (earlier.content[0]?.text ?? '');
+    expect(earlierText).toContain('Earlier history omitted');
+    expect(ep.transcriptHydrated).toBe(true);
+
+    expect(
+      postSettleFull.some((u) => u.texts.some((t) => t.includes('Earlier history omitted')))
+    ).toBe(true);
+    expect(postSettleFull.some((u) => u.texts.includes('LATEST_ASSISTANT_KEPT'))).toBe(true);
+
+    const afterBytes = Buffer.byteLength(JSON.stringify(after.messages), 'utf8');
+    const latestBytes = Buffer.byteLength(JSON.stringify(last), 'utf8');
+    const markerOverhead = afterBytes - latestBytes;
+    expect(afterBytes).toBeLessThanOrEqual(
+      Math.max(INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES, latestBytes + markerOverhead)
+    );
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it('message_update same-length text replacement bumps streamRevision only', async () => {
     const { root, store, coordinator } = makeTempStore();
     const agent = makeAgent();
@@ -3230,7 +4917,7 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
     expect(before.messages.length).toBeGreaterThan(0);
     const rev = before.messagesRevision;
 
-    // Forge restore with host-session mismatch → applyUnavailable clears messages.
+    // Forge restore with host-session mismatch → applyUnavailable settles then defers clear.
     const forged: InteractiveAgentLinkV1 = {
       version: 1,
       runId,
@@ -3247,6 +4934,14 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
       cwd: root,
     } as never);
 
+    // Synchronous turn still retains transcript for settled consumers.
+    const mid = registry.get(key)!;
+    expect(mid.status).toBe('unavailable');
+    expect(mid.messages.length).toBeGreaterThan(0);
+
+    // Deferred transition clears transcript and bumps revision.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
     const after = registry.get(key)!;
     expect(after.status).toBe('unavailable');
     expect(after.messages).toHaveLength(0);

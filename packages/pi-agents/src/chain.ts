@@ -33,7 +33,6 @@ import { emptyUsage } from './empty-usage.ts';
 import { renderTaskTemplate } from './template.ts';
 import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
-  cloneResults,
   cloneSingleResult,
   type ChainExecutionDetails,
   type ChainFanoutStep,
@@ -228,6 +227,16 @@ function hasEmptyFanoutCompletionEvidence(
   return entry !== undefined && entry.step === logical.step;
 }
 
+/** Copy an output entry and isolate structured payload from shared mutable sources. */
+function isolateOutputEntry(entry: ChainOutputEntry): ChainOutputEntry {
+  return {
+    text: entry.text,
+    structured: entry.structured !== undefined ? structuredClone(entry.structured) : undefined,
+    agent: entry.agent,
+    step: entry.step,
+  };
+}
+
 /**
  * Build a complete restored logical-step array from request topology.
  * Overlays trustworthy presentation state by step number (never by unchecked
@@ -368,11 +377,14 @@ function rehydrateCompletedSequentialFromDurable(
     const durableResult = durableCompletedSequentialResult(units, stepNumber);
     if (!durableResult) continue;
 
-    // Compact then clone into mutable workflow state so legacy full transcripts
-    // are projected before messages are cleared.
-    const cloned = cloneSingleResult(snapshotSingleResult(durableResult));
-    if (cloned.step === undefined) cloned.step = stepNumber;
-    upsertSequentialResult(results, cloned);
+    // Compact into snapshot-owned immutable results before aggregate sharing.
+    let snap = snapshotSingleResult(durableResult);
+    if (snap.step === undefined) {
+      const shell = copySnapshotShell(snap);
+      shell.step = stepNumber;
+      snap = snapshotSingleResult(shell);
+    }
+    upsertSequentialResult(results, snap);
 
     if (!sequential.name) continue;
     // Later-step-wins: never overwrite a same-named entry recorded by a later
@@ -380,15 +392,18 @@ function rehydrateCompletedSequentialFromDurable(
     // or earlier-step entries.
     const existing = outputs.get(sequential.name);
     if (existing !== undefined && existing.step > stepNumber) continue;
-    outputs.set(sequential.name, {
-      text: resultText(durableResult),
-      structured:
-        durableResult.structuredOutput !== undefined
-          ? structuredClone(durableResult.structuredOutput)
-          : undefined,
-      agent: sequential.agent,
-      step: stepNumber,
-    });
+    outputs.set(
+      sequential.name,
+      isolateOutputEntry({
+        text: resultText(durableResult),
+        structured:
+          durableResult.structuredOutput !== undefined
+            ? structuredClone(durableResult.structuredOutput)
+            : undefined,
+        agent: sequential.agent,
+        step: stepNumber,
+      })
+    );
   }
 }
 
@@ -427,10 +442,11 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
   let logicalSteps: ChainLogicalStep[];
 
   if (restored) {
-    results = cloneResults(restored.results);
+    // Normalize into snapshot-owned immutable results before workflow mutation/sharing.
+    results = restored.results.map((r) => snapshotSingleResult(r));
     for (const [name, entry] of Object.entries(restored.outputs)) {
-      // Shallow-copy entries so later rehydrate cannot mutate durable details.outputs.
-      outputs.set(name, { ...entry });
+      // Isolate structured payloads so mutation of restored details.outputs cannot leak.
+      outputs.set(name, isolateOutputEntry(entry));
     }
     // Prefer durable completed sequential unit results when presentation lags.
     rehydrateCompletedSequentialFromDurable(chain, results, outputs, restored.units);
@@ -457,7 +473,13 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
     logicalSteps = initLogicalSteps(chain);
   }
 
-  const outputsRecord = (): Record<string, ChainOutputEntry> => Object.fromEntries(outputs);
+  const outputsRecord = (): Record<string, ChainOutputEntry> => {
+    const out: Record<string, ChainOutputEntry> = {};
+    for (const [name, entry] of outputs) {
+      out[name] = isolateOutputEntry(entry);
+    }
+    return out;
+  };
 
   const buildDetails = (): SubagentDetails => {
     // Copy-on-write result shells; share frozen presentation/structuredOutput payloads.
@@ -792,7 +814,10 @@ async function runSequentialStep(
 
   const chainUpdate = makeSequentialUpdate(results, stepNumber, opts.onUpdate, buildDetails);
 
+  // Exactly-once: production runStep invokes the callback; stubs that ignore it get one fallback.
+  let terminalPostprocessed = false;
   const postprocessTerminal = (result: SingleResult): void => {
+    terminalPostprocessed = true;
     applyStructuredOutputValidation(result, outputSchema, stepNumber);
     if (!result.status || result.status === 'running') applyTerminalStatus(result);
     result.step = stepNumber;
@@ -813,11 +838,15 @@ async function runSequentialStep(
       skipCompletionCheck: outputSchema !== undefined,
       postprocessTerminal,
     });
-    // Idempotent fallback for injected runStep stubs that ignore postprocessTerminal:
-    // copy into mutable working state, re-apply postprocess, and resnapshot.
-    const working = cloneSingleResult(result);
-    postprocessTerminal(working);
-    result = snapshotSingleResult(working);
+    if (!terminalPostprocessed) {
+      // Injected runStep stubs that ignore postprocessTerminal get exactly one fallback.
+      const working = cloneSingleResult(result);
+      postprocessTerminal(working);
+      result = snapshotSingleResult(working);
+    } else {
+      // Production already postprocessed + snapshotted; re-snapshot is an owned fast path.
+      result = snapshotSingleResult(result);
+    }
   } catch (err) {
     if (isAbortError(err)) {
       const cancelled: SingleResult = {
@@ -896,12 +925,15 @@ async function runSequentialStep(
   logicalSteps[stepIndex].status = 'completed';
   const nextPreviousOutput = getResultFinalOutput(result);
   if (step.name) {
-    outputs.set(step.name, {
-      text: nextPreviousOutput,
-      structured: result.structuredOutput,
-      agent: step.agent,
-      step: stepNumber,
-    });
+    outputs.set(
+      step.name,
+      isolateOutputEntry({
+        text: nextPreviousOutput,
+        structured: result.structuredOutput,
+        agent: step.agent,
+        step: stepNumber,
+      })
+    );
   }
   return { done: false, previousOutput: nextPreviousOutput };
 }
@@ -1041,12 +1073,15 @@ async function runFanoutStep(
     fanoutMeta.skippedCount = skipped;
     fanoutMeta.status = 'completed';
     const text = '[]';
-    outputs.set(step.collect.name, {
-      text,
-      structured: [],
-      agent: step.parallel.agent,
-      step: stepNumber,
-    });
+    outputs.set(
+      step.collect.name,
+      isolateOutputEntry({
+        text,
+        structured: [],
+        agent: step.parallel.agent,
+        step: stepNumber,
+      })
+    );
     emit(`Fanout: 0/0 done`);
     return { done: false, previousOutput: text };
   }
@@ -1181,7 +1216,10 @@ async function runFanoutStep(
   };
 
   const makeTerminalPostprocess = (index: number, task: string) => {
-    return (result: SingleResult): void => {
+    // Per-invocation flag: production runStep sets it; stubs that ignore get one fallback.
+    let invoked = false;
+    const postprocessTerminal = (result: SingleResult): void => {
+      invoked = true;
       applyStructuredOutputValidation(result, outputSchema, stepNumber);
       if (!result.status || result.status === 'running') applyTerminalStatus(result);
       result.step = stepNumber;
@@ -1190,6 +1228,10 @@ async function runFanoutStep(
         count: renderedTasks.length,
         itemTask: task,
       };
+    };
+    return {
+      postprocessTerminal,
+      wasInvoked: () => invoked,
     };
   };
 
@@ -1240,7 +1282,7 @@ async function runFanoutStep(
             }
           : undefined;
 
-        const postprocessTerminal = makeTerminalPostprocess(index, task);
+        const { postprocessTerminal, wasInvoked } = makeTerminalPostprocess(index, task);
 
         try {
           const result = await opts.runStep({
@@ -1261,10 +1303,16 @@ async function runFanoutStep(
             // Worker finished after cancel: keep cancelled if we already marked it.
             if (resolveExecutionStatus(slots[index]) === 'cancelled') return slots[index];
           }
-          // Idempotent stub fallback: never mutate the returned compact snapshot in place.
-          const working = cloneSingleResult(result);
-          postprocessTerminal(working);
-          const compact = snapshotSingleResult(working);
+          let compact: SingleResult;
+          if (!wasInvoked()) {
+            // Injected stubs that ignore the callback get exactly one fallback.
+            const working = cloneSingleResult(result);
+            postprocessTerminal(working);
+            compact = snapshotSingleResult(working);
+          } else {
+            // Production already postprocessed + snapshotted; share owned payloads only.
+            compact = snapshotSingleResult(result);
+          }
           slots[index] = compact;
           fanoutMeta.latestIndex = index;
           if (!fanoutTerminal && !signal?.aborted) emitFanout();
@@ -1294,12 +1342,15 @@ async function runFanoutStep(
   } catch (err) {
     // Non-abort worker failures still settle via mapWithConcurrencyLimit; rethrow if unexpected.
     if (!isAbortError(err)) throw err;
+  } finally {
+    // Permanent terminal gate first so late worker callbacks cannot reschedule the
+    // coalescer after cancel (including unexpected non-abort exceptional exits).
+    fanoutTerminal = true;
+    fanoutContentCoalescer.cancel();
   }
 
   recount();
   syncSlotsToResults();
-  // Never let a stale content timer fire after fanout terminalizes.
-  fanoutContentCoalescer.cancel();
 
   const successCount = slots.filter((r) => resolveExecutionStatus(r) === 'completed').length;
   const cancelledCount = slots.filter((r) => resolveExecutionStatus(r) === 'cancelled').length;
@@ -1321,7 +1372,6 @@ async function runFanoutStep(
       }
     }
     fanoutMeta.status = 'cancelled';
-    fanoutTerminal = true;
     recount();
     syncSlotsToResults();
     markLaterSkipped(logicalSteps, stepIndex + 1);
@@ -1336,8 +1386,6 @@ async function runFanoutStep(
       },
     };
   }
-
-  fanoutTerminal = true;
 
   if (successCount !== slots.length) {
     fanoutMeta.status = 'failed';
@@ -1370,12 +1418,15 @@ async function runFanoutStep(
         }]`
       : ''
   }`;
-  outputs.set(step.collect.name, {
-    text,
-    structured: collected,
-    agent: step.parallel.agent,
-    step: stepNumber,
-  });
+  outputs.set(
+    step.collect.name,
+    isolateOutputEntry({
+      text,
+      structured: collected,
+      agent: step.parallel.agent,
+      step: stepNumber,
+    })
+  );
   return { done: false, previousOutput: text };
 }
 

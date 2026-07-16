@@ -195,14 +195,17 @@ async function finalizeDurable(
   result?: AgentResult
 ): Promise<void> {
   if (!durable) return;
-  const origin = durable.lifecycle.origin;
-  const lifecycleAborted = durable.lifecycle.signal.aborted;
-  // The foreground workflow catches aborts and surfaces them as isError results,
-  // so `err` is usually undefined on this path. The coordinator-owned lifecycle
-  // signal is the reliable indicator: when it aborted, classify the terminal as
-  // cancelled (user) or interrupted (shutdown/unknown) by the carried origin.
-  if (lifecycleAborted) {
-    const flags = originToFinalizeFlags(origin);
+  const abortOrigin =
+    err instanceof AgentAbortError
+      ? err.origin
+      : durable.lifecycle.signal.aborted
+        ? durable.lifecycle.origin
+        : undefined;
+  // Prefer original AgentAbortError.origin; otherwise lifecycle abort origin.
+  // The foreground workflow often catches aborts and surfaces them as isError
+  // results, so `err` may be undefined — lifecycle signal still classifies then.
+  if (abortOrigin !== undefined) {
+    const flags = originToFinalizeFlags(abortOrigin);
     await durable.started.finalize({
       details: result?.details ?? { ...durable.started.record.details },
       units: durable.started.units,
@@ -530,46 +533,49 @@ async function maybeResumeDurableRun(
   }
 
   const record = loaded.loaded.record;
-  // Normalize legacy full-message results once after post-claim revalidation and
-  // before any resume write can reserialize raw transcripts.
-  if (Array.isArray(record.details.results)) {
-    record.details.results = record.details.results.map((r) => snapshotSingleResult(r));
-  }
-  for (const unit of Object.values(record.units)) {
-    if (unit.result) unit.result = snapshotSingleResult(unit.result);
-  }
-  // Shallow-copy units so we can stage attempt increments before write.
-  const units: typeof record.units = {};
-  for (const [id, unit] of Object.entries(record.units)) {
-    units[id] = { ...unit, attempts: [...unit.attempts] };
-  }
-
-  // Fully completed runs reopen finished units so continuation can continue
-  // from stored context; selective resume leaves completed siblings alone.
-  reopenCompletedUnitsForResume(units);
-  // Increment attempts only after post-claim eligibility succeeds.
-  incrementIncompleteAttempts(units);
-
-  // Drop planned-only session paths from never-started units. A pre-begin stamp
-  // crash window may have left a path without attempt history; those are not
-  // established sessions and must not block a fresh first-write or flip
-  // resumeHadStoredSession.
-  for (const unit of Object.values(units)) {
-    if (isNeverStartedUnit(unit) && unit.sessionFile) {
-      delete unit.sessionFile;
-      delete unit.sessionPromptEstablished;
-      if (unit.result) delete unit.result.sessionFile;
-    }
-  }
-
-  // Transition to running and append the current continuation task atomically.
-  // Guard the post-claim persistence so a write failure releases the claim.
   const priorContinuations = record.continuationTasks ?? [];
   const accumulatedContinuations = resume.currentContinuationTask
     ? [...priorContinuations, resume.currentContinuationTask]
     : [...priorContinuations];
   const priorDelivery = { ...(record.continuationDelivery ?? {}) };
+
+  // All post-claim setup (normalize, stage, write, register) shares one cleanup
+  // boundary so any failure releases the claim without leaving an active holder.
+  let units!: typeof record.units;
   try {
+    // Normalize legacy full-message results once after post-claim revalidation and
+    // before any resume write can reserialize raw transcripts.
+    if (Array.isArray(record.details.results)) {
+      record.details.results = record.details.results.map((r) => snapshotSingleResult(r));
+    }
+    for (const unit of Object.values(record.units)) {
+      if (unit.result) unit.result = snapshotSingleResult(unit.result);
+    }
+    // Shallow-copy units so we can stage attempt increments before write.
+    units = {};
+    for (const [id, unit] of Object.entries(record.units)) {
+      units[id] = { ...unit, attempts: [...unit.attempts] };
+    }
+
+    // Fully completed runs reopen finished units so continuation can continue
+    // from stored context; selective resume leaves completed siblings alone.
+    reopenCompletedUnitsForResume(units);
+    // Increment attempts only after post-claim eligibility succeeds.
+    incrementIncompleteAttempts(units);
+
+    // Drop planned-only session paths from never-started units. A pre-begin stamp
+    // crash window may have left a path without attempt history; those are not
+    // established sessions and must not block a fresh first-write or flip
+    // resumeHadStoredSession.
+    for (const unit of Object.values(units)) {
+      if (isNeverStartedUnit(unit) && unit.sessionFile) {
+        delete unit.sessionFile;
+        delete unit.sessionPromptEstablished;
+        if (unit.result) delete unit.result.sessionFile;
+      }
+    }
+
+    // Transition to running and append the current continuation task atomically.
     await store.appendEvent(resumeRunId, {
       version: 1,
       event: 'run_resumed',
@@ -597,26 +603,26 @@ async function maybeResumeDurableRun(
         r.continuationDelivery = { ...priorDelivery };
       }
     });
+
+    // Sync the in-memory record with the persisted running state before
+    // registering so the coordinator's live units stay aliased to the handle
+    // the workflow mutates via beginUnit/endUnit/stampUnitSessionFile.
+    // Clear finishedAt here too: disk already dropped it, and a stale terminal
+    // timestamp on the live record would re-persist on the next flush.
+    record.status = 'running';
+    delete record.finishedAt;
+    record.units = units;
+    record.continuationTasks = accumulatedContinuations;
+    record.continuationDelivery = { ...priorDelivery };
+    if (record.startedAt === undefined) record.startedAt = Date.now();
+    record.updatedAt = Date.now();
+    coordinator.registerRun(resumeRunId, record);
   } catch (err) {
     await store.releaseRun(resumeRunId, claim.claimId);
     return {
       error: `resume_setup_failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-
-  // Sync the in-memory record with the persisted running state before
-  // registering so the coordinator's live units stay aliased to the handle
-  // the workflow mutates via beginUnit/endUnit/stampUnitSessionFile.
-  // Clear finishedAt here too: disk already dropped it, and a stale terminal
-  // timestamp on the live record would re-persist on the next flush.
-  record.status = 'running';
-  delete record.finishedAt;
-  record.units = units;
-  record.continuationTasks = accumulatedContinuations;
-  record.continuationDelivery = { ...priorDelivery };
-  if (record.startedAt === undefined) record.startedAt = Date.now();
-  record.updatedAt = Date.now();
-  coordinator.registerRun(resumeRunId, record);
 
   const lifecycle = createRunLifecycle(resumeRunId);
   const sessionsDir = path.join(store.getRunDir(resumeRunId), 'sessions');
@@ -1928,19 +1934,43 @@ async function runStepWithContext(
         options.unitContext?.sessionPromptEstablished !== false));
   // Prefer explicit task cwd, then persisted unit effectiveCwd, then project cwd.
   const fallbackCwd = cwd ?? options.unitContext?.effectiveCwd ?? options.projectCwd ?? ctx.cwd;
-  const applyPostprocess = (result: SingleResult): void => {
-    if (options.postprocessTerminal) options.postprocessTerminal(result);
-  };
+  // Declared early so the terminal finalizer can close over them. Populated when
+  // worktree isolation is active; success path requests finalization after postprocess.
+  let worktree: AgentWorktree | undefined;
+  let retainCleanWorktree = false;
+  let pendingWorktreeFinalization = false;
   /**
-   * Terminal compaction boundary: snapshot private mutable working state, pass the
-   * compact result to endUnit, and return it as the sole authoritative terminal result.
+   * Terminal compaction boundary for every exit:
+   * 1. terminal postprocess/schema/status/identity exactly once
+   * 2. worktree finalization using the final terminal status (success path only)
+   * 3. compact snapshot
+   * 4. endUnit/durability
+   * 5. return authoritative compact result
+   * Abort/early-failure paths handle worktree retention themselves before calling this;
+   * they leave pendingWorktreeFinalization false so finalizeWorktree is not re-applied.
    */
   const finalizeTerminalResult = (
     working: SingleResult,
     status?: ExecutionStatus
   ): SingleResult => {
+    if (options.postprocessTerminal) options.postprocessTerminal(working);
     if (working.finalOutput === undefined && working.messages.length > 0) {
       working.finalOutput = getResultFinalOutput(working);
+    }
+    // Worktree finalization must observe the postprocess-final status (e.g. schema
+    // failure retains a clean tree instead of deleting it as completed).
+    if (pendingWorktreeFinalization && worktree) {
+      pendingWorktreeFinalization = false;
+      finalizeWorktree(worktree, working, { retainClean: retainCleanWorktree });
+    }
+    // Authoritative unit/result path agreement: only retained existing worktrees
+    // keep a durable path. Deleted clean trees must clear unit + result metadata.
+    if (options.unitContext) {
+      if (working.worktreePath) {
+        options.unitContext.worktreePath = working.worktreePath;
+      } else {
+        delete options.unitContext.worktreePath;
+      }
     }
     const snapshot = snapshotSingleResult(working);
     if (options.unitContext && options.endUnit) {
@@ -2019,7 +2049,6 @@ async function runStepWithContext(
   // header cwd matches the actual child cwd. On resume, reopen the stored
   // worktree instead of creating a new one.
   const isolation = resolveIsolation(agent, taskIsolation);
-  let worktree: AgentWorktree | undefined;
   let effectiveCwd: string | undefined = cwd ?? options.unitContext?.effectiveCwd;
   const storedWorktreePath = options.unitContext?.worktreePath;
   const gitLookupCwd = options.unitContext?.effectiveCwd ?? options.projectCwd ?? cwd ?? ctx.cwd;
@@ -2097,7 +2126,12 @@ async function runStepWithContext(
           options.title
         );
         if (failure) {
-          removeAgentWorktree(worktree);
+          // runHookOrSynthesizeFailure already made the sole retain/remove decision.
+          // Retained (dirty/unknown/removal-failed) trees stay on disk with path metadata;
+          // only confirmed clean removals leave worktreePath unset.
+          if (!failure.worktreePath) {
+            worktree = undefined;
+          }
           return finalizeTerminalResult(failure, 'failed');
         }
       }
@@ -2146,10 +2180,26 @@ async function runStepWithContext(
     if (worktree && !storedWorktreePath) {
       const status = getWorktreeDirtyStatus(worktree.path);
       if (status.ok && status.output.trim().length === 0) {
-        removeAgentWorktree(worktree);
+        const removal = removeAgentWorktree(worktree);
+        if (removal.removed) {
+          worktree = undefined;
+        } else {
+          // Removal failed: retain path so durability/resume can inspect the orphan.
+          failure4.worktreePath = worktree.path;
+          failure4.worktreeDirty = false;
+          failure4.stderr += failure4.stderr ? '\n' : '';
+          failure4.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+        }
       } else {
         failure4.worktreePath = worktree.path;
         failure4.worktreeDirty = status.ok ? status.output.trim().length > 0 : true;
+        if (failure4.worktreeDirty) {
+          const diff = getWorktreeDiffSummary(worktree.path);
+          if (diff.ok) {
+            if (diff.stat) failure4.worktreeDiffStat = diff.stat;
+            if (diff.changedFiles) failure4.worktreeChangedFiles = diff.changedFiles;
+          }
+        }
       }
     } else if (storedWorktreePath) {
       failure4.worktreePath = storedWorktreePath;
@@ -2162,7 +2212,6 @@ async function runStepWithContext(
   // Interactive TUI registration: Pi (pre-spawn with session file) or Grok ACP
   // (resume with stored acpSessionId). Fresh Grok ACP registers after session/new.
   let endpointKey: string | undefined;
-  let retainCleanWorktree = false;
   const isGrokAcp = effectiveRuntime === GROK_ACP_RUNTIME;
   const acpSessionId = options.unitContext?.acpSessionId?.trim();
   const canRegisterInteractivePi =
@@ -2221,7 +2270,33 @@ async function runStepWithContext(
       if (failure) stampWorktreeOnFailure(failure);
       return false;
     }
-    removeAgentWorktree(worktree);
+    const removal = removeAgentWorktree(worktree);
+    if (!removal.removed) {
+      // Keep durable path/dirty metadata when cleanup fails so the orphan is inspectable.
+      if (failure) {
+        failure.worktreePath = worktree.path;
+        failure.worktreeDirty = false;
+        delete failure.worktreeDiffStat;
+        delete failure.worktreeChangedFiles;
+        failure.stderr += failure.stderr ? '\n' : '';
+        failure.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+      }
+      if (options.unitContext) {
+        options.unitContext.worktreePath = worktree.path;
+      }
+      return false;
+    }
+    // Clear path only after confirmed removal so endUnit cannot persist a missing tree.
+    if (failure) {
+      delete failure.worktreePath;
+      delete failure.worktreeDirty;
+      delete failure.worktreeDiffStat;
+      delete failure.worktreeChangedFiles;
+    }
+    if (options.unitContext) {
+      delete options.unitContext.worktreePath;
+    }
+    worktree = undefined;
     return true;
   };
 
@@ -2528,22 +2603,20 @@ async function runStepWithContext(
     if (!options.skipCompletionCheck) {
       enforceCompletionCheck(agent, result);
     }
-    // Schema validation / identity stamping before worktree cleanup and endUnit
-    // so durable terminal state reflects the final validated result.
-    applyPostprocess(result);
-    if (worktree) {
-      finalizeWorktree(worktree, result, { retainClean: retainCleanWorktree });
-    }
+    // Request worktree finalization after postprocess so retention uses the final
+    // terminal status (schema/completion failure retains clean trees).
+    if (worktree) pendingWorktreeFinalization = true;
     return finalizeTerminalResult(result);
   } catch (err) {
     if (isAbortError(err)) {
-      const origin = options.getAbortOrigin?.() ?? 'unknown';
+      // Prefer the original abort origin; fall back to lifecycle/signal origin.
+      const originalOrigin = err instanceof AgentAbortError ? err.origin : undefined;
+      const origin = originalOrigin ?? options.getAbortOrigin?.() ?? 'unknown';
       const provisional = getAbortResult(err);
       if (provisional) {
         // Mutable working state from the provisional compact/low-level snapshot.
         const working = cloneSingleResult(provisional);
         if (worktree) stampWorktreeOnFailure(working);
-        applyPostprocess(working);
         const snapshot = finalizeTerminalResult(working, originToUnitStatus(origin));
         // Replacement abort error carries the authoritative compact terminal snapshot.
         throw new AgentAbortError(snapshot, origin);
@@ -2615,10 +2688,21 @@ export function runHookOrSynthesizeFailure(
   failure.worktreeSetupError = failure.errorMessage;
   const cleanupStatus = getWorktreeDirtyStatus(worktree.path);
   if (cleanupStatus.ok && cleanupStatus.output.trim().length === 0) {
-    removeAgentWorktree(worktree);
+    const removal = removeAgentWorktree(worktree);
+    if (!removal.removed) {
+      failure.worktreePath = worktree.path;
+      failure.worktreeDirty = false;
+      failure.stderr += failure.stderr ? '\n' : '';
+      failure.stderr += `Worktree cleanup failed: ${removal.error ?? 'unknown'}. Retaining ${worktree.path}.`;
+    }
   } else {
     failure.worktreePath = worktree.path;
     failure.worktreeDirty = true;
+    const diff = getWorktreeDiffSummary(worktree.path);
+    if (diff.ok) {
+      if (diff.stat) failure.worktreeDiffStat = diff.stat;
+      if (diff.changedFiles) failure.worktreeChangedFiles = diff.changedFiles;
+    }
   }
   return failure;
 }

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import { Readable, Writable } from 'node:stream';
 import type { AgentConfig } from '../src/agents.ts';
+import { RESULT_UPDATE_INTERVAL_MS } from '../src/constants.ts';
 import type { SpawnFn, SpawnedChild } from '../src/execution.ts';
 import { AgentAbortError, mapWithConcurrencyLimit, runSingleAgent } from '../src/execution.ts';
 import type { SingleResult, SubagentDetails } from '../src/types.ts';
@@ -444,6 +445,7 @@ describe('runSingleAgentGrokAcp', () => {
     private readonly behavior: {
       multiCycle?: boolean;
       hang?: boolean;
+      highFrequency?: boolean;
       protocolVersion?: number;
       stopReason?: string;
       stderrText?: string;
@@ -573,6 +575,37 @@ describe('runSingleAgentGrokAcp', () => {
               },
             },
           });
+        }
+
+        if (this.behavior.highFrequency) {
+          for (let i = 0; i < 1000; i++) {
+            this.writeMsg({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: this.sessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: `tok${i} ` },
+                },
+              },
+            });
+            if (i % 50 === 0) {
+              this.writeMsg({
+                jsonrpc: '2.0',
+                method: 'session/update',
+                params: {
+                  sessionId: this.sessionId,
+                  update: {
+                    sessionUpdate: 'usage_update',
+                    used: i,
+                    size: 200000,
+                    cost: { amount: 0.01, currency: 'USD' },
+                  },
+                },
+              });
+            }
+          }
         }
 
         this.writeMsg({
@@ -861,6 +894,90 @@ describe('runSingleAgentGrokAcp', () => {
     expect(result.stopReason).toBe('error');
     expect(result.errorMessage).toMatch(/ENOENT|failed/i);
   });
+
+  it('1000 high-frequency content/tool/usage updates coalesce and terminal is not overtaken', async () => {
+    const ctx = captureAcpSpawn({ highFrequency: true });
+    const agent = makeAgent({ name: 'g', runtime: 'grok-acp' });
+    const statuses: string[] = [];
+    let updateCount = 0;
+    const result = await runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'stream',
+      undefined,
+      undefined,
+      undefined,
+      (partial) => {
+        updateCount += 1;
+        const st = partial.details?.results[0]?.status;
+        if (st) statuses.push(st);
+      },
+      makeDetails,
+      { spawnFn: ctx.spawnFn }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stopReason).toBe('end');
+    expect(result.status === 'completed' || result.stopReason === 'end').toBe(true);
+    // Coalescing: parent update count must be far below raw 1000+ notifications.
+    expect(updateCount).toBeLessThan(1000);
+    expect(updateCount).toBeGreaterThan(0);
+    // After the promise settles, no further parent updates may arrive (terminal is final).
+    const countAtSettle = updateCount;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(updateCount).toBe(countAtSettle);
+    // Pending running updates must not appear after settlement.
+    expect(statuses.every((s) => s === 'running' || s === 'completed' || s === 'failed')).toBe(
+      true
+    );
+  }, 20_000);
+
+  it('successful Grok terminal discards pending running flush and emits authoritative terminal', async () => {
+    const ctx = captureAcpSpawn();
+    const agent = makeAgent({ name: 'g', runtime: 'grok-acp', model: 'grok-4.5' });
+    const statuses: Array<string | undefined> = [];
+    const texts: string[] = [];
+    let updateCount = 0;
+    const result = await runSingleAgent(
+      process.cwd(),
+      [agent],
+      agent.name,
+      'review this',
+      undefined,
+      undefined,
+      undefined,
+      (partial) => {
+        updateCount += 1;
+        statuses.push(partial.details?.results[0]?.status);
+        const text = partial.content.find((c) => c.type === 'text');
+        if (text && text.type === 'text') texts.push(text.text);
+      },
+      makeDetails,
+      { spawnFn: ctx.spawnFn }
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stopReason).toBe('end');
+    expect(result.status).toBe('completed');
+    // Authoritative terminal is delivered via onUpdate (not a stale running flush)
+    // and also via the returned result.
+    expect(statuses.length).toBeGreaterThan(0);
+    expect(statuses[statuses.length - 1]).toBe('completed');
+    // No trailing running update after the terminal snapshot.
+    const lastRunning = statuses.lastIndexOf('running');
+    const lastCompleted = statuses.lastIndexOf('completed');
+    if (lastRunning >= 0) {
+      expect(lastCompleted).toBeGreaterThan(lastRunning);
+    }
+    // Final result remains complete.
+    expect(result.usage.input).toBe(11);
+    expect(result.usage.output).toBe(7);
+    expect(result.messages.length).toBeGreaterThanOrEqual(2);
+    const countAtSettle = updateCount;
+    await new Promise((r) => setTimeout(r, RESULT_UPDATE_INTERVAL_MS + 100));
+    expect(updateCount).toBe(countAtSettle);
+  }, 15_000);
 });
 
 describe('runSingleAgent execution status', () => {

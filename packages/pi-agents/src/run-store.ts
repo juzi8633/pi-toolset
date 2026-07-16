@@ -32,6 +32,17 @@ const RUN_STATUS_VALUES = new Set([
   'cancelled',
 ]);
 
+/** Durable unit/attempt statuses accepted for resume (includes skipped). */
+const UNIT_STATUS_VALUES = new Set([
+  'queued',
+  'running',
+  'completed',
+  'failed',
+  'cancelled',
+  'skipped',
+  'interrupted',
+]);
+
 /** Durable runtimes accepted on current records; absent means the Pi default. */
 const ALLOWED_DURABLE_RUNTIMES = new Set<string>([DEFAULT_RUNTIME, GROK_ACP_RUNTIME]);
 
@@ -44,6 +55,23 @@ function isAllowedDurableRuntime(runtime: unknown): boolean {
 
 function isAllowedDurableCapability(capability: unknown): boolean {
   return typeof capability === 'string' && ALLOWED_DURABLE_CAPABILITIES.has(capability);
+}
+
+/**
+ * Minimum durable SingleResult shell: non-null non-array object with `messages` array.
+ * Accepts legacy populated messages and compact empty messages; optional presentation
+ * is validated separately when present.
+ */
+function validateResultShell(result: unknown, pathLabel: string): string | undefined {
+  if (result === undefined) return undefined;
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    return `${pathLabel} must be a non-null object`;
+  }
+  const messages = (result as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) {
+    return `${pathLabel}.messages must be an array`;
+  }
+  return undefined;
 }
 
 /** Validate optional compact ResultPresentation on a durable SingleResult. */
@@ -105,6 +133,168 @@ function validateDisplayItem(item: unknown, pathLabel: string): string | undefin
     return undefined;
   }
   return `${pathLabel}.type must be text or toolCall`;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return (
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && Number.isFinite(value)
+  );
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return (
+    typeof value === 'number' && Number.isInteger(value) && value >= 1 && Number.isFinite(value)
+  );
+}
+
+/** Validate one durable ChainOutputEntry used by resume/restore. */
+function validateChainOutputEntry(entry: unknown, pathLabel: string): string | undefined {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+    return `${pathLabel} must be a non-null object`;
+  }
+  const e = entry as Record<string, unknown>;
+  if (typeof e.text !== 'string') {
+    return `${pathLabel}.text must be a string`;
+  }
+  if (typeof e.agent !== 'string') {
+    return `${pathLabel}.agent must be a string`;
+  }
+  if (!isPositiveInteger(e.step)) {
+    return `${pathLabel}.step must be a positive integer`;
+  }
+  // structured is optional unknown; any JSON value including null is accepted when present.
+  return undefined;
+}
+
+/** Validate one durable presentation ChainLogicalStep enough for resume/restore. */
+function validateChainLogicalStep(step: unknown, pathLabel: string): string | undefined {
+  if (step === null || typeof step !== 'object' || Array.isArray(step)) {
+    return `${pathLabel} must be a non-null object`;
+  }
+  const s = step as Record<string, unknown>;
+  if (s.kind !== 'sequential' && s.kind !== 'fanout') {
+    return `${pathLabel}.kind must be sequential or fanout`;
+  }
+  if (!isPositiveInteger(s.step)) {
+    return `${pathLabel}.step must be a positive integer`;
+  }
+  if (typeof s.agent !== 'string') {
+    return `${pathLabel}.agent must be a string`;
+  }
+  if (typeof s.status !== 'string' || !UNIT_STATUS_VALUES.has(s.status)) {
+    return `${pathLabel}.status has unsupported value ${String(s.status)}`;
+  }
+  if (s.title !== undefined && typeof s.title !== 'string') {
+    return `${pathLabel}.title must be a string when present`;
+  }
+  if (s.kind === 'sequential') {
+    if (typeof s.task !== 'string') {
+      return `${pathLabel}.task must be a string`;
+    }
+    return undefined;
+  }
+  if (typeof s.taskTemplate !== 'string') {
+    return `${pathLabel}.taskTemplate must be a string`;
+  }
+  if (typeof s.collectName !== 'string') {
+    return `${pathLabel}.collectName must be a string`;
+  }
+  if (s.sourceOutput !== undefined && typeof s.sourceOutput !== 'string') {
+    return `${pathLabel}.sourceOutput must be a string when present`;
+  }
+  if (s.sourcePath !== undefined && typeof s.sourcePath !== 'string') {
+    return `${pathLabel}.sourcePath must be a string when present`;
+  }
+  if (s.concurrency !== undefined && !isNonNegativeInteger(s.concurrency)) {
+    return `${pathLabel}.concurrency must be a non-negative integer when present`;
+  }
+  for (const countField of [
+    'executedCount',
+    'completedCount',
+    'failedCount',
+    'runningCount',
+    'queuedCount',
+    'skippedCount',
+  ] as const) {
+    if (!isNonNegativeInteger(s[countField])) {
+      return `${pathLabel}.${countField} must be a non-negative integer`;
+    }
+  }
+  if (s.latestIndex !== undefined && !isNonNegativeInteger(s.latestIndex)) {
+    return `${pathLabel}.latestIndex must be a non-negative integer when present`;
+  }
+  return undefined;
+}
+
+/**
+ * Minimum mode-aware SubagentDetails shape consumed by getRun / preflight / chain restore.
+ * Requires results; validates optional chain/outputs enough that resume cannot throw.
+ */
+function validateSubagentDetails(details: unknown): string | undefined {
+  if (details === null || typeof details !== 'object' || Array.isArray(details)) {
+    return 'invalid details';
+  }
+  const d = details as Record<string, unknown>;
+
+  if (!Array.isArray(d.results)) {
+    return 'details.results must be an array';
+  }
+  for (let i = 0; i < d.results.length; i++) {
+    const result = d.results[i];
+    const pathLabel = `details.results[${i}]`;
+    const shellError = validateResultShell(result, pathLabel);
+    if (shellError) return shellError;
+    if (!result || typeof result !== 'object') continue;
+    const resumeCapability = (result as { resumeCapability?: unknown }).resumeCapability;
+    if (resumeCapability !== undefined && !isAllowedDurableCapability(resumeCapability)) {
+      return `${pathLabel}.resumeCapability has unsupported value ${String(resumeCapability)}`;
+    }
+    const presentationError = validatePresentation(
+      (result as { presentation?: unknown }).presentation,
+      pathLabel
+    );
+    if (presentationError) return presentationError;
+  }
+
+  if (d.outputs !== undefined) {
+    if (d.outputs === null || typeof d.outputs !== 'object' || Array.isArray(d.outputs)) {
+      return 'details.outputs must be a non-null object';
+    }
+    for (const [name, entry] of Object.entries(d.outputs as Record<string, unknown>)) {
+      const entryError = validateChainOutputEntry(entry, `details.outputs[${name}]`);
+      if (entryError) return entryError;
+    }
+  }
+
+  if (d.chain !== undefined) {
+    if (d.chain === null || typeof d.chain !== 'object' || Array.isArray(d.chain)) {
+      return 'details.chain must be a non-null object';
+    }
+    const chain = d.chain as Record<string, unknown>;
+    if (!isNonNegativeInteger(chain.totalSteps)) {
+      return 'details.chain.totalSteps must be a non-negative integer';
+    }
+    if (!Array.isArray(chain.steps)) {
+      return 'details.chain.steps must be an array';
+    }
+    for (let i = 0; i < chain.steps.length; i++) {
+      const stepError = validateChainLogicalStep(chain.steps[i], `details.chain.steps[${i}]`);
+      if (stepError) return stepError;
+    }
+  }
+
+  const runMeta = d.run;
+  if (runMeta !== undefined) {
+    if (runMeta === null || typeof runMeta !== 'object' || Array.isArray(runMeta)) {
+      return 'details.run must be a non-null object when present';
+    }
+    const cap = (runMeta as { capability?: unknown }).capability;
+    if (cap !== undefined && !isAllowedDurableCapability(cap)) {
+      return `details.run.capability has unsupported value ${String(cap)}`;
+    }
+  }
+
+  return undefined;
 }
 
 /** Effective unit runtime: explicit value or the Pi default when absent. */
@@ -316,7 +506,7 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         error: { code: 'corrupt_run', runId: expectedRunId, message: 'invalid status' },
       };
     }
-    if (typeof r.details !== 'object' || r.details === null) {
+    if (typeof r.details !== 'object' || r.details === null || Array.isArray(r.details)) {
       return {
         ok: false,
         error: { code: 'corrupt_run', runId: expectedRunId, message: 'invalid details' },
@@ -464,7 +654,169 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           },
         };
       }
-      if (u.result !== undefined && u.result !== null && typeof u.result === 'object') {
+      // Core unit fields consumed by inspectResume/active resume must be well-typed.
+      if (typeof u.status !== 'string' || !UNIT_STATUS_VALUES.has(u.status)) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} has unsupported status ${String(u.status)}`,
+          },
+        };
+      }
+      if (
+        typeof u.attempt !== 'number' ||
+        !Number.isInteger(u.attempt) ||
+        u.attempt < 0 ||
+        !Number.isFinite(u.attempt)
+      ) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} attempt must be a non-negative integer`,
+          },
+        };
+      }
+      if (!Array.isArray(u.attempts)) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} attempts must be an array`,
+          },
+        };
+      }
+      for (let i = 0; i < u.attempts.length; i++) {
+        const attemptRec = u.attempts[i];
+        const attemptPath = `unit ${unitId} attempts[${i}]`;
+        if (!attemptRec || typeof attemptRec !== 'object' || Array.isArray(attemptRec)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath} must be an object`,
+            },
+          };
+        }
+        const a = attemptRec as Record<string, unknown>;
+        if (
+          typeof a.attempt !== 'number' ||
+          !Number.isInteger(a.attempt) ||
+          a.attempt < 0 ||
+          !Number.isFinite(a.attempt)
+        ) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath}.attempt must be a non-negative integer`,
+            },
+          };
+        }
+        if (typeof a.status !== 'string' || !UNIT_STATUS_VALUES.has(a.status)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath} has unsupported status ${String(a.status)}`,
+            },
+          };
+        }
+        if (typeof a.startedAt !== 'number' || !Number.isFinite(a.startedAt)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath}.startedAt must be a number`,
+            },
+          };
+        }
+        if (
+          a.finishedAt !== undefined &&
+          (typeof a.finishedAt !== 'number' || !Number.isFinite(a.finishedAt))
+        ) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath}.finishedAt must be a number when present`,
+            },
+          };
+        }
+        if (a.stopReason !== undefined && typeof a.stopReason !== 'string') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath}.stopReason must be a string when present`,
+            },
+          };
+        }
+        if (a.errorMessage !== undefined && typeof a.errorMessage !== 'string') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `${attemptPath}.errorMessage must be a string when present`,
+            },
+          };
+        }
+      }
+      // Resume always passes effectiveCwd to fs.existsSync; require a non-empty string.
+      // Writers always set it; no valid V1 fixture omits it.
+      if (typeof u.effectiveCwd !== 'string' || u.effectiveCwd.length === 0) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} effectiveCwd must be a non-empty string`,
+          },
+        };
+      }
+      if (u.agentFingerprint !== undefined && typeof u.agentFingerprint !== 'string') {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} agentFingerprint must be a string when present`,
+          },
+        };
+      }
+      // Crash-window flag is boolean-only; string "false" must not bypass handling.
+      if (
+        u.sessionPromptEstablished !== undefined &&
+        typeof u.sessionPromptEstablished !== 'boolean'
+      ) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} sessionPromptEstablished must be a boolean when present`,
+          },
+        };
+      }
+      if (u.result !== undefined) {
+        const shellError = validateResultShell(u.result, `unit ${unitId} result`);
+        if (shellError) {
+          return {
+            ok: false,
+            error: { code: 'corrupt_run', runId: expectedRunId, message: shellError },
+          };
+        }
         const resumeCapability = (u.result as { resumeCapability?: unknown }).resumeCapability;
         if (resumeCapability !== undefined && !isAllowedDurableCapability(resumeCapability)) {
           return {
@@ -487,15 +839,17 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           };
         }
       }
-      if (u.sessionFile !== undefined && typeof u.sessionFile !== 'string') {
-        return {
-          ok: false,
-          error: {
-            code: 'corrupt_run',
-            runId: expectedRunId,
-            message: `unit ${unitId} sessionFile not string`,
-          },
-        };
+      if (u.sessionFile !== undefined) {
+        if (typeof u.sessionFile !== 'string' || u.sessionFile.length === 0) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} sessionFile must be a non-empty string when present`,
+            },
+          };
+        }
       }
       if (u.acpSessionId !== undefined) {
         if (
@@ -513,15 +867,17 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           };
         }
       }
-      if (u.worktreePath !== undefined && typeof u.worktreePath !== 'string') {
-        return {
-          ok: false,
-          error: {
-            code: 'corrupt_run',
-            runId: expectedRunId,
-            message: `unit ${unitId} worktreePath not string`,
-          },
-        };
+      if (u.worktreePath !== undefined) {
+        if (typeof u.worktreePath !== 'string' || u.worktreePath.length === 0) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId: expectedRunId,
+              message: `unit ${unitId} worktreePath must be a non-empty string when present`,
+            },
+          };
+        }
       }
     }
     // Exact coverage of statically known units (single / parallel / sequential
@@ -543,51 +899,13 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         };
       }
     }
-    // Aggregate run capability and presentation result metadata, when present, are session-only.
-    if (r.details && typeof r.details === 'object') {
-      const details = r.details as { run?: unknown; results?: unknown };
-      const runMeta = details.run;
-      if (runMeta && typeof runMeta === 'object') {
-        const cap = (runMeta as { capability?: unknown }).capability;
-        if (cap !== undefined && !isAllowedDurableCapability(cap)) {
-          return {
-            ok: false,
-            error: {
-              code: 'corrupt_run',
-              runId: expectedRunId,
-              message: `details.run.capability has unsupported value ${String(cap)}`,
-            },
-          };
-        }
-      }
-      // Presentation results must not advertise unsupported resume capabilities.
-      if (Array.isArray(details.results)) {
-        for (let i = 0; i < details.results.length; i++) {
-          const result = details.results[i];
-          if (!result || typeof result !== 'object') continue;
-          const resumeCapability = (result as { resumeCapability?: unknown }).resumeCapability;
-          if (resumeCapability !== undefined && !isAllowedDurableCapability(resumeCapability)) {
-            return {
-              ok: false,
-              error: {
-                code: 'corrupt_run',
-                runId: expectedRunId,
-                message: `details.results[${i}].resumeCapability has unsupported value ${String(resumeCapability)}`,
-              },
-            };
-          }
-          const presentationError = validatePresentation(
-            (result as { presentation?: unknown }).presentation,
-            `details.results[${i}]`
-          );
-          if (presentationError) {
-            return {
-              ok: false,
-              error: { code: 'corrupt_run', runId: expectedRunId, message: presentationError },
-            };
-          }
-        }
-      }
+    // Mode-aware SubagentDetails minimum shape used by preflight/resume/chain restore.
+    const detailsError = validateSubagentDetails(r.details);
+    if (detailsError) {
+      return {
+        ok: false,
+        error: { code: 'corrupt_run', runId: expectedRunId, message: detailsError },
+      };
     }
     if (r.continuationTasks !== undefined) {
       if (!Array.isArray(r.continuationTasks)) {

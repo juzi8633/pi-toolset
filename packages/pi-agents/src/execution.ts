@@ -895,8 +895,9 @@ async function runSingleAgentGrokAcp(
         } else if (currentResult.exitCode === 0 && exitCode !== 0) {
           currentResult.exitCode = exitCode;
         }
-        // Deliver any pending content/usage before returning the live result.
-        contentCoalescer.flush();
+        // Discard pending running content; emit one authoritative terminal snapshot.
+        // Terminal state is also returned via the result for durable/parent finalization.
+        emitTerminal();
         return currentResult;
       } catch (err) {
         let certainty: DisposalCertainty;
@@ -1001,8 +1002,9 @@ async function runSingleAgentGrokAcp(
         heldLease.release();
         heldLease = undefined;
       }
-      // Deliver any pending content/usage before returning the live result.
-      contentCoalescer.flush();
+      // Discard pending running content; emit one authoritative terminal snapshot.
+      // Terminal state is also returned via the result for durable/parent finalization.
+      emitTerminal();
       return currentResult;
     } catch (err) {
       if (heldLease) {

@@ -675,18 +675,81 @@ describe('createRunCoordinator persistence and attempts', () => {
       usage: emptyUsage(),
       finalOutput: 'done',
     };
-    const detailsResults = [fat, fat];
-    const unitResult = fat;
-    const normalizedDetails = detailsResults.map((r) => snapshotSingleResult(r));
-    const normalizedUnit = snapshotSingleResult(unitResult);
+
+    // Coordinator-backed durable path: finishUnit stores compact shells, not raw messages.
+    const store = fakeStore({ now: () => 1 });
+    const record: AgentRunRecordV1 = {
+      version: 1,
+      runId: 'run-4mib',
+      mode: 'single',
+      agentScope: 'both',
+      status: 'running',
+      background: false,
+      createdAt: 1,
+      updatedAt: 1,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'noop',
+        task: 't',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [fat, fat],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'running', startedAt: 1 }],
+          effectiveCwd: '/tmp',
+          result: fat,
+        },
+      },
+      eventsFile: 'events.jsonl',
+    };
+    store.records.set('run-4mib', record);
+    const coord = createRunCoordinator({ store: store as never });
+    coord.registerRun('run-4mib', record);
+    coord.finishUnit(
+      'run-4mib',
+      {
+        runId: 'run-4mib',
+        unitId: 'single',
+        agent: 'noop',
+        runtime: undefined,
+        resumeCapability: 'session',
+        effectiveCwd: '/tmp',
+        attempt: 1,
+        sessionsDir: '/tmp',
+        neverStarted: false,
+      },
+      fat,
+      'completed'
+    );
+    await store.flushes();
+
+    const unitStored = store.records.get('run-4mib')!.units.single!.result!;
+    expect(unitStored.messages).toEqual([]);
+    expect(unitStored.finalOutput).toBe('done');
+    expect(JSON.stringify(unitStored)).not.toContain('Q'.repeat(64));
+
+    const normalizedDetails = [fat, fat].map((r) => snapshotSingleResult(r));
     const pretty = JSON.stringify(
-      { details: { results: normalizedDetails }, units: { single: { result: normalizedUnit } } },
+      { details: { results: normalizedDetails }, units: { single: { result: unitStored } } },
       null,
       2
     );
     expect(Buffer.byteLength(pretty, 'utf8')).toBeLessThan(512 * 1024);
     expect(pretty).not.toContain('Q'.repeat(64));
-    expect(normalizedUnit.finalOutput).toBe('done');
   });
 
   it('coalesces persistence within coalesceMs, but flushes on flushNow', async () => {

@@ -27,6 +27,7 @@ import type { InteractiveAgentLinkV1 } from '../src/run-types.ts';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { Theme } from '@earendil-works/pi-coding-agent';
 import type { PiRpcTransport } from '../src/pi-rpc-transport.ts';
+import { INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES } from '../src/constants.ts';
 
 function makeSnapshot(
   overrides: Partial<InteractiveEndpointSnapshot> & {
@@ -1927,6 +1928,183 @@ describe('relay + real registry branchKeys path', () => {
     expect(sent[0]!.details.output).toContain('exact-ok');
 
     relay.dispose();
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('relay settled ordering before deferred retention', () => {
+  it('settled snapshot precedes deferred idle eviction for oversized reloadable endpoint', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-relay-evict-'));
+    const store = createRunStore({ rootDir: root });
+    const coordinator = createRunCoordinator({ store });
+    const agent: AgentConfig = {
+      name: 'explore',
+      description: 'test',
+      systemPrompt: 'You explore.',
+      source: 'user',
+      filePath: '/tmp/explore.md',
+    };
+    let eventListener: ((e: unknown) => void) | undefined;
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'look',
+      },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/builtin',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionFile = path.join(store.getRunDir(runId), 'sessions', 'planned.jsonl');
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    fs.writeFileSync(
+      sessionFile,
+      '{"type":"session","version":3,"id":"test-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}\n'
+    );
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      transportFactory: async () =>
+        ({
+          async getState() {
+            return {
+              sessionId: 's',
+              thinkingLevel: 'off',
+              isStreaming: false,
+              isCompacting: false,
+              steeringMode: 'all',
+              followUpMode: 'one-at-a-time',
+              autoCompactionEnabled: true,
+              messageCount: 0,
+              pendingMessageCount: 0,
+            };
+          },
+          async prompt() {},
+          async steer() {},
+          async followUp() {},
+          async abort() {},
+          subscribe(fn: (e: unknown) => void) {
+            eventListener = fn;
+            return () => {
+              eventListener = undefined;
+            };
+          },
+          async dispose() {},
+          getStderr() {
+            return '';
+          },
+        }) as unknown as PiRpcTransport,
+    });
+    registry.setHostLinkAppender(() => undefined);
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId: 'host-relay-evict',
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: () => [],
+    });
+
+    const observed: Array<{ phase: string; count: number; final?: string }> = [];
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        const msgs = e.snapshot.messages;
+        const last = msgs[msgs.length - 1] as { content?: Array<{ text?: string }> } | undefined;
+        observed.push({
+          phase: 'settled',
+          count: msgs.length,
+          final: last?.content?.[0]?.text,
+        });
+      }
+      if (e.type === 'endpoint_updated' && e.snapshot.status === 'detached') {
+        observed.push({ phase: 'detached', count: e.snapshot.messages.length });
+      }
+    });
+
+    await registry.activate(snap.key, 'Task: relay-evict', 'prompt', undefined, 'view');
+    await new Promise((r) => setImmediate(r));
+    const chunk = 'R'.repeat(40 * 1024);
+    for (let i = 0; i < 20; i++) {
+      eventListener?.({
+        type: 'message_end',
+        message: {
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          content: i % 2 === 0 ? `u-${i}:${chunk}` : [{ type: 'text', text: `a-${i}:${chunk}` }],
+        },
+      });
+    }
+    eventListener?.({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'RELAY_SETTLED_FINAL' }],
+      },
+    });
+    eventListener?.({ type: 'agent_start' });
+    eventListener?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+
+    expect(observed.some((o) => o.phase === 'settled')).toBe(true);
+    const settledObs = observed.find((o) => o.phase === 'settled')!;
+    expect(settledObs.count).toBeGreaterThan(2);
+    expect(settledObs.final).toBe('RELAY_SETTLED_FINAL');
+    expect(
+      Buffer.byteLength(JSON.stringify(registry.get(snap.key)?.messages ?? []), 'utf8')
+    ).toBeLessThanOrEqual(
+      // Immediately after settle, may still hold pre-eviction or already empty after microtask.
+      INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES * 4
+    );
+
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setTimeout(r, 30));
+    const after = registry.get(snap.key)!;
+    expect(after.messages).toEqual([]);
+    // Ordering: settled observation happened before empty/detached state.
+    const settledIdx = observed.findIndex((o) => o.phase === 'settled');
+    const emptyIdx = observed.findIndex((o) => o.phase === 'detached' || o.count === 0);
+    expect(settledIdx).toBeGreaterThanOrEqual(0);
+    if (emptyIdx >= 0) expect(settledIdx).toBeLessThan(emptyIdx);
+
     await registry.shutdown();
     fs.rmSync(root, { recursive: true, force: true });
   });

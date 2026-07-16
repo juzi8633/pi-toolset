@@ -78,6 +78,18 @@ function truncateUtf8Tail(value: string, maxBytes: number): string {
   return value.slice(startOnCodePoint(value, bestStart));
 }
 
+/** Module-private ownership of presentation/structured payloads created here. */
+const snapshotOwnedPayloads = new WeakSet<object>();
+
+function markSnapshotOwned<T extends object>(value: T): T {
+  snapshotOwnedPayloads.add(value);
+  return value;
+}
+
+function isSnapshotOwnedPayload(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && snapshotOwnedPayloads.has(value);
+}
+
 function deepFreeze<T>(value: T): T {
   if (value === null || typeof value !== 'object') return value;
   if (Object.isFrozen(value)) return value;
@@ -89,15 +101,6 @@ function deepFreeze<T>(value: T): T {
     deepFreeze((value as Record<string, unknown>)[key]);
   }
   return Object.freeze(value);
-}
-
-function isDeeplyFrozen(value: unknown): boolean {
-  if (value === null || typeof value !== 'object') return true;
-  if (!Object.isFrozen(value)) return false;
-  if (Array.isArray(value)) return value.every((item) => isDeeplyFrozen(item));
-  return Object.keys(value as object).every((key) =>
-    isDeeplyFrozen((value as Record<string, unknown>)[key])
-  );
 }
 
 function textItemFits(text: string): boolean {
@@ -331,18 +334,39 @@ function boundDiagnosticTail(value: string, label: string): string {
 /** True when a result is already a snapshot-owned compact payload safe to share. */
 function isSnapshotOwnedCompact(result: SingleResult): boolean {
   if (result.messages.length !== 0 || result.presentation === undefined) return false;
-  if (!isDeeplyFrozen(result.presentation)) return false;
-  if (result.structuredOutput !== undefined && !isDeeplyFrozen(result.structuredOutput)) {
+  // Ownership, not external freeze, authorizes the fast path.
+  if (!isSnapshotOwnedPayload(result.presentation)) return false;
+  // Primitive / null structuredOutput cannot be WeakSet-owned; only objects need ownership.
+  if (
+    result.structuredOutput !== undefined &&
+    result.structuredOutput !== null &&
+    typeof result.structuredOutput === 'object' &&
+    !isSnapshotOwnedPayload(result.structuredOutput)
+  ) {
     return false;
   }
   return true;
 }
 
+/** Re-apply diagnostic caps so mutated shell strings cannot bypass the 64 KiB bound. */
+function rebindDiagnostics(result: SingleResult): {
+  stderr: string;
+  errorMessage: string | undefined;
+  errorStack: string | undefined;
+} {
+  return {
+    stderr: boundDiagnosticTail(result.stderr ?? '', 'stderr'),
+    errorMessage: boundDiagnosticPrefix(result.errorMessage, 'errorMessage'),
+    errorStack: boundDiagnosticPrefix(result.errorStack, 'errorStack'),
+  };
+}
+
 /**
- * Create a new top-level result shell for aggregate delivery.
- * Clones mutable shell fields while sharing snapshot-owned frozen presentation/structuredOutput.
+ * Internal owned-shell copier. Caller must guarantee snapshot-owned presentation
+ * (and object structuredOutput when present). Always re-bounds diagnostics.
  */
-export function copySnapshotShell(result: SingleResult): SingleResult {
+function copyOwnedSnapshotShell(result: SingleResult): SingleResult {
+  const diagnostics = rebindDiagnostics(result);
   return {
     ...result,
     messages: [],
@@ -353,7 +377,23 @@ export function copySnapshotShell(result: SingleResult): SingleResult {
       : undefined,
     presentation: result.presentation,
     structuredOutput: result.structuredOutput,
+    stderr: diagnostics.stderr,
+    errorMessage: diagnostics.errorMessage,
+    errorStack: diagnostics.errorStack,
   };
+}
+
+/**
+ * Create a new top-level result shell for aggregate delivery.
+ * Shares presentation/structuredOutput only when snapshot-owned; otherwise reprojects
+ * through `snapshotSingleResult()`. Always re-bounds diagnostic strings.
+ */
+export function copySnapshotShell(result: SingleResult): SingleResult {
+  if (isSnapshotOwnedCompact(result)) {
+    return copyOwnedSnapshotShell(result);
+  }
+  // Unowned / external frozen compact-looking shells must be fully reprojected.
+  return snapshotSingleResult(result);
 }
 
 interface DerivedPresentation {
@@ -418,8 +458,9 @@ function deriveSourcePresentation(result: SingleResult): DerivedPresentation {
  * Excludes raw child tool-result bodies. Idempotent for snapshot-owned compact results.
  */
 export function snapshotSingleResult(result: SingleResult): SingleResult {
+  // Use the private owned copier (not the public entry) to avoid recursion.
   if (isSnapshotOwnedCompact(result)) {
-    return copySnapshotShell(result);
+    return copyOwnedSnapshotShell(result);
   }
 
   const { finalOutput, transcript, latestActivity, priorOmitted } =
@@ -434,15 +475,20 @@ export function snapshotSingleResult(result: SingleResult): SingleResult {
 
   const boundedTranscript = transcript.map(boundDisplayItem);
   const boundedLatest = keepLatest ? boundDisplayItem(keepLatest) : undefined;
-  const presentation = deepFreeze(
-    fitPresentation(boundedTranscript, boundedLatest, finalOutput, priorOmitted)
+  const presentation = markSnapshotOwned(
+    deepFreeze(fitPresentation(boundedTranscript, boundedLatest, finalOutput, priorOmitted))
   );
 
-  const structuredOutput =
-    result.structuredOutput !== undefined
-      ? deepFreeze(structuredClone(result.structuredOutput))
-      : undefined;
+  let structuredOutput: SingleResult['structuredOutput'];
+  if (result.structuredOutput !== undefined) {
+    const cloned = structuredClone(result.structuredOutput);
+    structuredOutput =
+      cloned !== null && typeof cloned === 'object'
+        ? (markSnapshotOwned(deepFreeze(cloned)) as SingleResult['structuredOutput'])
+        : cloned;
+  }
 
+  const diagnostics = rebindDiagnostics(result);
   return {
     ...result,
     messages: [],
@@ -454,9 +500,9 @@ export function snapshotSingleResult(result: SingleResult): SingleResult {
       ? [...result.worktreeChangedFiles]
       : undefined,
     structuredOutput,
-    stderr: boundDiagnosticTail(result.stderr ?? '', 'stderr'),
-    errorMessage: boundDiagnosticPrefix(result.errorMessage, 'errorMessage'),
-    errorStack: boundDiagnosticPrefix(result.errorStack, 'errorStack'),
+    stderr: diagnostics.stderr,
+    errorMessage: diagnostics.errorMessage,
+    errorStack: diagnostics.errorStack,
   };
 }
 
