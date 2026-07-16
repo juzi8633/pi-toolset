@@ -367,8 +367,9 @@ function rehydrateCompletedSequentialFromDurable(
     const durableResult = durableCompletedSequentialResult(units, stepNumber);
     if (!durableResult) continue;
 
-    // Clone before inserting into mutable presentation results.
-    const cloned = cloneSingleResult(durableResult);
+    // Compact then clone into mutable workflow state so legacy full transcripts
+    // are projected before messages are cleared.
+    const cloned = cloneSingleResult(snapshotSingleResult(durableResult));
     if (cloned.step === undefined) cloned.step = stepNumber;
     upsertSequentialResult(results, cloned);
 
@@ -1071,7 +1072,7 @@ async function runFanoutStep(
       const unitId = restoredFanout?.unitIds[index];
       const unit = unitId ? opts.restored.units[unitId] : undefined;
       if (unit?.status === 'completed' && unit.result) {
-        return { ...unit.result };
+        return snapshotSingleResult(unit.result);
       }
       // Mapped unit that is not completed: skip presentation fallback and queue.
       if (!unit || unit.status === 'completed') {
@@ -1079,7 +1080,7 @@ async function runFanoutStep(
           (r) => r.step === stepNumber && r.fanout?.index === index
         );
         if (existing && resolveExecutionStatus(existing) === 'completed') {
-          return { ...existing };
+          return snapshotSingleResult(existing);
         }
       }
     }

@@ -525,6 +525,14 @@ async function maybeResumeDurableRun(
   }
 
   const record = loaded.loaded.record;
+  // Normalize legacy full-message results once after post-claim revalidation and
+  // before any resume write can reserialize raw transcripts.
+  if (Array.isArray(record.details.results)) {
+    record.details.results = record.details.results.map((r) => snapshotSingleResult(r));
+  }
+  for (const unit of Object.values(record.units)) {
+    if (unit.result) unit.result = snapshotSingleResult(unit.result);
+  }
   // Shallow-copy units so we can stage attempt increments before write.
   const units: typeof record.units = {};
   for (const [id, unit] of Object.entries(record.units)) {
@@ -569,6 +577,11 @@ async function maybeResumeDurableRun(
       r.status = 'running';
       delete r.finishedAt;
       r.units = units;
+      // Persist compact-normalized presentation results in the same post-claim write.
+      r.details = {
+        ...r.details,
+        results: record.details.results,
+      };
       r.updatedAt = Date.now();
       r.startedAt = r.startedAt ?? Date.now();
       if (resume.currentContinuationTask) {
@@ -1479,10 +1492,10 @@ async function runParallel(
     const unitCtx = durable?.unitFor(undefined, index, t.agent);
     const unit = unitCtx ? durable?.started.units[unitCtx.unitId] : undefined;
     if (unit?.status === 'completed') {
-      if (unit.result) return { ...unit.result };
+      if (unit.result) return snapshotSingleResult(unit.result);
       const existing = restoredResults[index];
       if (existing && resolveExecutionStatus(existing) === 'completed') {
-        return { ...existing };
+        return snapshotSingleResult(existing);
       }
       // Completed unit without a usable result: keep a completed slot so we do
       // not re-dispatch (selective resume leaves completed siblings alone).

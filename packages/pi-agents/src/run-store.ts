@@ -46,6 +46,67 @@ function isAllowedDurableCapability(capability: unknown): boolean {
   return typeof capability === 'string' && ALLOWED_DURABLE_CAPABILITIES.has(capability);
 }
 
+/** Validate optional compact ResultPresentation on a durable SingleResult. */
+function validatePresentation(presentation: unknown, pathLabel: string): string | undefined {
+  if (presentation === undefined) return undefined;
+  if (!presentation || typeof presentation !== 'object' || Array.isArray(presentation)) {
+    return `${pathLabel}.presentation must be an object`;
+  }
+  const p = presentation as Record<string, unknown>;
+  if (!Array.isArray(p.transcript)) {
+    return `${pathLabel}.presentation.transcript must be an array`;
+  }
+  for (let i = 0; i < p.transcript.length; i++) {
+    const itemError = validateDisplayItem(
+      p.transcript[i],
+      `${pathLabel}.presentation.transcript[${i}]`
+    );
+    if (itemError) return itemError;
+  }
+  if (p.latestActivity !== undefined) {
+    const latestError = validateDisplayItem(
+      p.latestActivity,
+      `${pathLabel}.presentation.latestActivity`
+    );
+    if (latestError) return latestError;
+  }
+  if (p.truncated === true) {
+    if (
+      typeof p.omittedItems !== 'number' ||
+      !Number.isInteger(p.omittedItems) ||
+      p.omittedItems <= 0
+    ) {
+      return `${pathLabel}.presentation.omittedItems must be a positive integer when truncated`;
+    }
+  } else if (p.truncated === false) {
+    return `${pathLabel}.presentation.truncated must be true or absent`;
+  } else if (p.truncated !== undefined) {
+    return `${pathLabel}.presentation.truncated must be true or absent`;
+  } else if (p.omittedItems !== undefined) {
+    return `${pathLabel}.presentation.omittedItems requires truncated: true`;
+  }
+  return undefined;
+}
+
+function validateDisplayItem(item: unknown, pathLabel: string): string | undefined {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    return `${pathLabel} must be a display item object`;
+  }
+  const d = item as Record<string, unknown>;
+  if (d.type === 'text') {
+    if (typeof d.text !== 'string') return `${pathLabel}.text must be a string`;
+    return undefined;
+  }
+  if (d.type === 'toolCall') {
+    if (typeof d.name !== 'string') return `${pathLabel}.name must be a string`;
+    if (d.args === null || typeof d.args !== 'object' || Array.isArray(d.args)) {
+      return `${pathLabel}.args must be a non-null object`;
+    }
+    return undefined;
+  }
+  return `${pathLabel}.type must be text or toolCall`;
+}
+
 /** Effective unit runtime: explicit value or the Pi default when absent. */
 function effectiveUnitRuntime(runtime: unknown): string {
   return typeof runtime === 'string' ? runtime : DEFAULT_RUNTIME;
@@ -415,6 +476,16 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
             },
           };
         }
+        const presentationError = validatePresentation(
+          (u.result as { presentation?: unknown }).presentation,
+          `unit ${unitId} result`
+        );
+        if (presentationError) {
+          return {
+            ok: false,
+            error: { code: 'corrupt_run', runId: expectedRunId, message: presentationError },
+          };
+        }
       }
       if (u.sessionFile !== undefined && typeof u.sessionFile !== 'string') {
         return {
@@ -503,6 +574,16 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
                 runId: expectedRunId,
                 message: `details.results[${i}].resumeCapability has unsupported value ${String(resumeCapability)}`,
               },
+            };
+          }
+          const presentationError = validatePresentation(
+            (result as { presentation?: unknown }).presentation,
+            `details.results[${i}]`
+          );
+          if (presentationError) {
+            return {
+              ok: false,
+              error: { code: 'corrupt_run', runId: expectedRunId, message: presentationError },
             };
           }
         }

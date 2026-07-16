@@ -266,6 +266,98 @@ describe('listRuns', () => {
     if (!loaded.ok) expect(loaded.error.code).toBe('corrupt_run');
   });
 
+  it('accepts valid presentation and rejects malformed truncation state', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+    const validResult = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [],
+      stderr: '',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 0,
+      },
+      finalOutput: 'done',
+      presentation: {
+        transcript: [{ type: 'toolCall', name: 'read', args: { path: 'a.ts' } }],
+        truncated: true,
+        omittedItems: 2,
+      },
+    };
+    record.units[unitId] = { ...record.units[unitId]!, result: validResult as never };
+    record.details = {
+      ...record.details,
+      results: [validResult as never],
+    };
+    writeFileSync(file, JSON.stringify(record));
+    const ok = store.getRun(runId);
+    expect(ok.ok).toBe(true);
+
+    const bad = structuredClone(record);
+    (
+      bad.units[unitId]!.result as unknown as { presentation: Record<string, unknown> }
+    ).presentation = {
+      transcript: [],
+      truncated: true,
+      // omittedItems missing
+    };
+    writeFileSync(file, JSON.stringify(bad));
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(false);
+    if (!loaded.ok) {
+      expect(loaded.error.code).toBe('corrupt_run');
+      expect(loaded.error.message).toContain('omittedItems');
+    }
+  });
+
+  it('still accepts legacy results with messages and no presentation', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const file = path.join(root, runId, 'run.json');
+    const record: AgentRunRecordV1 = JSON.parse(readFileSync(file, 'utf-8'));
+    const unitId = Object.keys(record.units)[0]!;
+    const legacy = {
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'legacy final' }],
+        },
+      ],
+      stderr: '',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 1,
+      },
+    };
+    record.units[unitId] = { ...record.units[unitId]!, result: legacy as never };
+    record.details = { ...record.details, results: [legacy as never] };
+    writeFileSync(file, JSON.stringify(record));
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+  });
+
   it('loads Version 1 records when continuationTasks is absent', async () => {
     const store = createRunStore({ rootDir: root, ...makeDeps() });
     const { runId } = await store.createRun(makeCreateInput());
