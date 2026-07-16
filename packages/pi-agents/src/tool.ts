@@ -46,7 +46,7 @@ import {
   resolveExecutionStatus,
   truncateParallelOutput,
 } from './output.ts';
-import { snapshotSingleResult } from './result-snapshot.ts';
+import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
   createRunLifecycle,
   bridgeIncomingSignal,
@@ -63,7 +63,6 @@ import type { RunCoordinator, UnitExecutionContext } from './run-coordinator.ts'
 import type { SubagentParams } from './schema.ts';
 import { assertAgentDelegationAllowed } from './security.ts';
 import {
-  cloneResults,
   cloneSingleResult,
   type ExecutionStatus,
   type IsolationMode,
@@ -1527,7 +1526,8 @@ async function runParallel(
 
   const emitParallelUpdate = () => {
     if (onUpdate) {
-      const snapshot = cloneResults(allResults);
+      // Copy-on-write: new array + shell clones; share frozen presentation/structuredOutput.
+      const snapshot = allResults.map(copySnapshotShell);
       const running = snapshot.filter((r) => resolveExecutionStatus(r) === 'running').length;
       const done = snapshot.filter((r) => {
         const s = resolveExecutionStatus(r);
@@ -1548,16 +1548,13 @@ async function runParallel(
   emitParallelUpdate();
 
   const makeCancelledSlot = (t: (typeof tasks)[number], index: number): SingleResult => {
-    const existing = allResults[index];
-    const cancelled: SingleResult = {
-      ...existing,
-      agent: t.agent,
-      task: t.task,
-      exitCode: 1,
-      status: 'cancelled',
-      stopReason: 'aborted',
-      errorMessage: existing.errorMessage || ABORT_MESSAGE,
-    };
+    const cancelled = copySnapshotShell(allResults[index]);
+    cancelled.agent = t.agent;
+    cancelled.task = t.task;
+    cancelled.exitCode = 1;
+    cancelled.status = 'cancelled';
+    cancelled.stopReason = 'aborted';
+    cancelled.errorMessage = cancelled.errorMessage || ABORT_MESSAGE;
     return cancelled;
   };
 
@@ -1571,11 +1568,12 @@ async function runParallel(
         return allResults[index];
       }
       const unitCtx = durable?.unitFor(undefined, index, t.agent);
-      allResults[index] = {
-        ...allResults[index],
-        status: 'running',
-        exitCode: -1,
-      };
+      {
+        const runningShell = copySnapshotShell(allResults[index]);
+        runningShell.status = 'running';
+        runningShell.exitCode = -1;
+        allResults[index] = runningShell;
+      }
       emitParallelUpdate();
 
       try {
@@ -1592,8 +1590,9 @@ async function runParallel(
           (partial) => {
             if (partial.details?.results[0]) {
               const partialResult = partial.details.results[0];
-              partialResult.status = partialResult.status ?? 'running';
-              allResults[index] = partialResult;
+              const shell = copySnapshotShell(partialResult);
+              shell.status = shell.status ?? 'running';
+              allResults[index] = shell;
               emitParallelUpdate();
             }
           },
@@ -1640,12 +1639,12 @@ async function runParallel(
               : {}),
           }
         );
-        // Never mutate the compact endUnit snapshot in place.
-        let stored = result;
-        if (!result.status || result.status === 'running') {
-          stored = cloneSingleResult(result);
-          applyTerminalStatus(stored);
-          stored = snapshotSingleResult(stored);
+        // Always store a private compact shell; never alias the returned endUnit object.
+        let stored = snapshotSingleResult(result);
+        if (!stored.status || stored.status === 'running') {
+          const working = cloneSingleResult(stored);
+          applyTerminalStatus(working);
+          stored = snapshotSingleResult(working);
         }
         allResults[index] = stored;
         emitParallelUpdate();
@@ -1653,13 +1652,14 @@ async function runParallel(
       } catch (err) {
         if (isAbortError(err)) {
           const fromErr = getAbortResult(err);
-          const cancelled = fromErr
-            ? {
-                ...fromErr,
-                status: 'cancelled' as const,
-                stopReason: fromErr.stopReason ?? 'aborted',
-              }
-            : makeCancelledSlot(t, index);
+          let cancelled: SingleResult;
+          if (fromErr) {
+            cancelled = copySnapshotShell(fromErr);
+            cancelled.status = 'cancelled';
+            cancelled.stopReason = fromErr.stopReason ?? 'aborted';
+          } else {
+            cancelled = makeCancelledSlot(t, index);
+          }
           if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
           allResults[index] = cancelled;
           emitParallelUpdate();
@@ -1702,7 +1702,7 @@ async function runParallel(
             : `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join('\n\n---\n\n')}`,
       },
     ],
-    details: makeDetails('parallel')(cloneResults(results)),
+    details: makeDetails('parallel')(results.map(copySnapshotShell)),
     ...(cancelledCount > 0 || successCount < results.length ? { isError: true } : {}),
   };
 }

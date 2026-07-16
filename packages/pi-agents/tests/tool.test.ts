@@ -15,7 +15,7 @@ import { clearDiscoveredSkills, setDiscoveredSkills } from '../src/skills.ts';
 import { createRunStore } from '../src/run-store.ts';
 import { agentFingerprint, createRunCoordinator } from '../src/run-coordinator.ts';
 import type { ListRunsResult, AgentRunRecordV1, RunUnitRecord } from '../src/run-types.ts';
-import type { SubagentDetails } from '../src/types.ts';
+import type { SingleResult, SubagentDetails } from '../src/types.ts';
 
 type AgentResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
 
@@ -3943,5 +3943,53 @@ describe('executeAgentTool public runId resume', () => {
     expect(order.indexOf('begin')).toBeGreaterThanOrEqual(0);
     expect(order.indexOf('stamp')).toBeGreaterThan(order.indexOf('begin'));
     expect(order.indexOf('spawn')).toBeGreaterThan(order.indexOf('stamp'));
+  });
+});
+
+describe('copy-on-write parallel updates', () => {
+  it('copySnapshotShell shares frozen presentation and isolates mutable shell fields', async () => {
+    const { copySnapshotShell } = await import('../src/result-snapshot.ts');
+    const presentation = Object.freeze({
+      transcript: Object.freeze([{ type: 'text' as const, text: 'note' }]),
+    }) as SingleResult['presentation'];
+    const structuredOutput = Object.freeze({ ok: true });
+    const base: SingleResult = {
+      agent: 'a',
+      agentSource: 'unknown',
+      task: 't',
+      exitCode: 0,
+      status: 'completed',
+      messages: [],
+      stderr: '',
+      usage: {
+        input: 1,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        contextTokens: 0,
+        turns: 1,
+      },
+      finalOutput: 'done',
+      presentation,
+      structuredOutput,
+      worktreeChangedFiles: ['a.ts'],
+      fanout: { index: 0, count: 2 },
+    };
+    const shellA = copySnapshotShell(base);
+    const shellB = copySnapshotShell(base);
+    expect(shellA).not.toBe(shellB);
+    expect(shellA.presentation).toBe(presentation);
+    expect(shellB.presentation).toBe(presentation);
+    expect(shellA.structuredOutput).toBe(structuredOutput);
+    shellA.usage.input = 99;
+    shellA.status = 'failed';
+    shellA.worktreeChangedFiles!.push('b.ts');
+    shellA.fanout!.index = 7;
+    expect(base.usage.input).toBe(1);
+    expect(shellB.usage.input).toBe(1);
+    expect(shellB.status).toBe('completed');
+    expect(shellB.worktreeChangedFiles).toEqual(['a.ts']);
+    expect(shellB.fanout?.index).toBe(0);
   });
 });

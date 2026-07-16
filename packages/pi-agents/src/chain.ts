@@ -30,7 +30,7 @@ import {
 } from './structured-output.ts';
 import { emptyUsage } from './empty-usage.ts';
 import { renderTaskTemplate } from './template.ts';
-import { snapshotSingleResult } from './result-snapshot.ts';
+import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
   cloneResults,
   cloneSingleResult,
@@ -459,7 +459,8 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
   const outputsRecord = (): Record<string, ChainOutputEntry> => Object.fromEntries(outputs);
 
   const buildDetails = (): SubagentDetails => {
-    const base = makeDetails(cloneResults(results), outputsRecord());
+    // Copy-on-write result shells; share frozen presentation/structuredOutput payloads.
+    const base = makeDetails(results.map(copySnapshotShell), outputsRecord());
     const chainDetails: ChainExecutionDetails = {
       totalSteps: chain.length,
       steps: cloneLogicalSteps(logicalSteps),
@@ -611,12 +612,15 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
         }
         markLaterSkipped(logicalSteps, idx + 1);
       }
-      // Mark any in-flight sequential result cancelled
-      for (const r of results) {
+      // Mark any in-flight sequential result cancelled via slot replacement.
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i]!;
         if (resolveExecutionStatus(r) === 'running') {
-          r.status = 'cancelled';
-          r.stopReason = r.stopReason ?? 'aborted';
-          if (r.exitCode === 0 || r.exitCode === -1) r.exitCode = 1;
+          const cancelled = copySnapshotShell(r);
+          cancelled.status = 'cancelled';
+          cancelled.stopReason = r.stopReason ?? 'aborted';
+          if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
+          results[i] = cancelled;
         }
       }
       return {
@@ -829,12 +833,14 @@ async function runSequentialStep(
         errorMessage: ABORT_MESSAGE,
         step: stepNumber,
       };
-      // Prefer any partial that was upserted
-      const existing = results.find((r) => r.step === stepNumber && r.fanout === undefined);
-      if (existing) {
-        existing.status = 'cancelled';
-        existing.stopReason = existing.stopReason ?? 'aborted';
-        if (existing.exitCode === 0 || existing.exitCode === -1) existing.exitCode = 1;
+      // Prefer any partial that was upserted — replace the slot, never mutate it.
+      const existingIdx = results.findIndex((r) => r.step === stepNumber && r.fanout === undefined);
+      if (existingIdx >= 0) {
+        const shell = copySnapshotShell(results[existingIdx]!);
+        shell.status = 'cancelled';
+        shell.stopReason = shell.stopReason ?? 'aborted';
+        if (shell.exitCode === 0 || shell.exitCode === -1) shell.exitCode = 1;
+        results[existingIdx] = shell;
       } else {
         upsertSequentialResult(results, cancelled);
       }
@@ -1145,21 +1151,17 @@ async function runFanoutStep(
   const markSlotCancelled = (index: number, fromErr?: unknown): SingleResult => {
     const fromAbort = fromErr ? getAbortResult(fromErr) : undefined;
     const base = fromAbort ?? slots[index];
-    // Never mutate the abort error's compact result or a prior snapshot in place.
-    const cancelled: SingleResult = {
-      ...base,
-      status: 'cancelled',
-      stopReason: base.stopReason ?? 'aborted',
-      exitCode: base.exitCode === 0 || base.exitCode === -1 ? 1 : base.exitCode,
-      errorMessage: base.errorMessage ?? ABORT_MESSAGE,
-      step: stepNumber,
-      fanout: {
-        index,
-        count: renderedTasks.length,
-        itemTask: renderedTasks[index],
-      },
-      messages: base.messages ? [...base.messages] : [],
-      usage: { ...base.usage },
+    // CoW shell — never mutate the abort error's result or a prior snapshot in place.
+    const cancelled = copySnapshotShell(base);
+    cancelled.status = 'cancelled';
+    cancelled.stopReason = base.stopReason ?? 'aborted';
+    if (cancelled.exitCode === 0 || cancelled.exitCode === -1) cancelled.exitCode = 1;
+    cancelled.errorMessage = cancelled.errorMessage ?? ABORT_MESSAGE;
+    cancelled.step = stepNumber;
+    cancelled.fanout = {
+      index,
+      count: renderedTasks.length,
+      itemTask: renderedTasks[index],
     };
     slots[index] = cancelled;
     fanoutMeta.latestIndex = index;
@@ -1196,11 +1198,12 @@ async function runFanoutStep(
             return slots[index];
           }
         }
-        slots[index] = {
-          ...slots[index],
-          status: 'running',
-          exitCode: -1,
-        };
+        {
+          const runningShell = copySnapshotShell(slots[index]);
+          runningShell.status = 'running';
+          runningShell.exitCode = -1;
+          slots[index] = runningShell;
+        }
         fanoutMeta.latestIndex = index;
         if (!fanoutTerminal) emitFanout();
 
@@ -1210,14 +1213,16 @@ async function runFanoutStep(
               if (fanoutTerminal || signal?.aborted) return;
               const current = partial.details?.results[0];
               if (!current) return;
-              current.status = current.status ?? 'running';
-              current.step = stepNumber;
-              current.fanout = {
+              // Replace the slot with a new shell — never mutate the partial snapshot.
+              const shell = copySnapshotShell(current);
+              shell.status = shell.status ?? 'running';
+              shell.step = stepNumber;
+              shell.fanout = {
                 index,
                 count: renderedTasks.length,
                 itemTask: task,
               };
-              slots[index] = current;
+              slots[index] = shell;
               fanoutMeta.latestIndex = index;
               emitFanout();
             }
@@ -1265,7 +1270,7 @@ async function runFanoutStep(
         signal,
         onUnstarted: (_task, index) => {
           // Presentation may mark skipped; durable state keeps the unit queued.
-          const skippedSlot = slots[index];
+          const skippedSlot = copySnapshotShell(slots[index]);
           skippedSlot.status = 'skipped';
           skippedSlot.exitCode = 1;
           skippedSlot.stopReason = skippedSlot.stopReason ?? 'aborted';
@@ -1288,14 +1293,17 @@ async function runFanoutStep(
   const abortedFanout = signal?.aborted || cancelledCount > 0 || skippedCount > 0;
 
   if (abortedFanout && successCount !== slots.length) {
-    for (const slot of slots) {
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i]!;
       const st = resolveExecutionStatus(slot);
       if (st === 'queued' || st === 'running') {
-        slot.status = st === 'running' ? 'cancelled' : 'skipped';
-        if (slot.status === 'cancelled') {
-          slot.stopReason = slot.stopReason ?? 'aborted';
-          if (slot.exitCode === 0 || slot.exitCode === -1) slot.exitCode = 1;
+        const shell = copySnapshotShell(slot);
+        shell.status = st === 'running' ? 'cancelled' : 'skipped';
+        if (shell.status === 'cancelled') {
+          shell.stopReason = shell.stopReason ?? 'aborted';
+          if (shell.exitCode === 0 || shell.exitCode === -1) shell.exitCode = 1;
         }
+        slots[i] = shell;
       }
     }
     fanoutMeta.status = 'cancelled';
@@ -1394,9 +1402,11 @@ function makeSequentialUpdate(
     ? (partial) => {
         const currentResult = partial.details?.results[0];
         if (currentResult) {
-          currentResult.status = currentResult.status ?? 'running';
-          currentResult.step = stepNumber;
-          upsertSequentialResult(results, currentResult);
+          // CoW: never mutate the inbound partial snapshot in place.
+          const shell = copySnapshotShell(currentResult);
+          shell.status = shell.status ?? 'running';
+          shell.step = stepNumber;
+          upsertSequentialResult(results, shell);
           onUpdate({
             content: partial.content,
             details: buildDetails(),
