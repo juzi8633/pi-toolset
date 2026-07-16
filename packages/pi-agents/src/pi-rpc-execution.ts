@@ -3,13 +3,9 @@
 
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
+import { ABORT_MESSAGE, AgentAbortError } from './abort.ts';
 import type { AgentConfig } from './agents.ts';
-import {
-  AgentAbortError,
-  type OnUpdateCallback,
-  type RunSingleAgentOptions,
-  ABORT_MESSAGE,
-} from './execution.ts';
+import type { OnUpdateCallback, RunSingleAgentOptions } from './execution.ts';
 import {
   InteractiveAgentError,
   type InteractiveAgentRegistry,

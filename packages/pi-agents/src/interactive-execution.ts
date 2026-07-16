@@ -5,6 +5,7 @@ import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { AgentConfig } from './agents.ts';
 import type { OnUpdateCallback, RunSingleAgentOptions } from './execution.ts';
 import type { InteractiveAgentRegistry } from './interactive-agent.ts';
+import { runSingleAgentPiRpc } from './pi-rpc-execution.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
 
 export interface RunSingleAgentInteractiveOptions extends RunSingleAgentOptions {
@@ -44,7 +45,6 @@ export async function runSingleAgentInteractive(
   const runtime = options.runtime ?? 'pi';
 
   if (runtime === 'pi') {
-    const { runSingleAgentPiRpc } = await import('./pi-rpc-execution.ts');
     return runSingleAgentPiRpc(
       defaultCwd,
       agents,
@@ -96,7 +96,6 @@ async function runGrokAcpInteractive(
   makeDetails: (results: SingleResult[]) => SubagentDetails,
   options: RunSingleAgentInteractiveOptions
 ): Promise<SingleResult> {
-  const { runSingleAgentPiRpc } = await import('./pi-rpc-execution.ts');
   const agent = agents.find((a) => a.name === agentName);
   // Grok ACP policy: no client-side maxTurns enforcement.
   const agentsForRun = agent

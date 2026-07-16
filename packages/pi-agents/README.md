@@ -30,6 +30,7 @@ The package is not published to a registry yet. Build it and load it with `-e`:
 
 ```sh
 mise run build --package packages/pi-agents
+# monorepo package.json loads packages/*/dist/index.js — rebuild after source changes
 pi -e ./packages/pi-agents/dist/index.js
 ```
 

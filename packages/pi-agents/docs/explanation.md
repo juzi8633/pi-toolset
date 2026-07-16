@@ -147,6 +147,17 @@ etc.) use `stopReason: "error"` (or a structured code when present), not
 `context_error`. When a thrown `Error` is turned into a failed result, its
 `stack` is stored on `errorStack` and written to the failure log.
 
+## Extension loading (jiti) and parallel TUI units
+
+Pi loads TypeScript extensions with **jiti** (`moduleCache: false`, CJS
+interop). A previous `execution → dynamic import(pi-rpc-execution) → execution`
+cycle could leave named exports incomplete under parallel interactive launches,
+surfacing as `Cannot read properties of undefined (reading 'emptyUsage')` at
+`runSingleAgentPiRpc` setup. Abort helpers live in `abort.ts`; RPC/interactive
+entrypoints use static imports so the graph is fully wired at load time. The
+monorepo `package.json` points `pi.extensions` at `packages/*/dist/index.js`
+(bundled, no inter-module require cycle).
+
 In `--no-session` parent runs, `fork` does not silently fall back to fresh
 context.
 

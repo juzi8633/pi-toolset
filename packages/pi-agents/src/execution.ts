@@ -40,8 +40,13 @@ import {
   releaseSessionLeaseWithCertainty,
   type DisposalCertainty,
 } from './session-lease.ts';
+import { ABORT_MESSAGE, AgentAbortError, isAbortError } from './abort.ts';
 import { emptyUsage } from './empty-usage.ts';
+import { runSingleAgentInteractive } from './interactive-execution.ts';
+import { runSingleAgentPiRpc } from './pi-rpc-execution.ts';
 import { cloneSingleResult, type SingleResult, type SubagentDetails } from './types.ts';
+
+export { ABORT_MESSAGE, AgentAbortError, getAbortResult, isAbortError } from './abort.ts';
 
 /** True when Grok ACP SingleResult is a successful matching-prompt completion. */
 function isGrokAcpSuccessfulCompletion(result: SingleResult): boolean {
@@ -141,8 +146,6 @@ export interface RunSingleAgentOptions {
   }) => Promise<string>;
 }
 
-export const ABORT_MESSAGE = 'Subagent was aborted';
-
 function stampUnitContext(result: SingleResult, options: RunSingleAgentOptions): void {
   const ctx = options.unitContext;
   if (!ctx) return;
@@ -154,32 +157,6 @@ function stampUnitContext(result: SingleResult, options: RunSingleAgentOptions):
     result.acpSessionId = ctx.acpSessionId;
   }
   result.resumeCapability = ctx.resumeCapability;
-}
-
-/** Abort error that carries a deep-cloned terminal SingleResult snapshot and the abort origin. */
-export class AgentAbortError extends Error {
-  readonly result: SingleResult;
-  readonly origin: RunAbortOrigin;
-
-  constructor(result: SingleResult, origin: RunAbortOrigin = 'unknown') {
-    super(ABORT_MESSAGE);
-    this.name = 'AgentAbortError';
-    this.result = cloneSingleResult(result);
-    this.origin = origin;
-  }
-}
-
-export function isAbortError(err: unknown): boolean {
-  return err instanceof AgentAbortError || (err instanceof Error && err.message === ABORT_MESSAGE);
-}
-
-export function getAbortResult(err: unknown): SingleResult | undefined {
-  if (err instanceof AgentAbortError) return err.result;
-  if (err && typeof err === 'object' && 'result' in err) {
-    const result = (err as { result?: SingleResult }).result;
-    if (result && typeof result === 'object' && 'agent' in result) return result;
-  }
-  return undefined;
 }
 
 export interface MapConcurrencyOptions<TIn, TOut> {
@@ -410,13 +387,15 @@ export async function runSingleAgent(
 
   // TUI Pi units with a registered interactive endpoint run through RPC so they
   // remain steerable; JSON/print/RPC host modes keep the one-shot JSON path.
+  // Static import (not dynamic): jiti loads extensions with moduleCache:false and
+  // CJS interop; dynamic import under parallel runs re-entered a circular graph
+  // and produced `undefined.emptyUsage` at pi-rpc-execution setup.
   if (
     options.hostMode === 'tui' &&
     options.interactiveRegistry &&
     options.endpointKey &&
     (options.sessionFile || options.unitContext?.sessionFile)
   ) {
-    const { runSingleAgentPiRpc } = await import('./pi-rpc-execution.ts');
     return runSingleAgentPiRpc(
       defaultCwd,
       agents,
@@ -763,7 +742,6 @@ async function runSingleAgentGrokAcp(
 
   // TUI with a registered interactive endpoint: registry is the sole reducer.
   if (options.hostMode === 'tui' && options.interactiveRegistry && options.endpointKey) {
-    const { runSingleAgentInteractive } = await import('./interactive-execution.ts');
     return runSingleAgentInteractive(
       defaultCwd,
       agents,
@@ -1147,7 +1125,6 @@ async function runFreshTuiGrokAcp(
       },
     });
 
-    const { runSingleAgentInteractive } = await import('./interactive-execution.ts');
     return runSingleAgentInteractive(
       defaultCwd,
       agents,
