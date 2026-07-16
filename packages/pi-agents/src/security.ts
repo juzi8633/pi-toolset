@@ -106,12 +106,20 @@ export function buildChildAgentEnv(
 
 export interface ToolCliArgsOptions {
   disableAgentTool?: boolean;
+  /** Force-include the dedicated child artifact reader when a handoff requires it. */
+  requireArtifactReader?: boolean;
 }
+
+const ARTIFACT_READER_TOOL = 'pi_agents_read_artifact';
 
 export function buildToolCliArgs(agent: AgentConfig, options: ToolCliArgsOptions = {}): string[] {
   const args: string[] = [];
   if (agent.tools && agent.tools.length > 0) {
-    args.push('--tools', agent.tools.join(','));
+    const tools = [...agent.tools];
+    if (options.requireArtifactReader && !tools.includes(ARTIFACT_READER_TOOL)) {
+      tools.push(ARTIFACT_READER_TOOL);
+    }
+    args.push('--tools', tools.join(','));
   }
   const excludes = agent.excludeTools ? [...agent.excludeTools] : [];
   if (options.disableAgentTool) {
@@ -120,6 +128,12 @@ export function buildToolCliArgs(agent: AgentConfig, options: ToolCliArgsOptions
     // the tool name Pi exposes.
     const filtered = excludes.filter((name) => !isAgentToolName(name));
     filtered.push(AGENT_TOOL_NAME);
+    excludes.length = 0;
+    excludes.push(...filtered);
+  }
+  if (options.requireArtifactReader) {
+    // Only remove the dedicated reader from excludes; do not broaden other tools.
+    const filtered = excludes.filter((name) => name !== ARTIFACT_READER_TOOL);
     excludes.length = 0;
     excludes.push(...filtered);
   }

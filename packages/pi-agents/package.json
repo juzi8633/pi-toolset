@@ -16,7 +16,8 @@
     "agent"
   ],
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./artifact-reader-extension": "./dist/artifact-reader-extension.js"
   },
   "pi": {
     "extensions": [

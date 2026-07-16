@@ -8,6 +8,7 @@ import type { AgentConfig } from '../src/agents.ts';
 import { RESULT_UPDATE_INTERVAL_MS } from '../src/constants.ts';
 import type { SpawnFn, SpawnedChild } from '../src/execution.ts';
 import { AgentAbortError, mapWithConcurrencyLimit, runSingleAgent } from '../src/execution.ts';
+import { getResultFinalOutput } from '../src/output.ts';
 import type { SingleResult, SubagentDetails } from '../src/types.ts';
 
 class FakeChild extends EventEmitter {
@@ -768,7 +769,9 @@ describe('runSingleAgentGrokAcp', () => {
     });
     expect(result.errorMessage).toBeUndefined();
     expect(JSON.stringify(result)).not.toContain('maxTurns=1');
-    expect(updates.some((u) => u.includes('preamble') || u.includes('Completed'))).toBe(true);
+    // Provisional parent updates may only show running/done placeholders; authority is result.
+    expect(updates.length).toBeGreaterThan(0);
+    expect(result.finalOutput || result.messages.length > 0).toBeTruthy();
 
     // Content/usage chunks are coalesced: intermediate mid-turn snapshots may be dropped,
     // but the final delivered usage (and authoritative result) remain complete.
@@ -1474,10 +1477,22 @@ describe('runSingleAgent compact parent projection', () => {
         expect(r.presentation).toBeDefined();
       }
     }
-    const last = updates[updates.length - 1]!.results[0]!;
-    expect(last.finalOutput).toBe('final answer');
+    // Low-level onUpdate is provisional (no authoritative finalOutput).
+    for (const details of updates) {
+      for (const r of details.results) {
+        expect(r.finalOutput).toBeUndefined();
+        expect(r.finalOutputRef).toBeUndefined();
+      }
+    }
+    // Authoritative returned result still exposes final text via messages.
+    expect(getResultFinalOutput(result)).toBe('final answer');
     expect(
-      last.presentation?.transcript.some((i) => i.type === 'text' && i.text === 'thinking')
+      result.messages.some(
+        (m) =>
+          m.role === 'assistant' &&
+          Array.isArray(m.content) &&
+          m.content.some((c) => c.type === 'text' && c.text === 'thinking')
+      )
     ).toBe(true);
   });
 

@@ -17,6 +17,10 @@ export const RESULT_INLINE_PAYLOAD_MAX_BYTES = 256 * 1024;
 export const RUN_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024;
 /** Maximum artifact bytes returned per child reader call. */
 export const ARTIFACT_READER_CHUNK_MAX_BYTES = 48 * 1024;
+/** Private env: absolute run directory root for child artifact reads. */
+export const PI_AGENTS_RUN_ARTIFACT_DIR = 'PI_AGENTS_RUN_ARTIFACT_DIR';
+/** Private env: owning run id for child artifact reads. */
+export const PI_AGENTS_RUN_ID = 'PI_AGENTS_RUN_ID';
 
 export const MAX_PARALLEL_TASKS = 8;
 export const MAX_FANOUT_ITEMS = MAX_PARALLEL_TASKS;

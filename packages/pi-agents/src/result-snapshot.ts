@@ -531,6 +531,7 @@ export function snapshotSingleResult(result: SingleResult): SingleResult {
  */
 export function snapshotProvisionalResult(result: SingleResult): SingleResult {
   const base = snapshotSingleResult(result);
+  const finalText = base.finalOutput;
   const provisional: SingleResult = {
     ...base,
     messages: [],
@@ -539,6 +540,26 @@ export function snapshotProvisionalResult(result: SingleResult): SingleResult {
   delete provisional.finalOutputRef;
   delete provisional.structuredOutput;
   delete provisional.structuredOutputRef;
+  // snapshotSingleResult de-duplicates final text out of transcript into finalOutput.
+  // After stripping finalOutput, restore it as latestActivity so parent UI still sees it.
+  if (
+    typeof finalText === 'string' &&
+    finalText.length > 0 &&
+    provisional.presentation &&
+    !provisional.presentation.latestActivity
+  ) {
+    const hasText = provisional.presentation.transcript.some(
+      (i) => i.type === 'text' && i.text === finalText
+    );
+    if (!hasText) {
+      provisional.presentation = markSnapshotOwned(
+        deepFreeze({
+          ...provisional.presentation,
+          latestActivity: { type: 'text' as const, text: finalText },
+        })
+      );
+    }
+  }
   return provisional;
 }
 
