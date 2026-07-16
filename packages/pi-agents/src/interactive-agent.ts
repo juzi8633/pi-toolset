@@ -109,6 +109,21 @@ export interface InteractiveActivationPolicy {
 
 export type InteractiveTerminalOverride = 'max_turns' | 'cancelled' | 'error';
 
+/**
+ * Tracks projected (payload-omitted) RPC shells for a single activation/generation.
+ * Compact agent_end alone does not populate this — only message/tool/turn shells do.
+ */
+export interface ProjectedOmissionState {
+  transportGeneration: number;
+  activationId: string;
+  /** Compact or full message_end events observed after activation baseline. */
+  expectedFinalizedDelta: number;
+  /** Assistant message_end events observed after activation baseline. */
+  expectedAssistantDelta: number;
+  /** True when any message/tool/turn payload was omitted and must be rehydrated. */
+  requiresRehydrate: boolean;
+}
+
 export interface InteractiveActivation {
   id: string;
   endpointKey: string;
@@ -206,6 +221,11 @@ export interface InteractiveAgentEndpoint {
   finalizedMessageBytes?: number[];
   /** Cached sum of finalizedMessageBytes (JSON array body without brackets/commas). */
   finalizedMessagesBytes?: number;
+  /**
+   * Live Pi RPC projection omissions for the current transport generation/activation.
+   * Compact agent_end alone does not populate this; message/tool/turn shells do.
+   */
+  projectedOmission?: ProjectedOmissionState;
   /**
    * Live-process-only: initial registration accepted a planned session path that
    * did not exist yet. Reopen revalidation may re-accept that missing path.
@@ -2806,6 +2826,238 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     }
   }
 
+  function ensureProjectedOmission(
+    ep: InteractiveAgentEndpoint
+  ): ProjectedOmissionState | undefined {
+    const activation = ep.activation;
+    if (!activation || activation.settled) return undefined;
+    if (
+      ep.projectedOmission &&
+      ep.projectedOmission.transportGeneration === ep.transportGeneration &&
+      ep.projectedOmission.activationId === activation.id
+    ) {
+      return ep.projectedOmission;
+    }
+    const state: ProjectedOmissionState = {
+      transportGeneration: ep.transportGeneration,
+      activationId: activation.id,
+      expectedFinalizedDelta: 0,
+      expectedAssistantDelta: 0,
+      requiresRehydrate: false,
+    };
+    ep.projectedOmission = state;
+    return state;
+  }
+
+  function noteProjectedPayloadOmission(ep: InteractiveAgentEndpoint): void {
+    const state = ensureProjectedOmission(ep);
+    if (!state) return;
+    state.requiresRehydrate = true;
+  }
+
+  function noteProjectedMessageEnd(ep: InteractiveAgentEndpoint, role: string): void {
+    const state = ensureProjectedOmission(ep);
+    if (!state) return;
+    state.requiresRehydrate = true;
+    state.expectedFinalizedDelta += 1;
+    if (role === 'assistant') {
+      state.expectedAssistantDelta += 1;
+      enforceMaxTurnsFromRole(ep, role);
+    }
+  }
+
+  function noteFullMessageEnd(ep: InteractiveAgentEndpoint, role: string): void {
+    // Count full message_end events so settle rehydrate can verify total post-baseline counts.
+    const state = ensureProjectedOmission(ep);
+    if (!state) return;
+    state.expectedFinalizedDelta += 1;
+    if (role === 'assistant') state.expectedAssistantDelta += 1;
+  }
+
+  function enforceMaxTurnsFromRole(ep: InteractiveAgentEndpoint, role: string): void {
+    if (
+      role !== 'assistant' ||
+      !ep.activation?.policy?.maxTurns ||
+      ep.activation.terminalOverride
+    ) {
+      return;
+    }
+    let postBaselineAssistant = 0;
+    // Prefer activation-scoped counters (full + compact ends) when present so
+    // compact assistant message_end can enforce maxTurns before rehydrate.
+    if (
+      ep.projectedOmission &&
+      ep.projectedOmission.transportGeneration === ep.transportGeneration &&
+      ep.projectedOmission.activationId === ep.activation.id
+    ) {
+      postBaselineAssistant = ep.projectedOmission.expectedAssistantDelta;
+    } else {
+      const baseline = ep.activation.baselineMessageCount;
+      for (let i = baseline; i < ep.messages.length; i++) {
+        if ((ep.messages[i] as { role?: string }).role === 'assistant') {
+          postBaselineAssistant += 1;
+        }
+      }
+    }
+    if (postBaselineAssistant >= ep.activation.policy.maxTurns) {
+      ep.activation.terminalOverride = 'max_turns';
+      const client = ep.client;
+      if (client) void client.abort().catch(() => undefined);
+    }
+  }
+
+  function needsProjectedRehydrate(ep: InteractiveAgentEndpoint): boolean {
+    const state = ep.projectedOmission;
+    const activation = ep.activation;
+    if (!state || !activation || activation.settled) return false;
+    if (!state.requiresRehydrate) return false;
+    if (state.transportGeneration !== ep.transportGeneration) return false;
+    if (state.activationId !== activation.id) return false;
+    // Pi session only — Grok ACP does not use RPC projection shells.
+    const runtime = ep.sessionArtifact?.runtime ?? 'pi';
+    if (runtime !== 'pi') return false;
+    if (!ep.client) return false;
+    return true;
+  }
+
+  /**
+   * Settle-time rehydrate for projected Pi RPC shells. Uses direct SessionManager.open
+   * on the live endpoint's session file — never ensureTranscriptHydrated / awaitSessionLease
+   * (the live endpoint still owns the writer lease until transport disposal).
+   */
+  function rehydrateProjectedPiAtSettle(
+    ep: InteractiveAgentEndpoint
+  ): { ok: true } | { ok: false; error: string } {
+    const state = ep.projectedOmission;
+    const activation = ep.activation;
+    if (!state || !activation) {
+      return { ok: false, error: 'missing projected omission state' };
+    }
+    const sessionFile =
+      (ep.sessionArtifact?.runtime === 'pi' ? ep.sessionArtifact.sessionFile : undefined) ||
+      ep.sessionFile;
+    if (!sessionFile || sessionFile.trim() === '') {
+      return { ok: false, error: 'missing session file for projected rehydrate' };
+    }
+    if (!fs.existsSync(sessionFile)) {
+      return { ok: false, error: 'session file missing for projected rehydrate' };
+    }
+
+    let loaded: { ok: true; messages: readonly AgentMessage[] } | { ok: false; error: string };
+    try {
+      // Direct open — do not await the writer lease; we are the live owner.
+      const sm = SessionManager.open(sessionFile);
+      const branch = sm.getBranch();
+      const messages: AgentMessage[] = [];
+      for (const entry of branch) {
+        if (entry.type === 'message') messages.push(entry.message as AgentMessage);
+      }
+      loaded = { ok: true, messages: isolateFinalizedMessages(messages) };
+    } catch (err) {
+      loaded = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (!loaded.ok) return loaded;
+
+    // Endpoint/activation may have changed during open (should not — sync path).
+    if (endpoints.get(ep.key) !== ep) {
+      return { ok: false, error: 'endpoint replaced during projected rehydrate' };
+    }
+    if (!ep.activation || ep.activation.id !== activation.id || ep.activation.settled) {
+      return { ok: false, error: 'activation changed during projected rehydrate' };
+    }
+    if (ep.transportGeneration !== state.transportGeneration) {
+      return { ok: false, error: 'transport generation changed during projected rehydrate' };
+    }
+
+    const baseline = activation.baselineMessageCount;
+    const messages = loaded.messages;
+    if (messages.length < baseline) {
+      return {
+        ok: false,
+        error: `session shorter than baseline (${messages.length} < ${baseline})`,
+      };
+    }
+    const postBaseline = messages.slice(baseline);
+    if (postBaseline.length < state.expectedFinalizedDelta) {
+      return {
+        ok: false,
+        error: `incomplete session rehydrate (finalized ${postBaseline.length} < expected ${state.expectedFinalizedDelta})`,
+      };
+    }
+    let assistantCount = 0;
+    for (const msg of postBaseline) {
+      if ((msg as { role?: string }).role === 'assistant') assistantCount += 1;
+    }
+    if (assistantCount < state.expectedAssistantDelta) {
+      return {
+        ok: false,
+        error: `incomplete session rehydrate (assistant ${assistantCount} < expected ${state.expectedAssistantDelta})`,
+      };
+    }
+
+    replaceFinalizedMessages(ep, messages);
+    ep.transcriptHydrated = true;
+
+    // Recompute model/usage/stopReason from post-baseline assistant messages without
+    // double-counting compact streaming events that never updated usage fully.
+    if (ep.usage) {
+      let turns = 0;
+      let input = 0;
+      let output = 0;
+      let cacheRead = 0;
+      let cacheWrite = 0;
+      let cost = 0;
+      let contextTokens = 0;
+      let model: string | undefined;
+      let stopReason: string | undefined;
+      for (const msg of postBaseline) {
+        if ((msg as { role?: string }).role !== 'assistant') continue;
+        turns += 1;
+        const usage = (
+          msg as unknown as {
+            usage?: {
+              input?: number;
+              output?: number;
+              cacheRead?: number;
+              cacheWrite?: number;
+              totalTokens?: number;
+              cost?: { total?: number };
+            };
+            model?: string;
+            stopReason?: string;
+          }
+        ).usage;
+        if (usage) {
+          input += usage.input || 0;
+          output += usage.output || 0;
+          cacheRead += usage.cacheRead || 0;
+          cacheWrite += usage.cacheWrite || 0;
+          cost += usage.cost?.total || 0;
+          contextTokens = usage.totalTokens || contextTokens;
+        }
+        if ((msg as { model?: string }).model) model = (msg as { model?: string }).model;
+        if ((msg as { stopReason?: string }).stopReason) {
+          stopReason = (msg as { stopReason?: string }).stopReason;
+        }
+      }
+      ep.usage.turns = turns;
+      ep.usage.input = input;
+      ep.usage.output = output;
+      ep.usage.cacheRead = cacheRead;
+      ep.usage.cacheWrite = cacheWrite;
+      ep.usage.cost = cost;
+      ep.usage.contextTokens = contextTokens;
+      if (model) ep.usage.model = model;
+      if (stopReason) ep.usage.stopReason = stopReason;
+    }
+
+    ep.projectedOmission = undefined;
+    return { ok: true };
+  }
+
   interface ResolvedArtifacts {
     sessionFile: string;
     sessionArtifact: InteractiveSessionArtifact;
@@ -3579,6 +3831,36 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             kind = 'meta';
             break;
           }
+          // Projected message/tool/turn shells: rehydrate from the live native session
+          // before publishing activation_settled. Never use ensureTranscriptHydrated here.
+          if (needsProjectedRehydrate(ep)) {
+            const rehydrated = rehydrateProjectedPiAtSettle(ep);
+            if (!rehydrated.ok) {
+              const msg = `Projected session rehydrate failed: ${rehydrated.error}`;
+              ep.status = 'error';
+              ep.lastError = msg;
+              ep.errorCode = 'hydrate_error';
+              ep.activation.terminalOverride = 'error';
+              ep.activation.error = msg;
+              ep.projectedOmission = undefined;
+              clearTransientActivity(ep);
+              ep.activation.settled = true;
+              const activationId = ep.activation.id;
+              const settledSnap = publish(ep, 'full');
+              emit({
+                type: 'activation_settled',
+                key: ep.key,
+                activationId,
+                snapshot: settledSnap,
+              });
+              ep.activation = undefined;
+              scheduleIdleTranscriptEviction(ep);
+              void enforceIdleLru();
+              return;
+            }
+          } else {
+            ep.projectedOmission = undefined;
+          }
           // Grok ACP: settle without a real prompt_completed is cancel-grace or
           // incomplete — never treat as successful completed delivery.
           const isGrokAcp = ep.sessionArtifact?.runtime === 'grok-acp';
@@ -3624,6 +3906,14 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       }
       case 'message_start':
       case 'message_update':
+        if (evt.payloadOmitted === true) {
+          // Compact projected shell: drop unsafe streaming row, keep activation running.
+          noteProjectedPayloadOmission(ep);
+          ep.streamingMessage = undefined;
+          ep.streamRevision += 1;
+          kind = 'meta';
+          break;
+        }
         if (evt.message) {
           // Project + bound non-authoritative payloads; freeze so snapshots cannot share mutables.
           ep.streamingMessage = freezeDeep(
@@ -3634,12 +3924,22 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         kind = 'transcript';
         break;
       case 'message_end':
+        if (evt.payloadOmitted === true) {
+          const role = typeof evt.role === 'string' ? evt.role : 'unknown';
+          noteProjectedMessageEnd(ep, role);
+          ep.streamingMessage = undefined;
+          ep.streamRevision += 1;
+          // Bounded omission metadata only — authority comes from settle rehydrate.
+          kind = 'full';
+          break;
+        }
         if (evt.message) {
           const msg = evt.message as AgentMessage;
           // Finalized messages are append-only and treated as immutable thereafter.
           appendFinalizedMessage(ep, msg);
           ep.streamingMessage = undefined;
           ep.streamRevision += 1;
+          noteFullMessageEnd(ep, typeof msg.role === 'string' ? msg.role : 'unknown');
           if (msg.role === 'assistant' && ep.usage) {
             ep.usage.turns += 1;
             const usage = (
@@ -3668,33 +3968,41 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             if ((msg as { stopReason?: string }).stopReason) {
               ep.usage.stopReason = (msg as { stopReason?: string }).stopReason;
             }
-            // Max-turn policy counts post-baseline assistant messages only.
-            if (
-              ep.activation &&
-              ep.activation.policy?.maxTurns &&
-              !ep.activation.terminalOverride
-            ) {
-              const baseline = ep.activation.baselineMessageCount;
-              let postBaselineAssistant = 0;
-              for (let i = baseline; i < ep.messages.length; i++) {
-                if ((ep.messages[i] as { role?: string }).role === 'assistant') {
-                  postBaselineAssistant += 1;
-                }
-              }
-              if (postBaselineAssistant >= ep.activation.policy.maxTurns) {
-                ep.activation.terminalOverride = 'max_turns';
-                const client = ep.client;
-                if (client) {
-                  void client.abort().catch(() => undefined);
-                }
-              }
-            }
+            enforceMaxTurnsFromRole(ep, 'assistant');
           }
         }
         // Finalized history + usage/meta for parent tool projection.
         kind = 'full';
         break;
+      case 'turn_end':
+        if (evt.payloadOmitted === true) {
+          noteProjectedPayloadOmission(ep);
+          // Clear only unsafe transient presentation; keep activation running.
+          ep.streamingMessage = undefined;
+          ep.streamRevision += 1;
+          kind = 'meta';
+          break;
+        }
+        kind = 'meta';
+        break;
       case 'tool_execution_start': {
+        if (evt.payloadOmitted === true) {
+          noteProjectedPayloadOmission(ep);
+          const rawId = String(evt.toolCallId ?? '');
+          const mapKey = activeToolMapKey(rawId);
+          // Bound shell-only tool row without args/result payloads.
+          ep.activeTools.set(
+            mapKey,
+            projectActiveToolEntry({
+              toolCallId: rawId,
+              toolName: evt.toolName,
+              args: {},
+            })
+          );
+          ep.streamRevision += 1;
+          kind = 'transcript';
+          break;
+        }
         const rawId = String(evt.toolCallId ?? '');
         const mapKey = activeToolMapKey(rawId);
         // Bound complete entry (id/name/args) and freeze nested payloads at ingest.
@@ -3713,6 +4021,27 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         break;
       }
       case 'tool_execution_update': {
+        if (evt.payloadOmitted === true) {
+          noteProjectedPayloadOmission(ep);
+          const rawId = String(evt.toolCallId ?? '');
+          const mapKey = activeToolMapKey(rawId);
+          const existing = ep.activeTools.get(mapKey);
+          if (existing) {
+            ep.activeTools.set(
+              mapKey,
+              projectActiveToolEntry({
+                toolCallId: existing.toolCallId,
+                toolName: existing.toolName,
+                args: existing.args,
+                isError: existing.isError,
+                ended: existing.ended,
+              })
+            );
+          }
+          ep.streamRevision += 1;
+          kind = 'transcript';
+          break;
+        }
         const rawId = String(evt.toolCallId ?? '');
         const mapKey = activeToolMapKey(rawId);
         const existing = ep.activeTools.get(mapKey);
@@ -3735,6 +4064,27 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         break;
       }
       case 'tool_execution_end': {
+        if (evt.payloadOmitted === true) {
+          noteProjectedPayloadOmission(ep);
+          const rawId = String(evt.toolCallId ?? '');
+          const mapKey = activeToolMapKey(rawId);
+          const existing = ep.activeTools.get(mapKey);
+          if (existing) {
+            ep.activeTools.set(
+              mapKey,
+              projectActiveToolEntry({
+                toolCallId: existing.toolCallId,
+                toolName: existing.toolName,
+                args: existing.args,
+                isError: Boolean(evt.isError),
+                ended: true,
+              })
+            );
+          }
+          ep.streamRevision += 1;
+          kind = 'transcript';
+          break;
+        }
         const rawId = String(evt.toolCallId ?? '');
         const mapKey = activeToolMapKey(rawId);
         const existing = ep.activeTools.get(mapKey);

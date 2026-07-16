@@ -4119,6 +4119,204 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it('rehydrates projected message shells from the native session before agent_settled', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key, sessionFile } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    const largeText = `projected-authority-${'X'.repeat(4096)}`;
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    const header = {
+      type: 'session',
+      version: 3,
+      id: 'sess-projected',
+      timestamp: new Date().toISOString(),
+      cwd: root,
+    };
+    const userEntry = {
+      type: 'message',
+      id: 'm-user',
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'task' }],
+        timestamp: Date.now(),
+      },
+    };
+    const assistantEntry = {
+      type: 'message',
+      id: 'm-asst',
+      parentId: 'm-user',
+      timestamp: new Date().toISOString(),
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: largeText }],
+        usage: { input: 3, output: 7, totalTokens: 10, cost: { total: 0.01 } },
+        model: 'test-model',
+        stopReason: 'end',
+        timestamp: Date.now(),
+      },
+    };
+    fs.writeFileSync(
+      sessionFile,
+      `${JSON.stringify(header)}\n${JSON.stringify(userEntry)}\n${JSON.stringify(assistantEntry)}\n`
+    );
+
+    let settledSnap:
+      { messages?: readonly unknown[]; errorCode?: string; status?: string } | undefined;
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        settledSnap = e.snapshot as unknown as typeof settledSnap;
+      }
+    });
+
+    await registry.activate(key, 'Task: projected rehydrate', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    // Compact projected shells only — no full message payloads delivered to the reducer.
+    eventListenerRef.current?.({ type: 'agent_start' });
+    eventListenerRef.current?.({
+      type: 'message_end',
+      payloadOmitted: true,
+      role: 'user',
+    });
+    eventListenerRef.current?.({
+      type: 'message_end',
+      payloadOmitted: true,
+      role: 'assistant',
+    });
+    eventListenerRef.current?.({
+      type: 'turn_end',
+      payloadOmitted: true,
+    });
+    eventListenerRef.current?.({
+      type: 'agent_end',
+      messages: [],
+      messagesOmitted: true,
+      willRetry: false,
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // Before settle: projected ends must not leave authoritative assistant content in memory.
+    const mid = registry.get(key);
+    expect(mid?.activation?.settled).toBe(false);
+    expect(JSON.stringify(mid?.messages ?? [])).not.toContain('projected-authority-');
+
+    eventListenerRef.current?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+
+    expect(settledSnap).toBeDefined();
+    expect(settledSnap?.errorCode).toBeUndefined();
+    expect(JSON.stringify(settledSnap?.messages ?? [])).toContain('projected-authority-');
+    expect(JSON.stringify(settledSnap?.messages ?? [])).toContain(largeText.slice(0, 32));
+    expect(registry.get(key)?.activation).toBeUndefined();
+    expect(registry.get(key)?.status).toBe('idle');
+    expect(registry.get(key)?.usage?.model).toBe('test-model');
+    expect(registry.get(key)?.usage?.turns).toBe(1);
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('fails projected settle with hydrate_error when the session is missing', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key, sessionFile } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    // Ensure the planned path does not exist.
+    if (fs.existsSync(sessionFile)) fs.rmSync(sessionFile, { force: true });
+
+    let settledSnap: { errorCode?: string; lastError?: string; status?: string } | undefined;
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        settledSnap = e.snapshot as unknown as typeof settledSnap;
+      }
+    });
+
+    await registry.activate(key, 'Task: missing session', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    eventListenerRef.current?.({ type: 'agent_start' });
+    eventListenerRef.current?.({
+      type: 'message_end',
+      payloadOmitted: true,
+      role: 'assistant',
+    });
+    eventListenerRef.current?.({
+      type: 'agent_end',
+      messages: [],
+      messagesOmitted: true,
+      willRetry: false,
+    });
+    eventListenerRef.current?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+
+    expect(settledSnap?.errorCode).toBe('hydrate_error');
+    expect(settledSnap?.lastError ?? '').toContain('Projected session rehydrate failed');
+    expect(registry.get(key)?.status).toBe('error');
+    expect(registry.get(key)?.activation).toBeUndefined();
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not rehydrate on compact agent_end alone', async () => {
+    const { root, store, coordinator } = makeTempStore();
+    const agent = makeAgent();
+    const eventListenerRef: { current?: (e: unknown) => void } = {};
+    const { registry, key, sessionFile } = await registerWithFakeTransport({
+      root,
+      store,
+      coordinator,
+      agent,
+      eventListenerRef,
+    });
+
+    // Missing session would fail rehydrate — agent_end alone must not trigger it.
+    if (fs.existsSync(sessionFile)) fs.rmSync(sessionFile, { force: true });
+
+    let settledSnap: { errorCode?: string; status?: string } | undefined;
+    registry.subscribe((e) => {
+      if (e.type === 'activation_settled') {
+        settledSnap = e.snapshot as unknown as typeof settledSnap;
+      }
+    });
+
+    await registry.activate(key, 'Task: agent_end only', 'prompt', undefined, 'tool_call');
+    await new Promise((r) => setImmediate(r));
+
+    eventListenerRef.current?.({ type: 'agent_start' });
+    eventListenerRef.current?.({
+      type: 'agent_end',
+      messages: [],
+      messagesOmitted: true,
+      willRetry: false,
+    });
+    eventListenerRef.current?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+
+    expect(settledSnap?.errorCode).toBeUndefined();
+    expect(registry.get(key)?.status).toBe('idle');
+
+    await registry.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it('T1 late handshake after T2 reopen cannot install client or settle B', async () => {
     const { root, store, coordinator } = makeTempStore();
     // Empty systemPrompt avoids temp-file work in spawn so the factory gate is the barrier.
