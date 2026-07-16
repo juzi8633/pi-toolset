@@ -377,10 +377,14 @@ The package ships three workflow prompts, available as slash commands:
 | `/implement-and-review <query>` | general -> reviewer -> general |
 
 Each prompt instructs Pi to run a chain with named steps. The general agent steps
-require the final output to include `## Completed`, `## Files Changed`, and
-`## Validation`. The reviewer step classifies findings under `## Critical (must
-fix)`, `## Warnings (should fix)`, and `## Suggestions (consider)`, writing
-`- None.` under Critical when empty.
+must include `## Completed`, `## Files Changed`, and `## Validation` (also
+enforced by general's `completionCheck`). Explore output uses
+`## Files Retrieved` / `## Key Code` / `## Architecture` / `## Start Here`.
+Planner output starts with `# Plan`. The reviewer step classifies findings under
+`## Critical (must fix)`, `## Warnings (should fix)`, and
+`## Suggestions (consider)`, writing `- None.` under Critical when empty, using
+`path:line - [issue] — [why] — [fix or defer]` finding lines, and ending Summary
+with `Verdict: Ship` / `Ship with fixes` / `Do not ship`.
 
 ## Interactive agent view
 

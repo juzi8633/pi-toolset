@@ -305,20 +305,20 @@ invocation.
 
 ## Bundled agents
 
-| Agent      | Purpose              | Tools                         | Extras                                                                           |
-| ---------- | -------------------- | ----------------------------- | -------------------------------------------------------------------------------- |
-| `explore`  | Fast codebase recon  | `read, grep, find, ls, bash`  | `noSkills`, `maxSubagentDepth: 0`                                                |
-| `planner`  | Implementation plans | `read, grep, find, ls, write` | `noSkills`, `maxSubagentDepth: 0`, `completionCheck` set                         |
-| `reviewer` | Code review          | `read, grep, find, ls, bash`  | `excludeTools: edit, write, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
-| `general`  | General-purpose      | (all default tools)           | follows `PI_AGENT_MAX_DEPTH`                                                     |
+| Agent      | Purpose              | Tools                        | Extras                                                                           |
+| ---------- | -------------------- | ---------------------------- | -------------------------------------------------------------------------------- |
+| `explore`  | Fast codebase recon  | `read, grep, find, ls, bash` | `noSkills`, `maxSubagentDepth: 0`, `completionCheck` set                         |
+| `planner`  | Implementation plans | `read, grep, find, ls`       | `excludeTools: write, edit, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
+| `reviewer` | Code review          | `read, grep, find, ls, bash` | `excludeTools: edit, write, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
+| `general`  | General-purpose      | (all default tools)          | follows `PI_AGENT_MAX_DEPTH`, `completionCheck` set                              |
 
 ## Workflow prompts
 
-| Prompt                          | Flow                           | Acceptance contract                                                                                                                                                                                                                                 |
-| ------------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/implement <query>`            | explore -> planner -> general  | Steps named `context`, `plan`; general references `{outputs.plan}`. General final output must include `## Completed`, `## Files Changed`, `## Validation` (commands run + pass/fail, or `Not run: <reason>`).                                       |
-| `/explore-and-plan <query>`     | explore -> planner             | Steps named `context`, `plan`. Plan-only; no file changes; no general agent.                                                                                                                                                                        |
-| `/implement-and-review <query>` | general -> reviewer -> general | Steps named `implementation`, `review`. Reviewer must emit `## Critical (must fix)\n- None.` when empty. Final general resolves every Critical item, reports remaining Warnings, and stops with the blocker if any Critical cannot be fixed safely. |
+| Prompt                          | Flow                           | Acceptance contract                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/implement <query>`            | explore -> planner -> general  | Steps named `context`, `plan`; general references `{outputs.plan}`. General final output must include `## Completed`, `## Files Changed`, `## Validation` (commands run + pass/fail, or `Not run: <reason>`).                                                                                                                                                                                |
+| `/explore-and-plan <query>`     | explore -> planner             | Steps named `context`, `plan`. Plan-only; no file changes; no general agent.                                                                                                                                                                                                                                                                                                                 |
+| `/implement-and-review <query>` | general -> reviewer -> general | Steps named `implementation`, `review`. Reviewer must emit `## Critical (must fix)\n- None.` when empty, unified finding lines (`path:line - [issue] — [why] — [fix or defer]`), and a Summary `Verdict` of Ship / Ship with fixes / Do not ship. Final general resolves every Critical item, reports remaining Warnings, and stops with the blocker if any Critical cannot be fixed safely. |
 
 ## Slash commands
 
