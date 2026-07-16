@@ -567,7 +567,7 @@ describe('createRunCoordinator persistence and attempts', () => {
       usage: emptyUsage(),
       stopReason: 'end',
     };
-    coord.finishUnit('run-1', ctx(), result, 'completed');
+    await coord.finishUnit('run-1', ctx(), result, 'completed');
     await store.flushes();
     const stored = store.records.get('run-1')!;
     const unit = stored.units['single']!;
@@ -635,7 +635,7 @@ describe('createRunCoordinator persistence and attempts', () => {
       usage: emptyUsage(),
       finalOutput: 'final answer',
     };
-    coord.finishUnit('run-compact', ctx({ runId: 'run-compact' }), result, 'completed');
+    await coord.finishUnit('run-compact', ctx({ runId: 'run-compact' }), result, 'completed');
     await store.flushes();
 
     expect(result.messages).toHaveLength(2);
@@ -719,7 +719,7 @@ describe('createRunCoordinator persistence and attempts', () => {
     store.records.set('run-4mib', record);
     const coord = createRunCoordinator({ store: store as never });
     coord.registerRun('run-4mib', record);
-    coord.finishUnit(
+    await coord.finishUnit(
       'run-4mib',
       {
         runId: 'run-4mib',
@@ -4614,7 +4614,7 @@ describe('persistSessionFile', () => {
         usage: emptyUsage(),
       };
       // ctx omits sessionFile — terminal result must still carry the unit path.
-      coord.finishUnit(
+      await coord.finishUnit(
         runId,
         {
           runId,
@@ -4756,7 +4756,7 @@ describe('persistSessionFile', () => {
       acpSessionId: 'stale-acp',
       resumeCapability: 'session',
     };
-    coord.finishUnit('run-stale-clear', ctx, result, 'completed');
+    await coord.finishUnit('run-stale-clear', ctx, result, 'completed');
     // Caller object remains as supplied; private stored shell clears identity.
     expect(result.sessionFile).toBe('/sessions/stale.jsonl');
     expect(result.acpSessionId).toBe('stale-acp');
@@ -4827,7 +4827,7 @@ describe('persistSessionFile', () => {
       acpSessionId: 'stale-acp',
       resumeCapability: 'session',
     };
-    coord.finishUnit('run-stale-replace', ctx, result, 'completed');
+    await coord.finishUnit('run-stale-replace', ctx, result, 'completed');
     // Caller object remains as supplied; private stored shell gets canonical identity.
     expect(result.sessionFile).toBe('/sessions/stale.jsonl');
     expect(result.acpSessionId).toBe('stale-acp');
@@ -4917,7 +4917,7 @@ describe('persistSessionFile', () => {
       for (const index of [1, 2, 0]) {
         const unitId = expansion.unitIds[index]!;
         const sessionFile = `/sessions/${unitId}.jsonl`;
-        coord.finishUnit(
+        await coord.finishUnit(
           runId,
           {
             runId,

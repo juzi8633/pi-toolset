@@ -18,7 +18,7 @@ import { applyTerminalStatus, getResultFinalOutput } from './output.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { emptyUsage } from './empty-usage.ts';
-import { snapshotSingleResult } from './result-snapshot.ts';
+import { snapshotProvisionalResult } from './result-snapshot.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
 
 /** Structured error codes from InteractiveAgentError / GrokAcpClientError / plain {code}. */
@@ -87,8 +87,8 @@ function emitRunningSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
-  const snapshot = snapshotSingleResult(currentResult);
+  // Provisional UI update — no authoritative inline/ref values while running.
+  const snapshot = snapshotProvisionalResult(currentResult);
   snapshot.status = 'running';
   onUpdate({
     content: [
@@ -107,8 +107,8 @@ function emitTerminalSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
-  const snapshot = snapshotSingleResult(currentResult);
+  // Low-level terminal callback remains provisional; durable authority is finishUnit.
+  const snapshot = snapshotProvisionalResult(currentResult);
   onUpdate({
     content: [
       {

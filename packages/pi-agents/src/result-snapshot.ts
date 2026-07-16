@@ -498,21 +498,30 @@ export function snapshotSingleResult(result: SingleResult): SingleResult {
     ...result,
     messages: [],
     presentation,
-    finalOutput: result.finalOutputRef ? undefined : finalOutput,
-    finalOutputRef: result.finalOutputRef ? { ...result.finalOutputRef } : undefined,
     usage: { ...result.usage },
     fanout: result.fanout ? { ...result.fanout } : undefined,
     worktreeChangedFiles: result.worktreeChangedFiles
       ? [...result.worktreeChangedFiles]
       : undefined,
-    structuredOutput,
-    structuredOutputRef,
     stderr: diagnostics.stderr,
     errorMessage: diagnostics.errorMessage,
     errorStack: diagnostics.errorStack,
   };
-  if (snap.finalOutputRef) delete snap.finalOutput;
-  if (snap.structuredOutputRef) delete snap.structuredOutput;
+  // Own-property mutual exclusion: never leave both inline and ref keys present.
+  delete snap.finalOutput;
+  delete snap.finalOutputRef;
+  delete snap.structuredOutput;
+  delete snap.structuredOutputRef;
+  if (result.finalOutputRef) {
+    snap.finalOutputRef = { ...result.finalOutputRef };
+  } else {
+    snap.finalOutput = finalOutput;
+  }
+  if (structuredOutputRef) {
+    snap.structuredOutputRef = structuredOutputRef;
+  } else if (structuredOutput !== undefined) {
+    snap.structuredOutput = structuredOutput;
+  }
   return snap;
 }
 

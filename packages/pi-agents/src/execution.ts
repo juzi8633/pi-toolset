@@ -44,7 +44,7 @@ import { ABORT_MESSAGE, AgentAbortError, isAbortError } from './abort.ts';
 import { emptyUsage } from './empty-usage.ts';
 import { runSingleAgentInteractive } from './interactive-execution.ts';
 import { runSingleAgentPiRpc } from './pi-rpc-execution.ts';
-import { snapshotSingleResult } from './result-snapshot.ts';
+import { snapshotProvisionalResult } from './result-snapshot.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
 import { createLatestValueCoalescer } from './update-coalescer.ts';
 
@@ -234,8 +234,8 @@ function emitRunningSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
-  const snapshot = snapshotSingleResult(currentResult);
+  // Provisional UI update — no authoritative inline/ref values while running.
+  const snapshot = snapshotProvisionalResult(currentResult);
   snapshot.status = 'running';
   onUpdate({
     content: [
@@ -254,8 +254,8 @@ function emitTerminalSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
-  const snapshot = snapshotSingleResult(currentResult);
+  // Low-level terminal callback remains provisional; durable authority is finishUnit.
+  const snapshot = snapshotProvisionalResult(currentResult);
   onUpdate({
     content: [
       {

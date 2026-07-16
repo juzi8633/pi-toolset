@@ -281,7 +281,7 @@ interface DurableRunContext {
   /** Stamp the per-unit start; awaited before session stamp / interactive register. */
   beginUnit(ctx: UnitExecutionContext): void | Promise<void>;
   /** Stamp the per-unit terminal. */
-  endUnit(ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus): void;
+  endUnit(ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus): Promise<void>;
   /**
    * Strict awaited first-write of a unit sessionFile after Pi session creation.
    * Disk-first CAS via the coordinator; same path is idempotent.
@@ -393,12 +393,12 @@ async function maybeStartDurableRun(
   const beginUnit = async (unitCtx: UnitExecutionContext) => {
     await coordinator.startUnit(started.runId, unitCtx);
   };
-  const endUnit = (
+  const endUnit = async (
     unitCtx: UnitExecutionContext,
     result: SingleResult,
     status: ExecutionStatus
   ) => {
-    coordinator.finishUnit(started.runId, unitCtx, result, status);
+    await coordinator.finishUnit(started.runId, unitCtx, result, status);
   };
   const stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
     const unit = units[unitId];
@@ -660,12 +660,12 @@ async function maybeResumeDurableRun(
   const beginUnit = async (unitCtx: UnitExecutionContext) => {
     await coordinator.startUnit(resumeRunId, unitCtx);
   };
-  const endUnit = (
+  const endUnit = async (
     unitCtx: UnitExecutionContext,
     result: SingleResult,
     status: ExecutionStatus
   ) => {
-    coordinator.finishUnit(resumeRunId, unitCtx, result, status);
+    await coordinator.finishUnit(resumeRunId, unitCtx, result, status);
   };
   const stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
     const unit = units[unitId];
@@ -1903,7 +1903,11 @@ async function runStepWithContext(
     getAbortOrigin?: () => RunAbortOrigin;
     stampUnitSessionFile?: (sessionFile: string) => void | Promise<void>;
     beginUnit?: (ctx: UnitExecutionContext) => void | Promise<void>;
-    endUnit?: (ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus) => void;
+    endUnit?: (
+      ctx: UnitExecutionContext,
+      result: SingleResult,
+      status: ExecutionStatus
+    ) => void | Promise<void>;
     /** Runs before worktree cleanup and durable endUnit (schema validation, metadata). */
     postprocessTerminal?: (result: SingleResult) => void;
     interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
@@ -1949,10 +1953,10 @@ async function runStepWithContext(
    * Abort/early-failure paths handle worktree retention themselves before calling this;
    * they leave pendingWorktreeFinalization false so finalizeWorktree is not re-applied.
    */
-  const finalizeTerminalResult = (
+  const finalizeTerminalResult = async (
     working: SingleResult,
     status?: ExecutionStatus
-  ): SingleResult => {
+  ): Promise<SingleResult> => {
     if (options.postprocessTerminal) options.postprocessTerminal(working);
     if (working.finalOutput === undefined && working.messages.length > 0) {
       working.finalOutput = getResultFinalOutput(working);
@@ -1974,7 +1978,11 @@ async function runStepWithContext(
     }
     const snapshot = snapshotSingleResult(working);
     if (options.unitContext && options.endUnit) {
-      options.endUnit(options.unitContext, snapshot, status ?? resolveExecutionStatus(snapshot));
+      await options.endUnit(
+        options.unitContext,
+        snapshot,
+        status ?? resolveExecutionStatus(snapshot)
+      );
     }
     return snapshot;
   };
@@ -2005,7 +2013,7 @@ async function runStepWithContext(
           : {}),
       }
     );
-    return finalizeTerminalResult(failed, 'failed');
+    return await finalizeTerminalResult(failed, 'failed');
   }
 
   const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
@@ -2040,7 +2048,7 @@ async function runStepWithContext(
         `Cannot resolve skill name(s): ${missing.join(', ')}. Available skills: ${availableText}.`,
         options.title
       );
-      return finalizeTerminalResult(failure, 'failed');
+      return await finalizeTerminalResult(failure, 'failed');
     }
     resolvedSkillPaths = resolved;
   }
@@ -2068,7 +2076,7 @@ async function runStepWithContext(
           'Worktree isolation requires a git repository.',
           options.title
         );
-        return finalizeTerminalResult(failure1, 'failed');
+        return await finalizeTerminalResult(failure1, 'failed');
       }
       const opened = openAgentWorktree(repoRoot, storedWorktreePath);
       if (!opened.ok) {
@@ -2081,7 +2089,7 @@ async function runStepWithContext(
           opened.error,
           options.title
         );
-        return finalizeTerminalResult(failure2, 'failed');
+        return await finalizeTerminalResult(failure2, 'failed');
       }
       worktree = opened.worktree;
       effectiveCwd = worktree.path;
@@ -2097,7 +2105,7 @@ async function runStepWithContext(
           'Worktree isolation requires a git repository.',
           options.title
         );
-        return finalizeTerminalResult(failure3, 'failed');
+        return await finalizeTerminalResult(failure3, 'failed');
       }
       try {
         worktree = createAgentWorktree(repoRoot, agentName, taskIndex);
@@ -2113,7 +2121,7 @@ async function runStepWithContext(
           message,
           options.title
         );
-        return finalizeTerminalResult(failure5, 'failed');
+        return await finalizeTerminalResult(failure5, 'failed');
       }
 
       if (agent.worktreeSetupHook) {
@@ -2132,7 +2140,7 @@ async function runStepWithContext(
           if (!failure.worktreePath) {
             worktree = undefined;
           }
-          return finalizeTerminalResult(failure, 'failed');
+          return await finalizeTerminalResult(failure, 'failed');
         }
       }
     }
@@ -2206,7 +2214,7 @@ async function runStepWithContext(
       const dirty = getWorktreeDirtyStatus(storedWorktreePath);
       failure4.worktreeDirty = dirty.ok ? dirty.output.trim().length > 0 : true;
     }
-    return finalizeTerminalResult(failure4, 'failed');
+    return await finalizeTerminalResult(failure4, 'failed');
   }
 
   // Interactive TUI registration: Pi (pre-spawn with session file) or Grok ACP
@@ -2424,7 +2432,7 @@ async function runStepWithContext(
         );
         if (formalCode) failure.errorCode = formalCode;
         maybeRemoveOwnedCleanWorktree(failure);
-        return finalizeTerminalResult(failure, 'failed');
+        return await finalizeTerminalResult(failure, 'failed');
       }
     }
 
@@ -2445,7 +2453,7 @@ async function runStepWithContext(
       );
       failure.errorCode = 'session_prompt_unestablished';
       maybeRemoveOwnedCleanWorktree(failure);
-      return finalizeTerminalResult(failure, 'failed');
+      return await finalizeTerminalResult(failure, 'failed');
     }
 
     executionStarted = true;
@@ -2606,7 +2614,7 @@ async function runStepWithContext(
     // Request worktree finalization after postprocess so retention uses the final
     // terminal status (schema/completion failure retains clean trees).
     if (worktree) pendingWorktreeFinalization = true;
-    return finalizeTerminalResult(result);
+    return await finalizeTerminalResult(result);
   } catch (err) {
     if (isAbortError(err)) {
       // Prefer the original abort origin; fall back to lifecycle/signal origin.
@@ -2617,7 +2625,7 @@ async function runStepWithContext(
         // Mutable working state from the provisional compact/low-level snapshot.
         const working = cloneSingleResult(provisional);
         if (worktree) stampWorktreeOnFailure(working);
-        const snapshot = finalizeTerminalResult(working, originToUnitStatus(origin));
+        const snapshot = await finalizeTerminalResult(working, originToUnitStatus(origin));
         // Replacement abort error carries the authoritative compact terminal snapshot.
         throw new AgentAbortError(snapshot, origin);
       }
@@ -2649,11 +2657,11 @@ async function runStepWithContext(
     // Always terminalize when we own a unit context (including post-begin stamp
     // failure) so durable state is not left running without a finishUnit.
     if (options.unitContext && options.endUnit) {
-      return finalizeTerminalResult(failure, 'failed');
+      return await finalizeTerminalResult(failure, 'failed');
     }
     if (beganUnit) throw err;
     // Compact even non-durable early failures so raw transcripts never escape.
-    return finalizeTerminalResult(failure, 'failed');
+    return await finalizeTerminalResult(failure, 'failed');
   } finally {
     await agentContext.cleanup();
   }

@@ -852,12 +852,19 @@ describe('executeAgentTool durable run persistence', () => {
 });
 
 describe('durable chain fanout item lifecycle', () => {
+  const AGENT_DIR_BEFORE_FANOUT = process.env.PI_CODING_AGENT_DIR;
   let tmpRoot: string;
 
   beforeEach(() => {
     tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-fanout-'));
+    process.env.PI_CODING_AGENT_DIR = path.join(tmpRoot, 'pi-agent');
   });
   afterEach(() => {
+    if (AGENT_DIR_BEFORE_FANOUT !== undefined) {
+      process.env.PI_CODING_AGENT_DIR = AGENT_DIR_BEFORE_FANOUT;
+    } else {
+      delete process.env.PI_CODING_AGENT_DIR;
+    }
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -967,7 +974,7 @@ describe('durable chain fanout item lifecycle', () => {
         fanout: { index, count: 3, itemTask: text },
         finalOutput: text,
       };
-      coordinator.finishUnit(runId, ctx, result, 'completed');
+      await coordinator.finishUnit(runId, ctx, result, 'completed');
     };
 
     // Out-of-order terminals (1, 2, 0) — each unit keeps its own sessionFile.
@@ -1075,7 +1082,7 @@ describe('durable chain fanout item lifecycle', () => {
     };
     // Intentionally skip persistSessionFile — full merge must not accept live-only path.
     coordinator.startUnit(runId, ctx);
-    coordinator.finishUnit(
+    await coordinator.finishUnit(
       runId,
       ctx,
       {
@@ -1312,7 +1319,7 @@ describe('durable chain fanout item lifecycle', () => {
       step: 1,
       fanoutIndex: 0,
     };
-    coordinator.startUnit(created.runId, ctx);
+    await coordinator.startUnit(created.runId, ctx);
     const result = {
       agent: 'worker',
       agentSource: 'builtin' as const,
@@ -1338,7 +1345,7 @@ describe('durable chain fanout item lifecycle', () => {
       worktreeDirty: false,
     };
     // Production order: postprocess (already applied) then finishUnit.
-    coordinator.finishUnit(created.runId, ctx, result, 'failed');
+    await coordinator.finishUnit(created.runId, ctx, result, 'failed');
     await new Promise((r) => setTimeout(r, 20));
 
     const loaded = store.getRun(created.runId);
@@ -1445,10 +1452,10 @@ describe('durable chain fanout item lifecycle', () => {
       finalOutput: 'done-a',
     };
     coordinator.startUnit(created.runId, makeCtx(0));
-    coordinator.finishUnit(created.runId, makeCtx(0), completedResult, 'completed');
+    await coordinator.finishUnit(created.runId, makeCtx(0), completedResult, 'completed');
 
     coordinator.startUnit(created.runId, makeCtx(1));
-    coordinator.finishUnit(
+    await coordinator.finishUnit(
       created.runId,
       makeCtx(1),
       {
@@ -1611,7 +1618,7 @@ describe('durable chain fanout item lifecycle', () => {
         finalOutput: `out-${i}`,
       };
       results.push(result);
-      coordinator.finishUnit(created.runId, ctx, result, 'completed');
+      await coordinator.finishUnit(created.runId, ctx, result, 'completed');
     }
 
     live.details = { ...live.details, results };
@@ -1767,11 +1774,17 @@ describe('executeAgentTool terminal finalization', () => {
 
 describe('executeAgentTool public runId resume', () => {
   let tmpRoot: string;
+  const AGENT_DIR_BEFORE = process.env.PI_CODING_AGENT_DIR;
 
   beforeEach(() => {
     tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-agents-runid-'));
+    // Isolate user agent discovery so local ~/.pi agents with missing skills
+    // cannot poison package tool tests.
+    process.env.PI_CODING_AGENT_DIR = path.join(tmpRoot, 'pi-agent');
   });
   afterEach(() => {
+    if (AGENT_DIR_BEFORE !== undefined) process.env.PI_CODING_AGENT_DIR = AGENT_DIR_BEFORE;
+    else delete process.env.PI_CODING_AGENT_DIR;
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
@@ -1782,7 +1795,9 @@ describe('executeAgentTool public runId resume', () => {
   }
 
   function exploreAgent() {
-    const agents = discoverAgents(process.cwd(), 'both').agents;
+    // Discover from tmpRoot so fingerprint matches executeAgentTool(cwd: tmpRoot)
+    // under PI_CODING_AGENT_DIR isolation (no project overrides from repo cwd).
+    const agents = discoverAgents(tmpRoot, 'both').agents;
     const explore = agents.find((a) => a.name === 'explore');
     if (!explore) throw new Error('builtin explore agent not found');
     return explore;

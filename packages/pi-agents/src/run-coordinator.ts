@@ -14,6 +14,7 @@ import type {
   ResumeCapability,
   WorkflowFanoutState,
 } from './run-types.ts';
+import { externalizeTerminalResult } from './result-payload.ts';
 import { snapshotSingleResult } from './result-snapshot.ts';
 import type { ExecutionStatus, SingleResult, SubagentDetails } from './types.ts';
 import { emptyUsage } from './empty-usage.ts';
@@ -361,13 +362,17 @@ export interface RunCoordinator {
    * recoverable after a crash.
    */
   startUnit(runId: string, ctx: UnitExecutionContext, result?: SingleResult): Promise<void>;
-  /** Mark a unit's terminal state for its current attempt. Preserves attempt history. */
+  /**
+   * Mark a unit's terminal state for its current attempt. Externalizes oversized
+   * authority, strictly persists run.json + unit_terminal, then returns the
+   * committed artifact-aware snapshot.
+   */
   finishUnit(
     runId: string,
     ctx: UnitExecutionContext,
     result: SingleResult,
     finalStatus: ExecutionStatus | 'interrupted'
-  ): void;
+  ): Promise<SingleResult>;
   /** Persist `details` and `units` snapshots (coalesced except for flushNow). */
   persist(input: PersistUpdateInput): void;
   /** Finalize a run: derive terminal status, flush, and publish the owner claim release. */
@@ -1315,38 +1320,61 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
     lastPersist.set(runId, now());
   }
 
-  function finishUnit(
+  async function finishUnit(
     runId: string,
     ctx: UnitExecutionContext,
     result: SingleResult,
     finalStatus: ExecutionStatus | 'interrupted'
-  ): void {
+  ): Promise<SingleResult> {
+    // Spill oversized authority before any durable ref is published.
+    let externalized: SingleResult;
+    let status: ExecutionStatus | 'interrupted' = finalStatus;
+    try {
+      externalized = await externalizeTerminalResult(result, store, runId);
+    } catch (err) {
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code: unknown }).code)
+          : 'artifact_write_error';
+      const message = err instanceof Error ? err.message : 'artifact externalization failed';
+      externalized = snapshotSingleResult({
+        ...result,
+        status: 'failed',
+        exitCode: result.exitCode === 0 ? 1 : result.exitCode,
+        errorCode: code,
+        errorMessage: message,
+        finalOutput: undefined,
+        finalOutputRef: undefined,
+        structuredOutput: undefined,
+        structuredOutputRef: undefined,
+      });
+      status = 'failed';
+    }
+
     // Private compact shell — never mutate the caller-supplied result object.
-    const stored = snapshotSingleResult(result);
+    const stored = snapshotSingleResult(externalized);
     stampResultMetadata(stored, ctx);
-    stored.status = finalStatus;
+    stored.status = status;
+
+    // Build a private clone of latest live/disk authority; mutate only after strict write.
     const live = ensureLiveRecord(runId);
-    if (!live) return;
-    const unit = live.units[ctx.unitId];
+    if (!live) return stored;
+
+    const privateUnits = structuredClone(live.units) as Record<string, RunUnitRecord>;
+    const unit = privateUnits[ctx.unitId];
     if (unit) {
       const last = unit.attempts[unit.attempts.length - 1];
       if (last && last.attempt === ctx.attempt && last.status === 'running') {
-        // Finalize the running attempt recorded by startUnit with real timestamps.
-        last.status = finalStatus;
+        last.status = status;
         last.finishedAt = now();
         if (stored.stopReason !== undefined) last.stopReason = stored.stopReason;
         if (stored.errorMessage !== undefined) last.errorMessage = stored.errorMessage;
       } else {
-        // No running attempt (pre-execution failure or crash recovery).
-        recordAttempt(unit, finalStatus, last?.startedAt ?? now(), now(), {
+        recordAttempt(unit, status, last?.startedAt ?? now(), now(), {
           stopReason: stored.stopReason,
           errorMessage: stored.errorMessage,
         });
       }
-      // Canonical session identity is unit.sessionFile / unit.acpSessionId after
-      // strict first-write. Exact set-or-delete onto stored + ctx so a stale ctx
-      // identity cannot survive when the unit has none or a different value.
-      // Never first-write identity onto the unit from ctx here.
       const unitSession =
         unit.sessionFile !== undefined && unit.sessionFile.trim() !== ''
           ? unit.sessionFile
@@ -1367,12 +1395,8 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
         delete stored.acpSessionId;
         delete ctx.acpSessionId;
       }
-      // Canonical unit capability is authoritative for nested/live resume labels.
       stored.resumeCapability = unit.capability;
       ctx.resumeCapability = unit.capability;
-      // Worktree path is authoritative from the terminal result only. A deleted
-      // clean worktree must clear unit/ctx metadata so resume cannot point at a
-      // missing path persisted earlier by startUnit.
       if (stored.worktreePath !== undefined && stored.worktreePath.trim() !== '') {
         unit.worktreePath = stored.worktreePath;
         ctx.worktreePath = stored.worktreePath;
@@ -1380,26 +1404,89 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
         delete unit.worktreePath;
         delete ctx.worktreePath;
       }
-      unit.status = finalStatus;
+      unit.status = status;
       unit.result = stored;
     }
-    void store
-      .appendEvent(runId, {
+
+    // Strict run.json first, then unit_terminal event, then mirror into live.
+    // Fall back to best-effort APIs for partial test doubles that predate strict methods.
+    const updateRunFn =
+      typeof store.updateRunStrict === 'function'
+        ? store.updateRunStrict.bind(store)
+        : store.updateRun.bind(store);
+    const appendEventFn =
+      typeof store.appendEventStrict === 'function'
+        ? store.appendEventStrict.bind(store)
+        : store.appendEvent.bind(store);
+    await updateRunFn(runId, (record) => {
+      record.units = privateUnits;
+      // Keep details.results in sync for single-result modes when present.
+      if (Array.isArray(record.details.results)) {
+        const idx = record.details.results.findIndex(
+          (r) => r.unitId === ctx.unitId && r.attempt === ctx.attempt
+        );
+        if (idx >= 0) record.details.results[idx] = stored;
+      }
+    });
+    try {
+      await appendEventFn(runId, {
         version: 1,
         event: 'unit_terminal',
         runId,
         timestamp: now(),
         unitId: ctx.unitId,
         attempt: ctx.attempt,
-        status: finalStatus,
-      })
-      .catch(() => {});
-    persist({
-      runId,
-      details: live.details,
-      units: live.units,
-      flushNow: true,
-    });
+        status,
+      });
+    } catch (err) {
+      // run.json is authoritative; mirror disk but report durable write failure.
+      const disk = store.getRun(runId);
+      if (disk.ok) {
+        const liveRec = active.get(runId);
+        if (liveRec) {
+          liveRec.units = structuredClone(disk.loaded.record.units);
+          liveRec.details = structuredClone(disk.loaded.record.details);
+        }
+      }
+      throw {
+        code: 'durable_write_error',
+        message: err instanceof Error ? err.message : 'unit_terminal append failed',
+        runId,
+      };
+    }
+
+    // Mirror committed authority into the existing live unit objects in place so
+    // DurableRunContext.started.units (same references) observes the terminal state.
+    const liveRec = active.get(runId);
+    if (liveRec) {
+      const liveUnit = liveRec.units[ctx.unitId];
+      const committed = privateUnits[ctx.unitId];
+      if (liveUnit && committed) {
+        liveUnit.status = committed.status;
+        liveUnit.attempt = committed.attempt;
+        liveUnit.attempts = committed.attempts;
+        liveUnit.result = committed.result;
+        if (committed.sessionFile !== undefined) liveUnit.sessionFile = committed.sessionFile;
+        else delete liveUnit.sessionFile;
+        if (committed.acpSessionId !== undefined) liveUnit.acpSessionId = committed.acpSessionId;
+        else delete liveUnit.acpSessionId;
+        if (committed.worktreePath !== undefined) liveUnit.worktreePath = committed.worktreePath;
+        else delete liveUnit.worktreePath;
+        if (committed.sessionPromptEstablished !== undefined) {
+          liveUnit.sessionPromptEstablished = committed.sessionPromptEstablished;
+        }
+      } else if (committed) {
+        liveRec.units[ctx.unitId] = committed;
+      }
+      if (Array.isArray(liveRec.details.results)) {
+        const idx = liveRec.details.results.findIndex(
+          (r) => r.unitId === ctx.unitId || (r.agent === stored.agent && r.task === stored.task)
+        );
+        if (idx >= 0) liveRec.details.results[idx] = stored;
+        else liveRec.details.results.push(stored);
+      }
+    }
+    return stored;
   }
 
   async function finalizeRun(
