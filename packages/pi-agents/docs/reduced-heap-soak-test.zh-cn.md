@@ -1,6 +1,6 @@
 # Reduced-heap soak 测试说明
 
-本说明用于在真实 Pi 前台进程中，以 512 MiB V8 old-space 上限重复运行混合 subagent 工作流，验证 parent 进程不会因 child 原始 tool-result 被重复保留而发生堆耗尽，同时检查 compact parent presentation、durable `run.json`、fanout、interruption 和 resume 行为。
+本说明用于在真实 Pi 前台进程中，以 1024 MiB V8 old-space 上限重复运行混合 subagent 工作流，验证 parent 进程不会因 child 原始 tool-result 被重复保留而发生堆耗尽，同时检查 compact parent presentation、durable `run.json`、fanout、interruption 和 resume 行为。
 
 ## 适用对象
 
@@ -24,182 +24,137 @@
 - parent session 和 `run.json` 的增长量与 compact presentation/final output 相符，而不是与全部 child tool output 总量相符。
 - Ctrl+O 在运行中和终态下均能正确显示 retained presentation、final output、usage 和 run identity。
 
-> `NODE_OPTIONS=--max-old-space-size=512` 限制的是 V8 old-space，不是整个进程 RSS。RSS 包含 native memory、代码、buffer 等，因此 RSS 偶尔超过 512 MiB 不直接表示失败。重点观察是否发生 V8 OOM，以及 RSS 是否随原始 tool output 持续近似线性增长。
+> `NODE_OPTIONS=--max-old-space-size=1024` 限制的是 V8 old-space，不是整个进程 RSS。RSS 包含 native memory、代码、buffer 等，因此 RSS 偶尔超过 1024 MiB 不直接表示失败。重点观察是否发生 V8 OOM，以及 RSS 是否随原始 tool output 持续近似线性增长。实测表明 parent 空闲启动时 old-space 已接近 ~512 MiB，因此 `512` 无法启动；本说明采用 `1024` 作为 reduced-heap 上限。
 
-## 1. 构建待测版本
+---
 
-所有命令都应从待测 worktree 执行。以下路径对应 `fix/subagent-memory-optimization` worktree：
+## 准备工作
+
+需要 **两个终端**，都先进入待测 worktree：
 
 ```bash
 cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
-
-mise run build --package packages/pi-agents
 ```
 
-创建隔离的测试目录和 parent session 目录：
+| 终端 | 用途 |
+| --- | --- |
+| **终端 A** | 只跑 parent Pi（前台 TUI）。不要在这里做采样或 record。 |
+| **终端 B** | 跑所有 soak 脚本：setup / sampler / record / summary / cleanup。 |
+
+脚本目录（下文用相对路径，均相对于 worktree 根）：
+
+```text
+./packages/pi-agents/scripts/soak/
+```
+
+`SOAK` 工作目录由 `setup.sh` 创建，并写入指针文件 `$XDG_RUNTIME_DIR/pi-agents-soak.current`（默认 `/tmp/pi-agents-soak.current`）。之后所有脚本自动读取该指针，**终端 B 不必再 `export SOAK`**。
+
+所有任务保持只读，避免 soak 测试修改工作区。
+
+---
+
+## 逐步执行
+
+### 步骤 1 — 构建并创建 SOAK 目录（终端 B）
 
 ```bash
-SOAK=$(mktemp -d /tmp/pi-agents-memory-soak.XXXXXX)
-mkdir -p "$SOAK/parent-sessions"
-touch "$SOAK/start-marker"
-
-echo "SOAK=$SOAK"
+./packages/pi-agents/scripts/soak/setup.sh
 ```
 
-记录输出的完整路径。后续终端必须使用同一个 `SOAK` 值。
+**做什么**：构建 `@balaenis/pi-agents`，创建 `/tmp/pi-agents-memory-soak.XXXXXX`，初始化 `parent-sessions/` 与 `start-marker`，写入指针。
 
-隔离 parent session 有两个目的：
+**成功标志**：打印 `SOAK work dir ready: /tmp/pi-agents-memory-soak....`。记下该路径（验证结束后保留 artifacts 时要用）。
 
-- 防止历史 Pi session 干扰 parent session 大小测量。
-- interruption 后可以精确找到并重新打开同一个 parent session。
+**参数**：无。可选环境变量见文末。
 
-## 2. 启动 reduced-heap parent Pi
+---
 
-在终端 A 中执行：
+### 步骤 2 — 启动 reduced-heap parent Pi（终端 A）
 
 ```bash
-sh -c '
-  echo $$ > "$1/pi.pid"
-  exec env \
-    NODE_OPTIONS=--max-old-space-size=512 \
-    PI_SKIP_VERSION_CHECK=1 \
-    pi \
-      --no-extensions \
-      --approve \
-      --name memory-soak \
-      --session-dir "$1/parent-sessions" \
-      -e ./packages/pi-agents/dist/index.js
-' sh "$SOAK"
+./packages/pi-agents/scripts/soak/start-parent.sh
 ```
 
-命令会：
+**做什么**：以 `NODE_OPTIONS=--max-old-space-size=1024` 启动 Pi；`--no-extensions` + 显式 `-e packages/pi-agents/dist/index.js`；session 写入 `$SOAK/parent-sessions`；PID 写入 `$SOAK/pi.pid`。
 
-- 将 parent Pi 的准确 PID 写入 `$SOAK/pi.pid`。
-- 对 parent Pi 和其继承环境的 child Pi 应用 512 MiB old-space 上限。
-- 禁用自动发现的 extension，只显式加载当前 worktree 的构建产物，避免误测已安装的旧版本。
-- 将 parent session 写入 `$SOAK/parent-sessions`。
+**成功标志**：进入 Pi TUI，无 `JavaScript heap out of memory`，无 extension path 错误。
 
-Pi 启动后保持终端 A 打开。
+**参数**：
 
-## 3. 采样 RSS 和序列化文件大小
+| 参数 | 何时用 |
+| --- | --- |
+| （无） | 首次启动（本步） |
+| `--resume` | 仅在步骤 6 重启时使用，不要在这里加 |
 
-打开终端 B，填入第 1 步输出的 `SOAK` 路径：
+保持终端 A 打开，后续 Pi 输入都在这里完成。
+
+---
+
+### 步骤 3 — 启动采样并记录 baseline（终端 B）
+
+先启动后台采样（需步骤 2 已写出 `pi.pid`）：
 
 ```bash
-SOAK=/tmp/pi-agents-memory-soak.REPLACE_ME
-RUNS="$HOME/.pi/agent/@balaenis/pi-agents/runs"
+./packages/pi-agents/scripts/soak/start-sampler.sh
 ```
 
-初始化采样文件：
+**做什么**：若尚无表头则创建 `samples.tsv` / `checkpoints.tsv`；后台每 2 秒采样 parent RSS、parent session 总字节、本次新 `run.json` 总字节；PID 写入 `$SOAK/sampler.pid`。
+
+**成功标志**：打印 `Sampler started (pid ..., sampling pid ...)`。
+
+然后立刻记一条基线：
 
 ```bash
-printf 'timestamp\tpid\trss_kib\tparent_bytes\tnew_run_bytes\n' > "$SOAK/samples.tsv"
-printf 'label\tpid\trss_kib\tparent_bytes\trun_id\trun_bytes\tstatus\n' > "$SOAK/checkpoints.tsv"
+./packages/pi-agents/scripts/soak/record.sh baseline
 ```
 
-定义后台采样函数：
+**参数**：
 
-```bash
-start_sampler() {
-  local pid
-  pid=$(cat "$SOAK/pi.pid")
+| 位置 | 含义 | 本步取值 |
+| --- | --- | --- |
+| `$1` label | checkpoint 名称 | 固定 `baseline` |
+| `$2` run-id | 可选；对应 durable run | 本步省略 |
 
-  (
-    while kill -0 "$pid" 2>/dev/null; do
-      parent_bytes=$(
-        find "$SOAK/parent-sessions" -type f -name '*.jsonl' \
-          -printf '%s\n' 2>/dev/null |
-          awk '{sum += $1} END {print sum + 0}'
-      )
+**成功标志**：终端打印一行 TSV（label=`baseline`，run_id=`none`），并追加到 `$SOAK/checkpoints.tsv`。
 
-      run_bytes=$(
-        find "$RUNS" -type f -name run.json -newer "$SOAK/start-marker" \
-          -printf '%s\n' 2>/dev/null |
-          awk '{sum += $1} END {print sum + 0}'
-      )
+---
 
-      printf '%s\t%s\t%s\t%s\t%s\n' \
-        "$(date -Iseconds)" \
-        "$pid" \
-        "$(ps -o rss= -p "$pid" | xargs)" \
-        "$parent_bytes" \
-        "$run_bytes" \
-        >> "$SOAK/samples.tsv"
-
-      sleep 2
-    done
-  ) &
-
-  echo $! > "$SOAK/sampler.pid"
-}
-
-start_sampler
-```
-
-`ps -o rss=` 返回 KiB。`new_run_bytes` 是测试开始后所有新 `run.json` 的当前总大小。
-
-定义逐次 checkpoint 函数：
-
-```bash
-record() {
-  local label=$1
-  local run_id=${2:-}
-  local pid
-  local parent_bytes
-  local run_bytes=0
-  local status=none
-
-  pid=$(cat "$SOAK/pi.pid")
-  parent_bytes=$(
-    find "$SOAK/parent-sessions" -type f -name '*.jsonl' \
-      -printf '%s\n' 2>/dev/null |
-      awk '{sum += $1} END {print sum + 0}'
-  )
-
-  if [[ -n "$run_id" && -f "$RUNS/$run_id/run.json" ]]; then
-    run_bytes=$(stat -c '%s' "$RUNS/$run_id/run.json")
-    status=$(jq -r '.status' "$RUNS/$run_id/run.json")
-  fi
-
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$label" \
-    "$pid" \
-    "$(ps -o rss= -p "$pid" | xargs)" \
-    "$parent_bytes" \
-    "${run_id:-none}" \
-    "$run_bytes" \
-    "$status" \
-    | tee -a "$SOAK/checkpoints.tsv"
-}
-
-record baseline
-```
-
-每个 `agent` 调用完成后，从 expanded result 或 `/agent runs` 复制 `run-...` ID，再执行：
-
-```bash
-record 01-long-single run-REPLACE_ME
-```
-
-## 4. 执行 10 次混合调用
+### 步骤 4 — 执行 10 次混合调用
 
 推荐矩阵：
 
-| 序号 | 调用类型            | 目的                                            |
-| ---: | ------------------- | ----------------------------------------------- |
-|    1 | 长 Single           | 制造大量 child tool calls 和 tool results       |
-|  2–5 | 四个短 Single       | 观察同一 parent 中重复调用后的增长趋势          |
-|    6 | 八任务 Parallel     | 覆盖 aggregate copy-on-write 和 compact results |
-|    7 | 短 Single           | 在大型 aggregate 后继续观察 parent 状态         |
-|    8 | Chain + 八项 fanout | 覆盖 structured output、fanout 和 collect       |
-|    9 | 后台长 Single       | 制造可恢复的 interruption                       |
-|   10 | Resume 第 9 次      | 验证 durable session continuation               |
+| 序号 | 调用类型 | 终端 A | 终端 B（完成后立刻 record） |
+| ---: | --- | --- | --- |
+| 1 | 长 Single | 粘贴 4.1 提示词 | `record.sh 01-long-single <runId>` |
+| 2–5 | 四个短 Single | 粘贴 4.2 模板（换 `<AREA>`） | `record.sh 02-short` … `05-short` |
+| 6 | 八任务 Parallel | 粘贴 4.3 提示词 | `record.sh 06-parallel <runId>` |
+| 7 | 短 Single | 粘贴 4.4 提示词（output / memory-regression） | `record.sh 07-short <runId>` |
+| 8 | Chain + fanout | 粘贴 4.5 提示词 | `record.sh 08-chain <runId>` |
+| 9 | 后台长 Single | 粘贴 5 的提示词 | `record.sh 09-background-running <runId>` |
+| 10 | Resume 第 9 次 | 步骤 6 中粘贴 resume | `record.sh 10-resume <runId>` |
 
-所有任务都应保持只读，避免 soak 测试修改工作区。
+**每次 agent 调用后如何取 `runId`**：
 
-### 4.1 长 Single
+1. 在 Pi 中展开结果（Ctrl+O），或运行 `/agent runs`。
+2. 复制形如 `run-...` 的 ID。
+3. 在终端 B 执行对应 `record.sh`，把 `run-REPLACE_ME` 换成真实 ID。
 
-在 Pi 中输入：
+`record.sh` 用法：
+
+```bash
+./packages/pi-agents/scripts/soak/record.sh <label> [run-id]
+```
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `<label>` | 是 | 本次 checkpoint 名，建议用表中固定标签 |
+| `[run-id]` | 否 | durable run ID；省略则记为 `none` |
+
+---
+
+#### 4.1 长 Single（调用 1）
+
+**终端 A** 输入：
 
 ```text
 Call the agent tool exactly once using:
@@ -213,57 +168,119 @@ Call the agent tool exactly once using:
 Return only a short summary of the agent result.
 ```
 
-运行期间和完成后分别按一次 Ctrl+O，确认：
+运行期间和完成后各按一次 **Ctrl+O**，确认：
 
 - collapsed latest activity 正常更新。
 - expanded view 显示 retained assistant/tool-call presentation。
 - final output 只出现一次。
 - usage 和 run identity 正常。
-- 若达到 presentation 上限，omission marker 显示正确；若本次未自然触发，则由 deterministic presentation tests 覆盖该行为，不要仅为制造 marker 消耗大量模型 token。
+- 若达到 presentation 上限，omission marker 显示正确；若本次未自然触发，则由 deterministic presentation tests 覆盖，不要仅为制造 marker 消耗大量模型 token。
 
-完成后在终端 B 执行：
+**终端 B**（把 `run-REPLACE_ME` 换成真实 ID）：
 
 ```bash
-record 01-long-single run-REPLACE_ME
+./packages/pi-agents/scripts/soak/record.sh 01-long-single run-REPLACE_ME
 ```
 
-### 4.2 四个短 Single
+---
 
-依次检查不同区域：
+#### 4.2 四个短 Single（调用 2–5）
 
-1. `src/result-snapshot.ts` 与 rendering tests。
-2. `src/run-store.ts`、`src/run-coordinator.ts` 与 durable tests。
-3. `src/chain.ts` 与 fanout tests。
-4. `src/interactive-agent.ts` 与 interactive tests。
+下面四条可直接粘贴，无需再改 `<AREA>`。每条跑完后在终端 B 用对应 label 记录。
 
-每次在 Pi 中使用以下模板，并替换 `<AREA>`：
+##### 调用 2 — result snapshot / render（label `02-short`）
+
+**终端 A**：
 
 ```text
 Call the agent tool exactly once using:
 
 {
   "agent": "explore",
-  "title": "memory soak short",
-  "task": "Read-only memory soak. Inspect <AREA> using 8-12 read, grep, and non-destructive bash tool calls. Do not modify files. Return a concise evidence-based summary."
+  "title": "memory soak short 02",
+  "task": "Read-only memory soak. Inspect packages/pi-agents/src/result-snapshot.ts, packages/pi-agents/src/render.ts, packages/pi-agents/tests/result-snapshot.test.ts, and packages/pi-agents/tests/render.test.ts using 8-12 read, grep, and non-destructive bash tool calls. Do not modify files. Return a concise evidence-based summary of how compact presentation is built and tested."
 }
 
 Return only a short summary of the agent result.
 ```
 
-每次完成后记录：
+**终端 B**：
 
 ```bash
-record 02-short run-REPLACE_ME
-record 03-short run-REPLACE_ME
-record 04-short run-REPLACE_ME
-record 05-short run-REPLACE_ME
+./packages/pi-agents/scripts/soak/record.sh 02-short run-REPLACE_ME
 ```
 
-每条命令应使用对应调用的真实 `runId`。
+##### 调用 3 — durable run store / coordinator（label `03-short`）
 
-### 4.3 八任务 Parallel
+**终端 A**：
 
-在 Pi 中输入：
+```text
+Call the agent tool exactly once using:
+
+{
+  "agent": "explore",
+  "title": "memory soak short 03",
+  "task": "Read-only memory soak. Inspect packages/pi-agents/src/run-store.ts, packages/pi-agents/src/run-coordinator.ts, packages/pi-agents/tests/run-store.test.ts, and packages/pi-agents/tests/run-coordinator.test.ts using 8-12 read, grep, and non-destructive bash tool calls. Do not modify files. Return a concise evidence-based summary of durable persistence and coordinator boundaries."
+}
+
+Return only a short summary of the agent result.
+```
+
+**终端 B**：
+
+```bash
+./packages/pi-agents/scripts/soak/record.sh 03-short run-REPLACE_ME
+```
+
+##### 调用 4 — chain / fanout（label `04-short`）
+
+**终端 A**：
+
+```text
+Call the agent tool exactly once using:
+
+{
+  "agent": "explore",
+  "title": "memory soak short 04",
+  "task": "Read-only memory soak. Inspect packages/pi-agents/src/chain.ts, packages/pi-agents/src/json-pointer.ts, packages/pi-agents/tests/chain.test.ts, and packages/pi-agents/tests/json-pointer.test.ts using 8-12 read, grep, and non-destructive bash tool calls. Do not modify files. Return a concise evidence-based summary of chain expand/collect and fanout mapping."
+}
+
+Return only a short summary of the agent result.
+```
+
+**终端 B**：
+
+```bash
+./packages/pi-agents/scripts/soak/record.sh 04-short run-REPLACE_ME
+```
+
+##### 调用 5 — interactive agent（label `05-short`）
+
+**终端 A**：
+
+```text
+Call the agent tool exactly once using:
+
+{
+  "agent": "explore",
+  "title": "memory soak short 05",
+  "task": "Read-only memory soak. Inspect packages/pi-agents/src/interactive-agent.ts, packages/pi-agents/src/interactive-view.ts, packages/pi-agents/tests/interactive-agent.test.ts, and packages/pi-agents/tests/interactive-view.test.ts using 8-12 read, grep, and non-destructive bash tool calls. Do not modify files. Return a concise evidence-based summary of interactive transcript retention and view updates."
+}
+
+Return only a short summary of the agent result.
+```
+
+**终端 B**：
+
+```bash
+./packages/pi-agents/scripts/soak/record.sh 05-short run-REPLACE_ME
+```
+
+---
+
+#### 4.3 八任务 Parallel（调用 6）
+
+**终端 A** 输入：
 
 ```text
 Call the agent tool exactly once using this parallel request. Do not modify files.
@@ -283,33 +300,51 @@ Call the agent tool exactly once using this parallel request. Do not modify file
 }
 ```
 
-运行中和完成后使用 Ctrl+O 检查有序 task 状态、latest activity、usage、final output 和 run identity。
+运行中和完成后用 **Ctrl+O** 检查有序 task 状态、latest activity、usage、final output 和 run identity。
 
-完成后记录：
-
-```bash
-record 06-parallel run-REPLACE_ME
-```
-
-检查该 run 的 durable 文件大小：
+**终端 B**：
 
 ```bash
-stat -c '%s bytes' "$RUNS/run-REPLACE_ME/run.json"
+./packages/pi-agents/scripts/soak/record.sh 06-parallel run-REPLACE_ME
 ```
 
-真实大小会受 final/structured output 影响。对于本说明的短 final output，Parallel `run.json` 应明显小于 native child session 总量；合成 regression 的 parent details 门槛为 2 MiB。
-
-### 4.4 第七个短 Single
-
-在 Parallel 后再执行一次 4.2 的短 Single 模板，并记录：
+可选：看该 run 的 durable 文件大小（`run.json` 应明显小于 native child session 总量；合成 regression 的 parent details 门槛为 2 MiB）：
 
 ```bash
-record 07-short run-REPLACE_ME
+stat -c '%s bytes' "$HOME/.pi/agent/@balaenis/pi-agents/runs/run-REPLACE_ME/run.json"
 ```
 
-### 4.5 Structured seed + 八项 fanout Chain
+---
 
-在 Pi 中输入：
+#### 4.4 第七个短 Single（调用 7）
+
+Parallel 之后再跑一条不同区域的短 Single，观察大型 aggregate 后 parent 的增长。
+
+**终端 A**：
+
+```text
+Call the agent tool exactly once using:
+
+{
+  "agent": "explore",
+  "title": "memory soak short 07",
+  "task": "Read-only memory soak. Inspect packages/pi-agents/src/output.ts, packages/pi-agents/src/execution.ts, packages/pi-agents/tests/output.test.ts, and packages/pi-agents/tests/memory-regression.test.ts using 8-12 read, grep, and non-destructive bash tool calls. Do not modify files. Return a concise evidence-based summary of parent-facing output boundaries and memory-regression coverage."
+}
+
+Return only a short summary of the agent result.
+```
+
+**终端 B**：
+
+```bash
+./packages/pi-agents/scripts/soak/record.sh 07-short run-REPLACE_ME
+```
+
+---
+
+#### 4.5 Structured seed + 八项 fanout Chain（调用 8）
+
+**终端 A** 输入：
 
 ```text
 Call the agent tool exactly once using:
@@ -364,19 +399,19 @@ Call the agent tool exactly once using:
 }
 ```
 
-完成后记录：
-
-```bash
-record 08-chain run-REPLACE_ME
-```
-
 检查 seed structured output、八项 frozen fanout mapping、collect result 和 final step 均存在。
 
-## 5. 制造 interruption
+**终端 B**：
 
-第 9 次调用使用后台模式和一个足够长的非破坏性 `sleep`，确保 parent 关闭时任务仍在运行。
+```bash
+./packages/pi-agents/scripts/soak/record.sh 08-chain run-REPLACE_ME
+```
 
-在 Pi 中输入：
+---
+
+### 步骤 5 — 制造 interruption（调用 9）
+
+**终端 A** 输入（后台模式 + 足够长的 `sleep`，保证 `/quit` 时任务仍在跑）：
 
 ```text
 Call the agent tool exactly once using:
@@ -389,82 +424,59 @@ Call the agent tool exactly once using:
 }
 ```
 
-后台调用会立即返回 `runId`。保存该 ID，然后记录运行中状态：
+后台调用会立刻返回 `runId`。**先保存该 ID**（步骤 6 resume 还要用同一个）。
+
+**终端 B** 记录运行中状态：
 
 ```bash
-record 09-background-running run-REPLACE_ME
+./packages/pi-agents/scripts/soak/record.sh 09-background-running run-REPLACE_ME
 ```
 
-在 Pi 中确认该 run 仍为 running：
+**终端 A** 确认仍在 running：
 
 ```text
 /agent status run-REPLACE_ME
 ```
 
-随后在 Pi 中执行：
+然后正常退出（不要 `kill -9`；`/quit` 会走 `session_shutdown`，使 durable work 进入可恢复的 `interrupted`）：
 
 ```text
 /quit
 ```
 
-不要使用 `kill -9`。正常 `/quit` 会触发 extension 的 `session_shutdown`，使正在运行的 durable work 进入可恢复的 `interrupted` 状态。
-
-parent 退出后，在终端 B 检查：
+**终端 B** 检查 durable 状态（预期 `interrupted`）：
 
 ```bash
-jq '{status, units}' "$RUNS/run-REPLACE_ME/run.json"
+jq '{status, units}' "$HOME/.pi/agent/@balaenis/pi-agents/runs/run-REPLACE_ME/run.json"
 ```
 
-预期 run 或未完成 unit 的状态为 `interrupted`。
+---
 
-## 6. 重启 parent 并 resume
+### 步骤 6 — 重启 parent 并 resume（调用 10）
 
-找到隔离目录中的 parent session：
+原采样循环会随旧 parent PID 退出，需要重启 parent 再重启 sampler。
+
+**终端 A**：
 
 ```bash
-SESSION=$(
-  find "$SOAK/parent-sessions" -type f -name '*.jsonl' \
-    -printf '%T@\t%p\n' |
-    sort -nr |
-    head -1 |
-    cut -f2-
-)
-
-echo "$SESSION"
+./packages/pi-agents/scripts/soak/start-parent.sh --resume
 ```
 
-在终端 A 中，从相同 worktree 重启：
+**参数**：必须带 `--resume`。脚本会自动选 `$SOAK/parent-sessions` 里最新的 `*.jsonl` 并用 `--session` 打开。
+
+**成功标志**：回到同一 parent session 的 TUI，无 OOM。
+
+**终端 B**（parent 起来后立刻重启采样）：
 
 ```bash
-cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
-
-sh -c '
-  echo $$ > "$1/pi.pid"
-  exec env \
-    NODE_OPTIONS=--max-old-space-size=512 \
-    PI_SKIP_VERSION_CHECK=1 \
-    pi \
-      --no-extensions \
-      --approve \
-      --session-dir "$1/parent-sessions" \
-      --session "$2" \
-      -e ./packages/pi-agents/dist/index.js
-' sh "$SOAK" "$SESSION"
+./packages/pi-agents/scripts/soak/start-sampler.sh
 ```
 
-重启后，终端 B 中原采样循环已随旧 PID 退出。重新调用：
-
-```bash
-start_sampler
-```
-
-在 Pi 中先检查 durable 状态：
+**终端 A** 先看 durable 状态，再 resume 第 9 次的同一个 `runId`：
 
 ```text
 /agent status run-REPLACE_ME
 ```
-
-然后执行第 10 次调用：
 
 ```text
 Call the agent tool exactly once using:
@@ -476,10 +488,10 @@ Call the agent tool exactly once using:
 Return only a short summary of the resumed result.
 ```
 
-完成后记录：
+**终端 B**：
 
 ```bash
-record 10-resume run-REPLACE_ME
+./packages/pi-agents/scripts/soak/record.sh 10-resume run-REPLACE_ME
 ```
 
 预期：
@@ -491,68 +503,33 @@ record 10-resume run-REPLACE_ME
 - final output、structured output 和 named/collected outputs 未丢失。
 - 最终 durable 状态为 `completed`。
 
-## 7. 汇总结果
+---
 
-格式化 checkpoint 表：
-
-```bash
-column -t -s $'\t' "$SOAK/checkpoints.tsv"
-```
-
-计算两个 parent 阶段中的最大 RSS：
+### 步骤 7 — 汇总结果（终端 B）
 
 ```bash
-awk -F '\t' '
-  NR > 1 && $3 + 0 > max { max = $3 + 0 }
-  END { printf "peak RSS: %.1f MiB\n", max / 1024 }
-' "$SOAK/samples.tsv"
+./packages/pi-agents/scripts/soak/summary.sh
 ```
 
-列出本次产生的 `run.json`：
+**参数**：无。自动读取当前 `SOAK` 指针。
 
-```bash
-find "$RUNS" -type f -name run.json -newer "$SOAK/start-marker" \
-  -printf '%s\t%p\n' |
-  sort -n |
-  numfmt --field=1 --to=iec
-```
+**输出内容**：
 
-比较每个 run 的 compact `run.json` 和 native child sessions：
+1. `checkpoints.tsv` 表格（10 次调用的 label / RSS / parent_bytes / run_id / run_bytes / status）
+2. 两个 parent 阶段的 peak RSS
+3. 本次产生的 `run.json` 大小列表
+4. 每个 run 的 compact `run.json` vs native child sessions
+5. 仍含 raw messages 的 run（新 compact run 通常应无输出）
 
-```bash
-for run in "$RUNS"/run-*; do
-  [[ "$run/run.json" -nt "$SOAK/start-marker" ]] || continue
+对于本次新建并完成的 compact run，raw-message 检查通常应无输出。若有输出，确认是否为预期 legacy fixture，而不是新运行路径重新写入完整 transcript。
 
-  echo "== $(basename "$run") =="
-  du -h "$run/run.json"
+---
 
-  find "$run/sessions" -type f -printf '%s\n' 2>/dev/null |
-    awk '{sum += $1} END {printf "child sessions: %.2f MiB\n", sum / 1048576}'
-done
-```
+### 步骤 8 — 通过与失败判定
 
-检查所有新 durable results 是否仍含 raw messages：
+#### 通过
 
-```bash
-find "$RUNS" -type f -name run.json -newer "$SOAK/start-marker" -print0 |
-  xargs -0 jq -r '
-    . as $run
-    | [
-        (.details.results[]? | select((.messages // []) | length > 0)),
-        (.units[]?.result? | select((.messages // []) | length > 0))
-      ]
-    | select(length > 0)
-    | $run.runId
-  '
-```
-
-对于本次新建并完成的 compact run，该命令通常应无输出。若有输出，检查它是否为预期 legacy fixture，而不是新运行路径重新写入完整 transcript。
-
-## 8. 通过与失败判定
-
-### 通过
-
-同时满足以下条件：
+同时满足：
 
 - 至少 10 次顶层调用已执行。
 - 无 V8 heap OOM，parent Pi 始终可交互。
@@ -563,9 +540,9 @@ find "$RUNS" -type f -name run.json -newer "$SOAK/start-marker" -print0 |
 - native child session 可以明显大于对应 `run.json`，说明 raw tool history 未被重复写入 parent/durable result。
 - RSS 可以波动或阶梯式增长，但没有与每次 child 原始输出量一致的持续线性增长。
 
-### 失败
+#### 失败
 
-出现任一情况即应保留 artifacts 并调查：
+出现任一情况即保留 artifacts 并调查：
 
 - `JavaScript heap out of memory` 或 parent 无响应。
 - terminal snapshot 缺失 final output、structured output、usage、status 或 run identity。
@@ -576,9 +553,11 @@ find "$RUNS" -type f -name run.json -newer "$SOAK/start-marker" -print0 |
 
 注意：`structuredOutput` 是 authoritative 数据，目前不会被自动截断。若测试任务主动生成巨大 structured output，`run.json` 变大不一定表示 compact presentation 回归。
 
-## 9. 保存报告和清理
+---
 
-建议保留以下材料用于 release review：
+### 步骤 9 — 保存报告并清理（终端 B）
+
+建议保留：
 
 - `$SOAK/samples.tsv`
 - `$SOAK/checkpoints.tsv`
@@ -588,14 +567,83 @@ find "$RUNS" -type f -name run.json -newer "$SOAK/start-marker" -print0 |
 - interruption/resume 前后的 durable status 和 attempt
 - parent 终端中是否出现 OOM、transport 或 terminal-state 错误
 
-退出最终 parent Pi 后，停止仍存活的 sampler 并删除 PID 文件：
+`SOAK` 路径可从指针读取：
 
 ```bash
-if [[ -f "$SOAK/sampler.pid" ]]; then
-  kill "$(cat "$SOAK/sampler.pid")" 2>/dev/null || true
-fi
-
-rm -f "$SOAK/pi.pid" "$SOAK/sampler.pid"
+cat "${XDG_RUNTIME_DIR:-/tmp}/pi-agents-soak.current"
 ```
 
-不要在验证结束前删除 `$SOAK` 或 durable run 目录。检查完成后，再依据项目的数据保留策略处理 parent session、native child sessions 和 run records；这些文件可能包含敏感 prompt、路径、final output 和 child 原始 tool results。
+在终端 A 退出最终 parent Pi 之后，在终端 B 清理采样器与 PID 文件（**不删除** SOAK 数据与 durable runs）：
+
+```bash
+./packages/pi-agents/scripts/soak/cleanup.sh
+```
+
+不要在验证结束前删除 `$SOAK` 或 durable run 目录。检查完成后再按项目数据保留策略处理；这些文件可能包含敏感 prompt、路径、final output 和 child 原始 tool results。
+
+---
+
+## 脚本一览（参数速查）
+
+所有脚本路径均相对于 worktree 根：`./packages/pi-agents/scripts/soak/`。
+
+| 顺序 | 终端 | 命令 | 参数 | 何时跑 |
+| ---: | --- | --- | --- | --- |
+| 1 | B | `setup.sh` | 无 | 开始时一次 |
+| 2 | A | `start-parent.sh` | 无 | setup 之后；保持前台 |
+| 3a | B | `start-sampler.sh` | 无 | parent 已启动后 |
+| 3b | B | `record.sh baseline` | label 仅 | sampler 启动后立刻 |
+| 4 | B | `record.sh <label> <runId>` | label + runId | 每次 agent 调用完成后 |
+| 5 | A | `/quit` | （Pi 内） | 调用 9 已 record 之后 |
+| 6a | A | `start-parent.sh --resume` | `--resume` | `/quit` 之后 |
+| 6b | B | `start-sampler.sh` | 无 | resume 的 parent 起来后 |
+| 6c | B | `record.sh 10-resume <runId>` | label + 同一 runId | resume 完成后 |
+| 7 | B | `summary.sh` | 无 | 10 次调用全部结束后 |
+| 9 | B | `cleanup.sh` | 无 | 最终 parent 退出后 |
+
+### 环境变量（可选）
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `SOAK` | 指针文件内容 | 覆盖 SOAK 目录 |
+| `SOAK_RUNS_DIR` | `$HOME/.pi/agent/@balaenis/pi-agents/runs` | durable runs 根目录 |
+| `SOAK_MAX_OLD_SPACE` | `1024` | parent V8 old-space 上限（MiB） |
+| `SOAK_POINTER` | `$XDG_RUNTIME_DIR/pi-agents-soak.current` | 指针文件路径 |
+
+> **堆上限实测（Node 26.3 / pi 0.80.9）**：`512` 在 parent 启动阶段即 OOM（old-space 已达 ~511.6 MiB）。`≤600` 无法启动；`≥640` 可启动。默认 `1024` 给 10 次混合调用留约 500 MiB 余量。更紧可用 `SOAK_MAX_OLD_SPACE=768`。
+
+### 端到端命令骨架（复制用）
+
+```bash
+# ========== 终端 B ==========
+cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
+./packages/pi-agents/scripts/soak/setup.sh
+
+# ========== 终端 A ==========
+cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
+./packages/pi-agents/scripts/soak/start-parent.sh
+# 保持此 TUI 打开；按步骤 4 粘贴提示词
+
+# ========== 终端 B ==========
+./packages/pi-agents/scripts/soak/start-sampler.sh
+./packages/pi-agents/scripts/soak/record.sh baseline
+
+# 调用 1–8 每次完成后：
+./packages/pi-agents/scripts/soak/record.sh 01-long-single run-REPLACE_ME
+# ... 02-short … 08-chain ...
+
+# 调用 9（后台）后：
+./packages/pi-agents/scripts/soak/record.sh 09-background-running run-REPLACE_ME
+# 然后在终端 A: /agent status …  →  /quit
+
+# ========== 终端 A ==========
+./packages/pi-agents/scripts/soak/start-parent.sh --resume
+# /agent status run-…  →  粘贴 resume 提示词
+
+# ========== 终端 B ==========
+./packages/pi-agents/scripts/soak/start-sampler.sh
+./packages/pi-agents/scripts/soak/record.sh 10-resume run-REPLACE_ME
+./packages/pi-agents/scripts/soak/summary.sh
+# 终端 A 退出 Pi 后：
+./packages/pi-agents/scripts/soak/cleanup.sh
+```
