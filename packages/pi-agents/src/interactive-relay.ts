@@ -17,6 +17,12 @@ import {
   type InteractiveRegistryEvent,
   type InteractiveTerminalOverride,
 } from './interactive-agent.ts';
+import {
+  formatParentArtifactDescriptor,
+  shouldSpillPayload,
+  textPayloadBytes,
+} from './result-payload.ts';
+import type { RunStore } from './run-store.ts';
 
 export const CONTINUATION_MESSAGE_TYPE = 'pi-agents-interactive-continuation';
 
@@ -31,8 +37,10 @@ export interface InteractiveContinuationDetails {
   status: 'completed' | 'cancelled' | 'error';
   /** Terminal override recorded by the registry, if any. */
   terminalOverride?: InteractiveTerminalOverride;
-  /** Final post-baseline assistant text, empty when the turn produced no output. */
-  output: string;
+  /** Final post-baseline assistant text when inline (mutually exclusive with outputRef). */
+  output?: string;
+  /** Artifact ref for oversized continuation text (mutually exclusive with output). */
+  outputRef?: import('./run-types.ts').RunArtifactRefV1;
   /** Whether the preceding tool-call activation was interrupted/cancelled. */
   precedingInterrupted: boolean;
   /** Error text when the continuation failed/cancelled with no output. */
@@ -61,6 +69,8 @@ export interface InteractiveRelayOptions {
   /** Resolves the current host ExtensionContext (session identity + branch). */
   getCtx: () => ExtensionContext | undefined;
   now?: () => number;
+  /** Optional store for spilling oversized continuation output before send. */
+  runStore?: RunStore;
   /** Test seam to observe suppressed notifications (no content is leaked). */
   onSuppressed?: (reason: string, key: string) => void;
 }
@@ -82,17 +92,52 @@ function terminalOverrideToStatus(
  * Includes agent/run/unit identity and the post-baseline final output (or a
  * status line for failed/cancelled turns with no text).
  */
-export function buildContinuationMessageContent(
+export async function buildContinuationMessageContent(
   snap: InteractiveEndpointSnapshot,
   baseline: number,
   status: 'completed' | 'cancelled' | 'error',
   precedingInterrupted: boolean,
-  now: () => number
-): { content: string; details: InteractiveContinuationDetails } {
+  now: () => number,
+  runStore?: RunStore
+): Promise<{ content: string; details: InteractiveContinuationDetails }> {
   const post = snap.messages.slice(baseline);
-  const output = getFinalOutput(post as unknown as Parameters<typeof getFinalOutput>[0]);
+  const rawOutput = getFinalOutput(post as unknown as Parameters<typeof getFinalOutput>[0]);
   const activation = snap.activation;
   const error = activation?.error;
+
+  let output: string | undefined = rawOutput;
+  let outputRef: InteractiveContinuationDetails['outputRef'];
+  if (rawOutput && shouldSpillPayload(textPayloadBytes(rawOutput)) && runStore) {
+    try {
+      outputRef = await runStore.writeTextArtifact(
+        snap.runId,
+        'interactive-continuation',
+        rawOutput
+      );
+      output = undefined;
+    } catch {
+      // Spill failure: deliver a bounded error without the original payload.
+      return {
+        content: [
+          `<pi-agents-continuation agent="${escapeXml(snap.agent)}" runId="${escapeXml(snap.runId)}" unitId="${escapeXml(snap.unitId)}" status="error">`,
+          `<status>Continuation output could not be externalized (artifact_write_error).</status>`,
+          `</pi-agents-continuation>`,
+        ].join('\n'),
+        details: {
+          runId: snap.runId,
+          unitId: snap.unitId,
+          agent: snap.agent,
+          endpointKey: snap.key,
+          activationId: activation?.id ?? '',
+          status: 'error',
+          precedingInterrupted,
+          error: 'artifact_write_error',
+          relayedAt: now(),
+        },
+      };
+    }
+  }
+
   const sections: string[] = [];
   sections.push(
     `<pi-agents-continuation agent="${escapeXml(snap.agent)}" runId="${escapeXml(
@@ -104,7 +149,11 @@ export function buildContinuationMessageContent(
   sections.push(
     `<summary>An interactive continuation for subagent ${snap.agent} (run ${snap.runId}) settled as ${status}.</summary>`
   );
-  if (output) {
+  if (outputRef) {
+    sections.push(
+      `<output-ref>${escapeXml(formatParentArtifactDescriptor(outputRef))}</output-ref>`
+    );
+  } else if (output) {
     sections.push(`<output>\n${output}\n</output>`);
   } else if (status !== 'completed') {
     sections.push(
@@ -124,7 +173,8 @@ export function buildContinuationMessageContent(
     activationId: activation?.id ?? '',
     status,
     ...(activation?.terminalOverride ? { terminalOverride: activation.terminalOverride } : {}),
-    output,
+    ...(output !== undefined ? { output } : {}),
+    ...(outputRef ? { outputRef } : {}),
     precedingInterrupted,
     ...(error ? { error } : {}),
     relayedAt: now(),
@@ -178,7 +228,21 @@ export function createInteractiveRelayCoordinator(options: InteractiveRelayOptio
    * endpoint removal can drop related entries without scanning opaque strings.
    */
   const relayed = new Map<string, string>();
+  /** In-flight activation ids reserved during async artifact I/O / send. */
+  const inFlight = new Set<string>();
+  const pendingWork = new Set<Promise<void>>();
   let disposed = false;
+
+  function trackWork(work: Promise<void>): void {
+    pendingWork.add(work);
+    void work.finally(() => pendingWork.delete(work));
+  }
+
+  async function waitForIdle(): Promise<void> {
+    while (pendingWork.size > 0) {
+      await Promise.allSettled([...pendingWork]);
+    }
+  }
 
   function currentHostSessionId(): string | undefined {
     const ctx = options.getCtx();
@@ -362,38 +426,54 @@ export function createInteractiveRelayCoordinator(options: InteractiveRelayOptio
     }
 
     const status = terminalOverrideToStatus(activation.terminalOverride, snap.status);
-    const { content, details } = buildContinuationMessageContent(
-      snap,
-      activation.baselineMessageCount,
-      status,
-      true,
-      now
+    const activationId = activation.id;
+    // Reserve activation before async artifact I/O so duplicates cannot double-send.
+    if (inFlight.has(activationId)) return;
+    inFlight.add(activationId);
+    trackWork(
+      (async () => {
+        try {
+          if (disposed) return;
+          const { content, details } = await buildContinuationMessageContent(
+            snap,
+            activation.baselineMessageCount,
+            status,
+            true,
+            now,
+            options.runStore
+          );
+          // Re-check trust immediately before send after async I/O.
+          if (disposed || relayed.has(activationId)) return;
+          const hostSession = currentHostSessionId();
+          if (!hostSession || snap.hostSessionId !== hostSession) {
+            options.onSuppressed?.('host_session_mismatch_after_io', key);
+            lastToolCallTerminal.delete(key);
+            return;
+          }
+          if (!liveBranchHasMatchingLink(snap) || !isActiveBranchMember(key)) {
+            options.onSuppressed?.('branch_stale_after_io', key);
+            lastToolCallTerminal.delete(key);
+            return;
+          }
+          pi.sendMessage(
+            {
+              customType: CONTINUATION_MESSAGE_TYPE,
+              content,
+              display: true,
+              details,
+            },
+            { triggerTurn: true, deliverAs: 'followUp' }
+          );
+          relayed.set(activationId, key);
+          pruneRelayedIfNeeded();
+          lastToolCallTerminal.delete(key);
+        } catch {
+          options.onSuppressed?.('send_failed', key);
+        } finally {
+          inFlight.delete(activationId);
+        }
+      })()
     );
-
-    try {
-      // Deliver as followUp so a currently-streaming host turn queues the
-      // continuation without interrupting; triggerTurn starts a new turn when
-      // the host is idle. display=true keeps a rendered row in the transcript.
-      pi.sendMessage(
-        {
-          customType: CONTINUATION_MESSAGE_TYPE,
-          content,
-          display: true,
-          details,
-        },
-        { triggerTurn: true, deliverAs: 'followUp' }
-      );
-      relayed.set(activation.id, key);
-      pruneRelayedIfNeeded();
-      // Consume the gate: a later view activation (different id) must not re-fire
-      // the host turn unless a new tool_call terminal re-arms the gate.
-      lastToolCallTerminal.delete(key);
-    } catch {
-      // Failed delivery: do not mark relayed and do not consume the gate, so a
-      // later view settle (or retry path) can re-attempt once. We never loop
-      // tightly from this catch alone — only the next activation_settled fires.
-      options.onSuppressed?.('send_failed', key);
-    }
   }
 
   const unsub = registry.subscribe((event) => {
@@ -418,6 +498,7 @@ export function createInteractiveRelayCoordinator(options: InteractiveRelayOptio
 
   return {
     dispose,
+    waitForIdle,
     /** Test helpers (not for production use). */
     _hasRecordedTerminal: (key: string) => lastToolCallTerminal.has(key),
     _wasRelayed: (activationId: string) => relayed.has(activationId),

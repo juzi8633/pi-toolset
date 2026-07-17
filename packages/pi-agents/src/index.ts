@@ -103,6 +103,7 @@ export default function (pi: ExtensionAPI) {
   function bindRelayCoordinator(): void {
     relayCoordinator?.dispose();
     relayCoordinator = createInteractiveRelayCoordinator({
+      runStore,
       registry: interactiveRegistry,
       pi,
       getCtx: () => latestUiCtx,

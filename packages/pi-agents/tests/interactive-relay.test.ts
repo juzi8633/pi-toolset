@@ -192,7 +192,7 @@ function snapshotWithActivation(
 }
 
 describe('createInteractiveRelayCoordinator', () => {
-  it('relays once when an interrupted tool-call is followed by a view continuation', () => {
+  it('relays once when an interrupted tool-call is followed by a view continuation', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -242,6 +242,7 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-1', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.customType).toBe(CONTINUATION_MESSAGE_TYPE);
     expect(sent[0]!.details.activationId).toBe('v-1');
@@ -252,7 +253,7 @@ describe('createInteractiveRelayCoordinator', () => {
     relay.dispose();
   });
 
-  it('does not relay after a normal completed tool-call post-chat', () => {
+  it('does not relay after a normal completed tool-call post-chat', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -290,12 +291,13 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-ok', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(relay._wasRelayed('v-ok')).toBe(false);
     relay.dispose();
   });
 
-  it('relays only post-baseline output, not hydrated history', () => {
+  it('relays only post-baseline output, not hydrated history', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -339,12 +341,13 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-2', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.details.output).toBe('new answer');
     relay.dispose();
   });
 
-  it('does not relay the same activation twice (exactly-once)', () => {
+  it('does not relay the same activation twice (exactly-once)', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -383,11 +386,12 @@ describe('createInteractiveRelayCoordinator', () => {
     registry.emit(settledEvent('r:u', 'v-3', viewSnap));
     registry.emit(settledEvent('r:u', 'v-3', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     relay.dispose();
   });
 
-  it('does not relay when host session changed', () => {
+  it('does not relay when host session changed', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     let currentSession = 'host-1';
@@ -427,11 +431,12 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-4', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     relay.dispose();
   });
 
-  it('does not relay when the endpoint is no longer visible on the active branch', () => {
+  it('does not relay when the endpoint is no longer visible on the active branch', async () => {
     const registry = makeFakeRegistry([]);
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -475,11 +480,12 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-5', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     relay.dispose();
   });
 
-  it('relays failed/cancelled continuations even with no output text', () => {
+  it('relays failed/cancelled continuations even with no output text', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -523,6 +529,7 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-6', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.details.status).toBe('error');
     expect(sent[0]!.details.output).toBe('');
@@ -531,7 +538,7 @@ describe('createInteractiveRelayCoordinator', () => {
     relay.dispose();
   });
 
-  it('view send does not block: relay observes settle independently', () => {
+  it('view send does not block: relay observes settle independently', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -571,11 +578,12 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-7', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     relay.dispose();
   });
 
-  it('a new tool_call activation clears the interrupted gate', () => {
+  it('a new tool_call activation clears the interrupted gate', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -629,13 +637,14 @@ describe('createInteractiveRelayCoordinator', () => {
     );
     registry.emit(settledEvent('r:u', 'v-8', viewSnap));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     relay.dispose();
   });
 });
 
 describe('buildContinuationMessageContent', () => {
-  it('marks the message as an interactive continuation with agent/run/unit identity', () => {
+  it('marks the message as an interactive continuation with agent/run/unit identity', async () => {
     const snap = makeSnapshot({
       key: 'r:u',
       hostSessionId: 'host-1',
@@ -648,7 +657,7 @@ describe('buildContinuationMessageContent', () => {
     });
     const activation = makeActivation('view', { id: 'v-x', baselineMessageCount: 0 });
     const snapWithAct = { ...snap, activation } as InteractiveEndpointSnapshot;
-    const { content, details } = buildContinuationMessageContent(
+    const { content, details } = await buildContinuationMessageContent(
       snapWithAct,
       0,
       'completed',
@@ -709,7 +718,7 @@ describe('renderContinuationMessage', () => {
 });
 
 describe('relay binding-scoped gate', () => {
-  it('B1 gate is not consumed by B2 activation with a different bindingId', () => {
+  it('B1 gate is not consumed by B2 activation with a different bindingId', async () => {
     const key = 'run-bind:u';
     const suppressed: string[] = [];
     const registry = makeFakeRegistry([key]);
@@ -758,6 +767,7 @@ describe('relay binding-scoped gate', () => {
         ])
       )
     );
+    await relay.waitForIdle();
     expect(sent).toHaveLength(0);
     expect(relay._wasRelayed('v-b2')).toBe(false);
     expect(suppressed).toContain('binding_mismatch');
@@ -790,6 +800,7 @@ describe('relay binding-scoped gate', () => {
         ])
       )
     );
+    await relay.waitForIdle();
     expect(sent).toHaveLength(1);
     expect(relay._wasRelayed('v-b2-ok')).toBe(true);
     expect(relay._hasRecordedTerminal(key)).toBe(false);
@@ -840,7 +851,7 @@ describe('relay binding-scoped gate', () => {
 });
 
 describe('relay continuation gate consumption (V1/V2)', () => {
-  it('consumes lastToolCallTerminal after successful V1 relay so V2 does not re-trigger host', () => {
+  it('consumes lastToolCallTerminal after successful V1 relay so V2 does not re-trigger host', async () => {
     const registry = makeFakeRegistry();
     const { pi, sent } = makeFakePi();
     const relay = createInteractiveRelayCoordinator({
@@ -884,6 +895,7 @@ describe('relay continuation gate consumption (V1/V2)', () => {
       makeActivation('view', { id: 'v1', baselineMessageCount: 0, settled: true })
     );
     registry.emit(settledEvent(key, 'v1', v1));
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.details.activationId).toBe('v1');
     expect(relay._hasRecordedTerminal(key)).toBe(false);
@@ -903,6 +915,7 @@ describe('relay continuation gate consumption (V1/V2)', () => {
       makeActivation('view', { id: 'v2', baselineMessageCount: 0, settled: true })
     );
     registry.emit(settledEvent(key, 'v2', v2));
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(relay._wasRelayed('v2')).toBe(false);
 
@@ -944,6 +957,7 @@ describe('relay continuation gate consumption (V1/V2)', () => {
       makeActivation('view', { id: 'v3', baselineMessageCount: 0, settled: true })
     );
     registry.emit(settledEvent(key, 'v3', v3));
+    await relay.waitForIdle();
     expect(sent.length).toBe(2);
     expect(sent[1]!.details.activationId).toBe('v3');
 
@@ -1112,6 +1126,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(suppressed).toContain('branch_not_visible');
     // Off-branch suppress consumes the tool-call gate — return must re-arm.
@@ -1159,6 +1174,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_end', messages: [], willRetry: false });
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
 
     // New tool_call terminal re-arms the gate.
@@ -1332,11 +1348,13 @@ describe('relay + real registry branchKeys path', () => {
     expect(registry.isOnActiveBranch(snap.key)).toBe(false);
     // applyUnavailable settles the open activation while untrusted — no relay.
     await new Promise((r) => setImmediate(r));
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
 
     // Late settle from transport must not relay either.
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
 
     // Restore legal B1 binding on original host — trust returns.
@@ -1389,6 +1407,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.details.output).toContain('legal-continue');
 
@@ -1580,6 +1599,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_end', messages: [], willRetry: false });
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(suppressed).toContain('branch_link_mismatch');
 
@@ -1607,6 +1627,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_end', messages: [], willRetry: false });
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(suppressed).toContain('branch_link_mismatch');
 
@@ -1651,6 +1672,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
 
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.details.output).toContain('live-branch-ok');
 
@@ -1846,6 +1868,7 @@ describe('relay + real registry branchKeys path', () => {
     suppressed.length = 0;
     sent.length = 0;
     await armAndSettleView('bad-version');
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(suppressed).toContain('branch_link_mismatch');
 
@@ -1854,6 +1877,7 @@ describe('relay + real registry branchKeys path', () => {
     suppressed.length = 0;
     sent.length = 0;
     await armAndSettleView('bad-createdAt');
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(suppressed).toContain('branch_link_mismatch');
 
@@ -1906,6 +1930,7 @@ describe('relay + real registry branchKeys path', () => {
     eventListener?.({ type: 'agent_end', messages: [], willRetry: false });
     eventListener?.({ type: 'agent_settled' });
     await new Promise((r) => setImmediate(r));
+    await relay.waitForIdle();
     expect(sent.length).toBe(0);
     expect(
       suppressed.includes('host_session_mismatch') || suppressed.includes('branch_link_mismatch')
@@ -1924,6 +1949,7 @@ describe('relay + real registry branchKeys path', () => {
     suppressed.length = 0;
     sent.length = 0;
     await armAndSettleView('exact-ok');
+    await relay.waitForIdle();
     expect(sent.length).toBe(1);
     expect(sent[0]!.details.output).toContain('exact-ok');
 

@@ -1544,7 +1544,38 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
 
     // Wait for any pending coalesced write, then do one final flush and release.
     cancelPendingTimer(runId);
-    await writeRun(runId);
+    // Prefer strict update when available (production RunStore); fall back to
+    // coalesced writeRun for older/test doubles.
+    if (typeof store.updateRunStrict === 'function') {
+      try {
+        await store.updateRunStrict(runId, (record) => {
+          mergeLiveIntoRecord(record, {
+            ...record,
+            details,
+            units,
+            status,
+            finishedAt: live.finishedAt,
+            updatedAt: live.updatedAt,
+            ...(options.lastError !== undefined ? { lastError: options.lastError } : {}),
+          });
+        });
+        await (
+          typeof store.appendEventStrict === 'function'
+            ? store.appendEventStrict
+            : store.appendEvent
+        ).call(store, runId, {
+          version: 1,
+          event: 'run_terminal',
+          runId,
+          timestamp: now(),
+          status,
+        });
+      } catch {
+        await writeRun(runId);
+      }
+    } else {
+      await writeRun(runId);
+    }
     lastPersist.set(runId, now());
     // The run is settled; drop the in-memory registration so subsequent
     // `isActive`/reconciliation can treat it as a past run.
