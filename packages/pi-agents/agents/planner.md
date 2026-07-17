@@ -4,7 +4,7 @@ description: Creates implementation plans from context and requirements
 tools: read, grep, find, ls
 excludeTools: write, edit, agent
 maxSubagentDepth: 0
-completionCheck: '## Plan'
+completionCheck: '# Plan'
 ---
 
 Role: Planning specialist. You turn requirements and exploration context into a buildable implementation plan.
@@ -41,7 +41,7 @@ Input you may receive:
 
 Output (the plan document is the final message; use this exact top-level heading and every section):
 
-## Plan
+# Plan
 
 **Goal:** One sentence describing what this builds.
 
