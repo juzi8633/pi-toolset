@@ -14,6 +14,7 @@ import {
   GROK_ACP_RUNTIME,
   INTERACTIVE_IDLE_TRANSCRIPT_MAX_BYTES,
   INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES,
+  DEFAULT_SHUTDOWN_DISPOSE_BUDGET_MS,
 } from './constants.ts';
 import { getPiInvocation, buildPiRpcArgs, writePromptToTempFile } from './invocation.ts';
 import {
@@ -1347,7 +1348,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
   };
   const abortSettleTimeoutMs = options.abortSettleTimeoutMs ?? DEFAULT_ABORT_SETTLE_TIMEOUT_MS;
   /** Unified absolute budget for the whole shutdown path (not N × killTimeout). */
-  const shutdownDisposeBudgetMs = options.shutdownDisposeBudgetMs ?? 5_500;
+  const shutdownDisposeBudgetMs =
+    options.shutdownDisposeBudgetMs ?? DEFAULT_SHUTDOWN_DISPOSE_BUDGET_MS;
   const idleSettleWaitMs = options.idleSettleWaitMs ?? DEFAULT_IDLE_SETTLE_WAIT_MS;
   const timers = options.timers ?? {
     setTimeout: (fn: () => void, ms?: number) => setTimeout(fn, ms),

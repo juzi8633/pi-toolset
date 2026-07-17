@@ -7,6 +7,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR_NAME, getAgentDir } from '@earendil-works/pi-coding-agent';
+import { NPM_ROOT_TIMEOUT_MS } from './constants.ts';
 
 export interface PackageAgentDir {
   packageName: string;
@@ -191,7 +192,7 @@ function getGlobalNpmRoot(): string | null {
   try {
     const out = execFileSync('npm', ['root', '-g'], {
       encoding: 'utf-8',
-      timeout: 5000,
+      timeout: NPM_ROOT_TIMEOUT_MS,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     cachedGlobalNpmRoot = out ? fs.realpathSync(out) : null;

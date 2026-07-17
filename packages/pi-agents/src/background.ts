@@ -10,6 +10,7 @@ import type {
 import { getMarkdownTheme } from '@earendil-works/pi-coding-agent';
 import { Container, Markdown, Spacer, Text, type Component } from '@earendil-works/pi-tui';
 import { getBuiltinAgentsDir, type AgentScope } from './agents.ts';
+import { PRESENTATION_ERROR_PREVIEW_CHARS } from './constants.ts';
 import { truncateParallelOutput } from './output.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import type {
@@ -419,9 +420,9 @@ export function renderBackgroundMessage(
     let text = header;
     text += `\n${theme.fg('dim', details.description)}`;
     if (details.status === 'failed' && details.error) {
-      text += `\n${theme.fg('error', truncate(details.error, 240))}`;
+      text += `\n${theme.fg('error', truncate(details.error, PRESENTATION_ERROR_PREVIEW_CHARS))}`;
     } else if (details.result) {
-      text += `\n${theme.fg('toolOutput', truncate(details.result, 240))}`;
+      text += `\n${theme.fg('toolOutput', truncate(details.result, PRESENTATION_ERROR_PREVIEW_CHARS))}`;
     }
     if (details.durationMs !== undefined) {
       text += `\n${theme.fg('muted', `(${formatDuration(details.durationMs)})`)}`;

@@ -16,6 +16,35 @@ export const RESULT_DIAGNOSTIC_MAX_BYTES = 64 * 1024;
 /** Parent content-update coalescing interval (matches TUI spinner cadence). */
 export const RESULT_UPDATE_INTERVAL_MS = 150;
 
+/** Default RPC request timeout before rejecting with a timeout error. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+/** Grace period to wait for child stdout/stderr to drain before forcing exit. */
+export const DEFAULT_KILL_TIMEOUT_MS = 5_000;
+/** Unified absolute budget for the entire interactive shutdown dispose path. */
+export const DEFAULT_SHUTDOWN_DISPOSE_BUDGET_MS = 5_500;
+/** Coalescing interval for per-run persistence writes. */
+export const DEFAULT_COALESCE_MS = 250;
+/** Timeout for `npm root -g` discovery. */
+export const NPM_ROOT_TIMEOUT_MS = 5_000;
+
+/** Max chars for error/details preview in compact message views. */
+export const PRESENTATION_ERROR_PREVIEW_CHARS = 240;
+/** Max chars for bash command preview in rendered tool calls. */
+export const PRESENTATION_COMMAND_PREVIEW_CHARS = 60;
+/** Max chars for unknown tool-call args JSON preview. */
+export const PRESENTATION_ARGS_PREVIEW_CHARS = 50;
+/** Max chars for tool-call names in compact items. */
+export const PRESENTATION_NAME_TRUNC_CHARS = 32;
+/** Max tail chars retained for worktree error detail. */
+export const PRESENTATION_OUTPUT_TAIL_CHARS = 400;
+/** Max chars for malformed JSON preview in protocol errors. */
+export const JSON_ERROR_PREVIEW_CHARS = 200;
+/** Max chars for background run-id prefix in continuation headers. */
+export const PRESENTATION_RUNID_PREVIEW_CHARS = 8;
+
+/** Max chars for auto-generated worktree directory name prefix. */
+export const WORKTREE_NAME_MAX_CHARS = 40;
+
 /** Per non-authoritative interactive message payload cap (thinking/tool args/results). */
 export const INTERACTIVE_NON_AUTHORITATIVE_ITEM_MAX_BYTES = 64 * 1024;
 /** Total warm idle endpoint transcript budget before eviction/rehydration. */

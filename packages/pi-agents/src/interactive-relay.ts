@@ -10,6 +10,7 @@ import type {
 import { getMarkdownTheme } from '@earendil-works/pi-coding-agent';
 import { Container, Markdown, Spacer, Text, type Component } from '@earendil-works/pi-tui';
 import { getFinalOutput } from './output.ts';
+import { PRESENTATION_ERROR_PREVIEW_CHARS, PRESENTATION_RUNID_PREVIEW_CHARS } from './constants.ts';
 import {
   INTERACTIVE_LINK_TYPE,
   type InteractiveAgentRegistry,
@@ -459,17 +460,20 @@ export function renderContinuationMessage(
   const header =
     `${statusIcon} ${theme.fg('toolTitle', theme.bold('interactive continuation '))}` +
     theme.fg('accent', details.agent) +
-    theme.fg('muted', ` [run ${details.runId.slice(0, 8)}]`);
+    theme.fg('muted', ` [run ${details.runId.slice(0, PRESENTATION_RUNID_PREVIEW_CHARS)}]`);
 
   if (!options.expanded) {
     let text = header;
     text += `\n${theme.fg('dim', `unit ${details.unitId} · ${details.status}`)}`;
     if (details.output) {
       const preview = details.output.split('\n')[0] ?? '';
-      const trimmed = preview.length > 240 ? `${preview.slice(0, 240)}…` : preview;
+      const trimmed =
+        preview.length > PRESENTATION_ERROR_PREVIEW_CHARS
+          ? `${preview.slice(0, PRESENTATION_ERROR_PREVIEW_CHARS)}…`
+          : preview;
       text += `\n${theme.fg('toolOutput', trimmed)}`;
     } else if (details.error) {
-      text += `\n${theme.fg('error', details.error.slice(0, 240))}`;
+      text += `\n${theme.fg('error', details.error.slice(0, PRESENTATION_ERROR_PREVIEW_CHARS))}`;
     } else {
       text += `\n${theme.fg('muted', '(no final text)')}`;
     }

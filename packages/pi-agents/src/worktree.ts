@@ -4,6 +4,7 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { WORKTREE_NAME_MAX_CHARS } from './constants.ts';
 
 export function getGitRoot(cwd: string): string | undefined {
   const result = spawnSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
@@ -15,7 +16,7 @@ export function getGitRoot(cwd: string): string | undefined {
 }
 
 function safeName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 40) || 'agent';
+  return name.replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, WORKTREE_NAME_MAX_CHARS) || 'agent';
 }
 
 export interface AgentWorktree {

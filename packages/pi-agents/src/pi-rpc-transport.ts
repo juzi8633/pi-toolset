@@ -14,10 +14,14 @@ import type {
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent } from '@earendil-works/pi-ai';
 import type { SpawnFn, SpawnedChild } from './execution.ts';
+import {
+  DEFAULT_KILL_TIMEOUT_MS,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  JSON_ERROR_PREVIEW_CHARS,
+} from './constants.ts';
 
 const MAX_STDOUT_RECORD_BYTES = 2 * 1024 * 1024;
 const MAX_STDERR_BYTES = 1 * 1024 * 1024;
-const DEFAULT_KILL_TIMEOUT_MS = 5000;
 const STDERR_TRUNCATION_MARKER = '[stderr truncated]\n';
 
 /** Synthetic event delivered to subscribers when the child exits unexpectedly. */
@@ -398,7 +402,10 @@ export class PiRpcTransport {
     try {
       data = JSON.parse(line);
     } catch {
-      this.failProtocol('malformed_json', `Malformed RPC JSON: ${line.slice(0, 200)}`);
+      this.failProtocol(
+        'malformed_json',
+        `Malformed RPC JSON: ${line.slice(0, JSON_ERROR_PREVIEW_CHARS)}`
+      );
       return;
     }
     if (!data || typeof data !== 'object') {
@@ -520,7 +527,7 @@ export class PiRpcTransport {
     const fullCommand = { ...command, id } as RpcCommand & { id: string };
 
     return new Promise<RpcResponse>((resolve, reject) => {
-      const timeoutMs = this.options.requestTimeoutMs ?? 30_000;
+      const timeoutMs = this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
       const clock = this.options.clock ?? { setTimeout, clearTimeout };
       const timer =
         timeoutMs > 0

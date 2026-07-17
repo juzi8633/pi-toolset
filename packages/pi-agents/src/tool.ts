@@ -29,6 +29,7 @@ import {
   GROK_ACP_RUNTIME,
   MAX_CONCURRENCY,
   MAX_PARALLEL_TASKS,
+  PRESENTATION_OUTPUT_TAIL_CHARS,
   RESULT_UPDATE_INTERVAL_MS,
 } from './constants.ts';
 import { createLatestValueCoalescer } from './update-coalescer.ts';
@@ -2675,7 +2676,7 @@ export function runHookOrSynthesizeFailure(
     ? `error: ${hookResult.error}`
     : `exit ${hookResult.exitCode}`;
   const tail = (hookResult.stderr || hookResult.stdout).trim();
-  const detail = tail ? `\n${tail.slice(-400)}` : '';
+  const detail = tail ? `\n${tail.slice(-PRESENTATION_OUTPUT_TAIL_CHARS)}` : '';
   const failure = synthesizeFailure(
     agentName,
     agent,

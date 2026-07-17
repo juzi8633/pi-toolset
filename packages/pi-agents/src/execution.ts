@@ -8,7 +8,11 @@ import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentConfig, Runtime } from './agents.ts';
-import { GROK_ACP_RUNTIME, RESULT_UPDATE_INTERVAL_MS } from './constants.ts';
+import {
+  GROK_ACP_RUNTIME,
+  RESULT_UPDATE_INTERVAL_MS,
+  DEFAULT_KILL_TIMEOUT_MS,
+} from './constants.ts';
 import { GrokAcpClientError, runGrokAcpClient } from './grok-acp-client.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import { originToUnitStatus } from './run-lifecycle.ts';
@@ -530,7 +534,7 @@ export async function runSingleAgent(
         proc.kill('SIGTERM');
         killTimer = setTimeout(() => {
           if (!hasClosed) proc.kill('SIGKILL');
-        }, 5000);
+        }, DEFAULT_KILL_TIMEOUT_MS);
       };
 
       const processLine = (line: string) => {
@@ -611,7 +615,7 @@ export async function runSingleAgent(
           proc.kill('SIGTERM');
           setTimeout(() => {
             if (!proc.killed) proc.kill('SIGKILL');
-          }, 5000);
+          }, DEFAULT_KILL_TIMEOUT_MS);
         };
         if (signal.aborted) killProc();
         else signal.addEventListener('abort', killProc, { once: true });

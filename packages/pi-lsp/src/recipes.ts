@@ -4,6 +4,7 @@
 import { accessSync, constants, statSync } from 'node:fs';
 import * as path from 'node:path';
 import { logForDebugging } from './log.ts';
+import { FALLBACK_STARTUP_TIMEOUT_MS } from './constants.ts';
 import type { ScopedLspServerConfig, LspServerRecipe } from './types.ts';
 
 /**
@@ -325,7 +326,7 @@ export function getDetectedRecipeServers(
       command: recipe.command,
       args: recipe.args ? [...recipe.args] : undefined,
       extensionToLanguage: { ...recipe.extensionToLanguage },
-      startupTimeout: recipe.startupTimeout ?? 10000,
+      startupTimeout: recipe.startupTimeout ?? FALLBACK_STARTUP_TIMEOUT_MS,
       maxRestarts: 3,
       transport: 'stdio',
       role: recipe.role ?? 'primary',

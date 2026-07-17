@@ -3,7 +3,7 @@
 
 import * as crypto from 'node:crypto';
 import type { AgentConfig, Runtime } from './agents.ts';
-import { DEFAULT_RUNTIME } from './constants.ts';
+import { DEFAULT_RUNTIME, DEFAULT_COALESCE_MS } from './constants.ts';
 import type { RunStore } from './run-store.ts';
 import type {
   AgentRunRecordV1,
@@ -436,7 +436,7 @@ export interface RunCoordinator {
 export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordinator {
   const store = options.store;
   const now = options.now ?? (() => Date.now());
-  const coalesceMs = options.coalesceMs ?? 250;
+  const coalesceMs = options.coalesceMs ?? DEFAULT_COALESCE_MS;
 
   const active = new Map<string, AgentRunRecordV1>();
   const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();

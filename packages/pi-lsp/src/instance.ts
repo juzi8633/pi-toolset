@@ -12,6 +12,7 @@ import {
   type StartupFailureClassification,
 } from './startup-errors.ts';
 import type { LspServerState, ScopedLspServerConfig } from './types.ts';
+import { DEFAULT_STARTUP_TIMEOUT_MS, DEFAULT_SHUTDOWN_TIMEOUT_MS } from './constants.ts';
 
 /**
  * LSP error code for "content modified" - indicates the server's state changed
@@ -290,7 +291,7 @@ export function createLSPServerInstance(
       };
 
       initPromise = client.initialize(initParams);
-      const timeout = config.startupTimeout ?? 30000;
+      const timeout = config.startupTimeout ?? DEFAULT_STARTUP_TIMEOUT_MS;
       await withTimeout(
         initPromise,
         timeout,
@@ -315,7 +316,9 @@ export function createLSPServerInstance(
       logError(lastError);
 
       try {
-        await client.stop({ shutdownTimeout: config.shutdownTimeout ?? 10000 });
+        await client.stop({
+          shutdownTimeout: config.shutdownTimeout ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+        });
       } catch (stopError) {
         logForDebugging(
           `LSP server '${name}' cleanup after failed startup completed with: ${errorMessage(stopError)}`
@@ -341,7 +344,7 @@ export function createLSPServerInstance(
 
     setState('stopping');
     try {
-      const timeout = config.shutdownTimeout ?? 10000;
+      const timeout = config.shutdownTimeout ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
       try {
         await client.stop({ shutdownTimeout: timeout });
       } catch (error) {

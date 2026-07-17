@@ -5,6 +5,7 @@ import {
   RESULT_DIAGNOSTIC_MAX_BYTES,
   RESULT_PRESENTATION_ITEM_MAX_BYTES,
   RESULT_PRESENTATION_MAX_BYTES,
+  PRESENTATION_NAME_TRUNC_CHARS,
 } from './constants.ts';
 import { getLatestActivity, getResultFinalOutput, getTranscriptAndFinal } from './output.ts';
 import type { DisplayItem, ResultPresentation, SingleResult } from './types.ts';
@@ -163,7 +164,7 @@ function boundToolCallItem(name: string, args: Record<string, unknown>): Display
     },
     {
       type: 'toolCall',
-      name: name.slice(0, 32),
+      name: name.slice(0, PRESENTATION_NAME_TRUNC_CHARS),
       args: {
         _omitted: true,
         omittedBytes: originalBytes,

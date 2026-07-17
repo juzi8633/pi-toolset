@@ -4,6 +4,7 @@
 import * as path from 'node:path';
 import type { FormatterConfig, FormatterRecipe, RecipeContext } from './types.ts';
 import { findExecutable, findUp, readPackageJson } from './utils.ts';
+import { DEFAULT_TIMEOUT_MS } from './constants.ts';
 
 export interface FormatterRegistry {
   getFormatterForFile(filePath: string): Promise<FormatterMatch | undefined>;
@@ -65,7 +66,7 @@ export function createFormatterRegistry(
           disabled: false,
           command: [],
           extensions: recipe.extensions,
-          timeoutMs: 30_000,
+          timeoutMs: DEFAULT_TIMEOUT_MS,
           source: 'builtin',
         },
         recipe,

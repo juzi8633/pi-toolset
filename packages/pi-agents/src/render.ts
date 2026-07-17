@@ -25,6 +25,10 @@ import {
   getResultTranscriptAndFinal,
   resolveExecutionStatus,
 } from './output.ts';
+import {
+  PRESENTATION_COMMAND_PREVIEW_CHARS,
+  PRESENTATION_ARGS_PREVIEW_CHARS,
+} from './constants.ts';
 import type { SubagentParams } from './schema.ts';
 import type {
   ChainExecutionDetails,
@@ -238,7 +242,10 @@ export function formatToolCall(
   switch (toolName) {
     case 'bash': {
       const command = (args.command as string) || '...';
-      const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
+      const preview =
+        command.length > PRESENTATION_COMMAND_PREVIEW_CHARS
+          ? `${command.slice(0, PRESENTATION_COMMAND_PREVIEW_CHARS)}...`
+          : command;
       return themeFg('muted', '$ ') + themeFg('toolOutput', preview);
     }
     case 'read': {
@@ -291,7 +298,10 @@ export function formatToolCall(
     }
     default: {
       const argsStr = JSON.stringify(args);
-      const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
+      const preview =
+        argsStr.length > PRESENTATION_ARGS_PREVIEW_CHARS
+          ? `${argsStr.slice(0, PRESENTATION_ARGS_PREVIEW_CHARS)}...`
+          : argsStr;
       return themeFg('accent', toolName) + themeFg('dim', ` ${preview}`);
     }
   }
