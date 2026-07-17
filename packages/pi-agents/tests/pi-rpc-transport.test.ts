@@ -393,47 +393,52 @@ describe('PiRpcTransport framing', () => {
     await transport.dispose();
   });
 
-  it('projects oversized canonical message/tool/turn shells', async () => {
-    const child = new FakeChild();
-    const transport = await spawnTransport(child);
-    const events: unknown[] = [];
-    transport.subscribe((e) => events.push(e));
+  it(
+    'projects oversized canonical message/tool/turn shells',
+    async () => {
+      const child = new FakeChild();
+      const transport = await spawnTransport(child);
+      const events: unknown[] = [];
+      transport.subscribe((e) => events.push(e));
 
-    const big = 'X'.repeat(8 * 1024 * 1024 + 1000);
-    const messageEnd = JSON.stringify({
-      type: 'message_end',
-      message: { role: 'assistant', content: big },
-    });
-    const turnEnd = JSON.stringify({
-      type: 'turn_end',
-      message: { role: 'assistant', content: big },
-      toolResults: [],
-    });
-    const toolEnd = JSON.stringify({
-      type: 'tool_execution_end',
-      toolCallId: 'call_9',
-      toolName: 'bash',
-      result: big,
-      isError: false,
-    });
-    expect(Buffer.byteLength(messageEnd, 'utf8')).toBeGreaterThan(STDOUT_RECORD_LIMIT_BYTES);
-
-    child.pushStdout(`${messageEnd}\n${turnEnd}\n${toolEnd}\n`);
-    await new Promise((r) => setImmediate(r));
-
-    expect(events).toEqual([
-      { type: 'message_end', payloadOmitted: true, role: 'assistant' },
-      { type: 'turn_end', payloadOmitted: true },
-      {
+      // Just over the ordinary 8 MiB cap so projection is required without thrashing CI.
+      const big = 'X'.repeat(8 * 1024 * 1024 + 64);
+      const messageEnd = JSON.stringify({
+        type: 'message_end',
+        message: { role: 'assistant', content: big },
+      });
+      const turnEnd = JSON.stringify({
+        type: 'turn_end',
+        message: { role: 'assistant', content: big },
+        toolResults: [],
+      });
+      const toolEnd = JSON.stringify({
         type: 'tool_execution_end',
-        payloadOmitted: true,
         toolCallId: 'call_9',
         toolName: 'bash',
+        result: big,
         isError: false,
-      },
-    ]);
-    await transport.dispose();
-  });
+      });
+      expect(Buffer.byteLength(messageEnd, 'utf8')).toBeGreaterThan(STDOUT_RECORD_LIMIT_BYTES);
+
+      child.pushStdout(`${messageEnd}\n${turnEnd}\n${toolEnd}\n`);
+      await new Promise((r) => setImmediate(r));
+
+      expect(events).toEqual([
+        { type: 'message_end', payloadOmitted: true, role: 'assistant' },
+        { type: 'turn_end', payloadOmitted: true },
+        {
+          type: 'tool_execution_end',
+          payloadOmitted: true,
+          toolCallId: 'call_9',
+          toolName: 'bash',
+          isError: false,
+        },
+      ]);
+      await transport.dispose();
+    },
+    { timeout: 30_000 }
+  );
 
   it('fails ordinary unknown records one byte above 8 MiB', async () => {
     const child = new FakeChild();
