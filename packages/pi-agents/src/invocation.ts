@@ -56,6 +56,8 @@ export interface BuildPiArgsOptions {
   sessionFile?: string;
   disableAgentTool?: boolean;
   resolvedSkillPaths?: string[];
+  requireArtifactReader?: boolean;
+  artifactReaderExtensionPath?: string;
   /**
    * Prompt construction mode. `task` (default) sends `Task: <task>`.
    * `session_continuation` reuses `--session` and sends the shared resume prompt

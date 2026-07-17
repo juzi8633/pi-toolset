@@ -4,6 +4,7 @@
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
@@ -29,6 +30,7 @@ import {
   buildPiArgs,
   buildSessionContinuationPrompt,
   getPiInvocation,
+  resolveArtifactReaderExtensionPath,
   writePromptToTempFile,
 } from './invocation.ts';
 import { applyTerminalStatus, getResultFinalOutput } from './output.ts';
@@ -461,13 +463,29 @@ export async function runSingleAgent(
       tmpPromptPath = tmp.filePath;
     }
 
-    const childEnv = buildChildAgentEnv(process.env, { agent: effectiveAgent });
+    const requireArtifactReader = options.unitContext?.requireArtifactReader === true;
+    const childEnv = buildChildAgentEnv(process.env, {
+      agent: effectiveAgent,
+      ...(requireArtifactReader && options.unitContext?.runId && options.unitContext?.sessionsDir
+        ? {
+            runId: options.unitContext.runId,
+            // sessionsDir is <runDir>/sessions — artifact root is the run dir.
+            runArtifactDir: path.dirname(options.unitContext.sessionsDir),
+          }
+        : {}),
+    });
     const disableAgentTool = !isAgentDelegationAllowed(childEnv);
     const args = buildPiArgs(effectiveAgent, invocationTask, {
       tmpPromptPath: tmpPromptPath ?? undefined,
       sessionFile: options.sessionFile,
       disableAgentTool,
       resolvedSkillPaths: options.resolvedSkillPaths,
+      ...(requireArtifactReader
+        ? {
+            requireArtifactReader: true,
+            artifactReaderExtensionPath: resolveArtifactReaderExtensionPath(),
+          }
+        : {}),
       ...(useSessionContinuation
         ? {
             prompt: {

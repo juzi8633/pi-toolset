@@ -53,6 +53,8 @@ export interface UnitExecutionContext {
   neverStarted?: boolean;
   /** One-based chain step number; immutable once the unit is created. */
   step?: number;
+  /** When true, Pi child launches receive the dedicated artifact reader extension. */
+  requireArtifactReader?: boolean;
   /** Zero-based fanout item index within a chain fanout step. */
   fanoutIndex?: number;
 }
