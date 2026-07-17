@@ -1157,6 +1157,73 @@ describe('memory regressions', () => {
     }
   });
 
+  it('externalizes 12 MiB final text so terminal SingleResult JSON stays under 1 MiB', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-mem-spill-'));
+    const store = createRunStore({ rootDir: root });
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'explore', task: 'spill' },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sentinel = 'SENTINEL_12MIB_PAYLOAD_MARKER';
+    const large = sentinel + 'Z'.repeat(12 * 1024 * 1024);
+    const { externalizeTerminalResult } = await import('../src/result-payload.ts');
+    const spilled = await externalizeTerminalResult(
+      {
+        agent: 'explore',
+        agentSource: 'user',
+        task: 'spill',
+        exitCode: 0,
+        status: 'completed',
+        messages: [],
+        stderr: '',
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          contextTokens: 0,
+          turns: 1,
+        },
+        finalOutput: large,
+        structuredOutput: { body: large },
+      },
+      store,
+      runId
+    );
+    const json = JSON.stringify(spilled);
+    expect(json.length).toBeLessThan(1 * 1024 * 1024);
+    expect(json).not.toContain(sentinel);
+    expect(spilled.finalOutputRef?.bytes).toBeGreaterThan(12 * 1024 * 1024);
+    expect(spilled.structuredOutputRef).toBeDefined();
+    const text = await store.readTextArtifact(runId, spilled.finalOutputRef!);
+    expect(text.startsWith(sentinel)).toBe(true);
+    expect(text.length).toBe(large.length);
+    fs.rmSync(root, { recursive: true, force: true });
+  }, 60_000);
+
   it('coalescer with deferred timer emits once for 1000 schedules', () => {
     let handler: (() => void) | undefined;
     const emitted: number[] = [];
