@@ -76,6 +76,8 @@ export interface ChainStepRequest {
    * Callers that ignore it still get the same result via the chain-side call.
    */
   postprocessTerminal?: (result: SingleResult) => void;
+  /** When true, the Pi child needs the dedicated artifact reader for handoffs. */
+  requireArtifactReader?: boolean;
 }
 
 export type ChainRunStep = (req: ChainStepRequest) => Promise<SingleResult>;
@@ -837,6 +839,7 @@ async function runSequentialStep(
       onUpdate: chainUpdate,
       skipCompletionCheck: outputSchema !== undefined,
       postprocessTerminal,
+      ...(rendered.requiresArtifactReader ? { requireArtifactReader: true } : {}),
     });
     if (!terminalPostprocessed) {
       // Injected runStep stubs that ignore postprocessTerminal get exactly one fallback.
@@ -1032,6 +1035,7 @@ async function runFanoutStep(
 
   // Render tasks for every scheduled item before expansion persistence / dispatch.
   const renderedTasks: string[] = [];
+  let fanoutRequiresArtifactReader = false;
   for (const item of items) {
     const rendered = renderTaskTemplate(step.parallel.task, {
       previous: previousOutput,
@@ -1041,6 +1045,7 @@ async function runFanoutStep(
     if (!rendered.ok) {
       return fanoutFailure(opts, `Unknown fanout template value: ${rendered.unknown}`);
     }
+    if (rendered.requiresArtifactReader) fanoutRequiresArtifactReader = true;
     renderedTasks.push(
       outputSchema
         ? `${rendered.text}\n\n${buildStructuredOutputInstruction(outputSchema)}`
@@ -1298,6 +1303,7 @@ async function runFanoutStep(
             onUpdate: itemUpdate,
             skipCompletionCheck: outputSchema !== undefined,
             postprocessTerminal,
+            ...(fanoutRequiresArtifactReader ? { requireArtifactReader: true } : {}),
           });
           if (fanoutTerminal || signal?.aborted) {
             // Worker finished after cancel: keep cancelled if we already marked it.

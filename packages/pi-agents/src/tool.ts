@@ -1432,6 +1432,9 @@ async function runChain(
           ...(durable
             ? (() => {
                 const unitContext = durable.unitFor(req.step, req.fanoutIndex, req.agent);
+                if (req.requireArtifactReader) {
+                  unitContext.requireArtifactReader = true;
+                }
                 return {
                   unitContext,
                   getAbortOrigin: () => durable.lifecycle.origin,
