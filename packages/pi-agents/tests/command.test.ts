@@ -223,7 +223,7 @@ function cacheProbingExec(
 ): { execute: typeof executeAgentTool; probe: () => SkillResolution } {
   let probed: SkillResolution = { resolved: [], missing: [] };
   const execute: typeof executeAgentTool = async () => {
-    probed = resolveSkillNames(probeNames);
+    probed = await resolveSkillNames(probeNames);
     return result;
   };
   return { execute, probe: () => probed };
@@ -580,7 +580,9 @@ describe('registerAgentCommand', () => {
     await commands.get('agent:myagent')!.handler('do something', ctx);
 
     expect(exec.calls).toHaveLength(0);
-    expect(resolveSkillNames(['librarian']).resolved).toEqual(['/stale/librarian/SKILL.md']);
+    expect((await resolveSkillNames(['librarian'])).resolved).toEqual([
+      '/stale/librarian/SKILL.md',
+    ]);
     expect(notifications[0].type).toBe('error');
     expect(notifications[0].message).toContain('Unknown agent');
   });

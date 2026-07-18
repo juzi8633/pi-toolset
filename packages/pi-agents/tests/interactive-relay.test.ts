@@ -1403,7 +1403,7 @@ describe('relay + real registry branchKeys path', () => {
     expect(registry.get(snap.key)?.activation?.origin).toBe('view');
 
     // Tree navigates away while still running: branchKeys cleared, endpoint stays operable.
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-relay-branch',
         getBranch: () => [],
@@ -1451,7 +1451,7 @@ describe('relay + real registry branchKeys path', () => {
         };
       });
     }
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-relay-branch',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: link }],
@@ -1635,7 +1635,7 @@ describe('relay + real registry branchKeys path', () => {
       hostSessionId: 'forged-other-host',
       createdAt: Date.now(),
     };
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'forged-other-host',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
@@ -1672,7 +1672,7 @@ describe('relay + real registry branchKeys path', () => {
         createdAt: snap.linkCreatedAt,
       };
     });
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-forge',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: legal }],
@@ -1844,7 +1844,7 @@ describe('relay + real registry branchKeys path', () => {
       { type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: legalLink },
     ];
     // Seed registry trust so isOnActiveBranch stays true while live branch diverges.
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-live-branch',
         getBranch: () => branchEntries,
@@ -1939,7 +1939,7 @@ describe('relay + real registry branchKeys path', () => {
         createdAt: snap.linkCreatedAt,
       };
     });
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-live-branch',
         getBranch: () => branchEntries,
@@ -2114,7 +2114,7 @@ describe('relay + real registry branchKeys path', () => {
         createdAt: snap.linkCreatedAt,
       };
     });
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => hostSessionId,
         getBranch: () => branchEntries,
@@ -2184,7 +2184,7 @@ describe('relay + real registry branchKeys path', () => {
     ];
     hostSessionId = 'other-host-session';
     // Re-seed registry trust under the foreign host so isOnActiveBranch alone is not enough.
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => hostSessionId,
         getBranch: () => branchEntries,
@@ -2197,7 +2197,7 @@ describe('relay + real registry branchKeys path', () => {
     // Force path: keep snap host as original by restoring legal trust first, then switch ctx only.
     hostSessionId = 'host-link-full';
     branchEntries = [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: legalLink }];
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => hostSessionId,
         getBranch: () => branchEntries,
@@ -2236,7 +2236,7 @@ describe('relay + real registry branchKeys path', () => {
     // Legal exact link + matching host context → relay succeeds.
     hostSessionId = 'host-link-full';
     branchEntries = [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: legalLink }];
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => hostSessionId,
         getBranch: () => branchEntries,

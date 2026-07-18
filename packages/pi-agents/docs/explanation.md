@@ -177,6 +177,16 @@ Resolved paths are the absolute `filePath` values reported by the host, so they
 stay valid regardless of the child's working directory (including worktree
 isolation).
 
+If no host snapshot has been applied yet (cache source is unset), resolution
+falls back once through pi's official discovery pipeline:
+`DefaultPackageManager.resolve` (with missing packages skipped) then
+`loadSkills({ includeDefaults: false })`. That path honors settings `skills`
+entries and exclusions (`!` / `+` / `-`), installed packages, default pi skill
+dirs, and Agent Skills locations (`~/.agents/skills` and ancestor
+`.agents/skills`). Host-seeded caches — including an explicit empty list —
+always win over this disk fallback. CLI flags and extension
+`resources_discover` contributions are still host-only.
+
 `skills` takes precedence over `noSkills`: a non-empty list always emits
 `--no-skills` + `--skill`, even when `noSkills: true`. Use `noSkills: true`
 alone to disable all skills; use `skills` to allowlist specific ones.

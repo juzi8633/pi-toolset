@@ -2544,7 +2544,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           }
 
           assertRegistration(reg);
-          const trust = resolveTrusted(exactLink, input.hostSessionId, {
+          const trust = await resolveTrusted(exactLink, input.hostSessionId, {
             allowPlannedMissing: existing.allowPlannedMissingSession,
           });
           if (!trust.ok) {
@@ -3239,11 +3239,11 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     requireArtifactReader?: boolean;
   }
 
-  function resolveTrusted(
+  async function resolveTrusted(
     link: InteractiveAgentLinkV1,
     hostSessionId: string,
     opts: { allowPlannedMissing?: boolean } = {}
-  ): { ok: true; resolved: ResolvedArtifacts } | { ok: false; reason: string } {
+  ): Promise<{ ok: true; resolved: ResolvedArtifacts } | { ok: false; reason: string }> {
     if (link.hostSessionId !== hostSessionId) {
       return { ok: false, reason: 'host_session_mismatch' };
     }
@@ -3347,7 +3347,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
 
     let resolvedSkillPaths: string[] | undefined;
     if (agent.skills && agent.skills.length > 0) {
-      const { resolved, missing } = resolveSkillNames(agent.skills);
+      const { resolved, missing } = await resolveSkillNames(agent.skills, effectiveCwd);
       if (missing.length > 0) return { ok: false, reason: 'skill_resolution_failed' };
       resolvedSkillPaths = resolved;
     }
@@ -3550,9 +3550,9 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     }
   }
 
-  function restoreActiveBranch(
+  async function restoreActiveBranch(
     ctx: Pick<ExtensionContext, 'sessionManager' | 'cwd'>
-  ): InteractiveEndpointSnapshot[] {
+  ): Promise<InteractiveEndpointSnapshot[]> {
     assertNotShutdown();
     const hostSessionId = ctx.sessionManager.getSessionId();
     const branch = ctx.sessionManager.getBranch();
@@ -3574,7 +3574,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       const existing = endpoints.get(key);
       // Always re-validate the current branch link, even when the key already exists
       // (forged/copied link data on the same run:unit must fail closed).
-      const trust = resolveTrusted(link, hostSessionId);
+      const trust = await resolveTrusted(link, hostSessionId);
       if (!trust.ok) {
         // Revoke trust then settle (applyUnavailable) so relay never sees old binding+active.
         restored.push(
@@ -3851,7 +3851,7 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       createdAt: ep.linkCreatedAt,
     };
     // Trust/path/fingerprint checks first (no session read).
-    const trust = resolveTrusted(link, ep.hostSessionId, {
+    const trust = await resolveTrusted(link, ep.hostSessionId, {
       allowPlannedMissing: !!ep.allowPlannedMissingSession,
     });
     if (!trust.ok) {

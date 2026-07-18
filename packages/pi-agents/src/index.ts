@@ -226,7 +226,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      interactiveRegistry.restoreActiveBranch(ctx);
+      await interactiveRegistry.restoreActiveBranch(ctx);
       if (ctx.mode === 'tui') {
         viewController.installWidget();
       }
@@ -238,7 +238,7 @@ export default function (pi: ExtensionAPI) {
   pi.on('session_tree', async (_event, ctx) => {
     latestUiCtx = ctx;
     try {
-      interactiveRegistry.restoreActiveBranch(ctx);
+      await interactiveRegistry.restoreActiveBranch(ctx);
       if (ctx.mode === 'tui') {
         viewController.installWidget();
       } else {

@@ -2281,9 +2281,9 @@ async function runStepWithContext(
       );
     }
   } else if (agent.skills && agent.skills.length > 0) {
-    const { resolved, missing } = resolveSkillNames(agent.skills);
+    const { resolved, missing } = await resolveSkillNames(agent.skills, fallbackCwd);
     if (missing.length > 0) {
-      const available = listAvailableSkillNames();
+      const available = await listAvailableSkillNames(fallbackCwd);
       const MAX_LIST = 20;
       const availableText =
         available.length === 0

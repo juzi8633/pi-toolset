@@ -312,7 +312,7 @@ describe('InteractiveAgentRegistry bindings and registration', () => {
       }),
     });
 
-    const restored = registry.restoreActiveBranch({
+    const restored = await registry.restoreActiveBranch({
       cwd: root,
       sessionManager: {
         getSessionId: () => 'other-host',
@@ -1747,7 +1747,7 @@ describe('InteractiveAgentRegistry reviewer fixes', () => {
     });
 
     // First restore succeeds.
-    let restored = registry.restoreActiveBranch({
+    let restored = await registry.restoreActiveBranch({
       cwd: root,
       sessionManager: {
         getSessionId: () => 'host-tree',
@@ -1758,7 +1758,7 @@ describe('InteractiveAgentRegistry reviewer fixes', () => {
     expect(registry.listVisible()).toHaveLength(1);
 
     // Same key with forged binding must revalidate to unavailable.
-    restored = registry.restoreActiveBranch({
+    restored = await registry.restoreActiveBranch({
       cwd: root,
       sessionManager: {
         getSessionId: () => 'host-tree',
@@ -1775,7 +1775,7 @@ describe('InteractiveAgentRegistry reviewer fixes', () => {
     expect(restored[0]!.lastError).toMatch(/binding/);
 
     // Branch without the link: endpoint must disappear and publish refresh.
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       cwd: root,
       sessionManager: {
         getSessionId: () => 'host-tree',
@@ -3379,7 +3379,7 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
       hostSessionId: 'forged-invalid-host',
       createdAt: Date.now(),
     };
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'forged-invalid-host',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
@@ -5314,7 +5314,7 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
       hostSessionId: 'forged-other-host',
       createdAt: before.linkCreatedAt,
     };
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-rev',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
@@ -5359,7 +5359,7 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
     expect(registry.get(key)?.status).toBe('running');
 
     // Navigate tree away: clear branch membership but leave running endpoint operable.
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-stream',
         getBranch: () => [],
@@ -5503,7 +5503,7 @@ describe('InteractiveAgentRegistry streaming snapshot cost', () => {
         },
       ];
 
-      const restored = registry.restoreActiveBranch({
+      const restored = await registry.restoreActiveBranch({
         cwd: root,
         sessionManager: {
           getSessionId: () => 'host-lazy',
@@ -5799,7 +5799,7 @@ describe('InteractiveAgentRegistry adversarial review fixes', () => {
       hostSessionId: 'forged-other-host',
       createdAt: Date.now(),
     };
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'forged-other-host',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
@@ -6718,7 +6718,7 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
         builtinAgentsDir: '/tmp',
       }),
     });
-    const restored = registry.restoreActiveBranch({
+    const restored = await registry.restoreActiveBranch({
       cwd: root,
       sessionManager: {
         getSessionId: () => 'host-rm',
@@ -8346,7 +8346,7 @@ describe('InteractiveAgentRegistry session lease pre-acquire, canonical key, hyd
         createdAt: 1,
       };
     });
-    const restored = reg.restoreActiveBranch({
+    const restored = await reg.restoreActiveBranch({
       cwd: root,
       sessionManager: {
         getSessionId: () => 'host-detail-barrier',
@@ -8681,7 +8681,7 @@ describe('Grok ACP session resume + Agent View restoration', () => {
       getSessionId: () => 'host-g',
       getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: link }],
     };
-    const restored = registry.restoreActiveBranch({
+    const restored = await registry.restoreActiveBranch({
       sessionManager: fakeSm as never,
       cwd: root,
     });
@@ -8750,7 +8750,7 @@ describe('Grok ACP session resume + Agent View restoration', () => {
       hostSessionId: 'host-g',
       createdAt: 50,
     };
-    const forgedSnap = registry.restoreActiveBranch({
+    const forgedSnap = await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-g',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: forged }],
@@ -8913,7 +8913,7 @@ describe('Grok ACP session resume + Agent View restoration', () => {
       hostSessionId: binding.hostSessionId,
       createdAt: binding.createdAt,
     };
-    registry.restoreActiveBranch({
+    await registry.restoreActiveBranch({
       sessionManager: {
         getSessionId: () => 'host-h',
         getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: link }],
@@ -10075,7 +10075,7 @@ describe('TUI restore reader extension launch paths', () => {
         expect(initial.status).toBe('registered');
       }
 
-      const restored = registry.restoreActiveBranch({
+      const restored = await registry.restoreActiveBranch({
         sessionManager: {
           getSessionId: () => hostSessionId,
           getBranch: () => [{ type: 'custom', customType: INTERACTIVE_LINK_TYPE, data: link }],
