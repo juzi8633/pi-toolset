@@ -4929,6 +4929,11 @@ describe('review-fixes: run-id validation and durability seams', () => {
       rootDir: root,
       ...makeDeps(),
       directoryFsync: true,
+      // Keep ordinary publication durable without host directory fsync (Windows EPERM).
+      // Only the strict post-rename seam is injected to fail.
+      directorySync: () => {
+        /* capability-supported no-op for create/lock paths */
+      },
       strictPostRenameDirectorySync: () => {
         throw {
           code: 'run_store_error',
