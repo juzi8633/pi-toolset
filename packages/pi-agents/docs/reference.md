@@ -393,15 +393,15 @@ TUI-only navigator for Pi and Grok ACP durable units linked to the active main-s
 | Host TUI  | `/agent view`   | Open navigator immediately (no `waitForIdle`)                                                         |
 | Host TUI  | `Ctrl+Alt+Down` | Same as `/agent view`                                                                                 |
 | Navigator | Up/Down         | Move between linked endpoints                                                                         |
-| Navigator | Enter           | Open selected endpoint detail                                                                         |
-| Navigator | Escape          | Close to host editor                                                                                  |
+| Navigator | Enter / Right   | Open selected endpoint detail                                                                         |
+| Navigator | Escape / Left   | Close to host editor                                                                                  |
 | Detail    | Up/Down         | Scroll transcript viewport                                                                            |
 | Detail    | End             | Resume tail-following                                                                                 |
 | Detail    | Enter           | Pi: `prompt` when idle, `steer` when running. Grok ACP: `prompt` when idle; rejected when running     |
 | Detail    | Alt+Enter       | Pi: `follow_up` when running; `prompt` otherwise. Grok ACP: `prompt` when idle; rejected when running |
 | Detail    | Ctrl+X          | Abort/cancel current child turn only (Pi abort RPC or Grok ACP `session/cancel`)                      |
 | Detail    | Ctrl+O          | Toggle last-15-line preview vs complete retained/bounded Agent View transcript                        |
-| Detail    | Escape          | Return to navigator                                                                                   |
+| Detail    | Escape / Left   | Return to navigator (Left only when the prompt is empty; otherwise moves the input cursor)            |
 
 ### Endpoint statuses
 

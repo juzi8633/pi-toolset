@@ -138,7 +138,7 @@ In interactive TUI mode, Pi and Grok ACP units register a branch-scoped link so 
 Ctrl+Alt+Down            # same shortcut
 ```
 
-`/agent view` opens in the input/editor area (non-overlay `ui.custom`, same surface as `/settings`) with a candidate list styled like the prompt autocomplete list. Escape restores the host editor; Enter on an endpoint opens its detail transcript.
+`/agent view` opens in the input/editor area (non-overlay `ui.custom`, same surface as `/settings`) with a candidate list styled like the prompt autocomplete list. Escape or Left restores the host editor; Enter or Right on an endpoint opens its detail transcript.
 
 The below-editor agent list appears only while at least one visible agent is `starting` or `running`, and **lists only those running endpoints** (plus the open hint). Idle, detached, error, and other non-running endpoints are omitted from the chrome and remain reachable from `/agent view`. While the navigator is open, that list (including the open hint) is hidden so it does not duplicate the navigator rows; it is restored after the navigator closes if any agent is still active.
 
@@ -157,7 +157,7 @@ List/widget status glyphs (Agent Nav uses the same mapping for every endpoint):
 | Alt+Enter             | Pi: queue follow-up when running; prompt otherwise. Grok ACP: prompt only when not running      |
 | Ctrl+X                | Abort/cancel only the selected child's current turn                                             |
 | Ctrl+O                | Toggle last-15-line preview vs complete retained/bounded Agent View transcript                  |
-| Escape                | Return to the navigator list                                                                    |
+| Escape / Left         | Return to the navigator list (Left only when the prompt is empty)                               |
 | Up/Down / End         | Scroll transcript / resume tail-follow                                                          |
 
 Detail opens in a **last-15-line** tail preview (fixed height, not terminal-row dependent). Use **Ctrl+O** to expand the complete retained/bounded Agent View transcript (assistant/tool-call presentation plus final output — not raw child tool-result bodies); Ctrl+O again collapses to the last 15 lines and jumps back to the tail. Raw/full native history is available only for reloadable native sessions (Pi `sessionFile` or Grok ACP `session/load`). Grok ACP history hydrates lazily on first detail open via a hydrate-only ACP `session/load` (no model prompt).

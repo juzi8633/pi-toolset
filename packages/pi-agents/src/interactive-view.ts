@@ -329,7 +329,7 @@ export class AgentNavigatorPanel implements Component, Focusable {
     // Top/bottom rules: accent + full-width ─.
     const border = this.opts.theme.fg('accent', '─'.repeat(Math.max(1, width)));
     const header = truncateToWidth(this.opts.theme.fg('accent', 'Agent navigator'), width);
-    const help = truncateToWidth(this.opts.theme.fg('dim', 'Enter open · Esc close'), width);
+    const help = truncateToWidth(this.opts.theme.fg('dim', 'Enter/→ open · ←/Esc close'), width);
     const listLines = this.list
       .render(width)
       .map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width) : l));
@@ -339,6 +339,17 @@ export class AgentNavigatorPanel implements Component, Focusable {
   handleInput(data: string): void {
     if (this.mode === 'detail' && this.detail) {
       this.detail.handleInput(data);
+      return;
+    }
+    // Right: open selected endpoint (same as Enter).
+    if (matchesKey(data, 'right')) {
+      const selected = this.list.getSelectedItem();
+      if (selected) this.handleListSelect(selected);
+      return;
+    }
+    // Left: close navigator (same as Esc).
+    if (matchesKey(data, 'left')) {
+      this.opts.onClose();
       return;
     }
     this.list.handleInput(data);
@@ -671,11 +682,11 @@ export class AgentDetailPanel implements Component, Focusable {
     // Collapsed: hint expand-all; expanded: hint fold back to last-N preview.
     const helpKeys = this.isGrokAcp()
       ? this.contentExpanded
-        ? 'Enter send · Ctrl+X cancel · Ctrl+O collapse · Up/Down · End · Esc back'
-        : 'Enter send · Ctrl+X cancel · Ctrl+O expand all · Up/Down · End · Esc back'
+        ? 'Enter send · Ctrl+X cancel · Ctrl+O collapse · Up/Down · End · ←/Esc back'
+        : 'Enter send · Ctrl+X cancel · Ctrl+O expand all · Up/Down · End · ←/Esc back'
       : this.contentExpanded
-        ? 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O collapse · Up/Down · End · Esc back'
-        : 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O expand all · Up/Down · End · Esc back';
+        ? 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O collapse · Up/Down · End · ←/Esc back'
+        : 'Enter send · Alt+Enter follow-up · Ctrl+X abort · Ctrl+O expand all · Up/Down · End · ←/Esc back';
     const help = truncateToWidth(this.opts.theme.fg('dim', helpKeys), width);
     const inputLines = this.isRunningInputBlocked()
       ? [
@@ -701,6 +712,11 @@ export class AgentDetailPanel implements Component, Focusable {
 
   handleInput(data: string): void {
     if (matchesKey(data, 'escape')) {
+      this.opts.onBack();
+      return;
+    }
+    // Left returns only when the prompt is empty; otherwise move the input cursor.
+    if (matchesKey(data, 'left') && this.input.getValue().length === 0) {
       this.opts.onBack();
       return;
     }

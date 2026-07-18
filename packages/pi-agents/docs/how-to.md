@@ -403,9 +403,9 @@ or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC 
 ### Select and inspect
 
 1. The list shows linked endpoints ordered by link creation time (full list: running, idle, detached, error, …).
-2. Enter on an endpoint opens its detail transcript (last 15 lines by default).
+2. Enter or Right on an endpoint opens its detail transcript (last 15 lines by default).
 3. In detail, Ctrl+O expands the complete retained/bounded Agent View transcript; Ctrl+O again collapses to the last 15 lines at the tail.
-4. Escape returns from detail to the list, or closes the list.
+4. Escape or Left returns from detail to the list, or closes the list. In detail, Left only returns when the prompt is empty; otherwise it moves the input cursor.
 5. Grok ACP history hydrates lazily on first detail open via `session/load` replay (no model prompt). Raw complete native history is available only for reloadable sessions; non-reloadable omitted history is unrecoverable.
 
 The below-editor chrome (when any agent is `starting`/`running`) lists only those running endpoints; open `/agent view` for the full set.

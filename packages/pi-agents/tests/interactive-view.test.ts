@@ -1598,6 +1598,78 @@ describe('interactive-view widget metadata refresh', () => {
     view.clearWidget();
   });
 
+  it('AgentNavigatorPanel right opens detail; left closes list and returns from detail', () => {
+    const LEFT = '\x1b[D';
+    const RIGHT = '\x1b[C';
+    const endpoints = [
+      metaRow({
+        key: 'run:active',
+        unitId: 'active',
+        title: 'worker-active',
+        status: 'running',
+        linkCreatedAt: 1,
+      }),
+    ];
+    const fullSnap = snap({
+      key: 'run:active',
+      linkCreatedAt: 1,
+      status: 'running',
+      agent: 'explore',
+      title: 'worker-active',
+    });
+    let closed = 0;
+    const nav = new AgentNavigatorPanel({
+      tui: { requestRender: () => undefined, terminal: { rows: 24, columns: 80 } } as never,
+      theme: fakeTheme() as never,
+      registry: {
+        listVisibleMeta: () => endpoints,
+        get: (key: string) => (key === 'run:active' ? fullSnap : undefined),
+        subscribe: () => () => undefined,
+      } as never,
+      endpointLabel: (ep) => ep.title || ep.agent,
+      statusText: (ep) => ep.status,
+      onClose: () => {
+        closed += 1;
+      },
+    });
+
+    // Help text advertises arrow navigation (wide enough to keep both glyphs).
+    const listRows = nav.render(100).join('\n');
+    expect(listRows).toContain('Enter/→ open');
+    expect(listRows).toContain('←/Esc close');
+
+    // Right arrow enters detail for the selected endpoint.
+    nav.handleInput(RIGHT);
+    expect((nav as unknown as { mode: string }).mode).toBe('detail');
+    const detailRows = nav.render(160).join('\n');
+    expect(detailRows).toContain('worker-active');
+    expect(detailRows).toContain('←/Esc back');
+
+    // With non-empty prompt, left moves the cursor and stays in detail.
+    nav.handleInput('a');
+    nav.handleInput('b');
+    nav.handleInput(LEFT);
+    expect((nav as unknown as { mode: string }).mode).toBe('detail');
+    const detailInput = (
+      nav as unknown as {
+        detail: { input: { getValue: () => string; setValue: (v: string) => void } };
+      }
+    ).detail.input;
+    expect(detailInput.getValue()).toBe('ab');
+
+    // Clear prompt; left with empty input returns to the list.
+    detailInput.setValue('');
+    nav.handleInput(LEFT);
+    expect((nav as unknown as { mode: string }).mode).toBe('list');
+    expect(closed).toBe(0);
+
+    // Left arrow on the list closes the navigator.
+    nav.handleInput(LEFT);
+    expect(closed).toBe(1);
+
+    nav.dispose();
+  });
+
   it('invalidates transcript cache via explicit stream/messages revisions', () => {
     const base = {
       messagesRevision: 1,
