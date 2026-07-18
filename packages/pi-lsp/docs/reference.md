@@ -146,11 +146,11 @@ counts are zero.
 
 ## Slash commands
 
-| Command            | Action                                                                                                                                                  |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/lsp status`                 | Inspect the current LSP runtime snapshot without starting stopped servers. Manager state, server counts, per-server details.                            |
-| `/lsp diagnostics`            | Inspect every tracked diagnostic (pending + delivered), grouped by file, tagged with severity, position, message, code, source, and originating server. |
-| `/lsp start`                  | Interactive panel to start/stop any configured server for the session. Arrow keys move, space toggles, esc closes. TUI only.                            |
+| Command                         | Action                                                                                                                                                                                |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/lsp status`                   | Inspect the current LSP runtime snapshot without starting stopped servers. Manager state, server counts, per-server details.                                                          |
+| `/lsp diagnostics`              | Inspect every tracked diagnostic (pending + delivered), grouped by file, tagged with severity, position, message, code, source, and originating server.                               |
+| `/lsp start`                    | Interactive panel to start/stop any configured server for the session. Arrow keys move, space toggles, esc closes. TUI only.                                                          |
 | `/lsp config <global\|project>` | Interactive panel listing built-in recipes plus that scope's user servers. Space toggles `enabled` and writes it to the scope's `config.json`. TUI only. Reload the session to apply. |
 
 ## Environment variables

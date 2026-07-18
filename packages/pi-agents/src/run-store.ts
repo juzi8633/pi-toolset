@@ -2050,7 +2050,9 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
   function fsyncPathStrict(filePath: string): void {
     let fd: number | undefined;
     try {
-      fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollowFlag());
+      // Open write-capable: Windows FlushFileBuffers rejects O_RDONLY with EPERM.
+      // O_RDWR is a no-op for content and works for owner-private 0600 files on POSIX.
+      fd = fs.openSync(filePath, fs.constants.O_RDWR | noFollowFlag());
       fileFsyncImpl(fd);
     } finally {
       closeFdQuiet(fd);

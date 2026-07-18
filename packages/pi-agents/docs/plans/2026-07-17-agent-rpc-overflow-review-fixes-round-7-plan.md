@@ -194,13 +194,13 @@
 
 ## Failure Behavior
 
-| Failure | Required behavior |
-| --- | --- |
+| Failure                               | Required behavior                                                       |
+| ------------------------------------- | ----------------------------------------------------------------------- |
 | Post-rename directory sync fails once | Restore prior `run.json`, return failure, no live/event/launch success. |
-| Rollback fails | Bounded durable rollback error; no launch or live success claim. |
-| Post-claim operation fails | Exactly one abandon, zero release. |
-| Same-inode path resolves outside root | `artifact_unavailable`. |
-| Chain/Parallel output spills | Actual content contains required descriptors, never `(no output)`. |
+| Rollback fails                        | Bounded durable rollback error; no launch or live success claim.        |
+| Post-claim operation fails            | Exactly one abandon, zero release.                                      |
+| Same-inode path resolves outside root | `artifact_unavailable`.                                                 |
+| Chain/Parallel output spills          | Actual content contains required descriptors, never `(no output)`.      |
 
 ## Open Questions
 

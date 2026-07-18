@@ -3,9 +3,13 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import {
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fsyncSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -415,5 +419,52 @@ describe('cross-platform claims and events', () => {
       expect(claim.ok).toBe(false);
     }
     expect(readdirSync(root)).toEqual(before);
+  });
+});
+
+describe('post-publish path fsync durability', () => {
+  it('createRun completes when directory fsync is unavailable', async () => {
+    // Regression: fsyncPathStrict must open write-capable handles. On Windows,
+    // O_RDONLY + fsync returns EPERM (FlushFileBuffers), which used to fail every createRun.
+    const store = createRunStore({
+      rootDir: root,
+      directoryFsync: false,
+      ...makeDeps(),
+    });
+    const { runId, record } = await store.createRun(makeCreateInput());
+    expect(runId.startsWith('run-')).toBe(true);
+    expect(record.status).toBe('queued');
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.loaded.record.runId).toBe(runId);
+    expect(knownLeftovers(store.getRunDir(runId))).toEqual([]);
+  });
+
+  it('host fsync requires a write-capable handle when O_RDONLY is rejected', () => {
+    // Documents the platform constraint that fsyncPathStrict must honor.
+    const probe = path.join(root, 'fsync-open-mode-probe.txt');
+    writeFileSync(probe, 'pi-agents-fsync-open-mode-probe\n');
+    const rdonly = openSync(probe, fsConstants.O_RDONLY);
+    let rdonlyFailed = false;
+    try {
+      fsyncSync(rdonly);
+    } catch (err) {
+      rdonlyFailed = true;
+      if (process.platform === 'win32') {
+        expect((err as NodeJS.ErrnoException).code).toBe('EPERM');
+      }
+    } finally {
+      closeSync(rdonly);
+    }
+    const rdwr = openSync(probe, fsConstants.O_RDWR);
+    try {
+      fsyncSync(rdwr);
+    } finally {
+      closeSync(rdwr);
+    }
+    if (process.platform === 'win32') {
+      expect(rdonlyFailed).toBe(true);
+    }
   });
 });
