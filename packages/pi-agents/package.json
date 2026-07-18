@@ -16,7 +16,8 @@
     "agent"
   ],
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./artifact-reader-extension": "./dist/artifact-reader-extension.js"
   },
   "pi": {
     "extensions": [
@@ -46,15 +47,15 @@
     "src/version.ts"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "^0.80.6",
-    "@earendil-works/pi-ai": "^0.80.6",
-    "@earendil-works/pi-coding-agent": "^0.80.6",
-    "@earendil-works/pi-tui": "^0.80.6",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@balaenis/pi-log": "0.0.0",
-    "@earendil-works/pi-agent-core": "^0.80.6"
+    "@earendil-works/pi-agent-core": "0.80.9"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.2.1"

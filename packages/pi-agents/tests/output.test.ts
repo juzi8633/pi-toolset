@@ -13,6 +13,7 @@ import {
   getResultFinalOutput,
   getResultLatestActivity,
   getResultOutput,
+  getResultParentOutput,
   getResultTranscriptAndFinal,
   getTranscriptAndFinal,
   resolveExecutionStatus,
@@ -614,5 +615,75 @@ describe('result-aware presentation helpers', () => {
       transcript: [],
       finalOutput: 'from messages',
     });
+  });
+});
+
+describe('getResultParentOutput', () => {
+  const ref = (sha256: string, bytes = 100): import('../src/run-types.ts').RunArtifactRefV1 => ({
+    kind: 'run-artifact',
+    version: 1,
+    runId: 'r',
+    payload: 'final-output',
+    relativePath: `artifacts/sha256/${sha256.slice(0, 2)}/${sha256}.txt`,
+    sha256,
+    bytes,
+    mediaType: 'text/plain; charset=utf-8',
+  });
+
+  it('returns inline finalOutput text', () => {
+    const r = baseResult({ finalOutput: 'hello' });
+    expect(getResultParentOutput(r)).toBe('hello');
+  });
+
+  it('returns finalOutputRef as a bounded artifact descriptor', () => {
+    const r = baseResult({
+      finalOutput: undefined,
+      finalOutputRef: ref('a'.repeat(64), 9999),
+    });
+    const out = getResultParentOutput(r);
+    expect(out).toContain('run-artifact');
+    expect(out).toContain('bytes=9999');
+    expect(out).not.toBe('(no output)');
+  });
+
+  it('truncates oversized descriptors to the 2 KiB cap', () => {
+    const hugePath = 'artifacts/sha256/aa/' + 'x'.repeat(3000) + '.txt';
+    const oversizedRef: import('../src/run-types.ts').RunArtifactRefV1 = {
+      kind: 'run-artifact',
+      version: 1,
+      runId: 'r',
+      payload: 'final-output',
+      relativePath: hugePath,
+      sha256: 'a'.repeat(64),
+      bytes: 99,
+      mediaType: 'text/plain; charset=utf-8',
+    };
+    const r = baseResult({
+      finalOutput: undefined,
+      finalOutputRef: oversizedRef,
+    });
+    const out = getResultParentOutput(r);
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(2048);
+    expect(out).toContain('payload=final-output');
+  });
+
+  it('returns (no output) when no output authority exists', () => {
+    const r = baseResult({
+      finalOutput: undefined,
+      finalOutputRef: undefined,
+      messages: [],
+      status: 'completed',
+    });
+    expect(getResultParentOutput(r)).toBe('(no output)');
+  });
+
+  it('returns ref-only output without inline content', () => {
+    const r = baseResult({
+      finalOutput: undefined,
+      finalOutputRef: ref('b'.repeat(64), 500),
+    });
+    const out = getResultParentOutput(r);
+    expect(out).not.toContain('secret-content');
+    expect(out).toContain('run-artifact');
   });
 });

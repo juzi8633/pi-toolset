@@ -2,7 +2,6 @@
 // ABOUTME: Correlates typed request/response pairs and fails closed on framing or process errors.
 
 import { spawn } from 'node:child_process';
-import { StringDecoder } from 'node:string_decoder';
 import type { Readable, Writable } from 'node:stream';
 import type {
   RpcCommand,
@@ -11,7 +10,6 @@ import type {
   RpcResponse,
   RpcSessionState,
 } from '@earendil-works/pi-coding-agent';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ImageContent } from '@earendil-works/pi-ai';
 import type { SpawnFn, SpawnedChild } from './execution.ts';
 import {
@@ -19,8 +17,13 @@ import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   JSON_ERROR_PREVIEW_CHARS,
 } from './constants.ts';
+import {
+  createPiRpcRecordProjector,
+  PiRpcProjectorError,
+  type PiRpcProjectedRecord,
+  type PiRpcRecordProjector,
+} from './pi-rpc-record-projector.ts';
 
-const MAX_STDOUT_RECORD_BYTES = 2 * 1024 * 1024;
 const MAX_STDERR_BYTES = 1 * 1024 * 1024;
 const STDERR_TRUNCATION_MARKER = '[stderr truncated]\n';
 
@@ -94,9 +97,9 @@ export class PiRpcTransport {
   private disposing = false;
   private intentionalClose = false;
   private disposePromise: Promise<void> | null = null;
-  private stdoutBuffer = '';
-  private stdoutByteLength = 0;
-  private readonly decoder = new StringDecoder('utf8');
+  private projector: PiRpcRecordProjector = createPiRpcRecordProjector();
+  private stdoutFailed = false;
+  private stdoutFinished = false;
   private readonly options: Required<Pick<PiRpcTransportOptions, 'killTimeoutMs'>> &
     PiRpcTransportOptions;
   private stopStdout: (() => void) | null = null;
@@ -138,6 +141,12 @@ export class PiRpcTransport {
   }
 
   async request(command: RpcCommand): Promise<RpcResponse> {
+    if (command.type === 'get_messages') {
+      throw new PiRpcTransportError(
+        'get_messages_disabled',
+        'get_messages is disabled; hydrate the validated sessionFile instead'
+      );
+    }
     return this.send(command);
   }
 
@@ -164,11 +173,6 @@ export class PiRpcTransport {
   async getState(): Promise<RpcSessionState> {
     const response = await this.send({ type: 'get_state' });
     return this.getData(response) as RpcSessionState;
-  }
-
-  async getMessages(): Promise<AgentMessage[]> {
-    const response = await this.send({ type: 'get_messages' });
-    return (this.getData(response) as { messages: AgentMessage[] }).messages;
   }
 
   /**
@@ -287,19 +291,15 @@ export class PiRpcTransport {
       this.appendStderr(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
     });
 
-    this.stopStdout = attachStdoutReader(child.stdout, {
-      decoder: this.decoder,
-      onLine: (line) => this.handleLine(line),
-      onOverflow: () => {
-        this.failProtocol('stdout_overflow', 'RPC stdout record exceeded 2 MiB');
+    this.stopStdout = attachStdoutProjector(child.stdout, {
+      onRecords: (records) => this.handleProjectedRecords(records),
+      onProtocolError: (code, message) => this.failProtocol(code, message),
+      push: (chunk) => this.projector.push(chunk),
+      finish: () => this.projector.finish(),
+      isFailed: () => this.stdoutFailed,
+      markFailed: () => {
+        this.stdoutFailed = true;
       },
-      getBuffer: () => this.stdoutBuffer,
-      setBuffer: (v, bytes) => {
-        this.stdoutBuffer = v;
-        this.stdoutByteLength = bytes;
-      },
-      getByteLength: () => this.stdoutByteLength,
-      maxBytes: MAX_STDOUT_RECORD_BYTES,
     });
 
     child.once('error', (err: Error) => {
@@ -314,7 +314,7 @@ export class PiRpcTransport {
 
     child.once('close', (code, signal) => {
       if (this.process !== child && this.exitNotified) return;
-      this.flushDecoder();
+      this.flushProjector();
       const error =
         this.exitError ??
         new PiRpcTransportError(
@@ -379,11 +379,29 @@ export class PiRpcTransport {
     }
   }
 
-  private flushDecoder(): void {
-    const rest = this.decoder.end();
-    if (rest) {
-      this.stdoutBuffer += rest;
-      this.stdoutByteLength += Buffer.byteLength(rest, 'utf8');
+  private flushProjector(): void {
+    if (this.stdoutFailed || this.stdoutFinished) return;
+    this.stdoutFinished = true;
+    try {
+      this.handleProjectedRecords(this.projector.finish());
+    } catch (err) {
+      // Intentional dispose/kill may leave an incomplete trailing record; match the
+      // pre-projector close path that did not promote incomplete input to a protocol error.
+      if (this.intentionalClose) {
+        this.stdoutFailed = true;
+        return;
+      }
+      if (err instanceof PiRpcProjectorError) {
+        if (err.priorRecords.length > 0) this.handleProjectedRecords(err.priorRecords);
+        this.stdoutFailed = true;
+        this.failProtocol(err.code, err.message);
+        return;
+      }
+      this.stdoutFailed = true;
+      this.failProtocol(
+        'malformed_json',
+        err instanceof Error ? err.message : 'Malformed RPC stdout'
+      );
     }
   }
 
@@ -397,7 +415,18 @@ export class PiRpcTransport {
     this.stderrBuf = combined.subarray(combined.length - MAX_STDERR_BYTES);
   }
 
-  private handleLine(line: string): void {
+  private handleProjectedRecords(records: PiRpcProjectedRecord[]): void {
+    for (const record of records) {
+      if (this.stdoutFailed || this.exitError) return;
+      if (record.kind === 'projected') {
+        this.deliverEvent(record.event);
+        continue;
+      }
+      this.handleOrdinaryLine(record.line);
+    }
+  }
+
+  private handleOrdinaryLine(line: string): void {
     let data: unknown;
     try {
       data = JSON.parse(line);
@@ -414,6 +443,17 @@ export class PiRpcTransport {
     }
 
     const record = data as Record<string, unknown>;
+
+    // Defensive compact: every valid agent_end is rewritten regardless of key order.
+    if (record.type === 'agent_end') {
+      data = {
+        type: 'agent_end',
+        messages: [],
+        messagesOmitted: true,
+        willRetry: record.willRetry === true,
+      };
+    }
+
     if (record.type === 'response' && typeof record.id === 'string') {
       const pending = this.pending.get(record.id);
       if (pending) {
@@ -428,6 +468,10 @@ export class PiRpcTransport {
       void this.replyUiRequest(record as unknown as RpcExtensionUIRequest);
     }
 
+    this.deliverEvent(data);
+  }
+
+  private deliverEvent(data: unknown): void {
     for (const listener of [...this.listeners]) {
       try {
         listener(data);
@@ -461,6 +505,7 @@ export class PiRpcTransport {
 
   private failProtocol(code: string, message: string): void {
     if (this.exitError) return;
+    this.stdoutFailed = true;
     const error = new PiRpcTransportError(code, message, this.getStderr());
     this.handleProcessFailure(error, { code: null, signal: null });
     // Catch so protocol dispose failures never become unhandled rejections;
@@ -601,62 +646,51 @@ function defaultSpawn(command: string, args: string[], options: object): Spawned
   return spawn(command, args, options) as unknown as SpawnedChild;
 }
 
-interface StdoutReaderState {
-  decoder: StringDecoder;
-  onLine: (line: string) => void;
-  onOverflow: () => void;
-  getBuffer: () => string;
-  setBuffer: (value: string, byteLength: number) => void;
-  getByteLength: () => number;
-  maxBytes: number;
+interface StdoutProjectorState {
+  onRecords: (records: PiRpcProjectedRecord[]) => void;
+  onProtocolError: (code: string, message: string) => void;
+  push: (chunk: Buffer | string) => PiRpcProjectedRecord[];
+  finish: () => PiRpcProjectedRecord[];
+  isFailed: () => boolean;
+  markFailed: () => void;
 }
 
-function attachStdoutReader(stream: Readable, state: StdoutReaderState): () => void {
-  let failed = false;
-
-  const onData = (chunk: Buffer | string) => {
-    if (failed) return;
-    const text = typeof chunk === 'string' ? chunk : state.decoder.write(chunk as Buffer);
-    let buffer = state.getBuffer() + text;
-    let byteLength = state.getByteLength() + Buffer.byteLength(text, 'utf8');
-
-    while (true) {
-      const newlineIndex = buffer.indexOf('\n');
-      if (newlineIndex === -1) break;
-      let line = buffer.slice(0, newlineIndex);
-      // Byte length of the complete record (before CR strip) — must enforce the
-      // 2 MiB limit before JSON.parse; a same-chunk terminated oversized line
-      // must not bypass the incomplete-buffer check below.
-      const lineBytes = Buffer.byteLength(line, 'utf8');
-      buffer = buffer.slice(newlineIndex + 1);
-      byteLength = Buffer.byteLength(buffer, 'utf8');
-      if (line.endsWith('\r')) line = line.slice(0, -1);
-      if (lineBytes > state.maxBytes) {
-        failed = true;
-        state.setBuffer('', 0);
-        state.onOverflow();
-        return;
-      }
-      state.onLine(line);
+function attachStdoutProjector(stream: Readable, state: StdoutProjectorState): () => void {
+  const deliverError = (err: unknown): void => {
+    // Deliver already-validated prior records before marking failed so the
+    // transport delivery path is not short-circuited by stdoutFailed.
+    if (err instanceof PiRpcProjectorError && err.priorRecords.length > 0) {
+      state.onRecords(err.priorRecords);
     }
-
-    if (byteLength > state.maxBytes) {
-      failed = true;
-      state.setBuffer('', 0);
-      state.onOverflow();
+    state.markFailed();
+    if (err instanceof PiRpcProjectorError) {
+      state.onProtocolError(err.code, err.message);
       return;
     }
-    state.setBuffer(buffer, byteLength);
+    state.onProtocolError(
+      'malformed_json',
+      err instanceof Error ? err.message : 'Malformed RPC stdout'
+    );
+  };
+
+  const onData = (chunk: Buffer | string) => {
+    if (state.isFailed()) return;
+    try {
+      const records = state.push(chunk);
+      if (records.length > 0) state.onRecords(records);
+    } catch (err) {
+      deliverError(err);
+    }
   };
 
   const onEnd = () => {
-    if (failed) return;
-    const rest = state.decoder.end();
-    if (!rest && !state.getBuffer()) return;
-    let buffer = state.getBuffer() + rest;
-    if (buffer.endsWith('\r')) buffer = buffer.slice(0, -1);
-    if (buffer.length > 0) state.onLine(buffer);
-    state.setBuffer('', 0);
+    if (state.isFailed()) return;
+    try {
+      const records = state.finish();
+      if (records.length > 0) state.onRecords(records);
+    } catch (err) {
+      deliverError(err);
+    }
   };
 
   stream.on('data', onData);

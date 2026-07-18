@@ -963,7 +963,12 @@ function renderChainExpanded(
         container.addChild(
           new Text(theme.fg('muted', `─── Collect: ${step.collectName} ───`), 0, 0)
         );
-        container.addChild(new Text(theme.fg('dim', details.outputs[step.collectName].text), 0, 0));
+        const collectText =
+          details.outputs[step.collectName].text ??
+          (details.outputs[step.collectName].textRef
+            ? `[artifact ${details.outputs[step.collectName].textRef!.sha256.slice(0, 12)}…]`
+            : '');
+        container.addChild(new Text(theme.fg('dim', collectText), 0, 0));
       }
     }
   }

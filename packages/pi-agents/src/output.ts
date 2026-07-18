@@ -3,6 +3,7 @@
 
 import type { Message } from '@earendil-works/pi-ai';
 import { PER_TASK_OUTPUT_CAP } from './constants.ts';
+import { formatParentArtifactDescriptor } from './result-payload.ts';
 import type { DisplayItem, ExecutionStatus, SingleResult } from './types.ts';
 
 export function formatTokens(count: number): string {
@@ -253,4 +254,24 @@ export function getTranscriptAndFinal(messages: Message[]): {
     }
   }
   return { transcript, finalOutput };
+}
+
+/** Parent artifact descriptor max UTF-8 bytes (2 KiB metadata cap). */
+const PARENT_DESCRIPTOR_MAX_BYTES = 2048;
+
+/**
+ * Ref-aware parent output text for terminal result delivery.
+ * Inline finalOutput text wins; finalOutputRef produces a metadata-only
+ * descriptor capped at 2 KiB; only absent authority produces "(no output)".
+ */
+export function getResultParentOutput(result: SingleResult): string {
+  if (result.finalOutput !== undefined && result.finalOutput !== '') return result.finalOutput;
+  if (result.finalOutputRef) {
+    const descriptor = formatParentArtifactDescriptor(result.finalOutputRef);
+    if (Buffer.byteLength(descriptor, 'utf8') <= PARENT_DESCRIPTOR_MAX_BYTES) return descriptor;
+    return `[run-artifact payload=${result.finalOutputRef.payload} bytes=${result.finalOutputRef.bytes}]`;
+  }
+  const scanned = getResultFinalOutput(result);
+  if (scanned) return scanned;
+  return '(no output)';
 }

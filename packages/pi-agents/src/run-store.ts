@@ -7,6 +7,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
 import { chainFanoutUnitId, chainStepUnitId, generateUnitIds, pad } from './run-coordinator.ts';
+import { createArtifactStore, isRunArtifactRef, type ArtifactStore } from './artifact-store.ts';
 import type {
   AgentRunRecordV1,
   ClaimOwner,
@@ -15,6 +16,8 @@ import type {
   CorruptRunEntry,
   ListRunsResult,
   LoadedRun,
+  RunArtifactPayload,
+  RunArtifactRefV1,
   RunLifecycleEvent,
   RunStoreError,
 } from './run-types.ts';
@@ -70,7 +73,7 @@ function isAllowedDurableCapability(capability: unknown): boolean {
 function validateResultShell(
   result: unknown,
   pathLabel: string,
-  options?: { unitStatus?: string }
+  options?: { unitStatus?: string; runId?: string }
 ): string | undefined {
   if (result === undefined) return undefined;
   if (result === null || typeof result !== 'object' || Array.isArray(result)) {
@@ -115,6 +118,97 @@ function validateResultShell(
         return `${pathLabel}.exitCode must be 0 when status is absent and unit is completed`;
       }
     }
+  }
+  const finalUnion = validateInlineOrRef(
+    r,
+    'finalOutput',
+    'finalOutputRef',
+    pathLabel,
+    options?.runId,
+    'final-output',
+    'text/plain; charset=utf-8',
+    { allowNeither: true }
+  );
+  if (finalUnion) return finalUnion;
+  const structuredUnion = validateInlineOrRef(
+    r,
+    'structuredOutput',
+    'structuredOutputRef',
+    pathLabel,
+    options?.runId,
+    'structured-output',
+    'application/json',
+    { allowNeither: true }
+  );
+  if (structuredUnion) return structuredUnion;
+  return undefined;
+}
+
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function validateArtifactRefField(
+  ref: unknown,
+  pathLabel: string,
+  runId: string | undefined,
+  expectedPayload: RunArtifactPayload,
+  expectedMedia: RunArtifactRefV1['mediaType']
+): string | undefined {
+  if (!isRunArtifactRef(ref)) {
+    return `${pathLabel} must be a Version 1 run-artifact ref`;
+  }
+  if (runId !== undefined && ref.runId !== runId) {
+    return `${pathLabel}.runId does not match owning run`;
+  }
+  if (ref.payload !== expectedPayload) {
+    return `${pathLabel}.payload must be ${expectedPayload}`;
+  }
+  if (ref.mediaType !== expectedMedia) {
+    return `${pathLabel}.mediaType must be ${expectedMedia}`;
+  }
+  if (!/^[a-f0-9]{64}$/.test(ref.sha256)) {
+    return `${pathLabel}.sha256 must be 64 lowercase hex chars`;
+  }
+  const expectedPath = `artifacts/sha256/${ref.sha256.slice(0, 2)}/${ref.sha256}.${expectedMedia === 'application/json' ? 'json' : 'txt'}`;
+  if (ref.relativePath !== expectedPath) {
+    return `${pathLabel}.relativePath does not match digest`;
+  }
+  if (!Number.isInteger(ref.bytes) || ref.bytes < 0) {
+    return `${pathLabel}.bytes must be a non-negative integer`;
+  }
+  return undefined;
+}
+
+function validateInlineOrRef(
+  obj: Record<string, unknown>,
+  inlineKey: string,
+  refKey: string,
+  pathLabel: string,
+  runId: string | undefined,
+  expectedPayload: RunArtifactPayload,
+  expectedMedia: RunArtifactRefV1['mediaType'],
+  options?: { allowNeither?: boolean; requireOne?: boolean }
+): string | undefined {
+  const hasInline = hasOwn(obj, inlineKey);
+  const hasRef = hasOwn(obj, refKey);
+  if (hasInline && hasRef) {
+    return `${pathLabel} must not set both ${inlineKey} and ${refKey}`;
+  }
+  if (!hasInline && !hasRef) {
+    if (options?.requireOne) {
+      return `${pathLabel} must set exactly one of ${inlineKey} or ${refKey}`;
+    }
+    return undefined;
+  }
+  if (hasRef) {
+    return validateArtifactRefField(
+      obj[refKey],
+      `${pathLabel}.${refKey}`,
+      runId,
+      expectedPayload,
+      expectedMedia
+    );
   }
   return undefined;
 }
@@ -193,21 +287,89 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 /** Validate one durable ChainOutputEntry used by resume/restore. */
-function validateChainOutputEntry(entry: unknown, pathLabel: string): string | undefined {
+function validateChainOutputEntry(
+  entry: unknown,
+  pathLabel: string,
+  runId?: string
+): string | undefined {
   if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
     return `${pathLabel} must be a non-null object`;
   }
   const e = entry as Record<string, unknown>;
-  if (typeof e.text !== 'string') {
+  const textUnion = validateInlineOrRef(
+    e,
+    'text',
+    'textRef',
+    pathLabel,
+    runId,
+    'chain-output-text',
+    'text/plain; charset=utf-8',
+    { requireOne: true }
+  );
+  if (textUnion) return textUnion;
+  if (hasOwn(e, 'text') && typeof e.text !== 'string') {
     return `${pathLabel}.text must be a string`;
   }
+  const structuredUnion = validateInlineOrRef(
+    e,
+    'structured',
+    'structuredRef',
+    pathLabel,
+    runId,
+    'chain-output-structured',
+    'application/json',
+    { allowNeither: true }
+  );
+  if (structuredUnion) return structuredUnion;
   if (typeof e.agent !== 'string') {
     return `${pathLabel}.agent must be a string`;
   }
   if (!isPositiveInteger(e.step)) {
     return `${pathLabel}.step must be a positive integer`;
   }
-  // structured is optional unknown; any JSON value including null is accepted when present.
+  return undefined;
+}
+
+function validateWorkflowFanoutState(
+  fanout: unknown,
+  pathLabel: string,
+  runId: string
+): string | undefined {
+  if (fanout === null || typeof fanout !== 'object' || Array.isArray(fanout)) {
+    return `${pathLabel} must be a non-null object`;
+  }
+  const f = fanout as Record<string, unknown>;
+  if (!isPositiveInteger(f.step)) {
+    return `${pathLabel}.step must be a positive integer`;
+  }
+  if (!Array.isArray(f.unitIds)) {
+    return `${pathLabel}.unitIds must be an array`;
+  }
+  for (let i = 0; i < f.unitIds.length; i++) {
+    if (typeof f.unitIds[i] !== 'string') {
+      return `${pathLabel}.unitIds[${i}] must be a string`;
+    }
+  }
+  const hasItems = hasOwn(f, 'items');
+  const hasItemsRef = hasOwn(f, 'itemsRef');
+  if (hasItems === hasItemsRef) {
+    return `${pathLabel} must set exactly one of items or itemsRef`;
+  }
+  if (hasItems) {
+    if (!Array.isArray(f.items)) return `${pathLabel}.items must be an array`;
+    if (f.items.length !== f.unitIds.length) {
+      return `${pathLabel}.items length must match unitIds`;
+    }
+  } else {
+    const refError = validateArtifactRefField(
+      f.itemsRef,
+      `${pathLabel}.itemsRef`,
+      runId,
+      'fanout-items',
+      'application/json'
+    );
+    if (refError) return refError;
+  }
   return undefined;
 }
 
@@ -297,7 +459,7 @@ function chainRequestStepAgent(chain: unknown[], step: number): string | undefin
  */
 function validateSubagentDetails(
   details: unknown,
-  options?: { mode?: string; request?: Record<string, unknown> }
+  options?: { mode?: string; request?: Record<string, unknown>; runId?: string }
 ): string | undefined {
   if (details === null || typeof details !== 'object' || Array.isArray(details)) {
     return 'invalid details';
@@ -310,7 +472,7 @@ function validateSubagentDetails(
   for (let i = 0; i < d.results.length; i++) {
     const result = d.results[i];
     const pathLabel = `details.results[${i}]`;
-    const shellError = validateResultShell(result, pathLabel);
+    const shellError = validateResultShell(result, pathLabel, { runId: options?.runId });
     if (shellError) return shellError;
     if (!result || typeof result !== 'object') continue;
     const resumeCapability = (result as { resumeCapability?: unknown }).resumeCapability;
@@ -329,7 +491,11 @@ function validateSubagentDetails(
       return 'details.outputs must be a non-null object';
     }
     for (const [name, entry] of Object.entries(d.outputs as Record<string, unknown>)) {
-      const entryError = validateChainOutputEntry(entry, `details.outputs[${name}]`);
+      const entryError = validateChainOutputEntry(
+        entry,
+        `details.outputs[${name}]`,
+        options?.runId
+      );
       if (entryError) return entryError;
     }
   }
@@ -467,6 +633,40 @@ function fsyncDir(dirPath: string): void {
   }
 }
 
+function fsyncFdStrict(fd: number): void {
+  try {
+    fs.fsyncSync(fd);
+  } catch (err) {
+    throw {
+      code: 'run_store_error',
+      message: `fsync failed: ${err instanceof Error ? err.message : String(err)}`,
+    } satisfies RunStoreError;
+  }
+}
+
+function fsyncDirStrict(dirPath: string): void {
+  if (!POSIX) return;
+  let dirFd: number | undefined;
+  try {
+    dirFd = fs.openSync(dirPath, 'r');
+    fsyncFdStrict(dirFd);
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err) throw err;
+    throw {
+      code: 'run_store_error',
+      message: `directory fsync failed: ${err instanceof Error ? err.message : String(err)}`,
+    } satisfies RunStoreError;
+  } finally {
+    if (dirFd !== undefined) {
+      try {
+        fs.closeSync(dirFd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 function isUnitIdValid(id: string): boolean {
   return /^[a-z0-9-]+$/.test(id);
 }
@@ -482,12 +682,55 @@ interface RunQueue {
   tail: Promise<unknown>;
 }
 
+/** Durable crash windows for strict run.json transactions (test injection). */
+export type StrictRunTxPhase =
+  | 'after_rollback_publication'
+  | 'after_prepared_marker'
+  | 'after_new_rename'
+  | 'after_new_directory_sync'
+  | 'after_committed_marker'
+  | 'during_cleanup'
+  | 'during_rollback_restore'
+  | 'after_cleanup_marker_unlink'
+  | 'after_cleanup_rollback_unlink'
+  | 'after_cleanup_first_dir_sync'
+  | 'after_cleanup_second_dir_sync';
+
+/**
+ * Test-only crash: throw from a strict transaction hook with this flag to leave
+ * on-disk state exactly as-is (no catch/finally restore or cleanup).
+ */
+export const STRICT_TX_BYPASS_CLEANUP = Symbol.for('pi-agents.strictTxBypassCleanup');
+
 export interface CreateRunStoreOptions {
   rootDir?: string;
   now?: () => number;
   randomUUID?: () => string;
   pid?: number;
   instanceId?: string;
+  /**
+   * Test seam: post-rename directory sync for strict run.json publication only.
+   * Defaults to the real strict directory fsync. Rollback prep/restore always
+   * uses the real fsync so one-shot publication faults can be verified.
+   */
+  strictPostRenameDirectorySync?: (dirPath: string) => void;
+  /**
+   * Test seam: called after each durable phase of a strict run.json transaction.
+   * Throwing before committed-marker durability restores prior authority unless
+   * the error carries STRICT_TX_BYPASS_CLEANUP (process-crash simulation).
+   * Throwing during cleanup without bypass leaves recoverable leftovers and
+   * still reports success; with bypass, cleanup stops immediately.
+   */
+  strictTransactionHook?: (phase: StrictRunTxPhase) => void;
+  /**
+   * Test seam: committed-marker directory sync only (after marker rename).
+   * Defaults to the real strict directory fsync.
+   */
+  strictCommittedMarkerDirectorySync?: (dirPath: string) => void;
+  /** Max wait for a live transaction lock before run_busy (default 2000ms). */
+  txLockWaitMs?: number;
+  /** Retry interval while waiting for a transaction lock (default 25ms). */
+  txLockRetryMs?: number;
 }
 
 export interface CreateRunInput {
@@ -516,6 +759,26 @@ export interface RunStore {
   getRun(runId: string): { ok: true; loaded: LoadedRun } | { ok: false; error: RunStoreError };
   updateRun(runId: string, mutate: (record: AgentRunRecordV1) => void): Promise<AgentRunRecordV1>;
   appendEvent(runId: string, event: RunLifecycleEvent): Promise<void>;
+  /** Strict update that propagates supported file/directory sync failures. */
+  updateRunStrict(
+    runId: string,
+    mutate: (record: AgentRunRecordV1) => void
+  ): Promise<AgentRunRecordV1>;
+  /** Strict event append that propagates supported file/directory sync failures. */
+  appendEventStrict(runId: string, event: RunLifecycleEvent): Promise<void>;
+  writeTextArtifact(
+    runId: string,
+    payload: RunArtifactPayload,
+    text: string
+  ): Promise<RunArtifactRefV1>;
+  writeJsonArtifact(
+    runId: string,
+    payload: RunArtifactPayload,
+    value: unknown
+  ): Promise<RunArtifactRefV1>;
+  readTextArtifact(runId: string, ref: RunArtifactRefV1): Promise<string>;
+  readJsonArtifact(runId: string, ref: RunArtifactRefV1): Promise<unknown>;
+  resolveArtifactPath(runId: string, ref: RunArtifactRefV1): Promise<string>;
   listRuns(): Promise<ListRunsResult>;
   claimRun(runId: string): Promise<ClaimResult>;
   releaseRun(runId: string, claimId: string): Promise<void>;
@@ -537,12 +800,3153 @@ export interface RunStore {
   isPidAlive(pid: number): boolean;
 }
 
+/** Hard upper bound for synchronous lock waits (milliseconds). */
+const TX_LOCK_WAIT_MS_MAX = 60_000;
+const TX_LOCK_WAIT_MS_DEFAULT = 2_000;
+const TX_LOCK_RETRY_MS_DEFAULT = 25;
+
+function normalizeTxLockTiming(
+  waitMs: number | undefined,
+  retryMs: number | undefined
+): { txLockWaitMs: number; txLockRetryMs: number } {
+  const waitRaw = waitMs === undefined ? TX_LOCK_WAIT_MS_DEFAULT : waitMs;
+  const retryRaw = retryMs === undefined ? TX_LOCK_RETRY_MS_DEFAULT : retryMs;
+  if (
+    typeof waitRaw !== 'number' ||
+    !Number.isFinite(waitRaw) ||
+    !Number.isInteger(waitRaw) ||
+    waitRaw <= 0 ||
+    waitRaw > TX_LOCK_WAIT_MS_MAX
+  ) {
+    throw {
+      code: 'run_store_error',
+      message: `txLockWaitMs must be a finite integer in 1..${TX_LOCK_WAIT_MS_MAX}`,
+    } satisfies RunStoreError;
+  }
+  if (
+    typeof retryRaw !== 'number' ||
+    !Number.isFinite(retryRaw) ||
+    !Number.isInteger(retryRaw) ||
+    retryRaw <= 0 ||
+    retryRaw > waitRaw
+  ) {
+    throw {
+      code: 'run_store_error',
+      message: 'txLockRetryMs must be a positive finite integer <= txLockWaitMs',
+    } satisfies RunStoreError;
+  }
+  return { txLockWaitMs: waitRaw, txLockRetryMs: retryRaw };
+}
+
 export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
   const rootDir = options.rootDir ?? getDefaultRunsRoot();
   const now = options.now ?? (() => Date.now());
   const randomUUID = options.randomUUID ?? crypto.randomUUID;
   const pid = options.pid ?? process.pid;
   const instanceId = options.instanceId ?? `${process.ppid ?? 0}-${Date.now()}-${randomUUID()}`;
+  const strictPostRenameDirectorySync = options.strictPostRenameDirectorySync ?? fsyncDirStrict;
+  const strictCommittedMarkerDirectorySync =
+    options.strictCommittedMarkerDirectorySync ?? fsyncDirStrict;
+  const strictTransactionHook = options.strictTransactionHook;
+  const { txLockWaitMs, txLockRetryMs } = normalizeTxLockTiming(
+    options.txLockWaitMs,
+    options.txLockRetryMs
+  );
+  const artifacts: ArtifactStore = createArtifactStore();
+
+  /** Deterministic private transaction filenames (never public refs). */
+  const TX_ROLLBACK_NAME = '.run.json.tx.rollback';
+  const TX_MARKER_NAME = '.run.json.tx.marker';
+  const TX_LOCK_DIR_NAME = '.run.json.tx.lock';
+  const TX_LOCK_OWNER_NAME = 'owner.json';
+  const TX_MARKER_VERSION = 1 as const;
+  const TX_LOCK_VERSION = 1 as const;
+
+  type TxPhase = 'prepared' | 'committed';
+  interface TxMarker {
+    version: typeof TX_MARKER_VERSION;
+    phase: TxPhase;
+    oldSha256: string;
+    oldBytes: number;
+    newSha256: string;
+    newBytes: number;
+  }
+
+  interface TxLockOwner {
+    version: typeof TX_LOCK_VERSION;
+    pid: number;
+    processStart: string;
+    token: string;
+    timestamp: number;
+  }
+
+  interface FileIdentity {
+    dev: number;
+    ino: number;
+  }
+
+  interface RunDirSession {
+    publicDir: string;
+    dirFd: number;
+    identity: FileIdentity;
+    uid: number;
+    mode: number;
+  }
+
+  interface HeldTxLock {
+    runId: string;
+    dir: string;
+    lockDir: string;
+    token: string;
+    session: RunDirSession;
+    lockIdentity: FileIdentity;
+  }
+
+  function isBypassCleanupError(err: unknown): boolean {
+    return (
+      !!err &&
+      typeof err === 'object' &&
+      (err as { [STRICT_TX_BYPASS_CLEANUP]?: unknown })[STRICT_TX_BYPASS_CLEANUP] === true
+    );
+  }
+
+  function fireStrictTxHook(phase: StrictRunTxPhase): void {
+    if (strictTransactionHook) strictTransactionHook(phase);
+  }
+
+  function sha256Hex(buf: Buffer): string {
+    return crypto.createHash('sha256').update(buf).digest('hex');
+  }
+
+  function noFollowFlag(): number {
+    if (typeof fs.constants.O_NOFOLLOW !== 'number') {
+      throw {
+        code: 'run_store_error',
+        message: 'O_NOFOLLOW is required for private transaction files',
+      } satisfies RunStoreError;
+    }
+    return fs.constants.O_NOFOLLOW;
+  }
+
+  function processStartIdentity(targetPid: number): string | undefined {
+    if (process.platform !== 'linux') return undefined;
+    try {
+      const stat = fs.readFileSync(`/proc/${targetPid}/stat`, 'utf8');
+      const closeParen = stat.lastIndexOf(')');
+      if (closeParen < 0) return undefined;
+      const after = stat.slice(closeParen + 2).split(' ');
+      // Field 22 (1-based) is starttime; after comm fields start at index 0 = state (field 3).
+      const starttime = after[19];
+      if (!starttime || !/^\d+$/.test(starttime)) return undefined;
+      return starttime;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function selfProcessStart(): string {
+    const start = processStartIdentity(process.pid);
+    if (start !== undefined) return start;
+    // Fail closed on unsupported platforms: identity cannot prove staleness.
+    return `unsupported-${process.platform}-${process.pid}`;
+  }
+
+  const selfStartIdentity = selfProcessStart();
+
+  function txPaths(dir: string): { rollback: string; marker: string; lockDir: string } {
+    return {
+      rollback: path.join(dir, TX_ROLLBACK_NAME),
+      marker: path.join(dir, TX_MARKER_NAME),
+      lockDir: path.join(dir, TX_LOCK_DIR_NAME),
+    };
+  }
+
+  function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
+    return a.dev === b.dev && a.ino === b.ino;
+  }
+
+  function identityOf(st: fs.Stats): FileIdentity {
+    return { dev: st.dev, ino: st.ino };
+  }
+
+  function directoryFlag(): number {
+    if (typeof fs.constants.O_DIRECTORY !== 'number') {
+      throw {
+        code: 'run_store_error',
+        message: 'O_DIRECTORY is required for run-directory transactions',
+      } satisfies RunStoreError;
+    }
+    return fs.constants.O_DIRECTORY;
+  }
+
+  function procFdBase(dirFd: number): string {
+    return `/proc/self/fd/${dirFd}`;
+  }
+
+  function childViaDirFd(dirFd: number, name: string): string {
+    // Entries are fixed private basenames; never join untrusted components.
+    if (!name || name.includes('/') || name.includes('\\') || name.includes('\0')) {
+      throw {
+        code: 'run_store_error',
+        message: 'invalid transaction entry name',
+      } satisfies RunStoreError;
+    }
+    return path.join(procFdBase(dirFd), name);
+  }
+
+  function closeFdQuiet(fd: number | undefined): void {
+    if (fd === undefined) return;
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * Open absolute path component-by-component from `/` with O_DIRECTORY|O_NOFOLLOW.
+   * Rejects any symlink or intermediate replacement so the final fd cannot be redirected.
+   */
+  function openPathComponentNoFollow(
+    absolutePath: string,
+    runId?: string
+  ): { dirFd: number; identity: FileIdentity; uid: number; mode: number } {
+    if (!POSIX) {
+      throw {
+        code: 'run_store_error',
+        runId,
+        message: 'directory-fd transactions require a POSIX /proc platform',
+      } satisfies RunStoreError;
+    }
+    const resolved = path.resolve(absolutePath);
+    if (!path.isAbsolute(resolved) || resolved.includes('\0')) {
+      throw {
+        code: 'run_store_error',
+        runId,
+        message: 'run path must be an absolute non-null path',
+      } satisfies RunStoreError;
+    }
+    const parts = resolved.split(path.sep).filter((p) => p.length > 0);
+    let parentFd: number | undefined;
+    try {
+      parentFd = fs.openSync('/', fs.constants.O_RDONLY | directoryFlag() | noFollowFlag());
+      let parentSt = fs.fstatSync(parentFd);
+      if (!parentSt.isDirectory()) {
+        throw {
+          code: 'run_store_error',
+          runId,
+          message: 'root path is not a directory',
+        } satisfies RunStoreError;
+      }
+      for (const part of parts) {
+        if (part === '.' || part === '..' || part.includes('\0')) {
+          throw {
+            code: 'corrupt_run',
+            runId,
+            message: 'run path contains unsafe components',
+          } satisfies RunStoreError;
+        }
+        // Public path component must not be a symlink before open.
+        const publicParent = parentFd === undefined ? '/' : undefined;
+        void publicParent;
+        const childViaProc = path.join(procFdBase(parentFd), part);
+        let nextFd: number | undefined;
+        try {
+          // lstat through proc-fd path (no-follow) before opening.
+          let linkCheck: fs.Stats;
+          try {
+            linkCheck = fs.lstatSync(childViaProc);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT') {
+              throw {
+                code: 'run_not_found',
+                runId,
+                message: 'run directory path component missing',
+              } satisfies RunStoreError;
+            }
+            throw {
+              code: 'run_store_error',
+              runId,
+              message: `run path component lstat failed: ${messageOf(err)}`,
+            } satisfies RunStoreError;
+          }
+          if (linkCheck.isSymbolicLink()) {
+            throw {
+              code: 'corrupt_run',
+              runId,
+              message: 'run path component is a symlink',
+            } satisfies RunStoreError;
+          }
+          if (!linkCheck.isDirectory()) {
+            throw {
+              code: 'corrupt_run',
+              runId,
+              message: 'run path component is not a directory',
+            } satisfies RunStoreError;
+          }
+          nextFd = fs.openSync(
+            childViaProc,
+            fs.constants.O_RDONLY | directoryFlag() | noFollowFlag()
+          );
+          const nextSt = fs.fstatSync(nextFd);
+          if (!nextSt.isDirectory()) {
+            throw {
+              code: 'corrupt_run',
+              runId,
+              message: 'opened run path component is not a directory',
+            } satisfies RunStoreError;
+          }
+          if (!sameIdentity(identityOf(linkCheck), identityOf(nextSt))) {
+            throw {
+              code: 'corrupt_run',
+              runId,
+              message: 'run path component replaced during open',
+            } satisfies RunStoreError;
+          }
+          // Close previous parent; retain the newly opened component.
+          closeFdQuiet(parentFd);
+          parentFd = nextFd;
+          nextFd = undefined;
+          parentSt = nextSt;
+        } catch (err) {
+          closeFdQuiet(nextFd);
+          throw err;
+        }
+      }
+      const st = parentSt;
+      const procPath = procFdBase(parentFd);
+      let procStat: fs.Stats;
+      try {
+        procStat = fs.statSync(procPath);
+      } catch (err) {
+        throw {
+          code: 'run_store_error',
+          runId,
+          message: `proc-fd resolution unavailable: ${messageOf(err)}`,
+        } satisfies RunStoreError;
+      }
+      if (!sameIdentity(identityOf(st), identityOf(procStat))) {
+        throw {
+          code: 'run_store_error',
+          runId,
+          message: 'proc-fd path does not resolve to opened directory inode',
+        } satisfies RunStoreError;
+      }
+      const result = {
+        dirFd: parentFd,
+        identity: identityOf(st),
+        uid: st.uid,
+        mode: st.mode,
+      };
+      parentFd = undefined; // ownership transferred
+      return result;
+    } catch (err) {
+      closeFdQuiet(parentFd);
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+      throw {
+        code: 'run_store_error',
+        runId,
+        message: `open path components failed: ${messageOf(err)}`,
+      } satisfies RunStoreError;
+    }
+  }
+
+  function openRunDirSession(publicDir: string, runId?: string): RunDirSession {
+    if (!POSIX) {
+      throw {
+        code: 'run_store_error',
+        runId,
+        message: 'directory-fd transactions require a POSIX /proc platform',
+      } satisfies RunStoreError;
+    }
+    let dirFd: number | undefined;
+    try {
+      const opened = openPathComponentNoFollow(publicDir, runId);
+      dirFd = opened.dirFd;
+      const stMode = opened.mode;
+      if ((stMode & 0o777) !== DIR_MODE) {
+        throw {
+          code: 'corrupt_run',
+          runId,
+          message: `run directory mode is not private 0o${DIR_MODE.toString(8)}`,
+        } satisfies RunStoreError;
+      }
+      if (typeof process.getuid === 'function') {
+        const uid = process.getuid();
+        if (opened.uid !== uid) {
+          throw {
+            code: 'corrupt_run',
+            runId,
+            message: 'run directory ownership does not match process uid',
+          } satisfies RunStoreError;
+        }
+      }
+      // Revalidate public path component chain still names the same inode.
+      revalidatePublicRunDir(publicDir, opened.identity, runId);
+      const session: RunDirSession = {
+        publicDir,
+        dirFd,
+        identity: opened.identity,
+        uid: opened.uid,
+        mode: opened.mode,
+      };
+      dirFd = undefined;
+      return session;
+    } catch (err) {
+      closeFdQuiet(dirFd);
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+      throw {
+        code: 'run_store_error',
+        runId,
+        message: `open run directory failed: ${messageOf(err)}`,
+      } satisfies RunStoreError;
+    }
+  }
+
+  function revalidatePublicRunDir(publicDir: string, expected: FileIdentity, runId?: string): void {
+    try {
+      // Re-walk components without following; final inode must match.
+      const reopened = openPathComponentNoFollow(publicDir, runId);
+      try {
+        if (!sameIdentity(expected, reopened.identity)) {
+          throw {
+            code: 'corrupt_run',
+            runId,
+            message: 'run directory was replaced during the transaction',
+          } satisfies RunStoreError;
+        }
+      } finally {
+        closeFdQuiet(reopened.dirFd);
+      }
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+      throw {
+        code: 'durable_write_error',
+        runId,
+        message: `run directory revalidation failed: ${messageOf(err)}`,
+      } satisfies RunStoreError;
+    }
+  }
+
+  function closeRunDirSession(session: RunDirSession): void {
+    closeFdQuiet(session.dirFd);
+  }
+
+  function fsyncDirFdStrict(dirFd: number): void {
+    fsyncFdStrict(dirFd);
+  }
+
+  function pathEntryKind(
+    filePath: string
+  ): 'absent' | 'regular' | 'symlink' | 'directory' | 'other' {
+    try {
+      const st = fs.lstatSync(filePath);
+      if (st.isSymbolicLink()) return 'symlink';
+      if (st.isFile()) return 'regular';
+      if (st.isDirectory()) return 'directory';
+      return 'other';
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return 'absent';
+      return 'other';
+    }
+  }
+
+  function validatePrivateEntryStats(
+    st: fs.Stats,
+    kind: 'file' | 'directory'
+  ): { ok: true } | { ok: false; reason: string } {
+    if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
+    if (kind === 'file') {
+      if (!st.isFile()) return { ok: false, reason: 'not a regular file' };
+      if (POSIX && (st.mode & 0o777) !== FILE_MODE) {
+        return { ok: false, reason: 'wrong mode' };
+      }
+    } else {
+      if (!st.isDirectory()) return { ok: false, reason: 'not a directory' };
+      if (POSIX && (st.mode & 0o777) !== DIR_MODE) {
+        return { ok: false, reason: 'wrong mode' };
+      }
+    }
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+      return { ok: false, reason: 'wrong uid' };
+    }
+    return { ok: true };
+  }
+
+  /** Validate a private regular file under runDir (lstat only; never follows). */
+  function validatePrivateRegularTxFile(
+    filePath: string,
+    runDir: string,
+    expectedBase: string
+  ): { ok: true } | { ok: false; reason: string } {
+    if (path.basename(filePath) !== expectedBase) {
+      return { ok: false, reason: 'unexpected basename' };
+    }
+    if (path.dirname(filePath) !== runDir) {
+      return { ok: false, reason: 'path escapes run directory' };
+    }
+    try {
+      const st = fs.lstatSync(filePath);
+      return validatePrivateEntryStats(st, 'file');
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return { ok: false, reason: 'absent' };
+      return { ok: false, reason: messageOf(err) };
+    }
+  }
+
+  interface VerifiedPrivateFile {
+    path: string;
+    expectedBase: string;
+    identity: FileIdentity;
+    digest: string;
+    bytes: number;
+    data: Buffer;
+    uid: number;
+    mode: number;
+    phase?: TxPhase;
+  }
+
+  /**
+   * Open a private transaction file with O_NOFOLLOW, verify lstat/fstat inode,
+   * uid/mode/type, and return identity + content digest + exact fd-read bytes.
+   */
+  function openVerifiedPrivateFile(
+    filePath: string,
+    runDir: string,
+    expectedBase: string,
+    opts?: { skipPathBound?: boolean; parseMarkerPhase?: boolean }
+  ): VerifiedPrivateFile {
+    if (path.basename(filePath) !== expectedBase) {
+      throw {
+        code: 'corrupt_run',
+        message: 'private transaction file unsafe: unexpected basename',
+      } satisfies RunStoreError;
+    }
+    if (!opts?.skipPathBound) {
+      const validated = validatePrivateRegularTxFile(filePath, runDir, expectedBase);
+      if (!validated.ok) {
+        throw {
+          code: 'corrupt_run',
+          message: `private transaction file unsafe: ${validated.reason}`,
+        } satisfies RunStoreError;
+      }
+    }
+    let fd: number | undefined;
+    try {
+      const before = fs.lstatSync(filePath);
+      const beforeV = validatePrivateEntryStats(before, 'file');
+      if (!beforeV.ok) {
+        throw {
+          code: 'corrupt_run',
+          message: `private transaction file unsafe: ${beforeV.reason}`,
+        } satisfies RunStoreError;
+      }
+      fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollowFlag());
+      const after = fs.fstatSync(fd);
+      if (!sameIdentity(identityOf(before), identityOf(after)) || !after.isFile()) {
+        throw {
+          code: 'corrupt_run',
+          message: 'private transaction file replaced during open',
+        } satisfies RunStoreError;
+      }
+      const modeCheck = validatePrivateEntryStats(after, 'file');
+      if (!modeCheck.ok) {
+        throw {
+          code: 'corrupt_run',
+          message: `private transaction file unsafe: ${modeCheck.reason}`,
+        } satisfies RunStoreError;
+      }
+      const data = fs.readFileSync(fd);
+      // Post-read fstat on the same fd must still match.
+      const postFd = fs.fstatSync(fd);
+      if (!sameIdentity(identityOf(after), identityOf(postFd)) || !postFd.isFile()) {
+        throw {
+          code: 'corrupt_run',
+          message: 'private transaction file replaced after read',
+        } satisfies RunStoreError;
+      }
+      let phase: TxPhase | undefined;
+      if (opts?.parseMarkerPhase) {
+        try {
+          const parsed = parseTxMarker(JSON.parse(data.toString('utf8')));
+          if (parsed) phase = parsed.phase;
+        } catch {
+          /* leave phase undefined */
+        }
+      }
+      return {
+        path: filePath,
+        expectedBase,
+        identity: identityOf(after),
+        digest: sha256Hex(data),
+        bytes: data.byteLength,
+        data,
+        uid: after.uid,
+        mode: after.mode,
+        phase,
+      };
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+      throw {
+        code: 'corrupt_run',
+        message: `private transaction file unsafe: ${messageOf(err)}`,
+      } satisfies RunStoreError;
+    } finally {
+      closeFdQuiet(fd);
+    }
+  }
+
+  /**
+   * Unlink only the exact verified inode/digest/uid/mode generation; preserve evidence
+   * on replacement. Never treats a newly valid file at the same path as authority.
+   */
+  function unlinkVerifiedPrivateFile(verified: VerifiedPrivateFile): void {
+    try {
+      const st = fs.lstatSync(verified.path);
+      if (!st.isFile() || st.isSymbolicLink()) {
+        throw {
+          code: 'corrupt_run',
+          message: 'refusing to unlink non-file after validation',
+        } satisfies RunStoreError;
+      }
+      if (!sameIdentity(verified.identity, identityOf(st))) {
+        throw {
+          code: 'generation_mismatch',
+          message: 'entry identity changed before unlink',
+        } satisfies RunStoreError;
+      }
+      if (st.uid !== verified.uid || (st.mode & 0o777) !== (verified.mode & 0o777)) {
+        throw {
+          code: 'corrupt_run',
+          message: 'entry uid/mode changed before unlink',
+        } satisfies RunStoreError;
+      }
+      // Re-open no-follow to confirm digest still matches before unlink.
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(verified.path, fs.constants.O_RDONLY | noFollowFlag());
+        const after = fs.fstatSync(fd);
+        if (!sameIdentity(verified.identity, identityOf(after))) {
+          throw {
+            code: 'corrupt_run',
+            message: 'entry identity changed before unlink open',
+          } satisfies RunStoreError;
+        }
+        const data = fs.readFileSync(fd);
+        if (sha256Hex(data) !== verified.digest || data.byteLength !== verified.bytes) {
+          throw {
+            code: 'corrupt_run',
+            message: 'entry content digest changed before unlink',
+          } satisfies RunStoreError;
+        }
+        if (verified.phase !== undefined) {
+          try {
+            const parsed = parseTxMarker(JSON.parse(data.toString('utf8')));
+            if (!parsed || parsed.phase !== verified.phase) {
+              throw {
+                code: 'corrupt_run',
+                message: 'entry phase changed before unlink',
+              } satisfies RunStoreError;
+            }
+          } catch (phaseErr) {
+            if (
+              phaseErr &&
+              typeof phaseErr === 'object' &&
+              'code' in phaseErr &&
+              'message' in phaseErr
+            ) {
+              throw phaseErr;
+            }
+            throw {
+              code: 'corrupt_run',
+              message: 'entry phase unreadable before unlink',
+            } satisfies RunStoreError;
+          }
+        }
+      } finally {
+        closeFdQuiet(fd);
+      }
+      fs.unlinkSync(verified.path);
+      // Confirm absence; replacement at path means identity race — preserve evidence.
+      if (pathEntryKind(verified.path) !== 'absent') {
+        const post = fs.lstatSync(verified.path);
+        if (sameIdentity(verified.identity, identityOf(post))) {
+          throw {
+            code: 'corrupt_run',
+            message: 'entry still present after unlink',
+          } satisfies RunStoreError;
+        }
+        throw {
+          code: 'corrupt_run',
+          message: 'entry replaced after unlink; evidence preserved',
+        } satisfies RunStoreError;
+      }
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+      throw {
+        code: 'corrupt_run',
+        message: `verified unlink failed: ${messageOf(err)}`,
+      } satisfies RunStoreError;
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  function unlinkIfIdentity(
+    filePath: string,
+    expected: FileIdentity,
+    kind: 'file' | 'directory'
+  ): void {
+    const st = fs.lstatSync(filePath);
+    if (kind === 'file') {
+      if (!st.isFile() || st.isSymbolicLink()) {
+        throw {
+          code: 'corrupt_run',
+          message: 'refusing to unlink non-file after validation',
+        } satisfies RunStoreError;
+      }
+    } else if (!st.isDirectory() || st.isSymbolicLink()) {
+      throw {
+        code: 'corrupt_run',
+        message: 'refusing to rmdir non-directory after validation',
+      } satisfies RunStoreError;
+    }
+    if (!sameIdentity(expected, identityOf(st))) {
+      throw {
+        code: 'corrupt_run',
+        message: 'entry identity changed before unlink',
+      } satisfies RunStoreError;
+    }
+    if (kind === 'file') fs.unlinkSync(filePath);
+    else fs.rmdirSync(filePath);
+  }
+
+  function readPrivateFileBytes(
+    filePath: string,
+    runDir: string,
+    expectedBase: string,
+    opts?: { skipPathBound?: boolean }
+  ): Buffer {
+    // Single no-follow open: return the exact fd-read bytes (no second path open).
+    return openVerifiedPrivateFile(filePath, runDir, expectedBase, opts).data;
+  }
+
+  /**
+   * Authority run.json read: O_NOFOLLOW + lstat/fstat match + uid/mode/type +
+   * same-fd bytes + post-read fstat. Never follows a replacement symlink.
+   */
+  function readAuthorityRunJson(
+    filePath: string,
+    runDir: string,
+    opts?: { skipPathBound?: boolean }
+  ): VerifiedPrivateFile {
+    const kind = pathEntryKind(filePath);
+    if (kind === 'symlink') {
+      throw {
+        code: 'corrupt_run',
+        message: 'run.json is a symlink',
+      } satisfies RunStoreError;
+    }
+    if (kind !== 'regular') {
+      throw {
+        code: 'corrupt_run',
+        message: kind === 'absent' ? 'run.json not found' : 'run.json is not a regular file',
+      } satisfies RunStoreError;
+    }
+    return openVerifiedPrivateFile(filePath, runDir, 'run.json', opts);
+  }
+
+  /** Read run.json authority without following symlinks; validate regular private file. */
+  function readRunJsonNoFollow(
+    filePath: string,
+    runDir: string,
+    opts?: { skipPathBound?: boolean }
+  ): Buffer {
+    return readAuthorityRunJson(filePath, runDir, opts).data;
+  }
+
+  /**
+   * Fast-path authority read: open run directory component-by-component, retain
+   * dir fd, and read run.json through that fd (never follows intermediate symlinks).
+   */
+  function readRunJsonViaDirComponents(runId: string, publicDir: string): Buffer {
+    const session = openRunDirSession(publicDir, runId);
+    try {
+      const lockedFile = childViaDirFd(session.dirFd, 'run.json');
+      return readAuthorityRunJson(lockedFile, publicDir, { skipPathBound: true }).data;
+    } finally {
+      closeRunDirSession(session);
+    }
+  }
+
+  /**
+   * Write private transaction bytes via O_CREAT|O_EXCL|O_NOFOLLOW temp + atomic rename.
+   * Paths may be public or dir-fd-relative; identity is checked through open fd.
+   */
+  function writePrivateBytesAtomic(
+    destPath: string,
+    runDir: string,
+    expectedBase: string,
+    data: Buffer,
+    dirSync: (dirPath: string) => void = fsyncDirStrict,
+    session?: RunDirSession
+  ): void {
+    if (path.basename(destPath) !== expectedBase) {
+      throw {
+        code: 'run_store_error',
+        message: 'transaction write destination basename mismatch',
+      } satisfies RunStoreError;
+    }
+    // When session is provided, dest is under /proc/self/fd/<dirFd>/...
+    if (!session) {
+      if (path.dirname(destPath) !== runDir) {
+        throw {
+          code: 'run_store_error',
+          message: 'transaction write destination escapes run directory',
+        } satisfies RunStoreError;
+      }
+    }
+
+    const existing = pathEntryKind(destPath);
+    if (existing === 'symlink' || existing === 'directory' || existing === 'other') {
+      throw {
+        code: 'corrupt_run',
+        message: `transaction destination is unsafe (${existing})`,
+      } satisfies RunStoreError;
+    }
+    if (existing === 'regular') {
+      try {
+        const st = fs.lstatSync(destPath);
+        const v = validatePrivateEntryStats(st, 'file');
+        if (!v.ok) {
+          throw {
+            code: 'corrupt_run',
+            message: `transaction destination is unsafe: ${v.reason}`,
+          } satisfies RunStoreError;
+        }
+      } catch (err) {
+        if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+        throw {
+          code: 'corrupt_run',
+          message: `transaction destination is unsafe: ${messageOf(err)}`,
+        } satisfies RunStoreError;
+      }
+    }
+
+    const tmpName = `.${expectedBase}.${instanceId}.${randomUUID()}.tmp`;
+    const tmp = session ? childViaDirFd(session.dirFd, tmpName) : path.join(runDir, tmpName);
+    let fd: number | undefined;
+    let writtenIdentity: FileIdentity | undefined;
+    try {
+      fd = fs.openSync(
+        tmp,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollowFlag(),
+        FILE_MODE
+      );
+      try {
+        fs.fchmodSync(fd, FILE_MODE);
+      } catch {
+        applyMode(tmp, FILE_MODE);
+      }
+      fs.writeFileSync(fd, data);
+      fsyncFdStrict(fd);
+      writtenIdentity = identityOf(fs.fstatSync(fd));
+      fs.closeSync(fd);
+      fd = undefined;
+
+      // Identity revalidation before rename (temp replacement race).
+      const tmpStat = fs.lstatSync(tmp);
+      if (
+        !writtenIdentity ||
+        !sameIdentity(writtenIdentity, identityOf(tmpStat)) ||
+        !tmpStat.isFile()
+      ) {
+        throw {
+          code: 'corrupt_run',
+          message: 'transaction temp replaced after close',
+        } satisfies RunStoreError;
+      }
+      const modeCheck = validatePrivateEntryStats(tmpStat, 'file');
+      if (!modeCheck.ok) {
+        throw {
+          code: 'corrupt_run',
+          message: `transaction temp unsafe: ${modeCheck.reason}`,
+        } satisfies RunStoreError;
+      }
+
+      fs.renameSync(tmp, destPath);
+
+      const destStat = fs.lstatSync(destPath);
+      if (!sameIdentity(writtenIdentity, identityOf(destStat)) || !destStat.isFile()) {
+        throw {
+          code: 'corrupt_run',
+          message: 'transaction destination identity mismatch after rename',
+        } satisfies RunStoreError;
+      }
+      const destMode = validatePrivateEntryStats(destStat, 'file');
+      if (!destMode.ok) {
+        throw {
+          code: 'corrupt_run',
+          message: `transaction destination unsafe after rename: ${destMode.reason}`,
+        } satisfies RunStoreError;
+      }
+
+      if (session) {
+        fsyncDirFdStrict(session.dirFd);
+        revalidatePublicRunDir(session.publicDir, session.identity);
+      } else {
+        dirSync(runDir);
+      }
+    } finally {
+      closeFdQuiet(fd);
+      try {
+        if (pathEntryKind(tmp) !== 'absent') fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  type MarkerPublishResult =
+    | { renameOccurred: true; dirSyncCompleted: true }
+    | { renameOccurred: true; dirSyncCompleted: false; syncError: unknown }
+    | { renameOccurred: false; dirSyncCompleted: false; error: unknown };
+
+  function writeMarkerStrict(
+    dir: string,
+    marker: TxMarker,
+    dirSync: (dirPath: string) => void = fsyncDirStrict,
+    session?: RunDirSession
+  ): MarkerPublishResult {
+    const markerPath = session
+      ? childViaDirFd(session.dirFd, TX_MARKER_NAME)
+      : path.join(dir, TX_MARKER_NAME);
+    const payload = Buffer.from(`${JSON.stringify(marker)}\n`);
+    const tmpName = `.${TX_MARKER_NAME}.${instanceId}.${randomUUID()}.tmp`;
+    const tmp = session ? childViaDirFd(session.dirFd, tmpName) : path.join(dir, tmpName);
+    let fd: number | undefined;
+    let writtenIdentity: FileIdentity | undefined;
+    try {
+      const existing = pathEntryKind(markerPath);
+      if (existing === 'symlink' || existing === 'directory' || existing === 'other') {
+        return {
+          renameOccurred: false,
+          dirSyncCompleted: false,
+          error: {
+            code: 'corrupt_run',
+            message: `transaction marker destination is unsafe (${existing})`,
+          } satisfies RunStoreError,
+        };
+      }
+      fd = fs.openSync(
+        tmp,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollowFlag(),
+        FILE_MODE
+      );
+      try {
+        fs.fchmodSync(fd, FILE_MODE);
+      } catch {
+        applyMode(tmp, FILE_MODE);
+      }
+      fs.writeFileSync(fd, payload);
+      fsyncFdStrict(fd);
+      writtenIdentity = identityOf(fs.fstatSync(fd));
+      fs.closeSync(fd);
+      fd = undefined;
+      const tmpStat = fs.lstatSync(tmp);
+      if (
+        !writtenIdentity ||
+        !sameIdentity(writtenIdentity, identityOf(tmpStat)) ||
+        !tmpStat.isFile()
+      ) {
+        return {
+          renameOccurred: false,
+          dirSyncCompleted: false,
+          error: {
+            code: 'corrupt_run',
+            message: 'transaction marker temp replaced after close',
+          } satisfies RunStoreError,
+        };
+      }
+      fs.renameSync(tmp, markerPath);
+      const destStat = fs.lstatSync(markerPath);
+      if (!sameIdentity(writtenIdentity, identityOf(destStat))) {
+        return {
+          renameOccurred: true,
+          dirSyncCompleted: false,
+          syncError: {
+            code: 'corrupt_run',
+            message: 'transaction marker identity mismatch after rename',
+          } satisfies RunStoreError,
+        };
+      }
+      try {
+        if (session) {
+          fsyncDirFdStrict(session.dirFd);
+          revalidatePublicRunDir(session.publicDir, session.identity);
+        }
+        // Always invoke the provided directory sync seam (may be the real fsync
+        // or a test injection for committed-marker publication uncertainty).
+        dirSync(dir);
+        return { renameOccurred: true, dirSyncCompleted: true };
+      } catch (syncErr) {
+        return { renameOccurred: true, dirSyncCompleted: false, syncError: syncErr };
+      }
+    } catch (err) {
+      return { renameOccurred: false, dirSyncCompleted: false, error: err };
+    } finally {
+      closeFdQuiet(fd);
+      try {
+        if (pathEntryKind(tmp) !== 'absent') fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function parseTxMarker(raw: unknown): TxMarker | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o.version !== TX_MARKER_VERSION) return undefined;
+    if (o.phase !== 'prepared' && o.phase !== 'committed') return undefined;
+    if (typeof o.oldSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(o.oldSha256)) return undefined;
+    if (typeof o.newSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(o.newSha256)) return undefined;
+    if (typeof o.oldBytes !== 'number' || !Number.isInteger(o.oldBytes) || o.oldBytes < 0) {
+      return undefined;
+    }
+    if (typeof o.newBytes !== 'number' || !Number.isInteger(o.newBytes) || o.newBytes < 0) {
+      return undefined;
+    }
+    // Reject unexpected own keys so forensic markers cannot smuggle state.
+    const allowed = new Set(['version', 'phase', 'oldSha256', 'oldBytes', 'newSha256', 'newBytes']);
+    for (const key of Object.keys(o)) {
+      if (!allowed.has(key)) return undefined;
+    }
+    return {
+      version: TX_MARKER_VERSION,
+      phase: o.phase,
+      oldSha256: o.oldSha256,
+      oldBytes: o.oldBytes,
+      newSha256: o.newSha256,
+      newBytes: o.newBytes,
+    };
+  }
+
+  function parseTxLockOwner(raw: unknown): TxLockOwner | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o.version !== TX_LOCK_VERSION) return undefined;
+    if (typeof o.pid !== 'number' || !Number.isInteger(o.pid) || o.pid <= 0) return undefined;
+    if (typeof o.processStart !== 'string' || o.processStart.length === 0) return undefined;
+    if (typeof o.token !== 'string' || !isStrictLockToken(o.token)) return undefined;
+    if (typeof o.timestamp !== 'number' || !Number.isFinite(o.timestamp)) return undefined;
+    const allowed = new Set(['version', 'pid', 'processStart', 'token', 'timestamp']);
+    for (const key of Object.keys(o)) {
+      if (!allowed.has(key)) return undefined;
+    }
+    return {
+      version: TX_LOCK_VERSION,
+      pid: o.pid,
+      processStart: o.processStart,
+      token: o.token,
+      timestamp: o.timestamp,
+    };
+  }
+
+  /**
+   * Phase-specific cleanup using optional authority-decision verified entries.
+   * When expected entries are provided, only that exact inode/digest generation is removed.
+   * Re-reading a replacement path as a new authority generation is never allowed.
+   */
+  function cleanupTxPhase(
+    dir: string,
+    phase: TxPhase,
+    session?: RunDirSession,
+    expected?: {
+      marker?: VerifiedPrivateFile;
+      rollback?: VerifiedPrivateFile;
+    }
+  ): { ok: true } | { ok: false; error: unknown } {
+    const marker = session
+      ? childViaDirFd(session.dirFd, TX_MARKER_NAME)
+      : path.join(dir, TX_MARKER_NAME);
+    const rollback = session
+      ? childViaDirFd(session.dirFd, TX_ROLLBACK_NAME)
+      : path.join(dir, TX_ROLLBACK_NAME);
+    const syncDir = (): void => {
+      if (session) fsyncDirFdStrict(session.dirFd);
+      else fsyncDirStrict(dir);
+    };
+    const unlinkEntry = (
+      filePath: string,
+      base: string,
+      expectedEntry?: VerifiedPrivateFile
+    ): void => {
+      if (pathEntryKind(filePath) === 'absent') {
+        if (expectedEntry) {
+          throw {
+            code: 'corrupt_run',
+            message: 'expected transaction entry absent before cleanup',
+          } satisfies RunStoreError;
+        }
+        return;
+      }
+      if (expectedEntry) {
+        // Re-verify the exact decision generation; never open a replacement as authority.
+        if (expectedEntry.path !== filePath || expectedEntry.expectedBase !== base) {
+          throw {
+            code: 'corrupt_run',
+            message: 'cleanup expected entry path mismatch',
+          } satisfies RunStoreError;
+        }
+        unlinkVerifiedPrivateFile(expectedEntry);
+        return;
+      }
+      const verified = openVerifiedPrivateFile(filePath, dir, base, {
+        skipPathBound: !!session,
+        parseMarkerPhase: base === TX_MARKER_NAME,
+      });
+      unlinkVerifiedPrivateFile(verified);
+    };
+    try {
+      if (phase === 'prepared') {
+        // Marker first, then rollback: orphan rollback with matching old run.json is safe.
+        if (pathEntryKind(marker) !== 'absent' || expected?.marker) {
+          unlinkEntry(marker, TX_MARKER_NAME, expected?.marker);
+          fireStrictTxHook('after_cleanup_marker_unlink');
+          syncDir();
+          fireStrictTxHook('after_cleanup_first_dir_sync');
+        }
+        if (pathEntryKind(rollback) !== 'absent' || expected?.rollback) {
+          unlinkEntry(rollback, TX_ROLLBACK_NAME, expected?.rollback);
+          fireStrictTxHook('after_cleanup_rollback_unlink');
+          syncDir();
+          fireStrictTxHook('after_cleanup_second_dir_sync');
+        }
+      } else {
+        // Rollback first, then marker: committed marker without rollback verifies new run.json.
+        if (pathEntryKind(rollback) !== 'absent' || expected?.rollback) {
+          unlinkEntry(rollback, TX_ROLLBACK_NAME, expected?.rollback);
+          fireStrictTxHook('after_cleanup_rollback_unlink');
+          syncDir();
+          fireStrictTxHook('after_cleanup_first_dir_sync');
+        }
+        if (pathEntryKind(marker) !== 'absent' || expected?.marker) {
+          unlinkEntry(marker, TX_MARKER_NAME, expected?.marker);
+          fireStrictTxHook('after_cleanup_marker_unlink');
+          syncDir();
+          fireStrictTxHook('after_cleanup_second_dir_sync');
+        }
+      }
+      return { ok: true };
+    } catch (err) {
+      if (isBypassCleanupError(err)) throw err;
+      return { ok: false, error: err };
+    }
+  }
+
+  /**
+   * After committed cleanup fails, re-read marker/rollback/run.json and accept
+   * success only when remaining artifacts unambiguously recover to the new run.json.
+   * Every authority read is O_NOFOLLOW + inode/digest verified.
+   * When expected marker/rollback identities are provided, any present entry with
+   * different dev/ino is rejected as generation_mismatch (replacement never washes).
+   */
+  function revalidateCommittedState(
+    dir: string,
+    expectedNew: { sha256: string; bytes: number },
+    session?: RunDirSession,
+    expected?: {
+      markerIdentity?: FileIdentity;
+      rollbackIdentity?: FileIdentity;
+    }
+  ): { ok: true } | { ok: false; error: RunStoreError } {
+    const marker = session
+      ? childViaDirFd(session.dirFd, TX_MARKER_NAME)
+      : path.join(dir, TX_MARKER_NAME);
+    const rollback = session
+      ? childViaDirFd(session.dirFd, TX_ROLLBACK_NAME)
+      : path.join(dir, TX_ROLLBACK_NAME);
+    const target = session ? childViaDirFd(session.dirFd, 'run.json') : path.join(dir, 'run.json');
+
+    const checkGeneration = (
+      filePath: string,
+      expectedIdentity: FileIdentity | undefined,
+      label: string
+    ): string | undefined => {
+      if (!expectedIdentity) return undefined;
+      try {
+        const st = fs.lstatSync(filePath);
+        if (!sameIdentity(expectedIdentity, identityOf(st))) {
+          return `committed cleanup: ${label} replaced (generation mismatch)`;
+        }
+      } catch {
+        // Missing when expected: also mismatch.
+        return `committed cleanup: ${label} missing (generation mismatch)`;
+      }
+      return undefined;
+    };
+
+    try {
+      // Reject replaced marker/rollback before re-reading content.
+      const markerKind = pathEntryKind(marker);
+      const rollbackKind = pathEntryKind(rollback);
+      if (expected?.markerIdentity && markerKind === 'regular') {
+        const genErr = checkGeneration(marker, expected.markerIdentity, 'marker');
+        if (genErr) return { ok: false, error: { code: 'generation_mismatch', message: genErr } };
+      }
+      if (expected?.rollbackIdentity && rollbackKind === 'regular') {
+        const genErr = checkGeneration(rollback, expected.rollbackIdentity, 'rollback');
+        if (genErr) return { ok: false, error: { code: 'generation_mismatch', message: genErr } };
+      }
+
+      if (
+        markerKind === 'symlink' ||
+        markerKind === 'directory' ||
+        markerKind === 'other' ||
+        rollbackKind === 'symlink' ||
+        rollbackKind === 'directory' ||
+        rollbackKind === 'other'
+      ) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            message: 'committed cleanup left unsafe transaction entries',
+          },
+        };
+      }
+      if (pathEntryKind(target) !== 'regular') {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            message: 'committed cleanup: run.json missing or unsafe',
+          },
+        };
+      }
+      // Authority run.json via single no-follow fd + digest (exact fd-read bytes).
+      const runVerified = readAuthorityRunJson(target, dir, {
+        skipPathBound: !!session,
+      });
+      if (runVerified.bytes !== expectedNew.bytes || runVerified.digest !== expectedNew.sha256) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            message: 'committed cleanup: run.json no longer matches committed digest',
+          },
+        };
+      }
+      // No leftovers: clean committed success.
+      if (markerKind === 'absent' && rollbackKind === 'absent') return { ok: true };
+
+      if (markerKind === 'regular') {
+        // Re-verify identity again before opening (TOCTOU defense).
+        if (expected?.markerIdentity) {
+          const genErr2 = checkGeneration(marker, expected.markerIdentity, 'marker');
+          if (genErr2)
+            return { ok: false, error: { code: 'generation_mismatch', message: genErr2 } };
+        }
+        const markerVerified = openVerifiedPrivateFile(marker, dir, TX_MARKER_NAME, {
+          skipPathBound: !!session,
+          parseMarkerPhase: true,
+        });
+        let parsed: unknown;
+        try {
+          // Use bytes already verified on the same fd open — no second path read.
+          parsed = JSON.parse(markerVerified.data.toString('utf8'));
+        } catch {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              message: 'committed cleanup: marker unreadable',
+            },
+          };
+        }
+        const m = parseTxMarker(parsed);
+        if (!m || m.phase !== 'committed') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              message: 'committed cleanup: marker is not a committed phase',
+            },
+          };
+        }
+        if (m.newBytes !== expectedNew.bytes || m.newSha256 !== expectedNew.sha256) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              message: 'committed cleanup: marker digest mismatch',
+            },
+          };
+        }
+        if (markerVerified.phase !== undefined && markerVerified.phase !== 'committed') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              message: 'committed cleanup: marker phase identity mismatch',
+            },
+          };
+        }
+        if (rollbackKind === 'regular') {
+          if (expected?.rollbackIdentity) {
+            const genErr3 = checkGeneration(rollback, expected.rollbackIdentity, 'rollback');
+            if (genErr3) {
+              return { ok: false, error: { code: 'generation_mismatch', message: genErr3 } };
+            }
+          }
+          openVerifiedPrivateFile(rollback, dir, TX_ROLLBACK_NAME, {
+            skipPathBound: !!session,
+          });
+        }
+        return { ok: true };
+      }
+
+      if (rollbackKind === 'regular') {
+        if (expected?.rollbackIdentity) {
+          const genErr4 = checkGeneration(rollback, expected.rollbackIdentity, 'rollback');
+          if (genErr4) {
+            return { ok: false, error: { code: 'generation_mismatch', message: genErr4 } };
+          }
+        }
+        openVerifiedPrivateFile(rollback, dir, TX_ROLLBACK_NAME, {
+          skipPathBound: !!session,
+        });
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        error: {
+          code: 'corrupt_run',
+          message: 'committed cleanup: non-recoverable leftover shape',
+        },
+      };
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+        return { ok: false, error: err as RunStoreError };
+      }
+      return {
+        ok: false,
+        error: {
+          code: 'durable_write_error',
+          message: `committed cleanup revalidation failed: ${messageOf(err)}`,
+        },
+      };
+    }
+  }
+
+  function removeTxFiles(dir: string, phase: TxPhase = 'prepared', session?: RunDirSession): void {
+    const result = cleanupTxPhase(dir, phase, session);
+    if (!result.ok) {
+      // Best-effort only for non-strict leftover sweeps; leave evidence on failure.
+    }
+  }
+
+  function fsyncPathStrict(filePath: string): void {
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollowFlag());
+      fsyncFdStrict(fd);
+    } finally {
+      closeFdQuiet(fd);
+    }
+  }
+
+  function sleepMs(ms: number): void {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    const bounded = Math.min(Math.floor(ms), TX_LOCK_WAIT_MS_MAX);
+    if (bounded <= 0) return;
+    const buf = new SharedArrayBuffer(4);
+    const arr = new Int32Array(buf);
+    Atomics.wait(arr, 0, 0, bounded);
+  }
+
+  /** Monotonic milliseconds for lock deadlines (immune to wall-clock jumps). */
+  function monotonicNowMs(): number {
+    return Number(process.hrtime.bigint() / 1_000_000n);
+  }
+
+  function isProcessAliveWithStart(ownerPid: number, processStart: string): boolean | 'unknown' {
+    if (ownerPid === process.pid && processStart === selfStartIdentity) return true;
+    try {
+      process.kill(ownerPid, 0);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return false;
+      if (code === 'EPERM') {
+        // Exists but inaccessible — cannot steal.
+        return true;
+      }
+      return 'unknown';
+    }
+    if (process.platform !== 'linux') {
+      // Cannot prove start identity on non-Linux; fail closed (treat as live).
+      return true;
+    }
+    const currentStart = processStartIdentity(ownerPid);
+    if (currentStart === undefined) {
+      // /proc unreadable while kill(0) succeeded — fail closed.
+      return 'unknown';
+    }
+    if (currentStart !== processStart) return false;
+    return true;
+  }
+
+  const TX_STEAL_INTENT_NAME = 'steal.intent';
+  const TX_RELEASE_INTENT_NAME = 'release.intent';
+  /** Fixed safe name for the previous owner during transfer (never from a read token). */
+  const TX_OWNER_PREVIOUS_NAME = 'owner.previous';
+  const TX_OWNER_TMP_PREFIX = '.owner.';
+  /**
+   * Strict single-component token: alphanumeric + dash/underscore only, bounded length.
+   * Never path separators, `..`, leading dots, or control characters.
+   */
+  const LOCK_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/;
+  const LOCK_TOKEN_MAX_LEN = 63;
+  interface StealIntent {
+    version: typeof TX_LOCK_VERSION;
+    kind: 'steal';
+    contenderToken: string;
+    contenderPid: number;
+    contenderProcessStart: string;
+    ownerToken: string;
+    ownerPid: number;
+    ownerProcessStart: string;
+    ownerIno: number;
+    ownerDev: number;
+    lockIno: number;
+    lockDev: number;
+    /** Locally generated temp basename for new owner (never derived from read tokens). */
+    newOwnerTempName: string;
+    /** Identity of the pre-published new-owner temp file. */
+    newOwnerTempIno: number;
+    newOwnerTempDev: number;
+    /** Content digest and byte length of the pre-published new-owner temp. */
+    newOwnerTempDigest: string;
+    newOwnerTempBytes: number;
+  }
+
+  interface ReleaseIntent {
+    version: typeof TX_LOCK_VERSION;
+    kind: 'release';
+    token: string;
+    ownerPid: number;
+    ownerProcessStart: string;
+    ownerIno: number;
+    ownerDev: number;
+    lockIno: number;
+    lockDev: number;
+  }
+
+  function isStrictLockToken(token: string): boolean {
+    if (typeof token !== 'string') return false;
+    if (token.length === 0 || token.length > LOCK_TOKEN_MAX_LEN) return false;
+    if (!LOCK_TOKEN_RE.test(token)) return false;
+    if (
+      token.includes('..') ||
+      token.includes('/') ||
+      token.includes('\\') ||
+      token.includes('\0')
+    ) {
+      return false;
+    }
+    /* eslint-disable-next-line no-control-regex */
+    if (/[\x00-\x1f\x7f]/.test(token)) return false;
+    return true;
+  }
+
+  function assertStrictLockToken(token: string, label: string): void {
+    if (!isStrictLockToken(token)) {
+      throw {
+        code: 'corrupt_run',
+        message: `lock ${label} token is not a strict single-component token`,
+      } satisfies RunStoreError;
+    }
+  }
+
+  /**
+   * Tombstone basename uses only a locally validated token. Never concatenates an
+   * unvalidated parsed token into a path; requires exact equality with held token.
+   */
+  function tombstoneNameForToken(token: string): string {
+    assertStrictLockToken(token, 'tombstone');
+    return `${TX_LOCK_DIR_NAME}.tomb.${token}`;
+  }
+
+  function parseStealIntent(raw: unknown): StealIntent | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o.version !== TX_LOCK_VERSION || o.kind !== 'steal') return undefined;
+    if (typeof o.contenderToken !== 'string' || !isStrictLockToken(o.contenderToken)) {
+      return undefined;
+    }
+    if (typeof o.ownerToken !== 'string' || !isStrictLockToken(o.ownerToken)) return undefined;
+    if (
+      typeof o.contenderPid !== 'number' ||
+      !Number.isInteger(o.contenderPid) ||
+      o.contenderPid <= 0
+    ) {
+      return undefined;
+    }
+    if (typeof o.ownerPid !== 'number' || !Number.isInteger(o.ownerPid) || o.ownerPid <= 0) {
+      return undefined;
+    }
+    if (typeof o.contenderProcessStart !== 'string' || !o.contenderProcessStart) return undefined;
+    if (typeof o.ownerProcessStart !== 'string' || !o.ownerProcessStart) return undefined;
+    if (typeof o.newOwnerTempName !== 'string' || !o.newOwnerTempName) return undefined;
+    // Temp name must be a locally-shaped safe basename under TX_OWNER_TMP_PREFIX.
+    if (
+      !o.newOwnerTempName.startsWith(TX_OWNER_TMP_PREFIX) ||
+      o.newOwnerTempName.includes('/') ||
+      o.newOwnerTempName.includes('\\') ||
+      o.newOwnerTempName.includes('\0') ||
+      o.newOwnerTempName.includes('..') ||
+      o.newOwnerTempName.length > 96
+    ) {
+      return undefined;
+    }
+    for (const k of [
+      'ownerIno',
+      'ownerDev',
+      'lockIno',
+      'lockDev',
+      'newOwnerTempIno',
+      'newOwnerTempDev',
+    ] as const) {
+      if (typeof o[k] !== 'number' || !Number.isInteger(o[k])) return undefined;
+    }
+    if (typeof o.newOwnerTempDigest !== 'string' || !/^[a-f0-9]{64}$/.test(o.newOwnerTempDigest)) {
+      return undefined;
+    }
+    if (
+      typeof o.newOwnerTempBytes !== 'number' ||
+      !Number.isInteger(o.newOwnerTempBytes) ||
+      o.newOwnerTempBytes < 0
+    ) {
+      return undefined;
+    }
+    const allowed = new Set([
+      'version',
+      'kind',
+      'contenderToken',
+      'contenderPid',
+      'contenderProcessStart',
+      'ownerToken',
+      'ownerPid',
+      'ownerProcessStart',
+      'ownerIno',
+      'ownerDev',
+      'lockIno',
+      'lockDev',
+      'newOwnerTempName',
+      'newOwnerTempIno',
+      'newOwnerTempDev',
+      'newOwnerTempDigest',
+      'newOwnerTempBytes',
+    ]);
+    for (const key of Object.keys(o)) {
+      if (!allowed.has(key)) return undefined;
+    }
+    return {
+      version: TX_LOCK_VERSION,
+      kind: 'steal',
+      contenderToken: o.contenderToken,
+      contenderPid: o.contenderPid,
+      contenderProcessStart: o.contenderProcessStart,
+      ownerToken: o.ownerToken,
+      ownerPid: o.ownerPid,
+      ownerProcessStart: o.ownerProcessStart,
+      ownerIno: o.ownerIno as number,
+      ownerDev: o.ownerDev as number,
+      lockIno: o.lockIno as number,
+      lockDev: o.lockDev as number,
+      newOwnerTempName: o.newOwnerTempName,
+      newOwnerTempIno: o.newOwnerTempIno as number,
+      newOwnerTempDev: o.newOwnerTempDev as number,
+      newOwnerTempDigest: o.newOwnerTempDigest,
+      newOwnerTempBytes: o.newOwnerTempBytes as number,
+    };
+  }
+
+  function parseReleaseIntent(raw: unknown): ReleaseIntent | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o.version !== TX_LOCK_VERSION || o.kind !== 'release') return undefined;
+    if (typeof o.token !== 'string' || !isStrictLockToken(o.token)) return undefined;
+    if (typeof o.ownerPid !== 'number' || !Number.isInteger(o.ownerPid) || o.ownerPid <= 0) {
+      return undefined;
+    }
+    if (typeof o.ownerProcessStart !== 'string' || !o.ownerProcessStart) return undefined;
+    for (const k of ['ownerIno', 'ownerDev', 'lockIno', 'lockDev'] as const) {
+      if (typeof o[k] !== 'number' || !Number.isInteger(o[k])) return undefined;
+    }
+    const allowed = new Set([
+      'version',
+      'kind',
+      'token',
+      'ownerPid',
+      'ownerProcessStart',
+      'ownerIno',
+      'ownerDev',
+      'lockIno',
+      'lockDev',
+    ]);
+    for (const key of Object.keys(o)) {
+      if (!allowed.has(key)) return undefined;
+    }
+    return {
+      version: TX_LOCK_VERSION,
+      kind: 'release',
+      token: o.token,
+      ownerPid: o.ownerPid,
+      ownerProcessStart: o.ownerProcessStart,
+      ownerIno: o.ownerIno as number,
+      ownerDev: o.ownerDev as number,
+      lockIno: o.lockIno as number,
+      lockDev: o.lockDev as number,
+    };
+  }
+
+  function openLockDirFd(lockDirPath: string): number {
+    return fs.openSync(lockDirPath, fs.constants.O_RDONLY | directoryFlag() | noFollowFlag());
+  }
+
+  function readLockOwnerVia(lockDirPath: string):
+    | {
+        owner: TxLockOwner;
+        ownerIdentity: FileIdentity;
+        lockIdentity: FileIdentity;
+        lockFd?: number;
+      }
+    | undefined {
+    let lockFd: number | undefined;
+    try {
+      const lockSt = fs.lstatSync(lockDirPath);
+      if (!lockSt.isDirectory() || lockSt.isSymbolicLink()) return undefined;
+      const lockIdentity = identityOf(lockSt);
+      const lockMode = validatePrivateEntryStats(lockSt, 'directory');
+      if (!lockMode.ok) return undefined;
+      lockFd = openLockDirFd(lockDirPath);
+      const lockFdSt = fs.fstatSync(lockFd);
+      if (!sameIdentity(lockIdentity, identityOf(lockFdSt))) {
+        closeFdQuiet(lockFd);
+        return undefined;
+      }
+      const ownerPath = path.join(procFdBase(lockFd), TX_LOCK_OWNER_NAME);
+      const kind = pathEntryKind(ownerPath);
+      if (kind !== 'regular') {
+        closeFdQuiet(lockFd);
+        return undefined;
+      }
+      const before = fs.lstatSync(ownerPath);
+      const v = validatePrivateEntryStats(before, 'file');
+      if (!v.ok) {
+        closeFdQuiet(lockFd);
+        return undefined;
+      }
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(ownerPath, fs.constants.O_RDONLY | noFollowFlag());
+        const after = fs.fstatSync(fd);
+        if (after.ino !== before.ino || after.dev !== before.dev || !after.isFile()) {
+          closeFdQuiet(lockFd);
+          return undefined;
+        }
+        const bytes = fs.readFileSync(fd);
+        const owner = parseTxLockOwner(JSON.parse(bytes.toString('utf8')));
+        if (!owner) {
+          closeFdQuiet(lockFd);
+          return undefined;
+        }
+        // Retain lockFd only if caller needs it; close for simple reads.
+        const result = {
+          owner,
+          ownerIdentity: identityOf(after),
+          lockIdentity,
+        };
+        closeFdQuiet(lockFd);
+        lockFd = undefined;
+        return result;
+      } finally {
+        closeFdQuiet(fd);
+      }
+    } catch {
+      closeFdQuiet(lockFd);
+      return undefined;
+    }
+  }
+
+  function readIntentInLockDir(
+    lockDirPath: string,
+    name: typeof TX_STEAL_INTENT_NAME | typeof TX_RELEASE_INTENT_NAME
+  ): { raw: Buffer; identity: FileIdentity } | undefined {
+    let lockFd: number | undefined;
+    try {
+      lockFd = openLockDirFd(lockDirPath);
+      const intentPath = path.join(procFdBase(lockFd), name);
+      if (pathEntryKind(intentPath) !== 'regular') return undefined;
+      const before = fs.lstatSync(intentPath);
+      const v = validatePrivateEntryStats(before, 'file');
+      if (!v.ok) return undefined;
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(intentPath, fs.constants.O_RDONLY | noFollowFlag());
+        const after = fs.fstatSync(fd);
+        if (!sameIdentity(identityOf(before), identityOf(after))) return undefined;
+        return { raw: fs.readFileSync(fd), identity: identityOf(after) };
+      } finally {
+        closeFdQuiet(fd);
+      }
+    } catch {
+      return undefined;
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  /**
+   * Remove a private regular file under a lock directory only when inode matches.
+   * Never follows symlinks; never recursive.
+   */
+  function unlinkNamedInDir(lockDirPath: string, name: string, expected?: FileIdentity): boolean {
+    let lockFd: number | undefined;
+    try {
+      lockFd = openLockDirFd(lockDirPath);
+      const child = path.join(procFdBase(lockFd), name);
+      if (pathEntryKind(child) === 'absent') return true;
+      if (pathEntryKind(child) !== 'regular') return false;
+      const st = fs.lstatSync(child);
+      const v = validatePrivateEntryStats(st, 'file');
+      if (!v.ok) return false;
+      if (expected && !sameIdentity(expected, identityOf(st))) return false;
+      fs.unlinkSync(child);
+      fsyncFdStrict(lockFd);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  /**
+   * Clean only a candidate/tombstone directory whose owner token and identities
+   * are fully verified through a no-follow directory fd. Never recursive follow.
+   */
+  function removeVerifiedLockSideDir(
+    sidePath: string,
+    expected?: { token?: string; lockIdentity?: FileIdentity }
+  ): { ok: true } | { ok: false; reason: string } {
+    let lockFd: number | undefined;
+    try {
+      const lockSt = fs.lstatSync(sidePath);
+      if (!lockSt.isDirectory() || lockSt.isSymbolicLink()) {
+        return { ok: false, reason: 'not a private directory' };
+      }
+      const lockMode = validatePrivateEntryStats(lockSt, 'directory');
+      if (!lockMode.ok) return { ok: false, reason: lockMode.reason };
+      if (expected?.lockIdentity && !sameIdentity(expected.lockIdentity, identityOf(lockSt))) {
+        return { ok: false, reason: 'lock identity mismatch' };
+      }
+      lockFd = openLockDirFd(sidePath);
+      const fdSt = fs.fstatSync(lockFd);
+      if (!sameIdentity(identityOf(lockSt), identityOf(fdSt))) {
+        return { ok: false, reason: 'lock dir replaced during open' };
+      }
+      const names = fs.readdirSync(procFdBase(lockFd));
+      // Only allow known private basenames inside a side directory.
+      const allowed = new Set([
+        TX_LOCK_OWNER_NAME,
+        TX_STEAL_INTENT_NAME,
+        TX_RELEASE_INTENT_NAME,
+        TX_OWNER_PREVIOUS_NAME,
+      ]);
+      for (const name of names) {
+        if (name.startsWith(TX_OWNER_TMP_PREFIX)) {
+          // Locally generated owner temp files created by this protocol
+          continue;
+        }
+        if (
+          name.startsWith(`.${TX_STEAL_INTENT_NAME}.`) ||
+          name.startsWith(`.${TX_RELEASE_INTENT_NAME}.`)
+        ) {
+          // Locally generated intent temp files (orphaned only — winner is removed)
+          try {
+            const child = path.join(procFdBase(lockFd), name);
+            if (pathEntryKind(child) === 'regular') {
+              fs.unlinkSync(child);
+            }
+          } catch {
+            /* leave evidence if unlink fails */
+          }
+          continue;
+        }
+        if (!allowed.has(name)) {
+          // Unknown entry — refuse recursive cleanup; leave evidence.
+          return { ok: false, reason: `unknown entry ${name}` };
+        }
+      }
+      // Verify owner if present and token expected.
+      const ownerPath = path.join(procFdBase(lockFd), TX_LOCK_OWNER_NAME);
+      if (pathEntryKind(ownerPath) === 'regular') {
+        const before = fs.lstatSync(ownerPath);
+        const v = validatePrivateEntryStats(before, 'file');
+        if (!v.ok) return { ok: false, reason: `owner unsafe: ${v.reason}` };
+        let fd: number | undefined;
+        try {
+          fd = fs.openSync(ownerPath, fs.constants.O_RDONLY | noFollowFlag());
+          const after = fs.fstatSync(fd);
+          if (!sameIdentity(identityOf(before), identityOf(after))) {
+            return { ok: false, reason: 'owner replaced' };
+          }
+          const owner = parseTxLockOwner(JSON.parse(fs.readFileSync(fd).toString('utf8')));
+          if (!owner) return { ok: false, reason: 'owner unreadable' };
+          if (expected?.token !== undefined && owner.token !== expected.token) {
+            return { ok: false, reason: 'owner token mismatch' };
+          }
+        } finally {
+          closeFdQuiet(fd);
+        }
+        // Unlink verified owner.
+        const st2 = fs.lstatSync(ownerPath);
+        if (!sameIdentity(identityOf(before), identityOf(st2))) {
+          return { ok: false, reason: 'owner changed before unlink' };
+        }
+        fs.unlinkSync(ownerPath);
+      }
+      // Unlink only regular private files we recognize; never recurse into subdirs.
+      for (const name of fs.readdirSync(procFdBase(lockFd))) {
+        const child = path.join(procFdBase(lockFd), name);
+        const kind = pathEntryKind(child);
+        if (kind === 'regular') {
+          const st = fs.lstatSync(child);
+          const v = validatePrivateEntryStats(st, 'file');
+          if (!v.ok) return { ok: false, reason: `entry ${name} unsafe` };
+          fs.unlinkSync(child);
+        } else if (kind !== 'absent') {
+          return { ok: false, reason: `non-file entry ${name}` };
+        }
+      }
+      fsyncFdStrict(lockFd);
+      closeFdQuiet(lockFd);
+      lockFd = undefined;
+      // Final rmdir of empty side directory by identity.
+      const finalSt = fs.lstatSync(sidePath);
+      if (!sameIdentity(identityOf(lockSt), identityOf(finalSt))) {
+        return { ok: false, reason: 'side dir replaced before rmdir' };
+      }
+      fs.rmdirSync(sidePath);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: messageOf(err) };
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  /**
+   * Remove only the current candidate built by this process (held path + identity).
+   * No prefix sweeps; no recursive deletion of unknown trees.
+   */
+  function removeOwnCandidate(
+    candidatePath: string,
+    lockIdentity: FileIdentity,
+    ownerToken: string
+  ): void {
+    const result = removeVerifiedLockSideDir(candidatePath, {
+      token: ownerToken,
+      lockIdentity,
+    });
+    if (!result.ok) {
+      // Leave evidence; do not force-delete.
+    }
+  }
+
+  /**
+   * Scan for known leftover names but only remove entries whose owner record,
+   * directory inode, uid, mode are fully verified AND owner is dead or token-matched.
+   * Unknown/unsafe prefixed entries are preserved and cause no recursive cleanup.
+   */
+  function collectSafeLockLeftovers(session: RunDirSession, _runId: string): void {
+    let names: string[];
+    try {
+      names = fs.readdirSync(procFdBase(session.dirFd));
+    } catch {
+      return;
+    }
+    const tombPrefix = `${TX_LOCK_DIR_NAME}.tomb.`;
+    for (const name of names) {
+      const isCand = name.startsWith(`${TX_LOCK_DIR_NAME}.cand.`);
+      const isQ = name.startsWith(`${TX_LOCK_DIR_NAME}.q.`);
+      const isTomb = name.startsWith(tombPrefix);
+      if (!isCand && !isQ && !isTomb) continue;
+      // Side dir names are fixed private prefixes + validated token or local instance id.
+      if (name.includes('/') || name.includes('\\') || name.includes('\0') || name.includes('..')) {
+        continue;
+      }
+      const sidePath = childViaDirFd(session.dirFd, name);
+      // Symlink candidate/tombstone: never follow; leave evidence.
+      if (pathEntryKind(sidePath) === 'symlink') {
+        // Bounded failure only if this blocks acquisition of fixed lock — ignore.
+        continue;
+      }
+      if (pathEntryKind(sidePath) !== 'directory') continue;
+      const inspected = readLockOwnerVia(sidePath);
+      if (!inspected) {
+        // Incomplete/malformed — preserve; do not blind-delete.
+        continue;
+      }
+      if (!isStrictLockToken(inspected.owner.token)) {
+        // Malicious/invalid owner token — never derive cleanup paths from it.
+        continue;
+      }
+      // Tombstone basename suffix must exactly equal verified owner token.
+      if (isTomb) {
+        const suffix = name.slice(tombPrefix.length);
+        if (suffix !== inspected.owner.token) {
+          // Wrong-token tombstone — preserve evidence.
+          continue;
+        }
+      }
+      // Only clean if owner is proven dead OR we can verify terminal abandoned state.
+      const alive = isProcessAliveWithStart(inspected.owner.pid, inspected.owner.processStart);
+      if (alive === false) {
+        removeVerifiedLockSideDir(sidePath, {
+          token: inspected.owner.token,
+          lockIdentity: inspected.lockIdentity,
+        });
+        try {
+          fsyncDirFdStrict(session.dirFd);
+        } catch {
+          /* leave for next attempt */
+        }
+        continue;
+      }
+      // Live foreign candidate: leave untouched (contender may still be building).
+    }
+  }
+
+  /**
+   * Publish a fixed intent via write+fsync temp then atomic hard-link to the fixed
+   * name (no-replace). EEXIST means another state transition owns the lock.
+   * Never uses rename onto an existing fixed intent name.
+   */
+  function writeExclusiveInLockDir(lockDirPath: string, name: string, data: Buffer): FileIdentity {
+    let lockFd: number | undefined;
+    try {
+      lockFd = openLockDirFd(lockDirPath);
+      const dest = path.join(procFdBase(lockFd), name);
+      if (pathEntryKind(dest) !== 'absent') {
+        throw {
+          code: 'run_busy',
+          message: `lock intent already present: ${name}`,
+        } satisfies RunStoreError;
+      }
+      // Locally generated random temp only — never from a read token.
+      const tmpName = `.${name}.${randomUUID()}.tmp`;
+      if (tmpName.includes('/') || tmpName.includes('..')) {
+        throw {
+          code: 'run_store_error',
+          message: 'invalid intent temp name',
+        } satisfies RunStoreError;
+      }
+      const tmp = path.join(procFdBase(lockFd), tmpName);
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(
+          tmp,
+          fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollowFlag(),
+          FILE_MODE
+        );
+        try {
+          fs.fchmodSync(fd, FILE_MODE);
+        } catch {
+          applyMode(tmp, FILE_MODE);
+        }
+        fs.writeFileSync(fd, data);
+        fsyncFdStrict(fd);
+        const written = identityOf(fs.fstatSync(fd));
+        fs.closeSync(fd);
+        fd = undefined;
+        const tmpStat = fs.lstatSync(tmp);
+        if (!sameIdentity(written, identityOf(tmpStat))) {
+          throw {
+            code: 'corrupt_run',
+            message: 'lock intent temp replaced',
+          } satisfies RunStoreError;
+        }
+        // Atomic no-replace publication: hard-link temp → fixed intent name.
+        try {
+          fs.linkSync(tmp, dest);
+        } catch (linkErr) {
+          const code = (linkErr as NodeJS.ErrnoException).code;
+          if (code === 'EEXIST') {
+            throw {
+              code: 'run_busy',
+              message: `lock intent already present: ${name}`,
+            } satisfies RunStoreError;
+          }
+          throw linkErr;
+        }
+        const destStat = fs.lstatSync(dest);
+        if (!sameIdentity(written, identityOf(destStat))) {
+          try {
+            fs.unlinkSync(dest);
+          } catch {
+            /* leave evidence */
+          }
+          throw {
+            code: 'corrupt_run',
+            message: 'lock intent identity mismatch after hard-link',
+          } satisfies RunStoreError;
+        }
+        // Linked intent and temp share inode; drop temp link, fsync lock dir.
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* best-effort temp cleanup */
+        }
+        fsyncFdStrict(lockFd);
+        return written;
+      } finally {
+        closeFdQuiet(fd);
+        try {
+          if (pathEntryKind(tmp) !== 'absent') fs.unlinkSync(tmp);
+        } catch {
+          /* ignore */
+        }
+      }
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  function writeOwnerTempInLockDir(
+    lockDirPath: string,
+    owner: TxLockOwner,
+    tmpName?: string
+  ): { tmpName: string; identity: FileIdentity } {
+    assertStrictLockToken(owner.token, 'owner');
+    let lockFd: number | undefined;
+    try {
+      lockFd = openLockDirFd(lockDirPath);
+      const name =
+        tmpName ?? `${TX_OWNER_TMP_PREFIX}${randomUUID().replace(/-/g, '').slice(0, 16)}.tmp`;
+      if (
+        !name.startsWith(TX_OWNER_TMP_PREFIX) ||
+        name.includes('/') ||
+        name.includes('\\') ||
+        name.includes('\0') ||
+        name.includes('..')
+      ) {
+        throw {
+          code: 'run_store_error',
+          message: 'invalid owner temp name',
+        } satisfies RunStoreError;
+      }
+      const tmp = path.join(procFdBase(lockFd), name);
+      const payload = Buffer.from(`${JSON.stringify(owner)}\n`);
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(
+          tmp,
+          fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollowFlag(),
+          FILE_MODE
+        );
+        try {
+          fs.fchmodSync(fd, FILE_MODE);
+        } catch {
+          applyMode(tmp, FILE_MODE);
+        }
+        fs.writeFileSync(fd, payload);
+        fsyncFdStrict(fd);
+        const written = identityOf(fs.fstatSync(fd));
+        fs.closeSync(fd);
+        fd = undefined;
+        fsyncFdStrict(lockFd);
+        return { tmpName: name, identity: written };
+      } finally {
+        closeFdQuiet(fd);
+      }
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  /**
+   * Dead-intent recovery for steal transfers using immutable intent identities.
+   * Determines transfer state from exact file presence + intent identity matches.
+   * All combinations restore the old owner and remove intent idempotently.
+   */
+  function recoverDeadStealIntent(
+    session: RunDirSession,
+    lockPath: string,
+    intent: StealIntent,
+    intentIdentity: FileIdentity
+  ): 'retry' | 'busy' {
+    const contenderAlive = isProcessAliveWithStart(
+      intent.contenderPid,
+      intent.contenderProcessStart
+    );
+    if (contenderAlive !== false) return 'busy';
+
+    const lockId: FileIdentity = { dev: intent.lockDev, ino: intent.lockIno };
+    const ownerId: FileIdentity = { dev: intent.ownerDev, ino: intent.ownerIno };
+    const tempId: FileIdentity = { dev: intent.newOwnerTempDev, ino: intent.newOwnerTempIno };
+    let lockFd: number | undefined;
+    try {
+      lockFd = openLockDirFd(lockPath);
+      const lockSt = fs.fstatSync(lockFd);
+      if (!sameIdentity(lockId, identityOf(lockSt))) return 'busy';
+
+      const ownerPath = path.join(procFdBase(lockFd), TX_LOCK_OWNER_NAME);
+      const previousPath = path.join(procFdBase(lockFd), TX_OWNER_PREVIOUS_NAME);
+      const tempPath = path.join(procFdBase(lockFd), intent.newOwnerTempName);
+      const ownerKind = pathEntryKind(ownerPath);
+      const previousKind = pathEntryKind(previousPath);
+      const tempKind = pathEntryKind(tempPath);
+
+      // State 1: old owner present + previous absent + temp present → remove temp + intent; old owner remains.
+      if (ownerKind === 'regular' && previousKind === 'absent' && tempKind === 'regular') {
+        const ownerSt = fs.lstatSync(ownerPath);
+        if (!sameIdentity(ownerId, identityOf(ownerSt))) return 'busy';
+        const tempSt = fs.lstatSync(tempPath);
+        if (!sameIdentity(tempId, identityOf(tempSt))) return 'busy';
+        unlinkNamedInDir(lockPath, intent.newOwnerTempName, tempId);
+        unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+        fsyncDirFdStrict(session.dirFd);
+        return 'retry';
+      }
+
+      // State 2: owner absent + previous old + temp present → rename previous back to owner, remove temp + intent.
+      if (ownerKind === 'absent' && previousKind === 'regular' && tempKind === 'regular') {
+        const prevSt = fs.lstatSync(previousPath);
+        if (!sameIdentity(ownerId, identityOf(prevSt))) return 'busy';
+        const tempSt = fs.lstatSync(tempPath);
+        if (!sameIdentity(tempId, identityOf(tempSt))) return 'busy';
+        unlinkNamedInDir(lockPath, intent.newOwnerTempName, tempId);
+        fs.renameSync(previousPath, ownerPath);
+        const restored = fs.lstatSync(ownerPath);
+        if (!sameIdentity(ownerId, identityOf(restored))) return 'busy';
+        fsyncFdStrict(lockFd);
+        unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+        fsyncDirFdStrict(session.dirFd);
+        return 'retry';
+      }
+
+      // State 3: owner is new (≠ old owner inode) + previous old + temp absent → remove new owner, rename previous back, remove intent.
+      if (ownerKind === 'regular' && previousKind === 'regular' && tempKind === 'absent') {
+        const ownerSt = fs.lstatSync(ownerPath);
+        if (sameIdentity(ownerId, identityOf(ownerSt))) {
+          // Owner is old owner, not new — ambiguous.
+          return 'busy';
+        }
+        const prevSt = fs.lstatSync(previousPath);
+        if (!sameIdentity(ownerId, identityOf(prevSt))) return 'busy';
+        unlinkNamedInDir(lockPath, TX_LOCK_OWNER_NAME);
+        fs.renameSync(previousPath, ownerPath);
+        const restored = fs.lstatSync(ownerPath);
+        if (!sameIdentity(ownerId, identityOf(restored))) return 'busy';
+        fsyncFdStrict(lockFd);
+        unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+        fsyncDirFdStrict(session.dirFd);
+        return 'retry';
+      }
+
+      // State 4: old owner present + previous absent + temp absent → remove intent.
+      if (ownerKind === 'regular' && previousKind === 'absent' && tempKind === 'absent') {
+        const ownerSt = fs.lstatSync(ownerPath);
+        if (!sameIdentity(ownerId, identityOf(ownerSt))) return 'busy';
+        unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+        fsyncDirFdStrict(session.dirFd);
+        return 'retry';
+      }
+
+      // Any other combination: ambiguous — fail closed preserving evidence.
+      return 'busy';
+    } catch {
+      return 'busy';
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  /**
+   * Generation-safe stale transfer with immutable intent.
+   * 1. Create and fsync contender's new-owner temp inside the fixed lock dir.
+   * 2. Publish one immutable hard-link steal.intent with exact identities.
+   * 3. Transfer: rename old owner → owner.previous, new temp → owner.json.
+   * 4. Remove previous and intent by identity; return acquired.
+   * Intent bytes never change after publication (no in-place phase updates).
+   */
+  function tryStealStaleLock(
+    session: RunDirSession,
+    contender: TxLockOwner,
+    _runId: string
+  ): 'stolen' | 'busy' | 'retry' {
+    assertStrictLockToken(contender.token, 'contender');
+    const lockPath = childViaDirFd(session.dirFd, TX_LOCK_DIR_NAME);
+    if (pathEntryKind(lockPath) !== 'directory') return 'retry';
+
+    // Foreign or dead steal intent present.
+    const existingSteal = readIntentInLockDir(lockPath, TX_STEAL_INTENT_NAME);
+    if (existingSteal) {
+      let parsed: StealIntent | undefined;
+      try {
+        parsed = parseStealIntent(JSON.parse(existingSteal.raw.toString('utf8')));
+      } catch {
+        parsed = undefined;
+      }
+      if (!parsed) {
+        // Unreadable intent — fail closed; never delete foreign/unknown intent blindly.
+        return 'busy';
+      }
+      if (parsed.contenderToken === contender.token) {
+        // Our own leftover: recover or drop via state machine.
+        const rec = recoverDeadStealIntent(session, lockPath, parsed, existingSteal.identity);
+        if (rec === 'busy') return 'busy';
+        return 'retry';
+      }
+      // Foreign contender: if dead, recover their transfer; else busy.
+      const rec = recoverDeadStealIntent(session, lockPath, parsed, existingSteal.identity);
+      if (rec === 'retry') return 'retry';
+      return 'busy';
+    }
+
+    // Complete a crashed release for a proven-dead owner before acquiring.
+    const releaseIntent = readIntentInLockDir(lockPath, TX_RELEASE_INTENT_NAME);
+    if (releaseIntent) {
+      let rel: ReleaseIntent | undefined;
+      try {
+        rel = parseReleaseIntent(JSON.parse(releaseIntent.raw.toString('utf8')));
+      } catch {
+        rel = undefined;
+      }
+      if (!rel) return 'busy';
+      const inspected = readLockOwnerVia(lockPath);
+      if (inspected && inspected.owner.token === rel.token) {
+        // PID/start identity must match release intent records.
+        if (
+          inspected.owner.pid !== rel.ownerPid ||
+          inspected.owner.processStart !== rel.ownerProcessStart
+        ) {
+          return 'busy';
+        }
+        const alive = isProcessAliveWithStart(inspected.owner.pid, inspected.owner.processStart);
+        if (alive === false) {
+          try {
+            if (
+              !sameIdentity(inspected.lockIdentity, {
+                dev: rel.lockDev,
+                ino: rel.lockIno,
+              }) ||
+              !sameIdentity(inspected.ownerIdentity, {
+                dev: rel.ownerDev,
+                ino: rel.ownerIno,
+              })
+            ) {
+              return 'busy';
+            }
+            // Tombstone name uses only the validated release token (exact equality).
+            const tombName = tombstoneNameForToken(rel.token);
+            const tombPath = childViaDirFd(session.dirFd, tombName);
+            fs.renameSync(lockPath, tombPath);
+            fsyncDirFdStrict(session.dirFd);
+            removeVerifiedLockSideDir(tombPath, {
+              token: rel.token,
+              lockIdentity: inspected.lockIdentity,
+            });
+            fsyncDirFdStrict(session.dirFd);
+            return 'retry';
+          } catch {
+            return 'busy';
+          }
+        }
+        if (alive === true) return 'busy';
+      }
+      // Unreadable/mismatched release intent: fail closed busy.
+      return 'busy';
+    }
+
+    const inspected = readLockOwnerVia(lockPath);
+    if (!inspected) {
+      // Incomplete/malformed fixed lock — fail closed.
+      return 'busy';
+    }
+    if (!isStrictLockToken(inspected.owner.token)) return 'busy';
+    const alive = isProcessAliveWithStart(inspected.owner.pid, inspected.owner.processStart);
+    if (alive !== false) return 'busy';
+
+    // 1. Create new-owner temp FIRST, before publishing immutable intent.
+    const newOwnerTempName = `${TX_OWNER_TMP_PREFIX}${randomUUID().replace(/-/g, '').slice(0, 16)}.tmp`;
+    let tmpIdentity: FileIdentity;
+    let tmpDigest: string;
+    let tmpBytes: number;
+    try {
+      const built = writeOwnerTempInLockDir(lockPath, contender, newOwnerTempName);
+      tmpIdentity = built.identity;
+      // Re-open to capture digest/bytes for the immutable intent.
+      const verified = openVerifiedPrivateFile(
+        path.join(lockPath, newOwnerTempName),
+        lockPath,
+        newOwnerTempName,
+        { skipPathBound: true }
+      );
+      tmpDigest = verified.digest;
+      tmpBytes = verified.bytes;
+    } catch {
+      // Orphan temp; best-effort cleanup.
+      try {
+        unlinkNamedInDir(lockPath, newOwnerTempName);
+      } catch {
+        /* ignore */
+      }
+      return 'busy';
+    }
+
+    // 2. Publish immutable steal intent with exact identities (including new temp).
+    const intent: StealIntent = {
+      version: TX_LOCK_VERSION,
+      kind: 'steal',
+      contenderToken: contender.token,
+      contenderPid: contender.pid,
+      contenderProcessStart: contender.processStart,
+      ownerToken: inspected.owner.token,
+      ownerPid: inspected.owner.pid,
+      ownerProcessStart: inspected.owner.processStart,
+      ownerIno: inspected.ownerIdentity.ino,
+      ownerDev: inspected.ownerIdentity.dev,
+      lockIno: inspected.lockIdentity.ino,
+      lockDev: inspected.lockIdentity.dev,
+      newOwnerTempName,
+      newOwnerTempIno: tmpIdentity.ino,
+      newOwnerTempDev: tmpIdentity.dev,
+      newOwnerTempDigest: tmpDigest,
+      newOwnerTempBytes: tmpBytes,
+    };
+    let intentIdentity: FileIdentity;
+    try {
+      intentIdentity = writeExclusiveInLockDir(
+        lockPath,
+        TX_STEAL_INTENT_NAME,
+        Buffer.from(`${JSON.stringify(intent)}\n`)
+      );
+    } catch (err) {
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code: unknown }).code)
+          : '';
+      if (code === 'run_busy' || code === 'EEXIST') {
+        unlinkNamedInDir(lockPath, newOwnerTempName, tmpIdentity);
+        return 'busy';
+      }
+      unlinkNamedInDir(lockPath, newOwnerTempName, tmpIdentity);
+      return 'busy';
+    }
+
+    // 3. Re-read identities after intent publication; verify nothing changed.
+    const recheck = readLockOwnerVia(lockPath);
+    if (
+      !recheck ||
+      recheck.owner.token !== inspected.owner.token ||
+      recheck.owner.pid !== inspected.owner.pid ||
+      recheck.owner.processStart !== inspected.owner.processStart ||
+      !sameIdentity(recheck.ownerIdentity, inspected.ownerIdentity) ||
+      !sameIdentity(recheck.lockIdentity, inspected.lockIdentity)
+    ) {
+      unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+      unlinkNamedInDir(lockPath, newOwnerTempName, tmpIdentity);
+      return 'busy';
+    }
+    const stillDead = isProcessAliveWithStart(recheck.owner.pid, recheck.owner.processStart);
+    if (stillDead !== false) {
+      unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+      unlinkNamedInDir(lockPath, newOwnerTempName, tmpIdentity);
+      return 'busy';
+    }
+
+    // 4. Transfer: rename old owner → owner.previous, new temp → owner.json. Intent unchanged.
+    let lockFd: number | undefined;
+    try {
+      lockFd = openLockDirFd(lockPath);
+      const lockSt = fs.fstatSync(lockFd);
+      if (!sameIdentity(inspected.lockIdentity, identityOf(lockSt))) {
+        throw new Error('lock dir identity changed');
+      }
+      const ownerPath = path.join(procFdBase(lockFd), TX_LOCK_OWNER_NAME);
+      const previousPath = path.join(procFdBase(lockFd), TX_OWNER_PREVIOUS_NAME);
+      const tmpPath = path.join(procFdBase(lockFd), newOwnerTempName);
+      const ownerSt = fs.lstatSync(ownerPath);
+      if (!sameIdentity(inspected.ownerIdentity, identityOf(ownerSt))) {
+        throw new Error('owner identity changed');
+      }
+      if (pathEntryKind(previousPath) !== 'absent') {
+        throw new Error('owner.previous already present');
+      }
+      fs.renameSync(ownerPath, previousPath);
+      const tmpSt = fs.lstatSync(tmpPath);
+      if (!sameIdentity(tmpIdentity, identityOf(tmpSt))) {
+        throw new Error('owner temp replaced');
+      }
+      fs.renameSync(tmpPath, ownerPath);
+      const newOwnerSt = fs.lstatSync(ownerPath);
+      if (!sameIdentity(tmpIdentity, identityOf(newOwnerSt))) {
+        throw new Error('new owner identity mismatch');
+      }
+      fsyncFdStrict(lockFd);
+
+      // 5. Drop intent + previous entry with exact identity checks. Transfer complete.
+      unlinkNamedInDir(lockPath, TX_OWNER_PREVIOUS_NAME, inspected.ownerIdentity);
+      unlinkNamedInDir(lockPath, TX_STEAL_INTENT_NAME, intentIdentity);
+      fsyncDirFdStrict(session.dirFd);
+      return 'stolen';
+    } catch {
+      // Leave immutable intent + file evidence for dead-intent recovery; drop our temp if still named.
+      try {
+        unlinkNamedInDir(lockPath, newOwnerTempName, tmpIdentity);
+      } catch {
+        /* ignore */
+      }
+      return 'busy';
+    } finally {
+      closeFdQuiet(lockFd);
+    }
+  }
+
+  function buildCompleteLockCandidate(
+    session: RunDirSession,
+    owner: TxLockOwner
+  ): { candidatePath: string; lockIdentity: FileIdentity } {
+    const candName = `${TX_LOCK_DIR_NAME}.cand.${instanceId}.${randomUUID()}`;
+    const candidatePath = childViaDirFd(session.dirFd, candName);
+    fs.mkdirSync(candidatePath, { mode: DIR_MODE });
+    applyMode(candidatePath, DIR_MODE);
+    const candStat = fs.lstatSync(candidatePath);
+    const candMode = validatePrivateEntryStats(candStat, 'directory');
+    if (!candMode.ok) {
+      removeOwnCandidate(candidatePath, identityOf(candStat), owner.token);
+      throw {
+        code: 'run_store_error',
+        message: `lock candidate directory unsafe: ${candMode.reason}`,
+      } satisfies RunStoreError;
+    }
+    const lockIdentity = identityOf(candStat);
+    const ownerPath = path.join(candidatePath, TX_LOCK_OWNER_NAME);
+    const payload = Buffer.from(`${JSON.stringify(owner)}\n`);
+    const tmp = path.join(candidatePath, `${TX_OWNER_TMP_PREFIX}${randomUUID()}.tmp`);
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(
+        tmp,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollowFlag(),
+        FILE_MODE
+      );
+      try {
+        fs.fchmodSync(fd, FILE_MODE);
+      } catch {
+        applyMode(tmp, FILE_MODE);
+      }
+      fs.writeFileSync(fd, payload);
+      fsyncFdStrict(fd);
+      const written = identityOf(fs.fstatSync(fd));
+      fs.closeSync(fd);
+      fd = undefined;
+      const tmpStat = fs.lstatSync(tmp);
+      if (!sameIdentity(written, identityOf(tmpStat))) {
+        throw {
+          code: 'corrupt_run',
+          message: 'lock owner temp replaced after close',
+        } satisfies RunStoreError;
+      }
+      fs.renameSync(tmp, ownerPath);
+      const ownerStat = fs.lstatSync(ownerPath);
+      if (!sameIdentity(written, identityOf(ownerStat))) {
+        throw {
+          code: 'corrupt_run',
+          message: 'lock owner identity mismatch after rename',
+        } satisfies RunStoreError;
+      }
+      fsyncPathStrict(ownerPath);
+      const candFd = fs.openSync(
+        candidatePath,
+        fs.constants.O_RDONLY | directoryFlag() | noFollowFlag()
+      );
+      try {
+        fsyncFdStrict(candFd);
+      } finally {
+        closeFdQuiet(candFd);
+      }
+      return { candidatePath, lockIdentity };
+    } catch (err) {
+      closeFdQuiet(fd);
+      removeOwnCandidate(candidatePath, lockIdentity, owner.token);
+      throw err;
+    }
+  }
+
+  function acquireTxLock(runId: string): HeldTxLock {
+    const publicDir = runDirOf(runId);
+    const deadline = monotonicNowMs() + txLockWaitMs;
+    const token = randomUUID();
+    const owner: TxLockOwner = {
+      version: TX_LOCK_VERSION,
+      pid: process.pid,
+      processStart: selfStartIdentity,
+      token,
+      timestamp: now(),
+    };
+
+    const session = openRunDirSession(publicDir, runId);
+    try {
+      collectSafeLockLeftovers(session, runId);
+
+      for (;;) {
+        revalidatePublicRunDir(session.publicDir, session.identity, runId);
+        const lockPath = childViaDirFd(session.dirFd, TX_LOCK_DIR_NAME);
+        const lockKind = pathEntryKind(lockPath);
+        if (lockKind === 'symlink' || lockKind === 'regular' || lockKind === 'other') {
+          throw {
+            code: 'corrupt_run',
+            runId,
+            message: `transaction lock path is unsafe (${lockKind})`,
+          } satisfies RunStoreError;
+        }
+
+        if (lockKind === 'absent') {
+          let candidatePath: string | undefined;
+          let candIdentity: FileIdentity | undefined;
+          try {
+            const built = buildCompleteLockCandidate(session, owner);
+            candidatePath = built.candidatePath;
+            candIdentity = built.lockIdentity;
+            try {
+              fs.renameSync(candidatePath, lockPath);
+              candidatePath = undefined;
+            } catch (renameErr) {
+              const code = (renameErr as NodeJS.ErrnoException).code;
+              if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+                if (candidatePath && candIdentity) {
+                  removeOwnCandidate(candidatePath, candIdentity, token);
+                }
+                candidatePath = undefined;
+              } else {
+                throw renameErr;
+              }
+            }
+            if (candidatePath === undefined && pathEntryKind(lockPath) === 'directory') {
+              const published = readLockOwnerVia(lockPath);
+              if (published && published.owner.token === token) {
+                fsyncDirFdStrict(session.dirFd);
+                revalidatePublicRunDir(session.publicDir, session.identity, runId);
+                return {
+                  runId,
+                  dir: publicDir,
+                  lockDir: path.join(publicDir, TX_LOCK_DIR_NAME),
+                  token,
+                  session,
+                  lockIdentity: published.lockIdentity,
+                };
+              }
+            }
+          } catch (err) {
+            if (candidatePath && candIdentity) {
+              removeOwnCandidate(candidatePath, candIdentity, token);
+            }
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+              if (err && typeof err === 'object' && 'code' in err && 'message' in err) throw err;
+              throw {
+                code: 'run_store_error',
+                runId,
+                message: `transaction lock acquire failed: ${messageOf(err)}`,
+              } satisfies RunStoreError;
+            }
+          }
+        } else {
+          // Fixed lock present: try generation-safe stale transfer (never remove fixed name).
+          const steal = tryStealStaleLock(session, owner, runId);
+          if (steal === 'stolen') {
+            // Confirm we own the fixed lock after in-place transfer.
+            const published = readLockOwnerVia(lockPath);
+            if (published && published.owner.token === token) {
+              fsyncDirFdStrict(session.dirFd);
+              revalidatePublicRunDir(session.publicDir, session.identity, runId);
+              return {
+                runId,
+                dir: publicDir,
+                lockDir: path.join(publicDir, TX_LOCK_DIR_NAME),
+                token,
+                session,
+                lockIdentity: published.lockIdentity,
+              };
+            }
+            continue;
+          }
+        }
+
+        if (monotonicNowMs() >= deadline) {
+          throw {
+            code: 'run_busy',
+            runId,
+            message: 'run transaction lock held by another live owner',
+          } satisfies RunStoreError;
+        }
+        const remaining = deadline - monotonicNowMs();
+        sleepMs(Math.min(txLockRetryMs, Math.max(1, remaining)));
+      }
+    } catch (err) {
+      closeRunDirSession(session);
+      throw err;
+    }
+  }
+
+  /**
+   * Release: exclusive release.intent (hard-link) inside owned fixed lock, then
+   * atomic rename of the verified fixed lock directory to a token tombstone.
+   * Every failure is stored and thrown after safe cleanup attempts — never returns
+   * success when intent/tombstone/public revalidation/verified release fails.
+   */
+  function releaseTxLock(held: HeldTxLock): void {
+    let releaseError: unknown;
+    try {
+      revalidatePublicRunDir(held.session.publicDir, held.session.identity, held.runId);
+      const lockPath = childViaDirFd(held.session.dirFd, TX_LOCK_DIR_NAME);
+      const current = readLockOwnerVia(lockPath);
+      if (
+        !current ||
+        current.owner.token !== held.token ||
+        !sameIdentity(current.lockIdentity, held.lockIdentity)
+      ) {
+        // Do not remove a lock we do not own / that was replaced.
+        releaseError = {
+          code: 'durable_write_error',
+          runId: held.runId,
+          message: 'transaction lock release: ownership lost before release',
+        } satisfies RunStoreError;
+      } else {
+        assertStrictLockToken(held.token, 'release');
+        const intent: ReleaseIntent = {
+          version: TX_LOCK_VERSION,
+          kind: 'release',
+          token: held.token,
+          ownerPid: current.owner.pid,
+          ownerProcessStart: current.owner.processStart,
+          ownerIno: current.ownerIdentity.ino,
+          ownerDev: current.ownerIdentity.dev,
+          lockIno: current.lockIdentity.ino,
+          lockDev: current.lockIdentity.dev,
+        };
+        let intentIdentity: FileIdentity | undefined;
+        try {
+          intentIdentity = writeExclusiveInLockDir(
+            lockPath,
+            TX_RELEASE_INTENT_NAME,
+            Buffer.from(`${JSON.stringify(intent)}\n`)
+          );
+        } catch (err) {
+          // Cannot publish release intent safely — leave lock for recovery; propagate.
+          releaseError = err;
+        }
+
+        if (!releaseError) {
+          // Re-verify ownership after intent publication.
+          const recheck = readLockOwnerVia(lockPath);
+          if (
+            !recheck ||
+            recheck.owner.token !== held.token ||
+            recheck.owner.pid !== current.owner.pid ||
+            recheck.owner.processStart !== current.owner.processStart ||
+            !sameIdentity(recheck.lockIdentity, held.lockIdentity) ||
+            !sameIdentity(recheck.ownerIdentity, current.ownerIdentity)
+          ) {
+            if (intentIdentity) {
+              unlinkNamedInDir(lockPath, TX_RELEASE_INTENT_NAME, intentIdentity);
+            }
+            releaseError = {
+              code: 'durable_write_error',
+              runId: held.runId,
+              message: 'transaction lock release: ownership changed after intent',
+            } satisfies RunStoreError;
+          }
+        }
+
+        if (!releaseError) {
+          // Tombstone basename requires exact equality with held/release-intent token.
+          const tombName = tombstoneNameForToken(held.token);
+          const tombPath = childViaDirFd(held.session.dirFd, tombName);
+          try {
+            fs.renameSync(lockPath, tombPath);
+          } catch (err) {
+            releaseError = err;
+          }
+          if (!releaseError) {
+            try {
+              fsyncDirFdStrict(held.session.dirFd);
+            } catch (err) {
+              releaseError = err;
+            }
+          }
+
+          // Remove tombstone via verified inode/token and no-follow fd traversal.
+          // Even if fsync failed, attempt cleanup; still surface the first error.
+          const removed = removeVerifiedLockSideDir(tombPath, {
+            token: held.token,
+            lockIdentity: held.lockIdentity,
+          });
+          if (!removed.ok) {
+            releaseError =
+              releaseError ??
+              ({
+                code: 'durable_write_error',
+                runId: held.runId,
+                message: `transaction lock tombstone cleanup failed: ${removed.reason}`,
+              } satisfies RunStoreError);
+          }
+          try {
+            fsyncDirFdStrict(held.session.dirFd);
+          } catch (err) {
+            releaseError = releaseError ?? err;
+          }
+
+          // Final public path check: replacement after release must surface.
+          try {
+            revalidatePublicRunDir(held.session.publicDir, held.session.identity, held.runId);
+          } catch (err) {
+            releaseError = releaseError ?? err;
+          }
+        }
+      }
+    } catch (err) {
+      releaseError = releaseError ?? err;
+    } finally {
+      closeRunDirSession(held.session);
+    }
+    if (releaseError) {
+      if (
+        releaseError &&
+        typeof releaseError === 'object' &&
+        'code' in releaseError &&
+        'message' in releaseError
+      ) {
+        throw releaseError;
+      }
+      throw {
+        code: 'durable_write_error',
+        runId: held.runId,
+        message: `transaction lock release failed: ${messageOf(releaseError)}`,
+      } satisfies RunStoreError;
+    }
+  }
+
+  function withTxLock<T>(runId: string, fn: (held: HeldTxLock) => T): T {
+    const held = acquireTxLock(runId);
+    let result: T;
+    let fnError: unknown;
+    try {
+      result = fn(held);
+    } catch (err) {
+      fnError = err;
+    }
+    // Always attempt release; any release failure prevents success.
+    let releaseError: unknown;
+    try {
+      releaseTxLock(held);
+    } catch (err) {
+      releaseError = err;
+    }
+    if (fnError && releaseError) {
+      // Deterministic combination: surface operation error with release context.
+      const fnMsg = messageOf(fnError);
+      const relMsg = messageOf(releaseError);
+      if (fnError && typeof fnError === 'object' && 'code' in fnError && 'message' in fnError) {
+        const e = fnError as RunStoreError;
+        throw {
+          ...e,
+          message: `${e.message}; also release failed: ${relMsg}`,
+        } satisfies RunStoreError;
+      }
+      throw {
+        code: 'run_store_error',
+        runId,
+        message: `${fnMsg}; also release failed: ${relMsg}`,
+      } satisfies RunStoreError;
+    }
+    if (fnError) throw fnError;
+    if (releaseError) throw releaseError;
+    return result!;
+  }
+
+  function hasTxArtifacts(dir: string): boolean {
+    const { rollback, marker, lockDir } = txPaths(dir);
+    return (
+      pathEntryKind(marker) !== 'absent' ||
+      pathEntryKind(rollback) !== 'absent' ||
+      pathEntryKind(lockDir) !== 'absent'
+    );
+  }
+
+  /**
+   * Recover an interrupted strict run.json transaction before load/parse.
+   * Caller must hold the transaction lock. prepared → restore old authority;
+   * committed → keep new authority and clean up. Malformed/unsafe state fails
+   * closed without deleting forensic material.
+   */
+  function recoverStrictTransactionLocked(
+    runId: string,
+    session?: RunDirSession
+  ): { ok: true } | { ok: false; error: RunStoreError } {
+    const dir = runDirOf(runId);
+    if (pathEntryKind(dir) === 'absent') return { ok: true };
+    if (session) {
+      revalidatePublicRunDir(session.publicDir, session.identity, runId);
+    }
+    const target = session ? childViaDirFd(session.dirFd, 'run.json') : path.join(dir, 'run.json');
+    const rollback = session
+      ? childViaDirFd(session.dirFd, TX_ROLLBACK_NAME)
+      : path.join(dir, TX_ROLLBACK_NAME);
+    const marker = session
+      ? childViaDirFd(session.dirFd, TX_MARKER_NAME)
+      : path.join(dir, TX_MARKER_NAME);
+    const skipBound = !!session;
+    const writeAtomic = (dest: string, base: string, data: Buffer) =>
+      writePrivateBytesAtomic(dest, dir, base, data, fsyncDirStrict, session);
+    const syncDir = () => {
+      if (session) fsyncDirFdStrict(session.dirFd);
+      else fsyncDirStrict(dir);
+    };
+
+    const markerKind = pathEntryKind(marker);
+    const rollbackKind = pathEntryKind(rollback);
+
+    if (markerKind === 'symlink' || markerKind === 'directory' || markerKind === 'other') {
+      return {
+        ok: false,
+        error: {
+          code: 'corrupt_run',
+          runId,
+          message: 'strict transaction marker is not a safe regular file',
+        },
+      };
+    }
+    if (rollbackKind === 'symlink' || rollbackKind === 'directory' || rollbackKind === 'other') {
+      return {
+        ok: false,
+        error: {
+          code: 'corrupt_run',
+          runId,
+          message: 'strict transaction rollback is not a safe regular file',
+        },
+      };
+    }
+
+    const markerExists = markerKind === 'regular';
+    const rollbackExists = rollbackKind === 'regular';
+
+    if (markerExists) {
+      try {
+        const st = fs.lstatSync(marker);
+        const v = validatePrivateEntryStats(st, 'file');
+        if (!v.ok) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId,
+              message: 'strict transaction marker is not a safe regular file',
+            },
+          };
+        }
+      } catch {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId,
+            message: 'strict transaction marker is not a safe regular file',
+          },
+        };
+      }
+    }
+    if (rollbackExists) {
+      try {
+        const st = fs.lstatSync(rollback);
+        const v = validatePrivateEntryStats(st, 'file');
+        if (!v.ok) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId,
+              message: 'strict transaction rollback is not a safe regular file',
+            },
+          };
+        }
+      } catch {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId,
+            message: 'strict transaction rollback is not a safe regular file',
+          },
+        };
+      }
+    }
+
+    // Orphan rollback before marker durability: verify run.json still matches
+    // the rollback bytes, then drop the redundant copy.
+    if (!markerExists && rollbackExists) {
+      try {
+        const rbVerified = openVerifiedPrivateFile(rollback, dir, TX_ROLLBACK_NAME, {
+          skipPathBound: skipBound,
+        });
+        if (pathEntryKind(target) === 'absent') {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId,
+              message: 'orphan rollback without run.json',
+            },
+          };
+        }
+        const current = readAuthorityRunJson(target, dir, { skipPathBound: skipBound });
+        if (!current.data.equals(rbVerified.data)) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId,
+              message: 'orphan rollback does not match run.json',
+            },
+          };
+        }
+        const cleaned = cleanupTxPhase(dir, 'prepared', session, {
+          rollback: rbVerified,
+        });
+        if (!cleaned.ok) {
+          return {
+            ok: false,
+            error: {
+              code: 'durable_write_error',
+              runId,
+              message: `strict transaction orphan cleanup failed: ${messageOf(cleaned.error)}`,
+            },
+          };
+        }
+        syncDir();
+        return { ok: true };
+      } catch (err) {
+        if (err && typeof err === 'object' && 'code' in err) {
+          return { ok: false, error: err as RunStoreError };
+        }
+        return {
+          ok: false,
+          error: {
+            code: 'durable_write_error',
+            runId,
+            message: `strict transaction orphan cleanup failed: ${messageOf(err)}`,
+          },
+        };
+      }
+    }
+
+    if (!markerExists) return { ok: true };
+
+    let markerVerified: VerifiedPrivateFile;
+    let parsed: unknown;
+    try {
+      markerVerified = openVerifiedPrivateFile(marker, dir, TX_MARKER_NAME, {
+        skipPathBound: skipBound,
+        parseMarkerPhase: true,
+      });
+      parsed = JSON.parse(markerVerified.data.toString('utf8'));
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && (err as RunStoreError).code) {
+        return { ok: false, error: err as RunStoreError };
+      }
+      return {
+        ok: false,
+        error: {
+          code: 'corrupt_run',
+          runId,
+          message: `strict transaction marker unreadable: ${messageOf(err)}`,
+        },
+      };
+    }
+    const m = parseTxMarker(parsed);
+    if (!m) {
+      return {
+        ok: false,
+        error: {
+          code: 'corrupt_run',
+          runId,
+          message: 'strict transaction marker is malformed',
+        },
+      };
+    }
+    // Carry phase from the authority-decision verified entry.
+    if (markerVerified.phase !== undefined && markerVerified.phase !== m.phase) {
+      return {
+        ok: false,
+        error: {
+          code: 'corrupt_run',
+          runId,
+          message: 'strict transaction marker phase identity mismatch',
+        },
+      };
+    }
+    markerVerified = { ...markerVerified, phase: m.phase };
+
+    if (m.phase === 'prepared') {
+      if (!rollbackExists) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId,
+            message: 'prepared transaction missing rollback bytes',
+          },
+        };
+      }
+      try {
+        const rbVerified = openVerifiedPrivateFile(rollback, dir, TX_ROLLBACK_NAME, {
+          skipPathBound: skipBound,
+        });
+        if (rbVerified.bytes !== m.oldBytes || rbVerified.digest !== m.oldSha256) {
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId,
+              message: 'prepared transaction rollback digest mismatch',
+            },
+          };
+        }
+        // Restore previous authority over run.json.
+        writeAtomic(target, 'run.json', rbVerified.data);
+        fsyncPathStrict(target);
+        syncDir();
+        // Cleanup only the exact verified generations from the authority decision.
+        const cleaned = cleanupTxPhase(dir, 'prepared', session, {
+          marker: markerVerified,
+          rollback: rbVerified,
+        });
+        if (!cleaned.ok) {
+          return {
+            ok: false,
+            error: {
+              code: 'durable_write_error',
+              runId,
+              message: `strict transaction prepared cleanup failed: ${messageOf(cleaned.error)}; recovery files preserved`,
+            },
+          };
+        }
+        return { ok: true };
+      } catch (err) {
+        if (isBypassCleanupError(err)) throw err;
+        if (err && typeof err === 'object' && 'code' in err) {
+          return { ok: false, error: err as RunStoreError };
+        }
+        return {
+          ok: false,
+          error: {
+            code: 'durable_write_error',
+            runId,
+            message: `strict transaction prepared recovery failed: ${messageOf(err)}; recovery files preserved`,
+          },
+        };
+      }
+    }
+
+    // committed: new authority must already be in run.json; only cleanup remains.
+    // Committed marker without rollback is still valid (mid-cleanup).
+    try {
+      if (pathEntryKind(target) === 'absent') {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId,
+            message: 'committed transaction missing run.json',
+          },
+        };
+      }
+      const current = readAuthorityRunJson(target, dir, { skipPathBound: skipBound });
+      if (current.bytes !== m.newBytes || current.digest !== m.newSha256) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId,
+            message: 'committed transaction run.json digest mismatch',
+          },
+        };
+      }
+      let rollbackVerified: VerifiedPrivateFile | undefined;
+      if (rollbackExists) {
+        rollbackVerified = openVerifiedPrivateFile(rollback, dir, TX_ROLLBACK_NAME, {
+          skipPathBound: skipBound,
+        });
+      }
+      const cleaned = cleanupTxPhase(dir, 'committed', session, {
+        marker: markerVerified,
+        rollback: rollbackVerified,
+      });
+      if (!cleaned.ok && !isBypassCleanupError(cleaned.error)) {
+        if (
+          cleaned.error &&
+          typeof cleaned.error === 'object' &&
+          'code' in cleaned.error &&
+          (cleaned.error as RunStoreError).code === 'generation_mismatch'
+        ) {
+          return { ok: false, error: cleaned.error as RunStoreError };
+        }
+        const recheck = revalidateCommittedState(
+          dir,
+          { sha256: m.newSha256, bytes: m.newBytes },
+          session,
+          {
+            markerIdentity: markerVerified.identity,
+            rollbackIdentity: rollbackVerified?.identity,
+          }
+        );
+        if (!recheck.ok) {
+          return {
+            ok: false,
+            error: {
+              ...recheck.error,
+              runId: recheck.error.runId ?? runId,
+              message:
+                recheck.error.message ??
+                `strict transaction committed cleanup failed: ${messageOf(cleaned.error)}; recovery files preserved`,
+            },
+          };
+        }
+      }
+      return { ok: true };
+    } catch (err) {
+      if (isBypassCleanupError(err)) throw err;
+      if (err && typeof err === 'object' && 'code' in err) {
+        return { ok: false, error: err as RunStoreError };
+      }
+      return {
+        ok: false,
+        error: {
+          code: 'durable_write_error',
+          runId,
+          message: `strict transaction committed cleanup failed: ${messageOf(err)}; recovery files preserved`,
+        },
+      };
+    }
+  }
 
   mkdirPrivate(rootDir);
 
@@ -575,6 +3979,7 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     return runDirOf(runId);
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   function runJsonPath(runId: string): string {
     return path.join(runDirOf(runId), 'run.json');
   }
@@ -930,9 +4335,21 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           },
         };
       }
+      // requireArtifactReader is an additive Version 1 boolean.
+      if (u.requireArtifactReader !== undefined && typeof u.requireArtifactReader !== 'boolean') {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: `unit ${unitId} requireArtifactReader must be a boolean when present`,
+          },
+        };
+      }
       if (u.result !== undefined) {
         const shellError = validateResultShell(u.result, `unit ${unitId} result`, {
           unitStatus: typeof u.status === 'string' ? u.status : undefined,
+          runId: expectedRunId,
         });
         if (shellError) {
           return {
@@ -1029,12 +4446,53 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
         r.request && typeof r.request === 'object' && !Array.isArray(r.request)
           ? (r.request as unknown as Record<string, unknown>)
           : undefined,
+      runId: expectedRunId,
     });
     if (detailsError) {
       return {
         ok: false,
         error: { code: 'corrupt_run', runId: expectedRunId, message: detailsError },
       };
+    }
+    if (r.workflowState !== undefined) {
+      if (
+        r.workflowState === null ||
+        typeof r.workflowState !== 'object' ||
+        Array.isArray(r.workflowState)
+      ) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: 'workflowState must be a non-null object',
+          },
+        };
+      }
+      const ws = r.workflowState as { fanouts?: unknown };
+      if (ws.fanouts === null || typeof ws.fanouts !== 'object' || Array.isArray(ws.fanouts)) {
+        return {
+          ok: false,
+          error: {
+            code: 'corrupt_run',
+            runId: expectedRunId,
+            message: 'workflowState.fanouts must be a non-null object',
+          },
+        };
+      }
+      for (const [key, fanout] of Object.entries(ws.fanouts as Record<string, unknown>)) {
+        const fanoutError = validateWorkflowFanoutState(
+          fanout,
+          `workflowState.fanouts[${key}]`,
+          expectedRunId
+        );
+        if (fanoutError) {
+          return {
+            ok: false,
+            error: { code: 'corrupt_run', runId: expectedRunId, message: fanoutError },
+          };
+        }
+      }
     }
     if (r.continuationTasks !== undefined) {
       if (!Array.isArray(r.continuationTasks)) {
@@ -1479,27 +4937,11 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     return undefined;
   }
 
-  function loadRunJson(
-    runId: string
+  function parseRunJsonBytes(
+    runId: string,
+    dir: string,
+    content: string
   ): { ok: true; loaded: LoadedRun } | { ok: false; error: RunStoreError } {
-    const dir = runDirOf(runId);
-    const file = runJsonPath(runId);
-    let content: string;
-    try {
-      content = fs.readFileSync(file, 'utf-8');
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') {
-        return {
-          ok: false,
-          error: { code: 'run_not_found', runId, message: 'run.json not found' },
-        };
-      }
-      return {
-        ok: false,
-        error: { code: 'corrupt_run', runId, message: `cannot read run.json: ${messageOf(err)}` },
-      };
-    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
@@ -1518,20 +4960,500 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     return { ok: true, loaded: { runDir: dir, record: validated.record } };
   }
 
-  function writeRunContents(runId: string, record: AgentRunRecordV1): void {
+  function loadRunJson(
+    runId: string
+  ): { ok: true; loaded: LoadedRun } | { ok: false; error: RunStoreError } {
     const dir = runDirOf(runId);
-    const target = path.join(dir, 'run.json');
-    const tmp = path.join(dir, `.run.json.${instanceId}.${randomUUID()}.tmp`);
-    const data = `${JSON.stringify(record, null, 2)}\n`;
-    let fd: number | undefined;
+
+    // Fast path: no transaction artifacts → open run dir component-by-component and
+    // read run.json through retained dir fd (O_NOFOLLOW authority read).
+    if (!hasTxArtifacts(dir)) {
+      let content: string;
+      try {
+        content = readRunJsonViaDirComponents(runId, dir).toString('utf-8');
+      } catch (err) {
+        if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+          const e = err as RunStoreError;
+          if (e.code === 'corrupt_run' && String(e.message).includes('not found')) {
+            return {
+              ok: false,
+              error: { code: 'run_not_found', runId, message: 'run.json not found' },
+            };
+          }
+          if (e.code === 'run_not_found') {
+            return {
+              ok: false,
+              error: { code: 'run_not_found', runId, message: e.message ?? 'run.json not found' },
+            };
+          }
+          return { ok: false, error: { ...e, runId } };
+        }
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') {
+          return {
+            ok: false,
+            error: { code: 'run_not_found', runId, message: 'run.json not found' },
+          };
+        }
+        return {
+          ok: false,
+          error: { code: 'corrupt_run', runId, message: `cannot read run.json: ${messageOf(err)}` },
+        };
+      }
+      // Re-check: a writer may have started between the artifact probe and read.
+      if (!hasTxArtifacts(dir)) {
+        return parseRunJsonBytes(runId, dir, content);
+      }
+    }
+
+    // Transaction state present: acquire lock, recover, then read.
     try {
-      fd = fs.openSync(tmp, 'w', FILE_MODE);
-      fs.writeFileSync(fd, data);
-      fsyncFd(fd);
+      return withTxLock(runId, (held) => {
+        const recovered = recoverStrictTransactionLocked(runId, held.session);
+        if (!recovered.ok) return recovered;
+        revalidatePublicRunDir(held.session.publicDir, held.session.identity, runId);
+        const lockedFile = childViaDirFd(held.session.dirFd, 'run.json');
+        let content: string;
+        try {
+          content = readRunJsonNoFollow(lockedFile, dir, { skipPathBound: true }).toString('utf-8');
+        } catch (err) {
+          if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+            const e = err as RunStoreError;
+            if (e.code === 'corrupt_run' && String(e.message).includes('not found')) {
+              return {
+                ok: false,
+                error: { code: 'run_not_found', runId, message: 'run.json not found' },
+              };
+            }
+            return { ok: false, error: { ...e, runId } };
+          }
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'ENOENT') {
+            return {
+              ok: false,
+              error: { code: 'run_not_found', runId, message: 'run.json not found' },
+            };
+          }
+          return {
+            ok: false,
+            error: {
+              code: 'corrupt_run',
+              runId,
+              message: `cannot read run.json: ${messageOf(err)}`,
+            },
+          };
+        }
+        return parseRunJsonBytes(runId, dir, content);
+      });
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+        return { ok: false, error: err as RunStoreError };
+      }
+      return {
+        ok: false,
+        error: {
+          code: 'run_store_error',
+          runId,
+          message: `load run lock failed: ${messageOf(err)}`,
+        },
+      };
+    }
+  }
+
+  function writeRunContentsLocked(
+    runId: string,
+    record: AgentRunRecordV1,
+    strict = false,
+    held?: HeldTxLock
+  ): void {
+    const dir = runDirOf(runId);
+    const session = held?.session;
+    if (session) revalidatePublicRunDir(session.publicDir, session.identity, runId);
+    const target = session ? childViaDirFd(session.dirFd, 'run.json') : path.join(dir, 'run.json');
+    const tmpName = `.run.json.${instanceId}.${randomUUID()}.tmp`;
+    const tmp = session ? childViaDirFd(session.dirFd, tmpName) : path.join(dir, tmpName);
+    const dataBuf = Buffer.from(`${JSON.stringify(record, null, 2)}\n`);
+    const targetExisted = pathEntryKind(target) !== 'absent';
+    const rollbackPath = session
+      ? childViaDirFd(session.dirFd, TX_ROLLBACK_NAME)
+      : path.join(dir, TX_ROLLBACK_NAME);
+    let previousBytes: Buffer | undefined;
+    let rollbackPublished = false;
+    let preparedDurable = false;
+    let committedDurable = false;
+    let fd: number | undefined;
+
+    const cleanupStagingOnly = (): void => {
+      try {
+        if (pathEntryKind(tmp) !== 'absent') fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const isTerminalTxError = (err: unknown): boolean => {
+      if (!err || typeof err !== 'object' || !('message' in err)) return false;
+      const msg = String((err as { message: unknown }).message ?? '');
+      const code =
+        'code' in err && typeof (err as { code?: unknown }).code === 'string'
+          ? (err as { code: string }).code
+          : '';
+      return (
+        code === 'durable_commit_uncertain' ||
+        code === 'durable_write_error' ||
+        msg.includes('prior run.json restored') ||
+        msg.includes('recovery files preserved') ||
+        msg.includes('recovery material incomplete') ||
+        msg.includes('commit publication is uncertain')
+      );
+    };
+
+    const restoredFailureMessage = (causeMessage: string): string => {
+      // Preserve the post-rename directory-sync wording expected by existing tests.
+      if (causeMessage.includes('directory fsync failed')) {
+        return `${causeMessage}; prior run.json restored`;
+      }
+      return `strict run.json update failed: ${causeMessage}; prior run.json restored`;
+    };
+
+    /**
+     * Restore previous authority from the durable rollback copy.
+     * On success removes marker/rollback. On I/O failure preserves recovery
+     * material and throws durable_write_error (never generic leftover cleanup).
+     */
+    const restoreFromRollback = (causeMessage: string): never => {
+      if (!previousBytes || pathEntryKind(rollbackPath) === 'absent') {
+        throw {
+          code: 'durable_write_error',
+          runId,
+          message: `strict run.json update failed: ${causeMessage}; recovery material incomplete`,
+        } satisfies RunStoreError;
+      }
+      try {
+        fireStrictTxHook('during_rollback_restore');
+        const rb = readPrivateFileBytes(rollbackPath, dir, TX_ROLLBACK_NAME, {
+          skipPathBound: !!session,
+        });
+        if (!rb.equals(previousBytes)) {
+          throw {
+            code: 'durable_write_error',
+            runId,
+            message: `strict run.json update failed: ${causeMessage}; rollback bytes mismatch; recovery files preserved`,
+          } satisfies RunStoreError;
+        }
+        writePrivateBytesAtomic(target, dir, 'run.json', rb, fsyncDirStrict, session);
+        fsyncPathStrict(target);
+        if (session) fsyncDirFdStrict(session.dirFd);
+        else fsyncDirStrict(dir);
+        // Restore succeeded — drop transaction leftovers (prepared order).
+        const cleaned = cleanupTxPhase(dir, 'prepared', session);
+        if (!cleaned.ok) {
+          throw {
+            code: 'durable_write_error',
+            runId,
+            message: `strict run.json recovery cleanup failed: ${messageOf(cleaned.error)}; recovery files preserved`,
+          } satisfies RunStoreError;
+        }
+        cleanupStagingOnly();
+        throw {
+          code: 'run_store_error',
+          runId,
+          message: restoredFailureMessage(causeMessage),
+        } satisfies RunStoreError;
+      } catch (rollbackErr) {
+        if (isBypassCleanupError(rollbackErr)) throw rollbackErr;
+        if (isTerminalTxError(rollbackErr)) throw rollbackErr;
+        // Preserve rollback + marker; do not call generic leftover cleanup.
+        throw {
+          code: 'durable_write_error',
+          runId,
+          message: `strict run.json recovery failed: ${messageOf(rollbackErr)}; recovery files preserved`,
+        } satisfies RunStoreError;
+      }
+    };
+
+    try {
+      // Always clear any interrupted transaction before publishing a new one.
+      // Ordinary writers also recover under the lock before reading/writing.
+      {
+        const recovered = recoverStrictTransactionLocked(runId, session);
+        if (!recovered.ok) throw recovered.error;
+      }
+
+      // Strict replacement of an existing run.json: durable prepared/committed protocol.
+      if (strict && targetExisted) {
+        previousBytes = readRunJsonNoFollow(target, dir, {
+          skipPathBound: !!session,
+        });
+        const markerBase: Omit<TxMarker, 'phase'> = {
+          version: TX_MARKER_VERSION,
+          oldSha256: sha256Hex(previousBytes),
+          oldBytes: previousBytes.byteLength,
+          newSha256: sha256Hex(dataBuf),
+          newBytes: dataBuf.byteLength,
+        };
+
+        writePrivateBytesAtomic(
+          rollbackPath,
+          dir,
+          TX_ROLLBACK_NAME,
+          previousBytes,
+          fsyncDirStrict,
+          session
+        );
+        rollbackPublished = true;
+        fireStrictTxHook('after_rollback_publication');
+
+        const preparedPub = writeMarkerStrict(
+          dir,
+          { ...markerBase, phase: 'prepared' },
+          fsyncDirStrict,
+          session
+        );
+        if (!preparedPub.renameOccurred || !preparedPub.dirSyncCompleted) {
+          const err =
+            'error' in preparedPub
+              ? preparedPub.error
+              : 'syncError' in preparedPub
+                ? preparedPub.syncError
+                : new Error('prepared marker publication failed');
+          // If rename happened but sync failed, prepared may be present; treat as prepared.
+          if (preparedPub.renameOccurred) {
+            preparedDurable = true;
+            restoreFromRollback(messageOf(err));
+          }
+          throw err;
+        }
+        preparedDurable = true;
+        fireStrictTxHook('after_prepared_marker');
+      }
+
+      // Staging file: O_CREAT|O_EXCL|O_NOFOLLOW + identity-checked rename.
+      fd = fs.openSync(
+        tmp,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | noFollowFlag(),
+        FILE_MODE
+      );
+      try {
+        fs.fchmodSync(fd, FILE_MODE);
+      } catch {
+        applyMode(tmp, FILE_MODE);
+      }
+      fs.writeFileSync(fd, dataBuf);
+      if (strict) fsyncFdStrict(fd);
+      else fsyncFd(fd);
+      const stagingIdentity = identityOf(fs.fstatSync(fd));
       fs.closeSync(fd);
       fd = undefined;
+      const tmpStat = fs.lstatSync(tmp);
+      if (!sameIdentity(stagingIdentity, identityOf(tmpStat)) || !tmpStat.isFile()) {
+        throw {
+          code: 'corrupt_run',
+          runId,
+          message: 'run.json temp replaced after close',
+        } satisfies RunStoreError;
+      }
       fs.renameSync(tmp, target);
-      fsyncDir(dir);
+      const destStat = fs.lstatSync(target);
+      if (!sameIdentity(stagingIdentity, identityOf(destStat)) || !destStat.isFile()) {
+        throw {
+          code: 'corrupt_run',
+          runId,
+          message: 'run.json identity mismatch after rename',
+        } satisfies RunStoreError;
+      }
+
+      if (strict) {
+        if (preparedDurable) fireStrictTxHook('after_new_rename');
+        try {
+          if (session) {
+            fsyncDirFdStrict(session.dirFd);
+            revalidatePublicRunDir(session.publicDir, session.identity, runId);
+          }
+          strictPostRenameDirectorySync(dir);
+        } catch (syncErr) {
+          if (isBypassCleanupError(syncErr)) throw syncErr;
+          const syncMessage = messageOf(syncErr);
+          if (preparedDurable && previousBytes) {
+            restoreFromRollback(syncMessage);
+          }
+          cleanupStagingOnly();
+          if (syncErr && typeof syncErr === 'object' && 'code' in syncErr) throw syncErr;
+          throw {
+            code: 'run_store_error',
+            runId,
+            message: `directory fsync failed: ${syncMessage}`,
+          } satisfies RunStoreError;
+        }
+
+        if (preparedDurable && previousBytes) {
+          try {
+            fireStrictTxHook('after_new_directory_sync');
+          } catch (hookErr) {
+            if (isBypassCleanupError(hookErr)) throw hookErr;
+            restoreFromRollback(messageOf(hookErr));
+          }
+
+          // Durably mark committed before treating the update as authoritative.
+          const committedMarker: TxMarker = {
+            version: TX_MARKER_VERSION,
+            phase: 'committed',
+            oldSha256: sha256Hex(previousBytes),
+            oldBytes: previousBytes.byteLength,
+            newSha256: sha256Hex(dataBuf),
+            newBytes: dataBuf.byteLength,
+          };
+          const commitPub = writeMarkerStrict(
+            dir,
+            committedMarker,
+            strictCommittedMarkerDirectorySync,
+            session
+          );
+
+          if (!commitPub.renameOccurred) {
+            // Committed marker never published — restore old authority.
+            restoreFromRollback(messageOf(commitPub.error));
+          }
+
+          if (commitPub.renameOccurred && !commitPub.dirSyncCompleted) {
+            // Committed rename may be visible; try to re-publish prepared durably,
+            // then rollback. If re-prepare fails, report durable_commit_uncertain.
+            const reprepare: TxMarker = {
+              version: TX_MARKER_VERSION,
+              phase: 'prepared',
+              oldSha256: sha256Hex(previousBytes),
+              oldBytes: previousBytes.byteLength,
+              newSha256: sha256Hex(dataBuf),
+              newBytes: dataBuf.byteLength,
+            };
+            const reprepPub = writeMarkerStrict(dir, reprepare, fsyncDirStrict, session);
+            if (reprepPub.renameOccurred && reprepPub.dirSyncCompleted) {
+              // Prepared durable again — safe to restore old authority.
+              restoreFromRollback(
+                `committed marker directory sync failed: ${messageOf(commitPub.syncError)}`
+              );
+            }
+            // Cannot durably re-prepare: leave files as-is for locked recovery.
+            throw {
+              code: 'durable_commit_uncertain',
+              runId,
+              message:
+                'strict run.json commit publication is uncertain; recovery files preserved for locked recovery',
+            } satisfies RunStoreError;
+          }
+
+          // Committed marker fully durable.
+          committedDurable = true;
+
+          // Verify committed marker and rollback identities before any cleanup hooks
+          // can replace them. Pass exact generation to cleanup so replacement is detected.
+          const markerPathForCleanup = session
+            ? childViaDirFd(session.dirFd, TX_MARKER_NAME)
+            : path.join(dir, TX_MARKER_NAME);
+          const committedMarkerVerified: VerifiedPrivateFile | undefined =
+            pathEntryKind(markerPathForCleanup) === 'regular'
+              ? openVerifiedPrivateFile(markerPathForCleanup, dir, TX_MARKER_NAME, {
+                  skipPathBound: !!session,
+                  parseMarkerPhase: true,
+                })
+              : undefined;
+          const cleanupRollbackVerified: VerifiedPrivateFile | undefined = rollbackPublished
+            ? openVerifiedPrivateFile(rollbackPath, dir, TX_ROLLBACK_NAME, {
+                skipPathBound: !!session,
+              })
+            : undefined;
+
+          // Post-commit: authority is new. Hook/cleanup failures must not report
+          // rollback; next load finishes leftover cleanup when state stays unambiguous.
+          try {
+            fireStrictTxHook('after_committed_marker');
+          } catch (hookErr) {
+            if (isBypassCleanupError(hookErr)) throw hookErr;
+            /* ignore ordinary hooks — committed */
+          }
+          try {
+            fireStrictTxHook('during_cleanup');
+            const cleaned = cleanupTxPhase(dir, 'committed', session, {
+              marker: committedMarkerVerified,
+              rollback: cleanupRollbackVerified,
+            });
+            if (!cleaned.ok) {
+              const errCode =
+                cleaned.error && typeof cleaned.error === 'object' && 'code' in cleaned.error
+                  ? (cleaned.error as RunStoreError).code
+                  : undefined;
+              if (errCode === 'generation_mismatch') {
+                throw cleaned.error;
+              }
+              const recheck = revalidateCommittedState(
+                dir,
+                { sha256: sha256Hex(dataBuf), bytes: dataBuf.byteLength },
+                session,
+                {
+                  markerIdentity: committedMarkerVerified?.identity,
+                  rollbackIdentity: cleanupRollbackVerified?.identity,
+                }
+              );
+              if (!recheck.ok) {
+                throw {
+                  code: recheck.error.code,
+                  runId,
+                  message:
+                    recheck.error.message ??
+                    `strict run.json committed cleanup failed: ${messageOf(cleaned.error)}`,
+                } satisfies RunStoreError;
+              }
+            }
+          } catch (cleanupErr) {
+            if (isBypassCleanupError(cleanupErr)) throw cleanupErr;
+            if (cleanupErr && typeof cleanupErr === 'object' && 'code' in cleanupErr) {
+              const code = (cleanupErr as RunStoreError).code;
+              if (
+                code === 'corrupt_run' ||
+                code === 'durable_write_error' ||
+                code === 'generation_mismatch'
+              )
+                throw cleanupErr;
+            }
+            const recheck = revalidateCommittedState(
+              dir,
+              { sha256: sha256Hex(dataBuf), bytes: dataBuf.byteLength },
+              session,
+              {
+                markerIdentity: committedMarkerVerified?.identity,
+                rollbackIdentity: cleanupRollbackVerified?.identity,
+              }
+            );
+            if (!recheck.ok) {
+              throw {
+                code: recheck.error.code,
+                runId,
+                message: recheck.error.message ?? messageOf(cleanupErr),
+              } satisfies RunStoreError;
+            }
+          }
+        }
+      } else {
+        if (session) fsyncDirFdStrict(session.dirFd);
+        else fsyncDir(dir);
+      }
+    } catch (err) {
+      if (isBypassCleanupError(err)) throw err;
+      if (isTerminalTxError(err)) throw err;
+      // Pre-commit: prepared marker exists → restore old authority from rollback.
+      if (strict && preparedDurable && !committedDurable && previousBytes) {
+        restoreFromRollback(messageOf(err));
+      }
+      // Rollback published but marker never durable: run.json still old; drop orphan.
+      if (strict && rollbackPublished && !preparedDurable && !committedDurable) {
+        try {
+          removeTxFiles(dir, 'prepared', session);
+        } catch {
+          /* leave for load recovery */
+        }
+        cleanupStagingOnly();
+      }
+      throw err;
     } finally {
       if (fd !== undefined) {
         try {
@@ -1540,12 +5462,21 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
           /* ignore */
         }
       }
+      // Staging temps are safe to drop even after a bypass crash; transaction
+      // marker/rollback/run.json are intentionally left untouched on bypass.
       try {
-        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+        cleanupStagingOnly();
       } catch {
         /* ignore */
       }
     }
+  }
+
+  function writeRunContents(runId: string, record: AgentRunRecordV1, strict = false): void {
+    // Every run.json writer holds the cross-instance transaction lock.
+    withTxLock(runId, (held) => {
+      writeRunContentsLocked(runId, record, strict, held);
+    });
   }
 
   function writeRunJsonAtomic(runId: string, record: AgentRunRecordV1): Promise<void> {
@@ -1554,7 +5485,7 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     });
   }
 
-  function appendEventLine(runId: string, event: RunLifecycleEvent): Promise<void> {
+  function appendEventLine(runId: string, event: RunLifecycleEvent, strict = false): Promise<void> {
     return runSerial(runId, async () => {
       const file = eventsPath(runId);
       mkdirPrivate(runDirOf(runId));
@@ -1563,9 +5494,11 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
       try {
         fd = fs.openSync(file, 'a', FILE_MODE);
         fs.writeFileSync(fd, line);
-        fsyncFd(fd);
+        if (strict) fsyncFdStrict(fd);
+        else fsyncFd(fd);
         fs.closeSync(fd);
         fd = undefined;
+        if (strict) fsyncDirStrict(runDirOf(runId));
       } finally {
         if (fd !== undefined) {
           try {
@@ -1995,18 +5928,174 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     mutate: (record: AgentRunRecordV1) => void
   ): Promise<AgentRunRecordV1> {
     return runSerial(runId, async () => {
-      const loaded = loadRunJson(runId);
-      if (!loaded.ok) throw loaded.error;
-      const record = loaded.loaded.record;
-      mutate(record);
-      record.updatedAt = now();
-      writeRunContents(runId, record);
-      return record;
+      // Full RMW under one transaction lock: recover → load → mutate → write.
+      return withTxLock(runId, (held) => {
+        const recovered = recoverStrictTransactionLocked(runId, held.session);
+        if (!recovered.ok) throw recovered.error;
+        revalidatePublicRunDir(held.session.publicDir, held.session.identity, runId);
+        const lockedFile = childViaDirFd(held.session.dirFd, 'run.json');
+        let content: string;
+        try {
+          content = readRunJsonNoFollow(lockedFile, held.dir, { skipPathBound: true }).toString(
+            'utf-8'
+          );
+        } catch (err) {
+          if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+            const e = err as RunStoreError;
+            if (e.code === 'corrupt_run' && String(e.message).includes('not found')) {
+              throw {
+                code: 'run_not_found',
+                runId,
+                message: 'run.json not found',
+              } satisfies RunStoreError;
+            }
+            throw { ...e, runId } satisfies RunStoreError;
+          }
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'ENOENT') {
+            throw {
+              code: 'run_not_found',
+              runId,
+              message: 'run.json not found',
+            } satisfies RunStoreError;
+          }
+          throw {
+            code: 'corrupt_run',
+            runId,
+            message: `cannot read run.json: ${messageOf(err)}`,
+          } satisfies RunStoreError;
+        }
+        const parsed = parseRunJsonBytes(runId, held.dir, content);
+        if (!parsed.ok) throw parsed.error;
+        const record = parsed.loaded.record;
+        mutate(record);
+        record.updatedAt = now();
+        writeRunContentsLocked(runId, record, false, held);
+        return record;
+      });
+    });
+  }
+
+  async function updateRunStrict(
+    runId: string,
+    mutate: (record: AgentRunRecordV1) => void
+  ): Promise<AgentRunRecordV1> {
+    // Same serial queue as updateRun; full RMW under transaction lock.
+    return runSerial(runId, async () => {
+      return withTxLock(runId, (held) => {
+        const recovered = recoverStrictTransactionLocked(runId, held.session);
+        if (!recovered.ok) throw recovered.error;
+        revalidatePublicRunDir(held.session.publicDir, held.session.identity, runId);
+        const lockedFile = childViaDirFd(held.session.dirFd, 'run.json');
+        let content: string;
+        try {
+          content = readRunJsonNoFollow(lockedFile, held.dir, { skipPathBound: true }).toString(
+            'utf-8'
+          );
+        } catch (err) {
+          if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+            const e = err as RunStoreError;
+            if (e.code === 'corrupt_run' && String(e.message).includes('not found')) {
+              throw {
+                code: 'run_not_found',
+                runId,
+                message: 'run.json not found',
+              } satisfies RunStoreError;
+            }
+            throw { ...e, runId } satisfies RunStoreError;
+          }
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code === 'ENOENT') {
+            throw {
+              code: 'run_not_found',
+              runId,
+              message: 'run.json not found',
+            } satisfies RunStoreError;
+          }
+          throw {
+            code: 'corrupt_run',
+            runId,
+            message: `cannot read run.json: ${messageOf(err)}`,
+          } satisfies RunStoreError;
+        }
+        const parsed = parseRunJsonBytes(runId, held.dir, content);
+        if (!parsed.ok) throw parsed.error;
+        const record = structuredClone(parsed.loaded.record) as AgentRunRecordV1;
+        mutate(record);
+        record.updatedAt = now();
+        const validated = validateRunRecord(record, runId, runDirOf(runId));
+        if (!validated.ok) throw validated.error;
+        writeRunContentsLocked(runId, validated.record, true, held);
+        return validated.record;
+      });
     });
   }
 
   async function appendEvent(runId: string, event: RunLifecycleEvent): Promise<void> {
-    await appendEventLine(runId, event);
+    await appendEventLine(runId, event, false);
+  }
+
+  async function appendEventStrict(runId: string, event: RunLifecycleEvent): Promise<void> {
+    await appendEventLine(runId, event, true);
+  }
+
+  async function writeTextArtifact(
+    runId: string,
+    payload: RunArtifactPayload,
+    text: string
+  ): Promise<RunArtifactRefV1> {
+    if (!isRunIdValid(runId)) {
+      throw { code: 'run_not_found', runId, message: 'invalid run id' } satisfies RunStoreError;
+    }
+    const dir = runDirOf(runId);
+    if (!fs.existsSync(dir)) {
+      throw {
+        code: 'run_not_found',
+        runId,
+        message: 'run directory missing',
+      } satisfies RunStoreError;
+    }
+    return artifacts.writeTextArtifact(runId, dir, payload, text);
+  }
+
+  async function writeJsonArtifact(
+    runId: string,
+    payload: RunArtifactPayload,
+    value: unknown
+  ): Promise<RunArtifactRefV1> {
+    if (!isRunIdValid(runId)) {
+      throw { code: 'run_not_found', runId, message: 'invalid run id' } satisfies RunStoreError;
+    }
+    const dir = runDirOf(runId);
+    if (!fs.existsSync(dir)) {
+      throw {
+        code: 'run_not_found',
+        runId,
+        message: 'run directory missing',
+      } satisfies RunStoreError;
+    }
+    return artifacts.writeJsonArtifact(runId, dir, payload, value);
+  }
+
+  async function readTextArtifact(runId: string, ref: RunArtifactRefV1): Promise<string> {
+    if (!isRunIdValid(runId)) {
+      throw { code: 'run_not_found', runId, message: 'invalid run id' } satisfies RunStoreError;
+    }
+    return artifacts.readTextArtifact(runId, runDirOf(runId), ref);
+  }
+
+  async function readJsonArtifact(runId: string, ref: RunArtifactRefV1): Promise<unknown> {
+    if (!isRunIdValid(runId)) {
+      throw { code: 'run_not_found', runId, message: 'invalid run id' } satisfies RunStoreError;
+    }
+    return artifacts.readJsonArtifact(runId, runDirOf(runId), ref);
+  }
+
+  async function resolveArtifactPath(runId: string, ref: RunArtifactRefV1): Promise<string> {
+    if (!isRunIdValid(runId)) {
+      throw { code: 'run_not_found', runId, message: 'invalid run id' } satisfies RunStoreError;
+    }
+    return artifacts.resolveArtifactPath(runId, runDirOf(runId), ref);
   }
 
   async function listRuns(): Promise<ListRunsResult> {
@@ -2025,10 +6114,23 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
       if (loaded.ok) {
         results.push(loaded.loaded);
       } else {
+        const errCode = loaded.error.code;
+        const preserved:
+          | 'corrupt_run'
+          | 'durable_write_error'
+          | 'durable_commit_uncertain'
+          | 'run_busy'
+          | 'run_store_error' =
+          errCode === 'durable_write_error' ||
+          errCode === 'durable_commit_uncertain' ||
+          errCode === 'run_busy' ||
+          errCode === 'run_store_error'
+            ? errCode
+            : 'corrupt_run';
         const corrupt: CorruptRunEntry = {
           runId,
           runDir: runDirOf(runId),
-          code: 'corrupt_run',
+          code: preserved,
           message: loaded.error.message,
         };
         results.push(corrupt);
@@ -2203,6 +6305,13 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     getRun,
     updateRun,
     appendEvent,
+    updateRunStrict,
+    appendEventStrict,
+    writeTextArtifact,
+    writeJsonArtifact,
+    readTextArtifact,
+    readJsonArtifact,
+    resolveArtifactPath,
     listRuns,
     claimRun,
     releaseRun,
@@ -2213,5 +6322,14 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
 }
 
 function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  if (err instanceof Error) return err.message;
+  if (
+    err &&
+    typeof err === 'object' &&
+    'message' in err &&
+    typeof (err as { message?: unknown }).message === 'string'
+  ) {
+    return (err as { message: string }).message;
+  }
+  return String(err);
 }

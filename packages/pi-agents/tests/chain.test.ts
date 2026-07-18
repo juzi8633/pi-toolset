@@ -10,6 +10,7 @@ import {
 } from '../src/chain.ts';
 import { chainFanoutStepId, chainFanoutUnitId } from '../src/run-coordinator.ts';
 import type { ChainOutputEntry, SingleResult, SubagentDetails } from '../src/types.ts';
+import type { RunArtifactRefV1 } from '../src/run-types.ts';
 
 const makeDetails = (
   results: SingleResult[],
@@ -1234,6 +1235,391 @@ describe('runChainWorkflow', () => {
     const statuses = fanoutResults.map((r) => r.status);
     expect(statuses.filter((s) => s === 'cancelled').length).toBeGreaterThanOrEqual(1);
     expect(statuses.filter((s) => s === 'skipped').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('restored fanout uses collect textRef over last child finalOutputRef for {previous}', async () => {
+    const collectRef: RunArtifactRefV1 = {
+      kind: 'run-artifact',
+      version: 1,
+      runId: 'run-1',
+      payload: 'chain-output-text',
+      relativePath:
+        'artifacts/sha256/aa/collect-digest-64-hex-chars-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt',
+      sha256: 'a'.repeat(64),
+      bytes: 999,
+      mediaType: 'text/plain; charset=utf-8',
+    };
+    const childRef: RunArtifactRefV1 = {
+      kind: 'run-artifact',
+      version: 1,
+      runId: 'run-1',
+      payload: 'final-output',
+      relativePath:
+        'artifacts/sha256/bb/child-digest-64-hex-chars-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy.txt',
+      sha256: 'b'.repeat(64),
+      bytes: 777,
+      mediaType: 'text/plain; charset=utf-8',
+    };
+    const chain: ChainItemInput[] = [
+      {
+        expand: { from: { output: 'ctx', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'out' },
+      },
+      { agent: 'next', task: 'use {previous}' },
+    ];
+    const units: Record<string, import('../src/run-types.ts').RunUnitRecord> = {
+      [chainFanoutUnitId(1, 0)]: {
+        unitId: chainFanoutUnitId(1, 0),
+        agent: 'worker',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        fanoutIndex: 0,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: {
+          ...makeAssistantResult('worker', 'child-text', 1),
+          finalOutputRef: childRef,
+        },
+      },
+      [chainFanoutUnitId(1, 1)]: {
+        unitId: chainFanoutUnitId(1, 1),
+        agent: 'worker',
+        agentFingerprint: 'fp',
+        runtime: undefined,
+        capability: 'session',
+        status: 'completed',
+        step: 1,
+        fanoutIndex: 1,
+        attempt: 1,
+        attempts: [],
+        effectiveCwd: '/tmp',
+        result: {
+          ...makeAssistantResult('worker', 'last-child-text', 1),
+          finalOutputRef: childRef,
+        },
+      },
+    };
+    const calls: string[] = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'next') calls.push(req.task);
+        return makeAssistantResult(req.agent, 'done', req.step);
+      },
+      restored: {
+        results: [
+          {
+            ...makeAssistantResult('worker', '', 1),
+            fanout: { index: 0, count: 2, itemTask: '' },
+            finalOutputRef: childRef,
+          } as SingleResult,
+          {
+            ...makeAssistantResult('worker', '', 1),
+            fanout: { index: 1, count: 2, itemTask: '' },
+            finalOutputRef: childRef,
+          } as SingleResult,
+        ],
+        outputs: {
+          out: {
+            textRef: { ...collectRef },
+            agent: 'worker',
+            step: 1,
+            structured: [],
+          },
+        },
+        logicalSteps: [
+          {
+            kind: 'fanout',
+            step: 1,
+            agent: 'worker',
+            taskTemplate: 'Process {item}',
+            status: 'completed',
+            sourceOutput: 'ctx',
+            sourcePath: '/items',
+            collectName: 'out',
+            executedCount: 2,
+            completedCount: 2,
+            failedCount: 0,
+            runningCount: 0,
+            queuedCount: 0,
+            skippedCount: 0,
+          },
+          { kind: 'sequential', step: 2, agent: 'next', task: 'use {previous}', status: 'queued' },
+        ],
+        units,
+        fanouts: {
+          [chainFanoutStepId(1)]: {
+            step: 1,
+            items: ['a', 'b'],
+            unitIds: [chainFanoutUnitId(1, 0), chainFanoutUnitId(1, 1)],
+          },
+        },
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    // {previous} must reference the collect textRef digest, NOT the last child's ref.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain('sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(calls[0]).not.toContain('sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  });
+});
+
+describe('runChainWorkflow chain-output externalization authority', () => {
+  const ref = (
+    payload: 'final-output' | 'structured-output' | 'chain-output-text' | 'chain-output-structured',
+    sha256: string,
+    mediaType: 'text/plain; charset=utf-8' | 'application/json',
+    bytes = 100
+  ): RunArtifactRefV1 => ({
+    kind: 'run-artifact',
+    version: 1,
+    runId: 'run-1',
+    payload,
+    relativePath: `artifacts/sha256/${sha256.slice(0, 2)}/${sha256}.${mediaType === 'application/json' ? 'json' : 'txt'}`,
+    sha256,
+    bytes,
+    mediaType,
+  });
+
+  it('oversized collect stores exact text/structured unions with refs, no inline descriptor authority', async () => {
+    const big = 'x'.repeat(300 * 1024);
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'list items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+      },
+    ];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      runStep: async (req) => {
+        if (req.agent === 'explore')
+          return makeAssistantResult(req.agent, '{"items":["a"]}', req.step);
+        return makeAssistantResult(req.agent, big, req.step);
+      },
+      externalizeChainOutput: {
+        text: async (text) => {
+          if (Buffer.byteLength(text, 'utf8') > 256 * 1024) {
+            return {
+              textRef: ref(
+                'chain-output-text',
+                'a'.repeat(64),
+                'text/plain; charset=utf-8',
+                Buffer.byteLength(text, 'utf8')
+              ),
+            };
+          }
+          return { text };
+        },
+        json: async (value) => {
+          const serialized = JSON.stringify(value);
+          if (Buffer.byteLength(serialized, 'utf8') > 256 * 1024) {
+            return {
+              valueRef: ref(
+                'chain-output-structured',
+                'b'.repeat(64),
+                'application/json',
+                Buffer.byteLength(serialized, 'utf8')
+              ),
+            };
+          }
+          return { value };
+        },
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    const entry = res.details.outputs!.results;
+    // Strict union: textRef present means text must be absent.
+    expect(entry.textRef).toBeDefined();
+    expect(entry.text).toBeUndefined();
+    // structured stays inline (array of one item) unless it exceeds the budget.
+    if (entry.structured !== undefined) {
+      expect(entry.structuredRef).toBeUndefined();
+    } else {
+      expect(entry.structuredRef).toBeDefined();
+    }
+    // Descriptors/refs never appear as inline structured authority.
+    expect(entry.structured).not.toEqual(expect.objectContaining({ sha256: expect.any(String) }));
+  });
+
+  it('restored named structuredRef followed by JSON Pointer/fanout resolves at runtime', async () => {
+    const chain: ChainItemInput[] = [
+      {
+        agent: 'explore',
+        task: 'list items',
+        name: 'context',
+        outputSchema: {
+          type: 'object',
+          required: ['items'],
+          properties: { items: { type: 'array', items: { type: 'string' } } },
+        },
+      },
+      {
+        expand: { from: { output: 'context', path: '/items' } },
+        parallel: { agent: 'worker', task: 'Process {item}' },
+        collect: { name: 'results' },
+      },
+    ];
+    const structuredRef = ref('structured-output', 'd'.repeat(64), 'application/json');
+    const restored: import('../src/chain.ts').RestoredChainState = {
+      results: [
+        {
+          ...makeAssistantResult('explore', '', 1),
+          finalOutputRef: ref('final-output', 'c'.repeat(64), 'text/plain; charset=utf-8'),
+          structuredOutputRef: structuredRef,
+        } as SingleResult,
+      ],
+      outputs: {
+        context: {
+          structuredRef,
+          agent: 'explore',
+          step: 1,
+        } as ChainOutputEntry,
+      },
+      logicalSteps: [
+        {
+          kind: 'sequential',
+          step: 1,
+          agent: 'explore',
+          task: 'list items',
+          status: 'completed',
+        },
+        {
+          kind: 'fanout',
+          step: 2,
+          agent: 'worker',
+          taskTemplate: 'Process {item}',
+          collectName: 'results',
+          status: 'queued',
+          executedCount: 0,
+          completedCount: 0,
+          failedCount: 0,
+          runningCount: 0,
+          queuedCount: 0,
+          skippedCount: 0,
+        },
+      ],
+      units: {
+        'chain-0001': {
+          unitId: 'chain-0001',
+          agent: 'explore',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session' as const,
+          status: 'completed' as const,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/tmp',
+          result: {
+            ...makeAssistantResult('explore', '', 1),
+            status: 'completed',
+            structuredOutputRef: structuredRef,
+          },
+        },
+      },
+      fanouts: {},
+    };
+    const calls: string[] = [];
+    const res = await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      restored,
+      resolveArtifact: async (r) => {
+        if (r.mediaType === 'application/json') return { items: ['x', 'y'] };
+        return 'text';
+      },
+      runStep: async (req) => {
+        calls.push(req.task);
+        return makeAssistantResult(req.agent, 'ok', req.step);
+      },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(calls).toContain('Process x');
+    expect(calls).toContain('Process y');
+  });
+
+  it('restored textRef preserves previousRef and {previous} handoff is a descriptor', async () => {
+    const chain: ChainItemInput[] = [
+      { agent: 'a', task: 'first', name: 'first' },
+      { agent: 'b', task: 'use {previous}' },
+    ];
+    const firstRef = ref('final-output', 'e'.repeat(64), 'text/plain; charset=utf-8');
+    const restored: import('../src/chain.ts').RestoredChainState = {
+      results: [
+        {
+          ...makeAssistantResult('a', '', 1),
+          finalOutputRef: firstRef,
+        } as SingleResult,
+      ],
+      outputs: {
+        first: {
+          textRef: { ...firstRef, payload: 'chain-output-text' },
+          agent: 'a',
+          step: 1,
+        } as ChainOutputEntry,
+      },
+      logicalSteps: [
+        { kind: 'sequential', step: 1, agent: 'a', task: 'first', status: 'completed' },
+        { kind: 'sequential', step: 2, agent: 'b', task: 'use {previous}', status: 'queued' },
+      ],
+      units: {
+        'chain-0001': {
+          unitId: 'chain-0001',
+          agent: 'a',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session' as const,
+          status: 'completed' as const,
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/tmp',
+          result: {
+            ...makeAssistantResult('a', '', 1),
+            status: 'completed',
+            finalOutputRef: firstRef,
+          },
+        },
+      },
+      fanouts: {},
+    };
+    const calls: string[] = [];
+    await runChainWorkflow({
+      chain,
+      signal: undefined,
+      onUpdate: undefined,
+      makeDetails,
+      restored,
+      runStep: async (req) => {
+        calls.push(req.task);
+        return makeAssistantResult(req.agent, 'b done', req.step);
+      },
+    });
+    // {previous} renders as a bounded child descriptor derived from textRef, not empty text.
+    expect(calls[0]).toContain('run-artifact');
+    expect(calls[0]).toContain('sha256=eeeeeeeeeeeeeeee');
   });
 });
 

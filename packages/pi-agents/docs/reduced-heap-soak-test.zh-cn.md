@@ -36,9 +36,9 @@
 cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
 ```
 
-| 终端 | 用途 |
-| --- | --- |
-| **终端 A** | 只跑 parent Pi（前台 TUI）。不要在这里做采样或 record。 |
+| 终端       | 用途                                                             |
+| ---------- | ---------------------------------------------------------------- |
+| **终端 A** | 只跑 parent Pi（前台 TUI）。不要在这里做采样或 record。          |
 | **终端 B** | 跑所有 soak 脚本：setup / sampler / record / summary / cleanup。 |
 
 脚本目录（下文用相对路径，均相对于 worktree 根）：
@@ -81,9 +81,9 @@ cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
 
 **参数**：
 
-| 参数 | 何时用 |
-| --- | --- |
-| （无） | 首次启动（本步） |
+| 参数       | 何时用                              |
+| ---------- | ----------------------------------- |
+| （无）     | 首次启动（本步）                    |
 | `--resume` | 仅在步骤 6 重启时使用，不要在这里加 |
 
 保持终端 A 打开，后续 Pi 输入都在这里完成。
@@ -110,10 +110,10 @@ cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
 
 **参数**：
 
-| 位置 | 含义 | 本步取值 |
-| --- | --- | --- |
-| `$1` label | checkpoint 名称 | 固定 `baseline` |
-| `$2` run-id | 可选；对应 durable run | 本步省略 |
+| 位置        | 含义                   | 本步取值        |
+| ----------- | ---------------------- | --------------- |
+| `$1` label  | checkpoint 名称        | 固定 `baseline` |
+| `$2` run-id | 可选；对应 durable run | 本步省略        |
 
 **成功标志**：终端打印一行 TSV（label=`baseline`，run_id=`none`），并追加到 `$SOAK/checkpoints.tsv`。
 
@@ -123,15 +123,15 @@ cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
 
 推荐矩阵：
 
-| 序号 | 调用类型 | 终端 A | 终端 B（完成后立刻 record） |
-| ---: | --- | --- | --- |
-| 1 | 长 Single | 粘贴 4.1 提示词 | `record.sh 01-long-single <runId>` |
-| 2–5 | 四个短 Single | 粘贴 4.2 模板（换 `<AREA>`） | `record.sh 02-short` … `05-short` |
-| 6 | 八任务 Parallel | 粘贴 4.3 提示词 | `record.sh 06-parallel <runId>` |
-| 7 | 短 Single | 粘贴 4.4 提示词（output / memory-regression） | `record.sh 07-short <runId>` |
-| 8 | Chain + fanout | 粘贴 4.5 提示词 | `record.sh 08-chain <runId>` |
-| 9 | 后台长 Single | 粘贴 5 的提示词 | `record.sh 09-background-running <runId>` |
-| 10 | Resume 第 9 次 | 步骤 6 中粘贴 resume | `record.sh 10-resume <runId>` |
+| 序号 | 调用类型        | 终端 A                                        | 终端 B（完成后立刻 record）               |
+| ---: | --------------- | --------------------------------------------- | ----------------------------------------- |
+|    1 | 长 Single       | 粘贴 4.1 提示词                               | `record.sh 01-long-single <runId>`        |
+|  2–5 | 四个短 Single   | 粘贴 4.2 模板（换 `<AREA>`）                  | `record.sh 02-short` … `05-short`         |
+|    6 | 八任务 Parallel | 粘贴 4.3 提示词                               | `record.sh 06-parallel <runId>`           |
+|    7 | 短 Single       | 粘贴 4.4 提示词（output / memory-regression） | `record.sh 07-short <runId>`              |
+|    8 | Chain + fanout  | 粘贴 4.5 提示词                               | `record.sh 08-chain <runId>`              |
+|    9 | 后台长 Single   | 粘贴 5 的提示词                               | `record.sh 09-background-running <runId>` |
+|   10 | Resume 第 9 次  | 步骤 6 中粘贴 resume                          | `record.sh 10-resume <runId>`             |
 
 **每次 agent 调用后如何取 `runId`**：
 
@@ -145,10 +145,10 @@ cd /home/julian/workspace/my/pi-toolset/.worktrees/subagent-memory-optimization
 ./packages/pi-agents/scripts/soak/record.sh <label> [run-id]
 ```
 
-| 参数 | 必填 | 说明 |
-| --- | --- | --- |
-| `<label>` | 是 | 本次 checkpoint 名，建议用表中固定标签 |
-| `[run-id]` | 否 | durable run ID；省略则记为 `none` |
+| 参数       | 必填 | 说明                                   |
+| ---------- | ---- | -------------------------------------- |
+| `<label>`  | 是   | 本次 checkpoint 名，建议用表中固定标签 |
+| `[run-id]` | 否   | durable run ID；省略则记为 `none`      |
 
 ---
 
@@ -587,28 +587,28 @@ cat "${XDG_RUNTIME_DIR:-/tmp}/pi-agents-soak.current"
 
 所有脚本路径均相对于 worktree 根：`./packages/pi-agents/scripts/soak/`。
 
-| 顺序 | 终端 | 命令 | 参数 | 何时跑 |
-| ---: | --- | --- | --- | --- |
-| 1 | B | `setup.sh` | 无 | 开始时一次 |
-| 2 | A | `start-parent.sh` | 无 | setup 之后；保持前台 |
-| 3a | B | `start-sampler.sh` | 无 | parent 已启动后 |
-| 3b | B | `record.sh baseline` | label 仅 | sampler 启动后立刻 |
-| 4 | B | `record.sh <label> <runId>` | label + runId | 每次 agent 调用完成后 |
-| 5 | A | `/quit` | （Pi 内） | 调用 9 已 record 之后 |
-| 6a | A | `start-parent.sh --resume` | `--resume` | `/quit` 之后 |
-| 6b | B | `start-sampler.sh` | 无 | resume 的 parent 起来后 |
-| 6c | B | `record.sh 10-resume <runId>` | label + 同一 runId | resume 完成后 |
-| 7 | B | `summary.sh` | 无 | 10 次调用全部结束后 |
-| 9 | B | `cleanup.sh` | 无 | 最终 parent 退出后 |
+| 顺序 | 终端 | 命令                          | 参数               | 何时跑                  |
+| ---: | ---- | ----------------------------- | ------------------ | ----------------------- |
+|    1 | B    | `setup.sh`                    | 无                 | 开始时一次              |
+|    2 | A    | `start-parent.sh`             | 无                 | setup 之后；保持前台    |
+|   3a | B    | `start-sampler.sh`            | 无                 | parent 已启动后         |
+|   3b | B    | `record.sh baseline`          | label 仅           | sampler 启动后立刻      |
+|    4 | B    | `record.sh <label> <runId>`   | label + runId      | 每次 agent 调用完成后   |
+|    5 | A    | `/quit`                       | （Pi 内）          | 调用 9 已 record 之后   |
+|   6a | A    | `start-parent.sh --resume`    | `--resume`         | `/quit` 之后            |
+|   6b | B    | `start-sampler.sh`            | 无                 | resume 的 parent 起来后 |
+|   6c | B    | `record.sh 10-resume <runId>` | label + 同一 runId | resume 完成后           |
+|    7 | B    | `summary.sh`                  | 无                 | 10 次调用全部结束后     |
+|    9 | B    | `cleanup.sh`                  | 无                 | 最终 parent 退出后      |
 
 ### 环境变量（可选）
 
-| 变量 | 默认 | 作用 |
-| --- | --- | --- |
-| `SOAK` | 指针文件内容 | 覆盖 SOAK 目录 |
-| `SOAK_RUNS_DIR` | `$HOME/.pi/agent/@balaenis/pi-agents/runs` | durable runs 根目录 |
-| `SOAK_MAX_OLD_SPACE` | `1024` | parent V8 old-space 上限（MiB） |
-| `SOAK_POINTER` | `$XDG_RUNTIME_DIR/pi-agents-soak.current` | 指针文件路径 |
+| 变量                 | 默认                                       | 作用                            |
+| -------------------- | ------------------------------------------ | ------------------------------- |
+| `SOAK`               | 指针文件内容                               | 覆盖 SOAK 目录                  |
+| `SOAK_RUNS_DIR`      | `$HOME/.pi/agent/@balaenis/pi-agents/runs` | durable runs 根目录             |
+| `SOAK_MAX_OLD_SPACE` | `1024`                                     | parent V8 old-space 上限（MiB） |
+| `SOAK_POINTER`       | `$XDG_RUNTIME_DIR/pi-agents-soak.current`  | 指针文件路径                    |
 
 > **堆上限实测（Node 26.3 / pi 0.80.9）**：`512` 在 parent 启动阶段即 OOM（old-space 已达 ~511.6 MiB）。`≤600` 无法启动；`≥640` 可启动。默认 `1024` 给 10 次混合调用留约 500 MiB 余量。更紧可用 `SOAK_MAX_OLD_SPACE=768`。
 

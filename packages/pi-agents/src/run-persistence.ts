@@ -15,7 +15,6 @@ import {
 import type {
   AgentRunRecordV1,
   RunAbortOrigin,
-  RunStatus,
   RunUnitRecord,
   StoredRunRequest,
 } from './run-types.ts';
@@ -186,47 +185,41 @@ interface FinalizeDurableRunInput extends RunFinalizeInput {
   claimId: string;
 }
 
-async function finalizeDurableRun(input: FinalizeDurableRunInput): Promise<void> {
+/**
+ * Shared strict terminal barrier for both fresh and resumed run completion.
+ * Success order: strict `finalizeRun()` -> one `appendEventStrict(run_terminal)`
+ * -> `unregisterRun()` -> `releaseRun()`. Any failure (including a release
+ * failure) enters the failure path: `unregisterRun()` -> `abandonRun()` -> rethrow.
+ * Never reports success, appends a terminal event, or releases a claim when a
+ * barrier step fails; the claim is abandoned so it cannot be silently retained.
+ */
+export async function finalizeDurableRun(input: FinalizeDurableRunInput): Promise<void> {
   const { store, coordinator, runId, claimId, details, units } = input;
   try {
-    await coordinator.finalizeRun(runId, details, units, {
+    const status = await coordinator.finalizeRun(runId, details, units, {
       success: input.success,
       cancelled: input.cancelled,
       interrupted: input.interrupted,
       lastError: input.lastError,
     });
-    const status = deriveFinalStatus(units, input);
-    await store.appendEvent(runId, {
+    await store.appendEventStrict(runId, {
       version: 1,
       event: 'run_terminal',
       runId,
       timestamp: Date.now(),
       status,
     });
-  } finally {
-    await safeRelease(store, runId, claimId);
+    coordinator.unregisterRun(runId);
+    await store.releaseRun(runId, claimId);
+  } catch (err) {
+    coordinator.unregisterRun(runId);
+    try {
+      await store.abandonRun(runId, claimId);
+    } catch {
+      /* abandon is best-effort after a barrier failure */
+    }
+    throw err;
   }
-}
-
-function deriveFinalStatus(
-  units: Record<string, RunUnitRecord>,
-  input: RunFinalizeInput
-): RunStatus {
-  if (input.cancelled) return 'cancelled';
-  if (input.interrupted) return 'interrupted';
-  if (input.success === false) return 'failed';
-  // Derive from units.
-  const records = Object.values(units);
-  if (records.length === 0) return 'queued';
-  const anyActive = records.some((u) => u.status === 'running' || u.status === 'queued');
-  if (anyActive) return 'running';
-  const anyInterrupted = records.some((u) => u.status === 'interrupted');
-  if (anyInterrupted) return 'interrupted';
-  const allCompleted = records.every((u) => u.status === 'completed');
-  if (allCompleted) return 'completed';
-  const anyFailed = records.some((u) => u.status === 'failed');
-  if (anyFailed) return 'failed';
-  return 'cancelled';
 }
 
 export class RunStoreError extends Error {
@@ -246,7 +239,7 @@ async function safeRelease(store: RunStore, runId: string, claimId: string): Pro
   }
 }
 
-async function safeAbandon(store: RunStore, runId: string, claimId: string): Promise<void> {
+export async function safeAbandon(store: RunStore, runId: string, claimId: string): Promise<void> {
   if (!claimId) return;
   try {
     await store.abandonRun(runId, claimId);

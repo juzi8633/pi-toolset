@@ -454,7 +454,7 @@ describe('inspectResume', () => {
           writeFileSync(unit.sessionFile, '{}\n');
         }
       });
-      const result = inspectResume(runId, store, { agents: [agent], hasContinuation: true });
+      const result = await inspectResume(runId, store, { agents: [agent], hasContinuation: true });
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.status).toBe('completed');
@@ -485,11 +485,11 @@ describe('inspectResume', () => {
           writeFileSync(unit.sessionFile, '{}\n');
         }
       });
-      const withoutFlag = inspectResume(runId, store, { agents: [agent] });
+      const withoutFlag = await inspectResume(runId, store, { agents: [agent] });
       expect(withoutFlag.ok).toBe(false);
       if (!withoutFlag.ok) expect(withoutFlag.reason).toBe('completed_without_continuation');
 
-      const explicitFalse = inspectResume(runId, store, {
+      const explicitFalse = await inspectResume(runId, store, {
         agents: [agent],
         hasContinuation: false,
       });
@@ -504,7 +504,7 @@ describe('inspectResume', () => {
     const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'pi-resume-'));
     try {
       const store = createRunStore({ rootDir: tmpRoot });
-      const result = inspectResume('run-nonexistent', store, { agents: [] });
+      const result = await inspectResume('run-nonexistent', store, { agents: [] });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toContain('not_found');
     } finally {
@@ -533,7 +533,7 @@ describe('inspectResume', () => {
       );
       // Use an agent with a different system prompt -> fingerprint mismatch.
       const changedAgent: AgentConfig = { ...agent, systemPrompt: 'changed' };
-      const result = inspectResume(runId, store, { agents: [changedAgent] });
+      const result = await inspectResume(runId, store, { agents: [changedAgent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons.some((r) => r.includes('fingerprint mismatch'))).toBe(true);
@@ -574,7 +574,7 @@ describe('inspectResume', () => {
         }
       });
       // Fingerprint-matched agent still resolves dispatch to pi (no request override).
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.blockingReasons.some((r) => r.includes('runtime mismatch'))).toBe(true);
@@ -617,7 +617,7 @@ describe('inspectResume', () => {
           unit.acpSessionId = 'sess-1';
         }
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       // Override wins over agent.runtime (pi); durable grok-acp matches dispatch.
@@ -655,7 +655,7 @@ describe('inspectResume', () => {
         r.units.single!.effectiveCwd = tmpRoot;
         delete r.units.single!.acpSessionId;
       });
-      const result = inspectResume(runId, store, {
+      const result = await inspectResume(runId, store, {
         agents: [agent],
       });
       expect(result.ok).toBe(true);
@@ -699,7 +699,7 @@ describe('inspectResume', () => {
         r.units.single!.effectiveCwd = tmpRoot;
         delete r.units.single!.acpSessionId;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons).toEqual([]);
@@ -735,7 +735,7 @@ describe('inspectResume', () => {
         r.units.single!.acpSessionId = 'sess-stored';
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons).toEqual([]);
@@ -778,7 +778,7 @@ describe('inspectResume', () => {
         r.units.single!.effectiveCwd = tmpRoot;
         delete r.units.single!.acpSessionId;
       });
-      const result = inspectResume(runId, store, {
+      const result = await inspectResume(runId, store, {
         agents: [agent],
       });
       expect(result.ok).toBe(true);
@@ -824,7 +824,7 @@ describe('inspectResume', () => {
         r.units.single!.acpSessionId = 'sess-after-history';
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons).toEqual([]);
@@ -863,7 +863,7 @@ describe('inspectResume', () => {
         ];
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons.some((b) => b.includes('session file missing'))).toBe(true);
@@ -904,7 +904,7 @@ describe('inspectResume', () => {
         ];
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons.some((b) => b.includes('session_prompt_unestablished'))).toBe(
@@ -944,7 +944,7 @@ describe('inspectResume', () => {
         r.units.single!.sessionFile = planned;
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons).toEqual([]);
@@ -984,7 +984,7 @@ describe('inspectResume', () => {
         r.units.single!.sessionFile = sessionFile;
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (result.ok) {
         expect(result.blockingReasons).toEqual([]);
@@ -1024,7 +1024,7 @@ describe('inspectResume', () => {
         ];
         r.units.single!.effectiveCwd = tmpRoot;
       });
-      const result = inspectResume(runId, store, { agents: [agent] });
+      const result = await inspectResume(runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.incompleteUnits).toHaveLength(1);
@@ -1100,7 +1100,7 @@ describe('inspectResume', () => {
         r.status = 'interrupted';
       });
 
-      const result = inspectResume(created.runId, store, { agents: [agent] });
+      const result = await inspectResume(created.runId, store, { agents: [agent] });
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.incompleteUnits).toHaveLength(1);
@@ -1216,8 +1216,8 @@ describe('Round 8 durable validation preflight safety', () => {
           expect(loaded.error.message).toContain(c.needle);
         }
 
-        expect(() => inspectResume(runId, store, { agents: [agent] })).not.toThrow();
-        const inspected = inspectResume(runId, store, { agents: [agent] });
+        await inspectResume(runId, store, { agents: [agent] });
+        const inspected = await inspectResume(runId, store, { agents: [agent] });
         expect(inspected.ok).toBe(false);
         if (!inspected.ok) {
           expect(inspected.reason).toContain(c.needle);
@@ -1296,7 +1296,7 @@ describe('Round 8 durable validation preflight safety', () => {
           expect(loaded.error.message).toContain(c.needle);
         }
 
-        const inspected = inspectResume(runId, store, { agents: [agent] });
+        const inspected = await inspectResume(runId, store, { agents: [agent] });
         expect(inspected.ok).toBe(false);
         if (!inspected.ok) expect(inspected.reason).toContain(c.needle);
 
@@ -1322,7 +1322,7 @@ describe('Round 8 durable validation preflight safety', () => {
       await store.updateRun(runId, (r) => {
         r.units.single!.sessionPromptEstablished = false;
       });
-      const crashWindow = inspectResume(runId, store, { agents: [agent] });
+      const crashWindow = await inspectResume(runId, store, { agents: [agent] });
       expect(crashWindow.ok).toBe(true);
       if (crashWindow.ok) {
         expect(
@@ -1354,7 +1354,7 @@ describe('Round 8 durable validation preflight safety', () => {
       writeRecord(file, record);
       const loaded = store.getRun(runId);
       expect(loaded.ok).toBe(true);
-      expect(() => inspectResume(runId, store, { agents: [agent] })).not.toThrow();
+      await inspectResume(runId, store, { agents: [agent] });
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -2550,7 +2550,7 @@ describe('completed fanout continuation preflight', () => {
       const beforeStatus = before.loaded.record.status;
       const beforeContinuations = before.loaded.record.continuationTasks;
 
-      const inspection = inspectResume(created.runId, store, {
+      const inspection = await inspectResume(created.runId, store, {
         agents: [seedAgent, workerAgent],
         hasContinuation: true,
       });

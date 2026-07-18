@@ -56,6 +56,8 @@ export interface BuildPiArgsOptions {
   sessionFile?: string;
   disableAgentTool?: boolean;
   resolvedSkillPaths?: string[];
+  requireArtifactReader?: boolean;
+  artifactReaderExtensionPath?: string;
   /**
    * Prompt construction mode. `task` (default) sends `Task: <task>`.
    * `session_continuation` reuses `--session` and sends the shared resume prompt
@@ -142,6 +144,9 @@ export interface BuildPiRpcArgsOptions {
   sessionFile?: string;
   disableAgentTool?: boolean;
   resolvedSkillPaths?: string[];
+  requireArtifactReader?: boolean;
+  /** Absolute path to dist/artifact-reader-extension.js when reader is required. */
+  artifactReaderExtensionPath?: string;
 }
 
 /**
@@ -166,12 +171,22 @@ function buildSharedPiFlags(
     tmpPromptPath?: string;
     disableAgentTool?: boolean;
     resolvedSkillPaths?: string[];
+    requireArtifactReader?: boolean;
+    artifactReaderExtensionPath?: string;
   }
 ): string[] {
   const args: string[] = [];
   if (agent.model) args.push('--model', agent.model);
   if (agent.thinking) args.push('--thinking', agent.thinking);
-  args.push(...buildToolCliArgs(agent, { disableAgentTool: options.disableAgentTool }));
+  args.push(
+    ...buildToolCliArgs(agent, {
+      disableAgentTool: options.disableAgentTool,
+      requireArtifactReader: options.requireArtifactReader,
+    })
+  );
+  if (options.requireArtifactReader && options.artifactReaderExtensionPath) {
+    args.push('--extension', options.artifactReaderExtensionPath);
+  }
   if (agent.noContextFiles) args.push('--no-context-files');
   if (options.resolvedSkillPaths && options.resolvedSkillPaths.length > 0) {
     args.push('--no-skills');
@@ -187,6 +202,11 @@ function buildSharedPiFlags(
     args.push(promptFlag, options.tmpPromptPath);
   }
   return args;
+}
+
+/** Resolve shipped dist/artifact-reader-extension.js next to this package entry. */
+export function resolveArtifactReaderExtensionPath(): string {
+  return new URL('./artifact-reader-extension.js', import.meta.url).pathname;
 }
 
 /**

@@ -3,7 +3,7 @@
 
 import type { Message } from '@earendil-works/pi-ai';
 import type { AgentScope, AgentSource } from './agents.ts';
-import type { ResumeCapability } from './run-types.ts';
+import type { ResumeCapability, RunArtifactRefV1 } from './run-types.ts';
 
 export type SystemPromptMode = 'append' | 'replace';
 export type DefaultContext = 'fresh' | 'fork';
@@ -96,7 +96,11 @@ export interface SingleResult {
   worktreeChangedFiles?: string[];
   worktreeSetupError?: string;
   finalOutput?: string;
+  /** Artifact ref for oversized final text; mutually exclusive with finalOutput. */
+  finalOutputRef?: RunArtifactRefV1;
   structuredOutput?: unknown;
+  /** Artifact ref for oversized structured output; mutually exclusive with structuredOutput. */
+  structuredOutputRef?: RunArtifactRefV1;
   structuredOutputError?: string;
   /** Durable run this unit belongs to; additive for older sessions. */
   runId?: string;
@@ -116,8 +120,12 @@ export interface SingleResult {
 }
 
 export interface ChainOutputEntry {
-  text: string;
+  text?: string;
+  /** Artifact ref for oversized chain text; mutually exclusive with text. */
+  textRef?: RunArtifactRefV1;
   structured?: unknown;
+  /** Artifact ref for oversized structured chain output; mutually exclusive with structured. */
+  structuredRef?: RunArtifactRefV1;
   agent: string;
   step: number;
 }

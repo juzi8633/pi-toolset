@@ -1,124 +1,169 @@
 # Agent RPC Overflow and Result Artifact Spill Implementation Plan
 
-**Goal:** Prevent oversized replayable Pi RPC events from failing subagent runs and externalize large authoritative result payloads into validated run-local artifacts without changing Chain, fanout, resume, or extension semantics.
+**Goal:** Preserve Pi RPC correctness for oversized replayable events and externalize oversized authoritative workflow results into validated run-local artifacts without changing Chain, fanout, resume, interactive continuation, or rendering semantics.
 
-**Inputs:** The failed durable run `run-40cc88b2-52c6-4c7a-a1f4-ee9547a00f1d`, the request to confirm that `agent_end.messages` is unused before stripping it, the requirement to keep all changes inside `pi-toolset`, Pi 0.80.7 RPC/session behavior, and `packages/pi-agents/docs/plans/2026-07-16-subagent-memory-optimization-plan.md`.
+**Inputs:** The current `packages/pi-agents` source and tests; historical failed run `run-40cc88b2-52c6-4c7a-a1f4-ee9547a00f1d`; `packages/pi-agents/docs/todos/2026-07-16-subagent-memory-optimization-followups.md`; `packages/pi-agents/docs/analysis/reduced-heap-soak-2026-07-17.md`; installed Pi 0.80.9 RPC, extension, package, and session documentation; installed Pi 0.80.9 runtime source; and the user decision to use `"*"` for Pi peer dependencies while pinning every Pi development dependency to exact `0.80.9`.
 
 **Assumptions:**
 
-- Pi upstream cannot be modified. The transport must therefore project the current canonical Pi `JSON.stringify()` shape locally and fail closed if a future Pi version changes the oversized shape.
-- The compact result snapshot work in `2026-07-16-subagent-memory-optimization-plan.md` lands before the result-artifact phase. The immediate replayable-event transport fix is independent and can ship first.
-- Native Pi `sessionFile` remains the authoritative full transcript. No second transcript artifact is created for projected RPC events or `get_messages`.
-- Fixed Version 1 limits are used initially: 2 MiB for ordinary RPC records, 64 MiB for a structurally valid projectable replayable event, 256 KiB per inline authoritative result payload, and 64 MiB per run artifact.
-- Large final output is handed to the parent or next agent as a bounded artifact descriptor. Large structured output is loaded only by trusted workflow code when schema, JSON Pointer, fanout, or resume semantics require the actual value.
+- Pi upstream is not modified. Exact-prefix projection remains local to `pi-agents` and is pinned to inspected Pi 0.80.9 producer order.
+- `packages/pi-agents/package.json` changes all `@earendil-works/pi-*` peer ranges to `"*"`; existing Pi development dependencies in the root and package manifests become exact `0.80.9` entries.
+- Native Pi `sessionFile` remains the sole authoritative transcript. Projected RPC records and disabled `get_messages` calls do not create a second transcript store.
+- Production registration through `src/index.ts` provides a `RunStore` and `RunCoordinator`. A non-durable/test-only path cannot spill outside a run directory.
+- Version 1 uses fixed limits: 8 MiB ordinary RPC record, 64 MiB canonical projectable RPC record, 16 KiB projected shell identity field, 256 KiB inline authoritative payload, 64 MiB artifact, and 48 KiB child-reader chunk.
+- Existing Version 1 inline records remain readable. New reference fields are additive; no Version 2 migration or historical rewrite is introduced.
+- JSON artifact bytes are `JSON.stringify(value, null, 2) + "\n"`; text artifacts are exact UTF-8 bytes. Threshold and digest checks use those exact persisted bytes.
+- Invalid UTF-8 keeps the current `StringDecoder` replacement behavior and is then validated as decoded JSON. Raw-byte UTF-8 rejection is out of scope.
+- Artifact garbage collection is out of scope. Version 1 retention deletes only an entire inactive run directory.
 
-**Architecture:** Split the work into three ordered boundaries. First, the Pi RPC reader performs a fully validating streaming projection for canonical oversized events whose payload is replayable from the native session (`message_start`, `message_update`, `message_end`, `turn_end`, tool execution start/update/end, and `agent_end`); all unrelated records retain the existing 2 MiB fail-closed limit. The interactive registry marks projected transcript events and rehydrates the persisted child branch before publishing `agent_settled`. Second, a run-local content-addressed artifact store publishes immutable text/JSON payloads before durable references are written. Third, terminal compact snapshots externalize oversized `finalOutput`, `structuredOutput`, Chain outputs, and frozen fanout items while workflow accessors preserve inline behavior for small values and resolve references only when required.
+**Architecture:** The transport retains the ordinary 8 MiB fail-closed boundary, but an incremental validator grants a separate 64 MiB budget only to exact canonical replayable Pi 0.80.9 events and emits bounded omission shells. The interactive registry restores omitted authority directly from the owned native session inside the `agent_settled` transition. Separately, terminal workflow publication externalizes oversized authority into immutable content-addressed run artifacts, strictly persists references before terminal events or parent delivery, and resolves references only in trusted workflow paths; child agents receive a narrowly scoped reader only when a handoff requires it.
 
-**Tech Stack:** TypeScript, Node streams and filesystem APIs, incremental JSON tokenization, SHA-256, Pi RPC JSONL, Pi `SessionManager`, Bun tests, Mise, ESLint, Prettier, and HK.
+**Tech Stack:** TypeScript, Bun 1.3.14, Node.js streams and filesystem APIs, incremental JSON tokenization, SHA-256, strict LF JSONL, Pi 0.80.9 RPC/extension/session APIs, Mise, ESLint, Prettier, and HK.
 
 ---
 
-## Audit Verdict
+## Repository Evidence
 
-`agent_end.messages` has no consumer in `packages/pi-agents` and can be removed at the Pi RPC transport boundary:
+- `packages/pi-agents/src/pi-rpc-transport.ts` currently defines `MAX_STDOUT_RECORD_BYTES = 8 * 1024 * 1024`, accepts complete records through 8 MiB, and fails larger records with `stdout_overflow` / `RPC stdout record exceeded 8 MiB`.
+- `packages/pi-agents/tests/pi-rpc-transport.test.ts` already covers above-2-MiB success, the exact 8 MiB boundary, terminated overflow, and unterminated overflow.
+- `packages/pi-agents/src/result-snapshot.ts` already exports `snapshotSingleResult`, `snapshotResults`, and `copySnapshotShell`; compact snapshot work is complete, with 1026 package tests passing and the reduced-heap soak recorded as PASS.
+- `packages/pi-agents/src/interactive-agent.ts` already has `projectFinalizedMessage`, lazy `SessionManager.open(sessionFile).getBranch()` hydration, endpoint transition queues, activation IDs, retention epochs, and deferred idle transcript eviction.
+- Raw child RPC `agent_end` is metadata-only in `interactive-agent.ts`; `agent_settled` performs terminal reduction and emits `activation_settled`.
+- `RunCoordinator.finishUnit()` is synchronous and fire-and-forgets terminal persistence; `RunCoordinator.finalizeRun()` is async but uses a best-effort write path.
+- `RunStore` has no artifact APIs or strict write variants; its current file and directory sync helpers swallow errors.
+- `SingleResult`, `ChainOutputEntry`, `WorkflowFanoutState`, and `InteractiveContinuationDetails` are inline-only. `inspectResume()` and `validateFanoutResumeState()` are synchronous.
+- Installed Pi 0.80.9 documents strict LF JSONL, `get_messages`, `agent_settled`, `SessionManager.open()`, custom tools, and package peer dependencies. Installed runtime source emits `message_update` as `type`, `assistantMessageEvent`, then `message`; tests must pin runtime order even though the RPC documentation example shows another order.
 
-- `packages/pi-agents/src/interactive-agent.ts` handles RPC `agent_end` only as a metadata tick: it updates `lastUsedAt`, keeps the activation running, and waits for `agent_settled`. It does not inspect `messages` or `willRetry`.
-- `packages/pi-agents/src/pi-rpc-execution.ts` consumes projected registry updates, not raw `agent_end` payloads.
-- `packages/pi-agents/src/execution.ts` handles only `message_end` and `tool_result_end` in the non-RPC subprocess path.
-- `packages/pi-agents/src/index.ts` subscribes to the host Pi Extension API `agent_end` only to stop spinners. That host event is distinct from the child RPC stdout record and is unaffected by transport projection.
-- Existing tests include `messages: []` in RPC fixtures but never assert on the field. `packages/pi-agents/tests/pi-rpc-transport.test.ts` already accepts an `agent_end` record with no `messages` field.
+## Requirement Coverage
 
-Pi internal extension and retry semantics remain intact because Pi consumes the original `agent_end.messages` before serializing the session event to RPC stdout. The local projection occurs only after those upstream decisions have happened. Preserve `willRetry` for protocol compatibility even though `pi-agents` currently does not branch on it.
+| Requirement                                                                     | Planned task |
+| ------------------------------------------------------------------------------- | ------------ |
+| Align Pi peer/dev dependency policy with the user decision                      | Task 1       |
+| Preserve the landed 8 MiB baseline and historical 2,320,362-byte regression     | Task 2       |
+| Disable unbounded `get_messages` before request side effects                    | Task 2       |
+| Fully validate and project only exact canonical replayable events               | Tasks 3–4    |
+| Compact every delivered child `agent_end`                                       | Task 4       |
+| Rehydrate omitted replayable authority before `agent_settled` publication       | Task 5       |
+| Store immutable validated run-local artifacts                                   | Task 6       |
+| Add additive Version 1 inline/reference contracts                               | Tasks 6–7    |
+| Prevent provisional snapshots from exposing authority                           | Task 7       |
+| Preserve child handoff semantics with a bounded dedicated reader                | Tasks 8–9    |
+| Preserve Chain, JSON Pointer, fanout, collect, and resume behavior              | Tasks 9–10   |
+| Preserve interactive continuation and rendering behavior                        | Task 11      |
+| Publish artifact, `run.json`, terminal event, and parent output in strict order | Task 12      |
+| Document limits, failure behavior, privacy, retention, and validation           | Task 13      |
 
-The failed run provides the baseline regression:
-
-- 143 run messages: 1 user, 50 assistant, and 92 tool-result messages.
-- Largest persisted session line: 106,832 bytes, below the 2 MiB ordinary-record limit.
-- Reconstructed final `agent_end` record: 2,320,362 bytes, 223,210 bytes above the limit.
-- The model first persisted a small context-window error message, then Pi emitted the oversized aggregate `agent_end`, which replaced the useful model error with `RPC stdout record exceeded 2 MiB`.
-
-`agent_end` projection alone is insufficient for generic large `finalOutput`: Pi emits cumulative `message_update`, full `message_end`, and `turn_end` records before terminal result externalization. These payloads are consumed for live UI, but their authoritative finalized forms are persisted in `sessionFile` before `agent_settled`. Oversized canonical instances may therefore be replaced by omission metadata only when the registry performs a verified settle-time session rehydrate before exposing the terminal snapshot.
-
-## Scope Decisions
+## Scope
 
 ### Included
 
-- Local, structurally validating projection of oversized canonical replayable Pi events.
-- Replacement of the `agent_end.messages` payload with an empty array for every record delivered to `pi-agents` subscribers, including records below 2 MiB.
-- Settle-time rehydration and usage/status recomputation whenever an oversized transcript/tool event was projected.
-- Explicit prevention of `get_messages` in `PiRpcTransport`; full history continues through the existing, lease-protected `sessionFile` hydration path.
-- Versioned, content-addressed, run-local artifacts for large terminal result and interactive-continuation payloads.
-- Exact-one-of inline/reference schemas for result, continuation, Chain output, and frozen fanout data.
-- Artifact-first durable commits, reference validation, lazy structured-value resolution, capability-checked file handoff, rendering, resume behavior, tests, and documentation.
+- The existing 8 MiB ordinary RPC record cap and exact error text.
+- Streaming projection for exact canonical oversized replayable Pi 0.80.9 events.
+- Settle-time direct native-session rehydrate for omitted message, turn, and tool payloads.
+- Explicit `get_messages` rejection in `PiRpcTransport`.
+- Immutable run-local text/JSON artifacts addressed by SHA-256.
+- Artifact-first strict durable reference publication and awaited terminal ordering.
+- Additive Version 1 inline-or-reference fields with legacy inline compatibility.
+- Provisional snapshots without authoritative inline values or refs.
+- Trusted lazy resolution for Chain, JSON Pointer, fanout, collect, and resume.
+- A conditional child-only `pi_agents_read_artifact` extension for Pi handoffs.
+- Artifact-aware continuation delivery, bounded descriptors, rendering, tests, and documentation.
 
-### Excluded
+### Out of Scope
 
-- Any modification or patch to `pi-mono` / `@earendil-works/pi-coding-agent`.
-- Raising the ordinary 2 MiB RPC record limit globally.
-- A local proxy subprocess between `pi-agents` and Pi.
-- Duplicating full transcripts into a second artifact format.
-- Automatic run/artifact retention or garbage collection. Version 1 continues to retain the whole run directory until manual deletion.
-- Externalization of arbitrary binary/image payloads.
+- Patches to Pi, `pi-agent-core`, or `pi-coding-agent`.
+- Configurable limits, a generic RPC proxy, binary/image artifacts, duplicate transcript artifacts, or an artifact-backed `get_messages` replacement.
+- Artifact garbage collection, partial-run cleanup, durable schema Version 2, or automatic rewriting of existing run/session files.
+- General filesystem capability for child agents beyond capabilities already granted by their selected agent configuration.
+- Support guesses for uninspected future Pi event shapes; key-order drift falls back to the ordinary 8 MiB failure.
 
-### `get_messages` Decision
+## Plan-Wide Implementation Rules
 
-Do not add artifact spill for `get_messages` in this repository:
-
-- `PiRpcTransport.getMessages()` has no production caller.
-- Pi Agent View and resume already hydrate Pi history from `SessionManager.open(sessionFile)` under the session lease.
-- A second `get_messages` artifact would duplicate prompts and tool results, increase privacy/disk exposure, and introduce a second transcript authority.
-- Because upstream cannot be changed, an oversized `get_messages` response would have to be intercepted with another protocol-specific streaming path. There is no current product requirement that justifies that complexity.
-
-Remove the unused convenience method and reject a generic `request({ type: "get_messages" })` with a structured `get_messages_disabled` transport error directing callers to `sessionFile` hydration. Reconsider a separate `getMessagesArtifact()` contract only when a real non-session consumer exists.
+- Every new TypeScript source or test file starts with two `ABOUTME:` comment lines; preserve the existing two-line headers in modified code files.
+- Generate multi-megabyte test fixtures in test code. Do not commit large JSONL or artifact fixtures.
+- Keep production limits fixed. Injectable limits/depth are test seams only.
+- Preserve strict LF framing, strip only one optional trailing CR, and never split on `U+2028` or `U+2029`.
+- Presence checks use own-property semantics so `null`, `false`, `0`, and `""` remain valid JSON values.
+- Never place a descriptor in an authoritative inline field, a ref object in `structuredOutput`, or hydrated artifact content back into durable ref fields.
+- Small inline workflows remain byte-compatible unless a task explicitly changes an error path.
 
 ## Data Contracts
 
-### Compact Replayable RPC Events
+### Safety Budgets
 
-Projected records delivered to listeners use these bounded shapes:
+| Boundary                               | Fixed budget | Behavior                                                                                                                        |
+| -------------------------------------- | -----------: | ------------------------------------------------------------------------------------------------------------------------------- |
+| Ordinary RPC record                    |        8 MiB | Responses, UI records, queue/retry/compaction events, unknown events, and non-canonical records fail closed above this size     |
+| Canonical projectable RPC record       |       64 MiB | Only exact-prefix, fully validated replayable events may reach this size; oversized payloads are omitted from listener delivery |
+| Projected shell identity string        |       16 KiB | Oversized `role`, `toolCallId`, or `toolName` revokes projectability                                                            |
+| Inline authoritative result payload    |      256 KiB | Larger text or exact JSON bytes spill before terminal publication                                                               |
+| One run artifact                       |       64 MiB | Larger artifacts fail with `artifact_too_large`                                                                                 |
+| Artifact content per child-reader call |       48 KiB | The text `content` contains at most 48 KiB of artifact bytes; continuation metadata is returned separately in bounded `details` |
+
+Existing 512 KiB presentation, 64 KiB presentation-item, 64 KiB diagnostic, 64 KiB interactive non-authoritative item, and 512 KiB idle transcript budgets remain independent.
+
+### Compact RPC Shells
 
 ```ts
-interface CompactPiRpcAgentEnd {
+export interface CompactPiRpcAgentEnd {
   type: 'agent_end';
   messages: [];
   messagesOmitted: true;
   willRetry: boolean;
 }
 
-type CompactPiRpcMessageOmitted = {
+export interface CompactPiRpcMessageEvent {
   type: 'message_start' | 'message_update' | 'message_end';
   payloadOmitted: true;
   role: string;
-};
+}
 
-type CompactPiRpcToolOmitted = {
+export interface CompactPiRpcToolEvent {
   type: 'tool_execution_start' | 'tool_execution_update' | 'tool_execution_end';
   payloadOmitted: true;
   toolCallId: string;
   toolName: string;
   isError?: boolean;
-};
+}
 
-type CompactPiRpcTurnEnd = {
+export interface CompactPiRpcTurnEnd {
   type: 'turn_end';
   payloadOmitted: true;
-};
+}
 ```
 
-Only current canonical producer prefixes are eligible for the extended streaming budget, including:
+Canonical Pi 0.80.9 top-level prefixes are:
 
-```json
-{"type":"agent_end","messages":[...],"willRetry":false}
-{"type":"message_start","message":{"role":"assistant",...}}
-{"type":"message_update","assistantMessageEvent":{...},"message":{"role":"assistant",...}}
-{"type":"message_end","message":{"role":"assistant",...}}
-{"type":"turn_end","message":{...},"toolResults":[...]}
-{"type":"tool_execution_start","toolCallId":"...","toolName":"...","args":{...}}
-{"type":"tool_execution_update","toolCallId":"...","toolName":"...","args":{...},"partialResult":{...}}
-{"type":"tool_execution_end","toolCallId":"...","toolName":"...","result":{...},"isError":false}
+```text
+agent_end:              type -> messages -> willRetry
+message_start:          type -> message
+message_update:         type -> assistantMessageEvent -> message
+message_end:            type -> message
+turn_end:               type -> message -> toolResults
+tool_execution_start:   type -> toolCallId -> toolName -> args
+tool_execution_update:  type -> toolCallId -> toolName -> args -> partialResult
+tool_execution_end:     type -> toolCallId -> toolName -> result -> isError
 ```
 
-A future key order, duplicate top-level key, or non-canonical oversized shape does not receive an exception and fails at the ordinary 2 MiB boundary. Once an exact eligible prefix has been recognized, that record receives the separate 64 MiB projectable budget; malformed JSON or an invalid required shell field discovered later fails as `malformed_json`. Valid sub-2-MiB records use normal `JSON.parse`; only `agent_end.messages` is always cleared because it is unconsumed. Other small event payloads remain available for normal live UI.
+The projector API introduced in Task 3 is:
+
+```ts
+export interface PiRpcRecordProjector {
+  push(chunk: Buffer | string): PiRpcProjectedRecord[];
+  finish(): PiRpcProjectedRecord[];
+}
+
+export type PiRpcProjectedRecord =
+  | { kind: 'ordinary'; line: string; bytes: number }
+  | {
+      kind: 'projected';
+      event: CompactPiRpcReplayableEvent;
+      bytes: number;
+      requiresSettleRehydrate: boolean;
+    };
+```
+
+Production construction uses fixed constants. Tests may inject ordinary/projectable byte caps, prefix probe bytes, shell-field bytes, and maximum depth.
 
 ### Run Artifact Reference
 
@@ -129,7 +174,6 @@ export type RunArtifactPayload =
   | 'chain-output-text'
   | 'chain-output-structured'
   | 'fanout-items'
-  | 'fanout-item'
   | 'interactive-continuation';
 
 export interface RunArtifactRefV1 {
@@ -144,108 +188,174 @@ export interface RunArtifactRefV1 {
 }
 ```
 
-`relativePath` must equal the digest-derived form:
+`relativePath` is derived only from digest and media type:
 
 ```text
 artifacts/sha256/<first-two-hex>/<64-hex-sha256>.txt
 artifacts/sha256/<first-two-hex>/<64-hex-sha256>.json
 ```
 
-The run ID and media type are part of validation, not path input. Callers never choose a relative path.
+`RunStore` gains these exact methods:
 
-### Inline-or-Reference Rules
+```ts
+writeTextArtifact(runId, payload, text): Promise<RunArtifactRefV1>
+writeJsonArtifact(runId, payload, value): Promise<RunArtifactRefV1>
+readTextArtifact(runId, ref): Promise<string>
+readJsonArtifact(runId, ref): Promise<unknown>
+resolveArtifactPath(runId, ref): Promise<string>
+updateRunStrict(runId, mutate): Promise<AgentRunRecordV1>
+appendEventStrict(runId, event): Promise<void>
+```
 
-- `SingleResult`: at most one of `finalOutput` / `finalOutputRef`, and at most one of `structuredOutput` / `structuredOutputRef`.
-- `ChainOutputEntry`: exactly one of `text` / `textRef`; zero or one structured value, represented by at most one of `structured` / `structuredRef`.
-- `WorkflowFanoutState`: exactly one of `items` / `itemsRef`.
-- `InteractiveContinuationDetails`: exactly one of `output` / `outputRef` when the continuation produced final text.
-- Legacy records containing inline fields remain valid and readable.
-- New records with both an inline value and its reference, or neither where a value is required, fail durable validation as `corrupt_run`.
+Every trusted read validates run ID, payload/media type, lowercase digest, byte count, derived relative path, containment, `lstat`, `realpath`, regular-file/no-symlink status, and SHA-256.
+
+### Additive Version 1 Rules
+
+- `SingleResult`: at most one of `finalOutput` / `finalOutputRef`; at most one of `structuredOutput` / `structuredOutputRef`.
+- `ChainOutputEntry`: exactly one of `text` / `textRef`; structured output is absent or exactly one of `structured` / `structuredRef`.
+- `WorkflowFanoutState`: exactly one of `items` / `itemsRef`; `unitIds` remains inline and ordered.
+- `InteractiveContinuationDetails`: when terminal text exists, exactly one of `output` / `outputRef`; both may be absent only for no-output terminal state.
+- Legacy inline Version 1 run records remain valid. New both/neither result/Chain/fanout unions, malformed refs, and cross-run refs fail as `corrupt_run` before claim or dispatch.
+- Continuation details are Pi custom-message data, not `AgentRunRecordV1`. Validate them in `interactive-relay.ts`; malformed inline/ref unions render or deliver one bounded `artifact_corrupt` status without resolving content.
+
+### Snapshot Phases
+
+```ts
+snapshotProvisionalResult(result: SingleResult): SingleResult
+snapshotSingleResult(result: SingleResult): SingleResult
+externalizeTerminalResult(result: SingleResult, store: RunStore, runId: string): Promise<SingleResult>
+```
+
+- `snapshotProvisionalResult` clears `messages`, all authoritative inline/ref fields, and retains only bounded presentation, diagnostics, usage, identity, and status.
+- `snapshotSingleResult` stays the terminal/legacy compact operation, becomes ref-aware, and never resolves refs.
+- `externalizeTerminalResult` measures private authority, leaves values at or below 256 KiB inline, writes larger values first, and returns a terminal snapshot containing only inline values or validated refs.
 
 ### Child Artifact Reader
-
-When Chain handoff text references a run artifact, Pi children receive one dedicated tool rather than relying on the general `read` tool:
 
 ```ts
 pi_agents_read_artifact({
   runId: 'run-...',
-  sha256: '<64 hex>',
+  sha256: '<64 lowercase hex>',
+  mediaType: 'text', // 'text' | 'json'
   offsetBytes: 0,
   maxBytes: 48 * 1024,
 });
 ```
 
-The tool receives the allowed artifact root through a private child environment variable, derives the content-addressed path from `runId`/digest, rejects caller paths, verifies the regular file and digest, returns a UTF-8-safe bounded chunk plus `nextOffsetBytes`, and supports long single-line text/JSON. It is loaded only for Pi-runtime steps whose rendered task contains an artifact handoff. Grok ACP cannot load this extension in Version 1 and fails before dispatch with `artifact_handoff_unsupported`.
+The extension reads private `PI_AGENTS_RUN_ARTIFACT_DIR` and `PI_AGENTS_RUN_ID`, derives the `.txt` or `.json` path from digest plus `mediaType`, rejects caller paths and cross-run IDs, validates the artifact, and returns at most 48 KiB of UTF-8 artifact content plus bounded `offsetBytes`, `nextOffsetBytes`, `bytesReturned`, and `eof` details. `offsetBytes` must be an integer from 0 through the exact artifact byte length and must start on a UTF-8 code-point boundary; exact EOF returns empty content with `eof: true`, while a larger or mid-code-point offset fails as `invalid_artifact_offset`. `maxBytes` is an integer from 4 through 48 KiB; the reader retreats the chunk end to the preceding UTF-8 boundary and sets `nextOffsetBytes` to that exact end. Missing, corrupt, and unauthorized artifacts use one bounded child-visible `artifact_unavailable` error so the tool does not reveal path-existence details.
 
 ## File Map
 
-### Immediate RPC Fix
+### Create
 
-- Create: `packages/pi-agents/src/pi-rpc-record-projector.ts` — Incremental JSON tokenizer and canonical replayable-event omission state machine.
-- Modify: `packages/pi-agents/src/pi-rpc-transport.ts` — Integrate record projection, retain ordinary limits, compact replayable events, and disable `get_messages`.
-- Modify: `packages/pi-agents/src/interactive-agent.ts` — Track omitted RPC transcript payloads and rehydrate the owned Pi session before terminal publication.
-- Create: `packages/pi-agents/tests/pi-rpc-record-projector.test.ts` — Chunk-boundary, malformed JSON, nesting, UTF-8, limit, and projection coverage.
-- Modify: `packages/pi-agents/tests/pi-rpc-transport.test.ts` — Realistic oversized aggregate/final-message regressions and disabled `get_messages` behavior.
-- Modify: `packages/pi-agents/tests/interactive-agent.test.ts` — Use compact `agent_end` fixtures and confirm settle/retry behavior is unchanged.
-- Modify: `packages/pi-agents/tests/pi-rpc-execution.test.ts` — Confirm compact `agent_end` never settles an activation.
-- Modify: `packages/pi-agents/tests/interactive-relay.test.ts` — Confirm relay ordering is unchanged with omitted messages.
+- `packages/pi-agents/src/pi-rpc-record-projector.ts` — incremental LF JSONL framing, JSON validation, exact-prefix classification, and bounded shell projection.
+- `packages/pi-agents/src/artifact-store.ts` — content-addressed atomic artifact writes, strict sync helpers, and verified reads.
+- `packages/pi-agents/src/result-payload.ts` — exact byte measurement, terminal spill decisions, descriptors, and trusted resolvers.
+- `packages/pi-agents/src/artifact-reader-extension.ts` — standalone child-only `pi_agents_read_artifact` Pi extension.
+- `packages/pi-agents/tests/pi-rpc-record-projector.test.ts` — grammar, prefix, cap, chunk-boundary, and projection coverage.
+- `packages/pi-agents/tests/artifact-store.test.ts` — atomicity, sync failure, deduplication, corruption, symlink, traversal, and crash-window coverage.
+- `packages/pi-agents/tests/result-payload.test.ts` — thresholds, refs, descriptors, exact serialization, and resolver coverage.
+- `packages/pi-agents/tests/artifact-reader-extension.test.ts` — schema, path derivation, validation, UTF-8 chunking, and bounded error coverage.
 
-### Artifact Store and Durable Schema
+### Modify: Package and Transport
 
-- Create: `packages/pi-agents/src/artifact-store.ts` — Content-addressed atomic publication, digest/size verification, safe path resolution, and text/JSON reads.
-- Modify: `packages/pi-agents/src/constants.ts` — Add inline, artifact, JSON-depth, prefix-probe, and projectable-record limits.
-- Modify: `packages/pi-agents/src/run-types.ts` — Add `RunArtifactRefV1`, artifact payload kinds, and inline/reference fanout state.
-- Modify: `packages/pi-agents/src/types.ts` — Add result and Chain-output artifact references while retaining legacy inline fields.
-- Modify: `packages/pi-agents/src/run-store.ts` — Expose run-scoped artifact write/read/resolve APIs, add strict non-swallowing writes, and validate every persisted reference.
-- Modify: `packages/pi-agents/src/run-persistence.ts` — Keep coordinator registration and durable claim ownership consistent on finalization success/failure.
-- Modify: `packages/pi-agents/src/run-coordinator.ts` — Await artifact-backed terminal snapshots and strict durable writes; support inline/reference fanout state throughout merge, mirror, equality, and expansion paths.
-- Modify: `packages/pi-agents/src/resume.ts` — Resolve and validate artifact-backed fanout mappings during both pre-claim and post-claim inspection.
-- Create: `packages/pi-agents/tests/artifact-store.test.ts` — Atomicity, permissions, deduplication, corruption, symlink, path traversal, and crash-window tests.
-- Modify: `packages/pi-agents/tests/run-store.test.ts` — Version 1 additive reference validation and legacy compatibility.
-- Modify: `packages/pi-agents/tests/run-coordinator.test.ts` — Artifact-first commit ordering and no dangling durable references.
+- `package.json` — pin root Pi development dependencies to exact `0.80.9`.
+- `bun.lock` — remove 0.80.6 Pi resolutions and record exact 0.80.9 development graph.
+- `packages/pi-agents/package.json` — use `"*"` Pi peers, exact `0.80.9` Pi dev dependencies, export/package the child extension, and build it in `postbuild` without bundling peer SDKs.
+- `packages/pi-agents/src/constants.ts` — centralize fixed RPC, artifact, and reader budgets.
+- `packages/pi-agents/src/pi-rpc-transport.ts` — integrate the projector, compact every `agent_end`, and reject `get_messages`.
+- `packages/pi-agents/src/interactive-agent.ts` — track projected omissions, settle-time rehydrate, and conditional reader injection for TUI RPC children.
 
-### Result and Workflow Integration
+### Modify: Artifact and Workflow Contracts
 
-- Create: `packages/pi-agents/src/result-payload.ts` — Byte accounting, terminal externalization, bounded handoff descriptors, and verified value resolvers.
-- Modify after prerequisite creation: `packages/pi-agents/src/result-snapshot.ts` — Externalize authoritative payloads only from terminal compact snapshots.
-- Modify: `packages/pi-agents/src/output.ts` — Resolve inline final text or format an artifact handoff without loading full text into parent context.
-- Modify: `packages/pi-agents/src/tool.ts` — Await terminal externalization/durability and return artifact-aware parent content.
-- Modify: `packages/pi-agents/src/execution.ts` — Keep low-level Pi/Grok terminal updates provisional so oversized terminal payloads cannot escape before externalization.
-- Modify: `packages/pi-agents/src/pi-rpc-execution.ts` — Keep RPC terminal updates provisional and defer authoritative terminal delivery to the artifact-aware boundary.
-- Modify: `packages/pi-agents/src/chain.ts` — Preserve handoff, structured validation, fanout expansion, collection, and resume with inline/reference values.
-- Create: `packages/pi-agents/src/artifact-reader-extension.ts` — Child-only `pi_agents_read_artifact` tool that derives paths from run ID/digest and returns bounded byte chunks.
-- Modify: `packages/pi-agents/src/security.ts` — Add the dedicated artifact-reader tool to effective child tool arguments only when an artifact handoff is present.
-- Modify: `packages/pi-agents/src/invocation.ts` — Explicitly load the child-only extension and pass its run-scoped environment when required.
-- Modify: `packages/pi-agents/src/interactive-relay.ts` — Externalize oversized continuation output before injecting a bounded host custom message.
-- Modify: `packages/pi-agents/src/index.ts` — Inject `RunStore` into the async continuation relay and track relay promises.
-- Modify: `packages/pi-agents/src/render.ts` — Render artifact metadata and paths without automatically loading large content.
-- Modify: `packages/pi-agents/package.json` — Build and publish the child-only artifact-reader extension as a separate `dist` entry.
-- Modify: `packages/pi-agents/src/completion-check.ts` — Assert completion checks run only against private inline runtime output before externalization.
-- Create: `packages/pi-agents/tests/result-payload.test.ts` — Threshold, exact-one-of, handoff descriptor, resolver, and corruption behavior.
-- Modify: `packages/pi-agents/tests/chain.test.ts` — Large previous output, named output, fanout, collection, and resume cases.
-- Create: `packages/pi-agents/tests/artifact-reader-extension.test.ts` — Digest-derived path guard, byte chunking, UTF-8 boundary, corruption, and permission tests.
-- Modify: `packages/pi-agents/tests/security.test.ts` — Dedicated artifact-reader allowlist injection and non-handoff isolation.
-- Modify: `packages/pi-agents/tests/invocation.test.ts` — Child extension/env arguments appear only for Pi artifact handoffs.
-- Modify: `packages/pi-agents/tests/interactive-relay.test.ts` — Large continuation output uses an artifact-backed bounded custom message.
-- Modify after prerequisite creation: `packages/pi-agents/tests/result-snapshot.test.ts` — Terminal externalization while preserving presentation and identity.
-- Modify after prerequisite creation: `packages/pi-agents/tests/memory-regression.test.ts` — Serialized parent/durable size with artifact-backed authoritative output.
-- Modify: `packages/pi-agents/tests/render.test.ts` — Collapsed/expanded artifact rendering.
+- `packages/pi-agents/src/run-types.ts` — artifact refs, payload kinds, and inline/reference fanout state.
+- `packages/pi-agents/src/types.ts` — result and Chain inline/reference fields.
+- `packages/pi-agents/src/run-store.ts` — artifact APIs, strict writes, and additive Version 1 validation.
+- `packages/pi-agents/src/result-snapshot.ts` — provisional snapshots and ref-aware terminal snapshots.
+- `packages/pi-agents/src/run-coordinator.ts` — strict async unit/run barriers and ref-aware fanout mirrors.
+- `packages/pi-agents/src/run-persistence.ts` — shared success/failure finalization and claim ordering.
+- `packages/pi-agents/src/execution.ts` — provisional callbacks and non-TUI child reader launch arguments.
+- `packages/pi-agents/src/pi-rpc-execution.ts` — provisional callbacks and committed terminal delivery.
+- `packages/pi-agents/src/abort.ts` — retain private abort authority until terminal publication.
+- `packages/pi-agents/src/tool.ts` — await terminal barriers and async resume inspection.
+- `packages/pi-agents/src/output.ts` — bounded inline/ref parent and handoff formatting.
+- `packages/pi-agents/src/completion-check.ts` — run checks against private full output before spill.
+- `packages/pi-agents/src/chain.ts` — ref-aware previous/named/collect output, structured resolution, fanout, and resume.
+- `packages/pi-agents/src/template.ts` — bounded descriptor substitution for referenced values.
+- `packages/pi-agents/src/resume.ts` — async ref validation and runtime-only resolved fanout state.
+- `packages/pi-agents/src/security.ts` — force-include only the dedicated reader when required.
+- `packages/pi-agents/src/invocation.ts` — shipped extension path and typed reader requirement.
+- `packages/pi-agents/src/interactive-relay.ts` — artifact-aware continuation publication and in-flight deduplication.
+- `packages/pi-agents/src/index.ts` — inject `RunStore` into the relay and await relay shutdown work.
+- `packages/pi-agents/src/render.ts` — render ref metadata without loading artifact content.
 
-### Documentation
+### Modify: Tests
 
-- Modify: `packages/pi-agents/README.md` — Add `artifacts/` layout, handoff behavior, privacy, disk growth, and manual deletion.
-- Modify: `packages/pi-agents/docs/reference.md` — Document RPC projection, limits, artifact schema, errors, and inline/reference contracts.
-- Modify: `packages/pi-agents/docs/explanation.md` — Explain control-plane projection versus session/result data planes.
-- Modify: `packages/pi-agents/docs/how-to.md` — Show how parent/next agents inspect spilled output and diagnose missing/corrupt artifacts.
+- `packages/pi-agents/tests/pi-rpc-transport.test.ts` — historical baseline, projector integration, caps, framing, compact `agent_end`, and disabled command.
+- `packages/pi-agents/tests/interactive-agent.test.ts` — omission tracking, direct rehydrate, settle ordering, eviction races, and TUI reader injection.
+- `packages/pi-agents/tests/pi-rpc-execution.test.ts` — provisional/terminal separation after rehydrate.
+- `packages/pi-agents/tests/interactive-relay.test.ts` — `agent_settled` authority, artifact-first continuation, and duplicate/stale delivery races.
+- `packages/pi-agents/tests/memory-regression.test.ts` — generated oversized transcript/result/fanout serialized-size thresholds.
+- `packages/pi-agents/tests/update-coalescer.test.ts` — async settle and terminal cancellation ordering.
+- `packages/pi-agents/tests/run-store.test.ts` — additive ref validation and legacy Version 1 compatibility.
+- `packages/pi-agents/tests/result-snapshot.test.ts` — phase behavior, ref ownership, idempotence, and limits.
+- `packages/pi-agents/tests/execution.test.ts` — provisional updates and non-TUI reader injection.
+- `packages/pi-agents/tests/run-coordinator.test.ts` — strict artifact/run/event ordering and failure windows.
+- `packages/pi-agents/tests/tool.test.ts` — awaited unit/run barriers, bounded parent output, and claim cleanup.
+- `packages/pi-agents/tests/output.test.ts` — inline/ref descriptors and legacy output behavior.
+- `packages/pi-agents/tests/completion-check.test.ts` — completion checks use private full output.
+- `packages/pi-agents/tests/chain.test.ts` — previous/named/collect refs, fanout refs, and prompt parity.
+- `packages/pi-agents/tests/resume.test.ts` — pre/post-claim artifact validation and no redispatch.
+- `packages/pi-agents/tests/security.test.ts` — conditional dedicated reader inclusion without capability broadening.
+- `packages/pi-agents/tests/invocation.test.ts` — shipped extension resolution and typed reader requirements.
+- `packages/pi-agents/tests/render.test.ts` — collapsed/expanded inline/ref rendering.
+
+### Modify: Documentation
+
+- `packages/pi-agents/README.md` — limits, artifact layout, reader behavior, dependency support, privacy, retention, and validation commands.
+- `packages/pi-agents/docs/reference.md` — RPC projection, refs, errors, limits, and disabled command.
+- `packages/pi-agents/docs/explanation.md` — control-plane projection, session authority, artifact publication, and trust boundaries.
+- `packages/pi-agents/docs/how-to.md` — inspect artifacts, read child handoffs, and diagnose missing/corrupt refs.
 
 ## Tasks
 
-### Task 1: Lock the Overflow Regression and Consumption Contract
+### Task 1: Align Pi Dependency and Package Contracts
 
-**Outcome:** Tests encode the observed failure shape and prove that `pi-agents` requires only the `agent_end` lifecycle signal, not its message array.
+**Outcome:** All Pi peer dependencies follow installed package guidance, all Pi development dependencies are exactly 0.80.9, and the lockfile contains no 0.80.6 Pi runtime.
 
 **Files:**
 
+- Modify: `package.json`
+- Modify: `packages/pi-agents/package.json`
+- Modify: `bun.lock`
+
+**Steps:**
+
+- [ ] Change root `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui` development ranges from `^0.80.9` to exact `0.80.9`.
+- [ ] Change every `@earendil-works/pi-*` peer in `packages/pi-agents/package.json` to `"*"`; leave `typebox` as `"*"`.
+- [ ] Change the package-local `@earendil-works/pi-agent-core` development dependency to exact `0.80.9`.
+- [ ] Run `bun install` from the repository root and verify `bun.lock` removes direct/nested Pi 0.80.6 resolutions.
+- [ ] Do not change dependency metadata in `pi-lsp` or `pi-format`; they already use `"*"` Pi peers and declare no Pi development versions.
+
+**Validation:**
+
+- Run: `bun install --frozen-lockfile`
+- Expected: install succeeds without modifying `bun.lock`.
+
+- Run: `bun -e "const r=await Bun.file('package.json').json(); const a=await Bun.file('packages/pi-agents/package.json').json(); for (const n of ['@earendil-works/pi-ai','@earendil-works/pi-coding-agent','@earendil-works/pi-tui']) if (r.devDependencies[n] !== '0.80.9') throw new Error(n); for (const [n,v] of Object.entries(a.peerDependencies)) if ((n.startsWith('@earendil-works/pi-') || n === 'typebox') && v !== '*') throw new Error(n); if (a.devDependencies['@earendil-works/pi-agent-core'] !== '0.80.9') throw new Error('pi-agent-core')"`
+- Expected: exits 0 with no output.
+
+- Run: `rg -n "@earendil-works/pi-(agent-core|ai|coding-agent|tui)@0\.80\.6|\^0\.80\.6" bun.lock package.json packages/pi-agents/package.json`
+- Expected: no matches.
+
+### Task 2: Lock the Transport Baseline and Disable `get_messages`
+
+**Outcome:** Permanent tests preserve the landed 8 MiB behavior and terminal lifecycle contract, while the unbounded history command is unavailable before request side effects.
+
+**Files:**
+
+- Modify: `packages/pi-agents/src/constants.ts`
+- Modify: `packages/pi-agents/src/pi-rpc-transport.ts`
 - Modify: `packages/pi-agents/tests/pi-rpc-transport.test.ts`
 - Modify: `packages/pi-agents/tests/interactive-agent.test.ts`
 - Modify: `packages/pi-agents/tests/pi-rpc-execution.test.ts`
@@ -253,88 +363,114 @@ The tool receives the allowed artifact root through a private child environment 
 
 **Steps:**
 
-- [ ] Generate a synthetic `agent_end` with 143 messages and a serialized size between 2.2 MiB and 2.3 MiB; do not commit a multi-megabyte fixture.
-- [ ] Generate a second fake-child sequence with cumulative `message_update`, full `message_end`, `turn_end`, `agent_end`, and `agent_settled` around a 4 MiB assistant final message persisted to a temporary native session file.
-- [ ] Assert the current transport fails with `stdout_overflow` before the production fix, matching the observed run and proving that `agent_end`-only projection would not support large final output.
-- [ ] Replace lifecycle fixtures with the compact shapes and retain `willRetry: true` / `false` variants.
-- [ ] Assert compact `agent_end` updates metadata only, never settles, never clears queues/tools/streaming, and never triggers continuation relay; `agent_settled` remains the sole terminal signal.
-- [ ] Assert projected transcript/tool events require settle-time hydration and that no terminal snapshot is published before hydration succeeds.
-- [ ] Add a source audit assertion with `rg` in the validation notes rather than a brittle code-scanning unit test.
+- [ ] Move `MAX_STDOUT_RECORD_BYTES = 8 * 1024 * 1024` to `constants.ts`; preserve `RPC stdout record exceeded 8 MiB` exactly.
+- [ ] Generate a 143-message canonical `agent_end` with the historical 1 user / 50 assistant / 92 tool-result distribution and exact serialized length 2,320,362 bytes; assert it succeeds under 8 MiB and preserves the preceding small model/context error.
+- [ ] Preserve exact-8-MiB success and 8-MiB-plus-one terminated/unterminated failure before `JSON.parse` or listener delivery.
+- [ ] Assert raw `agent_end` only updates metadata and never settles an activation, clears active stream/tool/queue state, resolves Pi RPC execution, or triggers continuation relay.
+- [ ] Assert `agent_settled` remains the only normal terminal signal.
+- [ ] Remove `PiRpcTransport.getMessages()` and its unused `AgentMessage` import.
+- [ ] Guard public `request()` before request ID allocation, pending-map mutation, timer creation, or stdin write. Reject `type: 'get_messages'` with code `get_messages_disabled` and message `get_messages is disabled; hydrate the validated sessionFile instead`.
+- [ ] Replace any request-correlation fixture that used `get_messages` with a second bounded command such as `get_state`.
 
 **Validation:**
 
 - Run: `(cd packages/pi-agents && bun test tests/pi-rpc-transport.test.ts tests/interactive-agent.test.ts tests/pi-rpc-execution.test.ts tests/interactive-relay.test.ts)`
-- Expected before Task 2: only the new oversized transport regressions fail with `stdout_overflow`; lifecycle tests accept bounded omission events.
+- Expected: all tests pass; the historical shape and exact boundary succeed, overflow remains fail-closed, `agent_end` remains non-terminal, and `get_messages` produces no write or pending request.
 
-### Task 2: Implement a Fail-Closed Streaming Replayable-Event Projector
+- Run: `rg -n "getMessages\(|get_messages" packages/pi-agents/src packages/pi-agents/tests`
+- Expected: source contains only the disabled-command guard; tests contain only rejection coverage.
 
-**Outcome:** Canonical replayable Pi events may exceed 2 MiB without retaining their full payloads, and the registry reconstructs authoritative transcript state from `sessionFile` before terminal publication.
+### Task 3: Implement the Incremental RPC Record Projector
+
+**Outcome:** A standalone projector can validate and classify one strict LF JSONL stream without retaining eligible oversized payloads or broadening the ordinary cap.
 
 **Files:**
 
 - Create: `packages/pi-agents/src/pi-rpc-record-projector.ts`
 - Modify: `packages/pi-agents/src/constants.ts`
-- Modify: `packages/pi-agents/src/pi-rpc-transport.ts`
-- Modify: `packages/pi-agents/src/interactive-agent.ts`
 - Create: `packages/pi-agents/tests/pi-rpc-record-projector.test.ts`
-- Modify: `packages/pi-agents/tests/pi-rpc-transport.test.ts`
-- Modify: `packages/pi-agents/tests/interactive-agent.test.ts`
-- Modify: `packages/pi-agents/tests/pi-rpc-execution.test.ts`
 
 **Steps:**
 
-- [ ] Add `MAX_STDOUT_RECORD_BYTES = 2 * 1024 * 1024`, `MAX_PROJECTABLE_RPC_RECORD_BYTES = 64 * 1024 * 1024`, `RPC_PREFIX_PROBE_BYTES = 512`, and `RPC_JSON_MAX_DEPTH = 256` to shared constants; remove the transport-local duplicate.
-- [ ] Give the projector injectable limit/depth options for tests while wiring the fixed constants in production.
-- [ ] Implement a streaming tokenizer that validates complete decoded JSON grammar: object/array key-value state, commas/colons, strings, escapes, four-hex-digit `\u` escapes, numbers, `true`/`false`/`null`, maximum nesting, LF framing, optional trailing CR, and EOF.
-- [ ] Recognize only the exact current Pi prefixes shown in the data contract for `agent_end`, `message_start`, `message_update` (notably `assistantMessageEvent` before `message`), `message_end`, `turn_end`, and tool execution start/update/end before the ordinary cap. If recognition is not complete within `RPC_PREFIX_PROBE_BYTES`, keep the record on the ordinary path.
-- [ ] For canonical `agent_end`, discard `messages`, preserve/validate `willRetry`, and emit the compact contract only after the entire record validates.
-- [ ] For message start/update/end, extract and validate `message.role` before discarding the remaining accumulated message payload; emit the compact message shell so assistant turn accounting can still run at `message_end`.
-- [ ] For tool start/update/end, preserve/validate `toolCallId`, `toolName`, and terminal `isError` when present, then discard args/result payloads. For `turn_end`, retain only the type/omission flag.
-- [ ] Track total bytes seen even when discarded; fail with `stdout_overflow` at `MAX_PROJECTABLE_RPC_RECORD_BYTES`.
-- [ ] On malformed projected input, fail with `malformed_json`; never turn malformed input into a synthetic valid event.
-- [ ] Preserve stdout order when a chunk contains the end of a projected record plus subsequent records.
-- [ ] Keep the existing `StringDecoder` split-code-point behavior and LF-only framing; define grammar validation over its decoded character stream.
-- [ ] In `handleLine()`, defensively compact valid sub-2-MiB `agent_end` records after `JSON.parse`, regardless of key order. Preserve other small event payloads.
-- [ ] Do not raise limits for user/queue events, compaction/retry events, extension UI, responses, or unknown record types.
-- [ ] Add an endpoint flag such as `rpcTranscriptPayloadOmitted`. Compact message/tool events set it, clear unsafe streaming/tool partial state, and publish at most bounded omission metadata while the activation remains running.
-- [ ] When a compact assistant `message_end` arrives, increment the activation's assistant-turn counter and apply the existing `maxTurns` abort policy immediately from the preserved role; do not wait until settle-time hydration to enforce the turn limit.
-- [ ] Before reducing `agent_settled`, if the flag is set, directly open the endpoint's already-owned/validated Pi `sessionFile` inside the same transition (do not wait on its own session lease), load the active branch, replace finalized messages, recompute post-baseline usage/model/stop reason/turn count without double-counting the compact event, clear the flag, and only then publish `activation_settled`.
-- [ ] If settle-time hydration is missing, malformed, path-mismatched, or does not contain the expected finalized branch, fail the activation with `hydrate_error`; never publish a successful terminal snapshot from omission metadata alone.
-- [ ] Add tests at every byte chunk boundary for representative records, plus the exact `message_update` key order, non-streaming oversized `message_start`, oversized tool start args, compact assistant `message_end` with `maxTurns: 1`, escaped quotes/backslashes, `\u2028`/`\u2029`, multibyte UTF-8, nested messages, empty arrays, CRLF, unterminated EOF, duplicate/out-of-order keys, trailing commas, invalid literals/numbers, depth overflow, multiple records per chunk, and non-canonical oversized fallback. Exercise the hard-cap branch with an injected small cap; keep realistic 2.2 MiB aggregate and 4 MiB final-output integrations.
+- [ ] Add `MAX_PROJECTABLE_RPC_RECORD_BYTES = 64 * 1024 * 1024`, `RPC_PREFIX_PROBE_BYTES = 512`, `RPC_JSON_MAX_DEPTH = 256`, and `RPC_PROJECTED_SHELL_FIELD_MAX_BYTES = 16 * 1024`.
+- [ ] Implement the `PiRpcRecordProjector` and `PiRpcProjectedRecord` API from Data Contracts. Keep a raw line buffer only through the ordinary 8 MiB boundary while concurrently validating/classifying the record.
+- [ ] Preserve LF-only framing, strip one optional trailing CR, preserve records after an LF in the same chunk, and complete decoder state in `finish()`.
+- [ ] Validate complete JSON grammar incrementally: containers, keys/values, separators, strings/escapes, four-hex-digit `\u` escapes, numbers, literals, duplicate top-level keys, maximum depth, complete record, and EOF.
+- [ ] Classify only the exact Pi 0.80.9 top-level orders listed in Data Contracts. Any unknown type, reordered/duplicate key, missing shell field, or shell string above 16 KiB remains ordinary.
+- [ ] Preserve only `willRetry`, `role`, `toolCallId`, `toolName`, and terminal `isError` in projected shells; discard large payload values after their syntax has been fully validated.
+- [ ] Count exact UTF-8 bytes even after payload discard. Throw `stdout_overflow` at the ordinary or projectable boundary and `malformed_json` for invalid grammar.
+- [ ] Revoke projectability on any late canonical-order or shell violation. If the record already crossed 8 MiB, fail without emitting a synthetic event.
+- [ ] Use injected limits/depth only in tests; production construction always uses constants.
+- [ ] Cover every byte split for representative prefixes, CRLF, multiple records/chunk, escaped quotes/backslashes, `U+2028`/`U+2029`, multibyte UTF-8, nested containers, EOF, invalid numbers/literals/escapes, trailing commas, duplicate/reordered keys, depth overflow, late invalidation, unknown events, and both cap branches.
 
 **Validation:**
 
-- Run: `(cd packages/pi-agents && bun test tests/pi-rpc-record-projector.test.ts tests/pi-rpc-transport.test.ts tests/interactive-agent.test.ts tests/pi-rpc-execution.test.ts)`
-- Expected: oversized eligible events become bounded omission events, the persisted 4 MiB final message is restored before settle, later records remain readable, and every oversized non-eligible record still fails at 2 MiB.
+- Run: `(cd packages/pi-agents && bun test tests/pi-rpc-record-projector.test.ts)`
+- Expected: all grammar, chunk-boundary, classification, omission, late-revocation, and independent-cap tests pass.
 
-### Task 3: Remove the Unused `get_messages` Hazard
+- Run: `mise run typecheck --package packages/pi-agents`
+- Expected: the new projector contracts type-check without transport integration.
 
-**Outcome:** `pi-agents` cannot accidentally request an unbounded single-line transcript response; native session hydration remains the only Pi history path.
+### Task 4: Integrate Projection into `PiRpcTransport`
+
+**Outcome:** Oversized canonical replayable events reach listeners as bounded shells through 64 MiB, every delivered `agent_end` is compact, and all other records remain subject to 8 MiB.
 
 **Files:**
 
 - Modify: `packages/pi-agents/src/pi-rpc-transport.ts`
 - Modify: `packages/pi-agents/tests/pi-rpc-transport.test.ts`
-- Modify: `packages/pi-agents/docs/reference.md`
-- Modify: `packages/pi-agents/docs/explanation.md`
 
 **Steps:**
 
-- [ ] Remove `PiRpcTransport.getMessages()` and the now-unused `AgentMessage` transport import.
-- [ ] Reject `request({ type: 'get_messages' })` before writing stdin with `PiRpcTransportError('get_messages_disabled', 'get_messages is disabled; hydrate the validated sessionFile instead')`.
-- [ ] Replace tests that used `get_messages` only as a second pending request with another bounded command such as `get_state`.
-- [ ] Add a test asserting the command writes no stdin bytes and creates no pending request.
-- [ ] Retain `interactive-agent.ts` hydration through `SessionManager.open(sessionFile)` and its existing session lease/path validation unchanged.
-- [ ] Document that Pi RPC upstream still exposes `get_messages`, but this integration intentionally does not use it because the response is unbounded and redundant with the native session artifact.
+- [ ] Replace whole-line stdout handling with the projector while preserving process failure, request correlation, listener order, backpressure, and same-chunk record order.
+- [ ] Parse ordinary records at or below 8 MiB with the existing `JSON.parse` path.
+- [ ] Defensively rewrite every small valid `agent_end`, regardless of key order, to `messages: []` and `messagesOmitted: true` while retaining boolean `willRetry`.
+- [ ] Deliver projected shells only after the complete record validates. Never deliver partial or malformed records.
+- [ ] Generate a canonical aggregate `agent_end` between 8.2 and 8.3 MiB; assert bounded delivery and synchronization of a following small record.
+- [ ] Generate canonical oversized message, turn, and tool events; assert their bounded shell fields and `requiresSettleRehydrate` metadata.
+- [ ] Test ordinary unknown/response/UI records at 8 MiB plus one, canonical records at 64 MiB plus one, late canonical invalidation after 8 MiB, and oversized required shell fields.
+- [ ] Keep the Task 2 historical 2,320,362-byte and exact-8-MiB regressions green.
 
 **Validation:**
 
-- Run: `rg -n "getMessages\(|get_messages" packages/pi-agents/src packages/pi-agents/tests`
-- Expected: only the explicit rejection guard, test, and documentation references remain; no production request path exists.
+- Run: `(cd packages/pi-agents && bun test tests/pi-rpc-record-projector.test.ts tests/pi-rpc-transport.test.ts)`
+- Expected: 8.2–8.3 MiB canonical records project, ordinary records still fail above 8 MiB, projectable records fail above 64 MiB, compact `agent_end` never exposes messages, and following records remain synchronized.
 
-### Task 4: Add the Run-Local Content-Addressed Artifact Store
+### Task 5: Rehydrate Projected Interactive Activations at Settle
 
-**Outcome:** Large immutable text/JSON payloads can be published and read safely, with artifact durability preceding any reference.
+**Outcome:** An activation that lost replayable payloads publishes one verified terminal snapshot from its native session before `activation_settled` and before deferred eviction.
+
+**Files:**
+
+- Modify: `packages/pi-agents/src/interactive-agent.ts`
+- Modify: `packages/pi-agents/tests/interactive-agent.test.ts`
+- Modify: `packages/pi-agents/tests/pi-rpc-execution.test.ts`
+- Modify: `packages/pi-agents/tests/interactive-relay.test.ts`
+- Modify: `packages/pi-agents/tests/memory-regression.test.ts`
+- Modify: `packages/pi-agents/tests/update-coalescer.test.ts`
+
+**Steps:**
+
+- [ ] Track omission state by endpoint transport generation and activation ID, including expected finalized-message and assistant-message counts. Compact `agent_end.messages` alone does not set rehydrate state because no local consumer used it.
+- [ ] For compact message/tool/turn shells, clear only unsafe transient presentation rows and publish bounded omission metadata while keeping the activation running.
+- [ ] On compact assistant `message_end`, enforce existing `maxTurns` immediately from the preserved role; use the existing non-blocking abort path.
+- [ ] Await event reduction in the endpoint transition queue so sealed coalesced stream updates reduce before boundary events and no later transition overtakes settle rehydrate.
+- [ ] Add `rehydrateProjectedPiAtSettle`. It runs only for a live Pi endpoint with omission state and directly calls `SessionManager.open(validatedSessionFile).getBranch()` inside the endpoint transition.
+- [ ] Do not call `ensureTranscriptHydrated()` or wait on `awaitSessionLease()`; the live endpoint still owns the writer lease until transport disposal.
+- [ ] Project hydrated messages through existing registry retention helpers, verify expected post-baseline finalized/assistant counts, replace the finalized view, mark `transcriptHydrated`, and recompute model/usage/stop reason without double-counting compact events.
+- [ ] Complete successful rehydrate before full `endpoint_updated`, `activation_settled`, activation clearing, `scheduleIdleTranscriptEviction`, and idle LRU enforcement.
+- [ ] On missing, malformed, path-mismatched, stale, or incomplete session data, settle failed with `errorCode: 'hydrate_error'` and a bounded message; never publish omission-only success.
+- [ ] Generate a persisted 12 MiB assistant final message followed by cumulative `message_update`, full `message_end`, `turn_end`, aggregate `agent_end`, and `agent_settled`. Route it through the real transport and registry reducer; assert settled consumers observe complete authority once before existing eviction limits apply.
+- [ ] Cover `willRetry`, max-turn abort, blocked transition queues, newer activation/retention epoch races, relay non-delivery on `agent_end`, and stale eviction suppression.
+
+**Validation:**
+
+- Run: `(cd packages/pi-agents && bun test tests/interactive-agent.test.ts tests/pi-rpc-execution.test.ts tests/interactive-relay.test.ts tests/memory-regression.test.ts tests/update-coalescer.test.ts)`
+- Expected: the 12 MiB sequence rehydrates before settle, `agent_end` remains non-terminal, failures become bounded `hydrate_error`, and eviction/coalescing cannot overtake the terminal snapshot.
+
+### Task 6: Add Run-Local Artifacts and Strict Store Primitives
+
+**Outcome:** Immutable text/JSON artifacts are durable and verified before refs are returned, and Version 1 records can validate additive inline/reference unions.
 
 **Files:**
 
@@ -348,153 +484,256 @@ The tool receives the allowed artifact root through a private child environment 
 **Steps:**
 
 - [ ] Add `RESULT_INLINE_PAYLOAD_MAX_BYTES = 256 * 1024` and `RUN_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024`.
-- [ ] Add the Version 1 reference and payload-kind types exactly as defined above.
-- [ ] Extend `RunStore` with `writeTextArtifact`, `writeJsonArtifact`, `readTextArtifact`, `readJsonArtifact`, and `resolveArtifactPath`; every method takes `runId` plus a validated reference or payload kind, never a caller-chosen path.
-- [ ] Serialize text as UTF-8 and structured values as two-space-indented JSON so the `read` tool can inspect large JSON artifacts by line range. Reject non-JSON values and payloads above the hard cap with `artifact_too_large`.
-- [ ] Create/verify `artifacts/`, `artifacts/sha256/`, digest-prefix directories, and staging files with private permissions (`0700` directories, `0600` files where supported). On every write attempt—not only after `mkdir` reports creation—strictly sync each parent in order (`run dir` for `artifacts`, `artifacts` for `sha256`, and `sha256` for the digest-prefix directory) before publishing content. This makes retries after a prior parent-sync failure idempotently re-establish directory reachability.
-- [ ] Hash bytes before publishing; derive the destination solely from SHA-256 and media type.
-- [ ] Write a same-filesystem staging file, strictly `fsync` it, atomically rename it to the content-addressed destination, and strictly `fsync` the digest-prefix directory. Propagate file-sync errors everywhere. On non-Windows platforms, propagate every directory-sync error; on Windows, skip directory `fsync` explicitly while retaining strict file flushes and atomic rename semantics. On Windows `EEXIST`, verify the existing regular file's exact size and digest before discarding staging.
-- [ ] Return the reference only after publication completes. A crash may leave an unreferenced staging/content file, but never a durable reference to an unpublished file.
-- [ ] Resolve references with strict run ID, regex, extension/media-type, containment, `lstat`/`realpath`, regular-file, byte-count, SHA-256, and no-symlink checks. Use `O_NOFOLLOW` where available and retain the realpath guard on every platform.
-- [ ] Add `RunStore.updateRunStrict()` / strict write plumbing that uses strict file and directory synchronization rather than the existing swallow-all directory-sync helper. Keep best-effort/coalesced writes separate and never use them for a terminal artifact reference.
-- [ ] Add run-record validation for every reference in unit results, presentation results, Chain outputs, and fanout state.
-- [ ] Keep legacy inline-only Version 1 records valid.
-- [ ] Do not clean unreferenced artifacts while another process may hold a run claim; Version 1 leaves them until the whole inactive run directory is manually deleted.
+- [ ] Add `RunArtifactPayload` and `RunArtifactRefV1` exactly as defined in Data Contracts.
+- [ ] Add the seven `RunStore` methods listed in Data Contracts; callers supply semantic values/refs, never paths.
+- [ ] Serialize text as exact UTF-8 and JSON as two-space-indented JSON plus one LF. Reject cycles, `undefined`, non-finite numbers, unsupported non-JSON values, and artifacts above 64 MiB.
+- [ ] Hash exact persisted bytes and derive the destination path only from digest and media type.
+- [ ] Create run artifact directories with `0700` and files with `0600` where supported.
+- [ ] Write a same-filesystem private staging file, write all bytes, strictly `fsync` the file, atomically rename, and strictly sync the containing directory chain on POSIX. On Windows, require file flush and atomic rename but do not claim unsupported directory sync.
+- [ ] On an existing digest path, verify regular-file status, exact bytes, and digest before deduplicating; never trust `EEXIST` alone.
+- [ ] Resolve every ref through run ID, payload/media type, lowercase digest, byte count, derived path, containment, `lstat`, `realpath`, regular-file/no-symlink, and SHA-256 checks. Use `O_NOFOLLOW` where supported and retain realpath checks on every platform.
+- [ ] Add strict filesystem helpers separately from current best-effort helpers. `updateRunStrict` and `appendEventStrict` use the existing per-run serial queue and propagate supported file/directory sync failures.
+- [ ] Extend `validateRunRecord` and nested validators for result, Chain, and fanout refs. Accept legacy inline Version 1 records and reject malformed/cross-run/both/neither unions as `corrupt_run`. Continuation custom-message validation belongs to Task 11, not `RunStore`.
+- [ ] Add narrow fault-injection seams for tests only. A crash may leave an unreferenced staging/content file but never a ref to an unpublished file.
 
 **Validation:**
 
 - Run: `(cd packages/pi-agents && bun test tests/artifact-store.test.ts tests/run-store.test.ts)`
-- Expected: content deduplicates by digest, directory-chain and file sync ordering runs on first write and retry, injected file/directory sync failures propagate, all published files verify, tampered/missing/symlinked/path-escaping refs fail closed, and a simulated pre-reference crash leaves only an unreferenced file.
+- Expected: identical bytes deduplicate; strict sync failures propagate; refs appear only after publication; tampered, missing, oversized, symlinked, path-escaping, wrong-run, wrong-size, and wrong-digest artifacts fail closed; legacy Version 1 records load.
 
-### Task 5: Add Artifact-Aware Result and Snapshot Contracts
+### Task 7: Add Phase-Aware Snapshots and Payload Externalization
 
-**Outcome:** Terminal compact snapshots preserve authoritative output by inline value or immutable reference without conflating the value with model-visible handoff text.
-
-**Prerequisite:** Complete the compact snapshot and presentation tasks in `2026-07-16-subagent-memory-optimization-plan.md` through terminal/durable snapshot integration.
+**Outcome:** Running updates are authority-free and bounded, while terminal helper APIs can produce inline values or verified refs without cloning oversized structured payloads first.
 
 **Files:**
 
 - Create: `packages/pi-agents/src/result-payload.ts`
 - Modify: `packages/pi-agents/src/types.ts`
 - Modify: `packages/pi-agents/src/result-snapshot.ts`
+- Modify: `packages/pi-agents/src/execution.ts`
+- Modify: `packages/pi-agents/src/pi-rpc-execution.ts`
+- Modify: `packages/pi-agents/src/abort.ts`
+- Modify: `packages/pi-agents/src/tool.ts`
+- Modify: `packages/pi-agents/src/chain.ts`
 - Modify: `packages/pi-agents/src/output.ts`
 - Modify: `packages/pi-agents/src/completion-check.ts`
 - Create: `packages/pi-agents/tests/result-payload.test.ts`
 - Modify: `packages/pi-agents/tests/result-snapshot.test.ts`
+- Modify: `packages/pi-agents/tests/execution.test.ts`
+- Modify: `packages/pi-agents/tests/pi-rpc-execution.test.ts`
+- Modify: `packages/pi-agents/tests/tool.test.ts`
+- Modify: `packages/pi-agents/tests/chain.test.ts`
+- Modify: `packages/pi-agents/tests/output.test.ts`
+- Modify: `packages/pi-agents/tests/completion-check.test.ts`
+- Modify: `packages/pi-agents/tests/memory-regression.test.ts`
+- Modify: `packages/pi-agents/tests/update-coalescer.test.ts`
 
 **Steps:**
 
-- [ ] Add `finalOutputRef` and `structuredOutputRef` to `SingleResult`; never place a descriptor string in `finalOutput` and never place a ref object in `structuredOutput`.
-- [ ] Add exact-one-of validators and pure byte-measurement helpers using the exact UTF-8 bytes that will be persisted.
-- [ ] Implement `externalizeTerminalResult(snapshot, runStore)` as an async terminal-only operation: values at or below 256 KiB stay inline; larger values are written first and replaced by refs on the snapshot.
-- [ ] Add explicit snapshot phases. Running/provisional snapshots must omit `finalOutput`, `structuredOutput`, and their refs and carry only bounded presentation/usage/status; the private runtime result alone retains full assistant text until the terminal barrier.
-- [ ] Run completion checks, final-output extraction, JSON extraction/schema validation, and worktree metadata stamping against the private full runtime result before externalization.
-- [ ] Implement `formatArtifactHandoff(ref, absolutePath)` with a bounded message containing payload kind, byte count, absolute read path, and SHA-256. Keep it below 2 KiB.
-- [ ] Implement result-aware helpers for parent content and rendering that prefer inline output, otherwise format the reference without reading the full artifact.
-- [ ] Implement verified async structured-value resolution for internal workflow use only.
-- [ ] If artifact publication fails, return a terminal `artifact_write_error` result with the native session identity and error details but without copying the oversized value into parent/durable details.
-- [ ] Preserve deep-freeze/idempotence rules from the compact snapshot plan; repeated snapshot/externalization calls reuse the same reference and never rewrite content.
+- [ ] Add `finalOutputRef` / `structuredOutputRef` to `SingleResult` and `textRef` / `structuredRef` to `ChainOutputEntry`; preserve legacy inline fields.
+- [ ] Implement exact byte measurement using the same text/JSON serialization as the artifact store.
+- [ ] Implement the three snapshot APIs from Data Contracts. `snapshotProvisionalResult` removes all authority fields and refs; `snapshotSingleResult` copies refs without resolving them; `externalizeTerminalResult` spills only values above 256 KiB.
+- [ ] Decide spill before deep cloning a structured value. Freeze/own only the resulting compact inline value or ref shell.
+- [ ] Add trusted async text/JSON resolvers and bounded parent/child descriptors capped at 2 KiB. Parent descriptors may show a validated absolute path; child descriptors contain run ID, digest, size, payload kind, reader `mediaType`, and explicit reader instructions.
+- [ ] Keep final-output extraction, completion checks, schema validation, status stamping, and worktree finalization on the private full runtime result before externalization.
+- [ ] Change running and low-level terminal `onUpdate` paths in `execution.ts` and `pi-rpc-execution.ts` to provisional snapshots.
+- [ ] Change Single/Parallel aggregate updates in `tool.ts` and running/fanout aggregate updates in `chain.ts` to provisional shells until terminal publication returns committed authority.
+- [ ] Keep abort authority private in `AgentAbortError` until the terminal path; do not replace it with a provisional shell prematurely.
+- [ ] Define bounded failures: `artifact_write_error` for a failed artifact write and `artifact_store_unavailable` for an oversized non-durable path. Neither includes the original payload or a dangling ref.
+- [ ] Prove pending provisional updates cannot publish after terminal cancellation and no provisional JSON contains inline/ref authority.
 
 **Validation:**
 
-- Run: `(cd packages/pi-agents && bun test tests/result-payload.test.ts tests/result-snapshot.test.ts tests/completion-check.test.ts)`
-- Expected: small terminal values remain behavior-compatible, every provisional update stays bounded and omits authoritative payload fields, large terminal values become verified refs, handoff text stays bounded, and completion/schema checks see the original full value.
+- Run: `(cd packages/pi-agents && bun test tests/result-payload.test.ts tests/result-snapshot.test.ts tests/completion-check.test.ts tests/execution.test.ts tests/pi-rpc-execution.test.ts tests/tool.test.ts tests/chain.test.ts tests/output.test.ts tests/memory-regression.test.ts tests/update-coalescer.test.ts)`
+- Expected: small snapshots remain compatible; provisional updates contain no authority; large helper inputs become verified refs; checks use private full values; descriptors and failures remain bounded.
 
-### Task 6: Make Artifact Publication a Durable Terminal Barrier
+### Task 8: Ship the Bounded Child Artifact Reader
 
-**Outcome:** `run.json`, terminal events, parent updates, and workflow callers never observe a reference before its artifact exists and verifies.
+**Outcome:** Pi child launches can receive one run-scoped artifact reader without gaining new general filesystem tools, and the package ships that extension as a separate peer-externalized entry.
+
+**Files:**
+
+- Create: `packages/pi-agents/src/artifact-reader-extension.ts`
+- Modify: `packages/pi-agents/src/security.ts`
+- Modify: `packages/pi-agents/src/invocation.ts`
+- Modify: `packages/pi-agents/src/execution.ts`
+- Modify: `packages/pi-agents/src/interactive-agent.ts`
+- Modify: `packages/pi-agents/package.json`
+- Create: `packages/pi-agents/tests/artifact-reader-extension.test.ts`
+- Modify: `packages/pi-agents/tests/security.test.ts`
+- Modify: `packages/pi-agents/tests/invocation.test.ts`
+- Modify: `packages/pi-agents/tests/execution.test.ts`
+- Modify: `packages/pi-agents/tests/interactive-agent.test.ts`
+
+**Steps:**
+
+- [ ] Register only `pi_agents_read_artifact` with `typebox`; limit the text `content` to 48 KiB of artifact data and keep continuation metadata in bounded `details`, below Pi's 50 KiB custom-tool content guidance.
+- [ ] Validate private env root/run ID, input run ID, lowercase digest, `mediaType: 'text' | 'json'`, offset, and `4..48 KiB` max bytes. Derive `.txt` or `.json` from digest plus media type; accept no caller path.
+- [ ] Reuse artifact verification rules and hash the complete file before returning content. Accept offsets only in `0..bytes` on UTF-8 code-point boundaries; exact EOF returns empty content, while larger/mid-code-point offsets throw `invalid_artifact_offset`. Retreat chunk end to a valid boundary and return exact `offsetBytes`, `nextOffsetBytes`, `bytesReturned`, and `eof` details.
+- [ ] Collapse missing, corrupt, and unauthorized child-visible failures to bounded `artifact_unavailable`; log no artifact content or private root.
+- [ ] Resolve `dist/artifact-reader-extension.js` from `import.meta.url` and represent reader need as a typed invocation requirement.
+- [ ] Extend `buildToolCliArgs` narrowly: when required, force-include `pi_agents_read_artifact` in an existing `--tools` allowlist and remove only that tool name from excludes. Do not add `read`, `bash`, or other filesystem tools.
+- [ ] Apply `--extension <resolved-dist-path>` and private env values to both Pi launch paths: non-TUI child launches in `execution.ts` and TUI RPC child launches in `interactive-agent.ts`.
+- [ ] Add package `exports` for the child entry and `scripts.postbuild` that runs `bun build ./src/artifact-reader-extension.ts --outdir dist --target node` with all Pi/typebox peers externalized.
+- [ ] Keep the extension out of `pi.extensions` so it is not loaded into the parent by default; load it only through explicit child `--extension` arguments.
+- [ ] Test long single-line text, JSON, text/JSON media-type path selection, exact EOF, offset past EOF, mid-code-point offset rejection, end-boundary retreat, digest mismatch, symlink/path escape, wrong run, permission failure, tool allow/exclude combinations, both launch paths, and non-reader launch parity.
+
+**Validation:**
+
+- Run: `(cd packages/pi-agents && bun test tests/artifact-reader-extension.test.ts tests/security.test.ts tests/invocation.test.ts tests/execution.test.ts tests/interactive-agent.test.ts)`
+- Expected: only required Pi launches receive the reader/env; artifact text content stays at or below 48 KiB and UTF-8 boundaries; offset/media-type rules are deterministic; invalid access yields one bounded error; existing capabilities do not broaden.
+
+- Run: `mise run build --package packages/pi-agents`
+- Expected: both `packages/pi-agents/dist/index.js` and `packages/pi-agents/dist/artifact-reader-extension.js` exist, with Pi/typebox packages externalized.
+
+- Run: `(cd packages/pi-agents && bun pm pack --dry-run 2>&1 | rg "dist/artifact-reader-extension\.js")`
+- Expected: the packed file list includes `dist/artifact-reader-extension.js`.
+
+### Task 9: Preserve Sequential Chain and Template Semantics
+
+**Outcome:** Inline Chain prompts remain byte-compatible, referenced text/structured outputs resolve only in trusted workflow code, and child prompts receive bounded reader handoffs rather than megabytes.
+
+**Files:**
+
+- Modify: `packages/pi-agents/src/result-payload.ts`
+- Modify: `packages/pi-agents/src/output.ts`
+- Modify: `packages/pi-agents/src/chain.ts`
+- Modify: `packages/pi-agents/src/template.ts`
+- Modify: `packages/pi-agents/src/invocation.ts`
+- Modify: `packages/pi-agents/tests/output.test.ts`
+- Modify: `packages/pi-agents/tests/chain.test.ts`
+- Modify: `packages/pi-agents/tests/invocation.test.ts`
+
+**Steps:**
+
+- [ ] Preserve exact inline substitution for `{previous}` and `{outputs.<name>}`.
+- [ ] For text refs, substitute the bounded child descriptor and mark the next Pi invocation as requiring the reader.
+- [ ] For trusted `readJsonPointer`, output-schema consumers, and internal Chain structured reads after externalization, resolve and verify refs at point of use.
+- [ ] Keep schema extraction/validation on private structured output before unit externalization; never store a descriptor as structured authority.
+- [ ] Reuse a unit artifact's digest/media type for named Chain outputs when content is identical. Revalidate the ref and change only semantic payload kind; do not read/rewrite bytes solely for naming.
+- [ ] Externalize oversized named and collected Chain text/structured values before they enter externally visible details or final run state.
+- [ ] Reject Grok ACP handoffs with `artifact_handoff_unsupported` before `beginUnit`, registration, or process dispatch.
+- [ ] Test byte-for-byte small prompt parity, large previous output, large named text/structured output, JSON Pointer resolution, collect spill, Pi reader requirements, and pre-dispatch Grok rejection.
+
+**Validation:**
+
+- Run: `(cd packages/pi-agents && bun test tests/output.test.ts tests/chain.test.ts tests/invocation.test.ts tests/execution.test.ts)`
+- Expected: small prompts are unchanged; large Pi handoffs are bounded and reader-enabled; trusted structured reads verify refs; Grok rejects before side effects.
+
+### Task 10: Preserve Fanout and Resume Semantics
+
+**Outcome:** Frozen fanout mappings may spill as aggregate refs, resume verifies every reachable authority ref before scheduling, and completed work is never redispatched because an artifact is corrupt.
+
+**Files:**
+
+- Modify: `packages/pi-agents/src/run-types.ts`
+- Modify: `packages/pi-agents/src/types.ts`
+- Modify: `packages/pi-agents/src/run-store.ts`
+- Modify: `packages/pi-agents/src/run-coordinator.ts`
+- Modify: `packages/pi-agents/src/chain.ts`
+- Modify: `packages/pi-agents/src/resume.ts`
+- Modify: `packages/pi-agents/src/tool.ts`
+- Modify: `packages/pi-agents/tests/run-store.test.ts`
+- Modify: `packages/pi-agents/tests/run-coordinator.test.ts`
+- Modify: `packages/pi-agents/tests/chain.test.ts`
+- Modify: `packages/pi-agents/tests/resume.test.ts`
+- Modify: `packages/pi-agents/tests/tool.test.ts`
+
+**Steps:**
+
+- [ ] Convert `WorkflowFanoutState` to exact `items` / `itemsRef` alternatives and add runtime-only `ResolvedWorkflowFanoutState` with verified inline `items`; never serialize the runtime type.
+- [ ] Reject an individual fanout item above 256 KiB exact JSON bytes with `fanout_item_too_large`; preserve the existing inline `{item}` contract.
+- [ ] Permit the ordered aggregate list to spill above 256 KiB. Publish `itemsRef`, then strictly persist mapping and queued child units atomically before scheduling any worker.
+- [ ] Resolve each referenced fanout result lazily while building collected arrays and reverify at point of use.
+- [ ] Update coordinator equality, idempotence, merge, disk/live mirror, and capture logic for inline/ref unions. Compare verified digest/media type, not path text.
+- [ ] Convert `validateFanoutResumeState()` and `inspectResume()` to async.
+- [ ] During read-only pre-claim inspection and again after claim against a fresh record, verify `itemsRef` plus every result/Chain ref resumed execution may read.
+- [ ] Return post-claim runtime-only `resolvedFanouts` and verified completed-output metadata to `RestoredChainState`; keep durable state ref-only.
+- [ ] On missing, tampered, unparsable, wrong-run, or oversized artifacts, fail `artifact_missing` / `artifact_corrupt` before dispatch. Never mark completed work incomplete, redispatch it, or recompute a frozen mapping.
+- [ ] Test inline/ref idempotence, aggregate spill, individual rejection, current/resumed fanout, runtime hydration not persisted, pre/post-claim corruption, claim race, and no duplicate dispatch.
+
+**Validation:**
+
+- Run: `(cd packages/pi-agents && bun test tests/run-store.test.ts tests/run-coordinator.test.ts tests/chain.test.ts tests/resume.test.ts tests/tool.test.ts)`
+- Expected: aggregate mappings spill and resolve only in runtime; every reachable ref is verified before scheduling; corrupt refs stop before worker side effects; completed units are never redispatched.
+
+### Task 11: Preserve Interactive Continuation and Rendering Semantics
+
+**Outcome:** Continuation messages externalize oversized output before delivery, stale activations cannot send after async I/O, and UI rendering shows metadata without loading artifacts.
+
+**Files:**
+
+- Modify: `packages/pi-agents/src/interactive-relay.ts`
+- Modify: `packages/pi-agents/src/index.ts`
+- Modify: `packages/pi-agents/src/render.ts`
+- Modify: `packages/pi-agents/tests/interactive-relay.test.ts`
+- Modify: `packages/pi-agents/tests/render.test.ts`
+
+**Steps:**
+
+- [ ] Add `outputRef` to `InteractiveContinuationDetails` with the Version 1 exact-one-of rule. Add a relay-local validator for this Pi custom-message data; malformed both/neither refs produce one bounded `artifact_corrupt` status and are never resolved.
+- [ ] Inject `RunStore` into the relay. Reserve `endpointKey + activationId` in an in-flight set before artifact I/O and spill output above 256 KiB before `pi.sendMessage`.
+- [ ] Immediately before send, recheck relay disposal, host session ID, branch binding, active-branch membership, endpoint generation, and activation ID. Suppress delivery if `/tree`, session switch, detach, or a newer activation invalidated trust.
+- [ ] On spill failure, send at most one bounded status/error message without original output. Duplicate settle for the same activation cannot double-write or double-send.
+- [ ] Track relay promises and expose `waitForIdle()`. Await it from `index.ts` during session shutdown before relay/registry disposal.
+- [ ] Preserve collapsed rendering. Expanded ref rendering shows payload kind, formatted bytes, validated path when available, and digest prefix; it never synchronously reads content.
+- [ ] Test duplicate settle during blocked artifact I/O, stale branch/session/activation changes, shutdown wait, legacy inline parity, malformed continuation inline/ref unions, bounded error delivery, and collapsed/expanded ref rendering.
+
+**Validation:**
+
+- Run: `(cd packages/pi-agents && bun test tests/interactive-relay.test.ts tests/render.test.ts)`
+- Expected: artifact publication precedes continuation delivery; stale/duplicate sends are suppressed; shutdown waits for tracked work; rendering remains bounded and performs no artifact read.
+
+### Task 12: Enforce the Async Strict Terminal Barrier
+
+**Outcome:** Production terminal paths activate externalization, and no terminal callback, durable event, claim release, parent output, or continuation can observe a ref before artifact and strict run authority exist.
 
 **Files:**
 
 - Modify: `packages/pi-agents/src/run-coordinator.ts`
 - Modify: `packages/pi-agents/src/run-persistence.ts`
-- Modify: `packages/pi-agents/src/tool.ts`
-- Modify: `packages/pi-agents/src/chain.ts`
 - Modify: `packages/pi-agents/src/execution.ts`
 - Modify: `packages/pi-agents/src/pi-rpc-execution.ts`
+- Modify: `packages/pi-agents/src/abort.ts`
+- Modify: `packages/pi-agents/src/tool.ts`
+- Modify: `packages/pi-agents/src/chain.ts`
 - Modify: `packages/pi-agents/src/interactive-relay.ts`
 - Modify: `packages/pi-agents/src/index.ts`
 - Modify: `packages/pi-agents/tests/run-coordinator.test.ts`
 - Modify: `packages/pi-agents/tests/tool.test.ts`
-- Modify: `packages/pi-agents/tests/interactive-relay.test.ts`
-
-**Steps:**
-
-- [ ] Change terminal `postprocessTerminal` / `endUnit` plumbing to support awaited async work; update every caller rather than fire-and-forget promises.
-- [ ] Keep the private runtime result until completion/schema/worktree processing finishes, then create a compact snapshot and await `externalizeTerminalResult`.
-- [ ] Make `RunCoordinator.finishUnit()` async. Cancel pending coalesced timers, build the terminal mutation on a private clone, and use a new strict coordinator flush path that directly awaits `store.updateRunStrict()` and propagates failures; do not mutate the live record first and do not route terminal durability through the existing `updateRun()` / best-effort `writeRun()` / `persist()` paths that swallow errors.
-- [ ] Only after the strict `run.json` update succeeds may the coordinator mirror terminal state into the live record, append/flush `unit_terminal`, and return. On strict-write failure, leave live state non-terminal, surface `durable_write_error`, and ensure a later coalesced flush cannot persist the rejected terminal clone.
-- [ ] Add the same private-clone, error-propagating barrier to `RunCoordinator.finalizeRun()`. Chain collect outputs and their refs are created after worker `finishUnit()` calls, so final run status/details/outputs must be durably written through `updateRunStrict()` before returning success; never use the current swallowing `writeRun()` path. Remove coordinator-owned unregistration from `finalizeRun()` so the claim owner can append `run_terminal` and then unregister/release in one ordered success path.
-- [ ] Externalize Chain collect text/structured payloads before strict `finalizeRun()`, include their refs in the private final record, and convert any artifact/final-write failure into `artifact_write_error` / `durable_write_error` rather than returning a successful Chain result.
-- [ ] Replace unconditional claim release in both `run-persistence.ts` and the resume `StartedRun.finalize` wrapper. On success: strict finalize, append `run_terminal`, unregister, then release the claim. On failure: cancel pending timers, discard the uncommitted private terminal clone, unregister the live coordinator record, mark the claim abandoned with `store.abandonRun()`, and rethrow. Never release a claim while leaving the run registered active, and never retain a live registration without its claim.
-- [ ] Store the artifact-aware snapshot in `unit.result` and `details.results`; never assign the mutable runtime object by reference.
-- [ ] Remove/suppress low-level terminal `onUpdate` emissions in `execution.ts` and `pi-rpc-execution.ts`. Their running/provisional emissions must use the phase-aware snapshot that omits authoritative payloads, including the final assistant `message_end`; emit the authoritative terminal parent update only after `finishUnit()` succeeds.
-- [ ] Preserve ordering for abort/error paths. If a native child session exists, artifact failure does not delete or rewrite it.
-- [ ] Extend `InteractiveContinuationDetails` with exact-one-of `output` / `outputRef`. Before `sendMessage`, reserve the activation in the exactly-once/in-flight set, externalize oversized continuation text through `RunStore`, and inject only a bounded descriptor; on artifact failure inject a bounded error/status without the original oversized text. Wire `RunStore` through `index.ts`, track the async relay promise, and catch every rejection.
-- [ ] Add controlled-promise tests proving ordering: artifact publish -> strict unit/final-run durable reference update -> unit/run terminal publication -> parent/relay callback. Include duplicate settle while relay artifact I/O is pending and a failed strict write followed by a coalesced flush.
-- [ ] Simulate unit write, Chain collect artifact, and final-run write failures; assert no path reports success or later flushes a rejected terminal clone with a dangling/missing ref. For finalization failure, assert the live registration is removed before the claim is abandoned and a later process can inspect/claim the last strictly persisted state.
-
-**Validation:**
-
-- Run: `(cd packages/pi-agents && bun test tests/run-coordinator.test.ts tests/tool.test.ts tests/chain.test.ts tests/execution.test.ts tests/pi-rpc-execution.test.ts tests/interactive-relay.test.ts)`
-- Expected: no terminal callback or completed durable unit precedes artifact publication and durable reference flush.
-
-### Task 7: Preserve Chain, Fanout, and Resume Semantics
-
-**Outcome:** Large outputs move through file references without injecting megabytes into prompts, while structured expansion and frozen mappings remain deterministic and resumable.
-
-**Files:**
-
-- Create: `packages/pi-agents/src/artifact-reader-extension.ts`
-- Modify: `packages/pi-agents/src/types.ts`
-- Modify: `packages/pi-agents/src/run-types.ts`
-- Modify: `packages/pi-agents/src/chain.ts`
-- Modify: `packages/pi-agents/src/template.ts`
-- Modify: `packages/pi-agents/src/security.ts`
-- Modify: `packages/pi-agents/src/invocation.ts`
-- Modify: `packages/pi-agents/src/run-store.ts`
-- Modify: `packages/pi-agents/src/run-coordinator.ts`
-- Modify: `packages/pi-agents/src/resume.ts`
-- Modify: `packages/pi-agents/src/tool.ts`
-- Modify: `packages/pi-agents/package.json`
-- Create: `packages/pi-agents/tests/artifact-reader-extension.test.ts`
+- Modify: `packages/pi-agents/tests/execution.test.ts`
+- Modify: `packages/pi-agents/tests/pi-rpc-execution.test.ts`
 - Modify: `packages/pi-agents/tests/chain.test.ts`
-- Modify: `packages/pi-agents/tests/security.test.ts`
-- Modify: `packages/pi-agents/tests/invocation.test.ts`
-- Modify: `packages/pi-agents/tests/run-coordinator.test.ts`
-- Modify: `packages/pi-agents/tests/resume.test.ts`
+- Modify: `packages/pi-agents/tests/interactive-relay.test.ts`
+- Modify: `packages/pi-agents/tests/update-coalescer.test.ts`
 
 **Steps:**
 
-- [ ] Add inline/reference fields to `ChainOutputEntry` and durable `WorkflowFanoutState`, plus a runtime-only `ResolvedWorkflowFanoutState` whose `items` is always a verified array. Durable refs must never be replaced with hydrated arrays in `run.json`.
-- [ ] Build `artifact-reader-extension.ts` as a separate published entry. Register only `pi_agents_read_artifact`, accept run ID/digest plus byte offset/limit (no path), derive and verify the content-addressed file under the environment-provided exact run directory, return at most 48 KiB on a UTF-8 boundary, and include `nextOffsetBytes`/EOF metadata.
-- [ ] Add a package `postbuild` command that builds `src/artifact-reader-extension.ts` to `dist/artifact-reader-extension.js`; keep Pi imports type-only so this child entry does not bundle a second host SDK. Resolve the shipped path from `import.meta.url` rather than cwd.
-- [ ] Extend child invocation/security options with `artifactReaderRoot`. For Pi steps whose rendered task contains a descriptor, pass the explicit extension path and private `PI_AGENTS_RUN_ARTIFACT_DIR=<exact run dir>` environment and force-add only `pi_agents_read_artifact` to the child allowlist. Do not grant general filesystem access. Reject artifact handoff to Grok ACP before unit registration with `artifact_handoff_unsupported`.
-- [ ] For `{previous}` and `{outputs.<name>}`, keep existing inline substitution for small values. For references, substitute a bounded descriptor that instructs the guaranteed dedicated tool; set `artifactReaderRoot` on that step request.
-- [ ] For `outputSchema`, complete extraction and validation before terminal externalization.
-- [ ] Before `readJsonPointer`, fanout expansion, or internal structured collection, resolve and verify a structured artifact through `RunStore`; never trust path/ref fields directly.
-- [ ] Externalize a collected Chain text/structured value above the threshold and reuse the underlying result artifact when digest/media type match.
-- [ ] Externalize frozen fanout `items` above the threshold before the expansion durability barrier. Persist `itemsRef`, `unitIds`, and queued child-unit records atomically through `store.updateRunStrict()` before scheduling any worker; ordinary `updateRun()` is forbidden at this side-effect boundary.
-- [ ] Reject an individual fanout item above 256 KiB with `fanout_item_too_large`; do not silently replace the established `{item}` value contract. Overall mappings may still spill when several individually valid items cross the aggregate threshold.
-- [ ] Update every coordinator fanout path (`mirrorAuthoritativeToLive`, equality/idempotency checks, expansion capture, disk mirror, and returned snapshots) to copy/compare the inline/reference union. When comparing a fresh inline expansion with a stored ref, externalize the candidate and compare digest/media type rather than loading untrusted path text.
-- [ ] Make `inspectResume()` and `validateFanoutResumeState()` async. Resolve and verify `itemsRef` during both pre-claim and post-claim inspection, then run the existing canonical bijection checks against a runtime-only resolved mapping. Update all tool/slash-command call sites to await inspection.
-- [ ] Carry the post-claim `resolvedFanouts` map through `preflightAndClaim()` / the tool resume entry into `RestoredChainState`. `chain.ts` consumes only this hydrated runtime map; coordinator/durable merge code continues to retain the original inline/reference record.
-- [ ] On resume, missing, tampered, oversized, or unparsable artifacts produce `artifact_missing` / `artifact_corrupt` and stop before dispatch. Never reinterpret a missing completed-unit artifact as incomplete work and never recompute an existing fanout mapping from mutable upstream output.
-- [ ] Add tests for: dedicated reader chunk continuation and long single-line payloads; no path escape; large sequential previous output; Pi/Grok handoff gating; large named text and structured output; aggregate mapping spill with individually bounded items; current-run and resumed fanout expansion; runtime hydration not persisted; inline/ref idempotency; pre/post-claim corruption; and unchanged execution order/attempt counts.
+- [ ] Change `RunCoordinator.finishUnit()` to `Promise<SingleResult>` and return the committed artifact-aware terminal snapshot.
+- [ ] Make `endUnit` and every success, abort, early-failure, and thrown-error terminal path await the promise exactly once. Typed publication errors must not recursively call `finishUnit`.
+- [ ] Cancel pending coalesced writes, externalize private authority first, and build unit/attempt terminal mutation on a private clone of latest disk/live authority.
+- [ ] Strictly publish the private clone with `updateRunStrict`. Do not mutate live state before success; a rejected clone must remain unreachable to stale timers.
+- [ ] After strict `run.json` success, append `unit_terminal` with `appendEventStrict`, mirror committed disk state into live state, and return the snapshot.
+- [ ] If the event append fails after `run.json` commits, mirror the authoritative disk state but throw `durable_write_error`; never report parent success.
+- [ ] Make `finalizeRun` use a private final clone and `updateRunStrict`; remove coordinator unregistration from this method.
+- [ ] Externalize final Chain collect outputs before strict run finalization.
+- [ ] Consolidate fresh and resumed finalization through one helper. Success order is strict run finalization -> strict `run_terminal` -> coordinator unregister -> `releaseRun`.
+- [ ] Failure order is cancel/unregister live state -> `abandonRun` -> rethrow. Never release a failed finalization claim or leave a registered run without ownership.
+- [ ] Emit authoritative parent and relay terminal updates only after awaited `finishUnit`; low-level updates remain provisional.
+- [ ] Cover failures before artifact publication, during strict unit write, `unit_terminal`, collect spill, strict run write, and `run_terminal`; no path may publish success or a dangling ref.
+- [ ] Use controlled promises to prove artifact -> strict `run.json` -> strict event -> live/parent/relay publication order and to prove stale timer/activation suppression.
 
 **Validation:**
 
-- Run: `(cd packages/pi-agents && bun test tests/artifact-reader-extension.test.ts tests/chain.test.ts tests/security.test.ts tests/invocation.test.ts tests/run-coordinator.test.ts tests/resume.test.ts tests/run-store.test.ts)`
-- Expected: small workflows are byte-for-byte equivalent in model handoff text, large sequential handoffs use the dedicated bounded reader, oversized individual fanout items fail before scheduling, artifact-backed mappings hydrate only in runtime state, and corrupt artifacts fail without redispatching completed units.
+- Run: `(cd packages/pi-agents && bun test tests/run-coordinator.test.ts tests/tool.test.ts tests/execution.test.ts tests/pi-rpc-execution.test.ts tests/chain.test.ts tests/interactive-relay.test.ts tests/update-coalescer.test.ts)`
+- Expected: terminal publication is awaited; refs never precede artifact/run authority; success unregisters before release; failure unregisters before abandon; stale updates cannot publish rejected authority.
 
-### Task 8: Update Rendering and Documentation
+### Task 13: Document the Feature and Run End-to-End Gates
 
-**Outcome:** Users can identify, inspect, retain, and remove artifact-backed results without mistaking descriptors for the authoritative content.
+**Outcome:** Users can reason about authority, limits, compatibility, retention, and recovery, and the complete package passes focused and repository validation.
 
 **Files:**
 
-- Modify: `packages/pi-agents/src/render.ts`
-- Modify: `packages/pi-agents/tests/render.test.ts`
 - Modify: `packages/pi-agents/README.md`
 - Modify: `packages/pi-agents/docs/reference.md`
 - Modify: `packages/pi-agents/docs/explanation.md`
@@ -502,69 +741,136 @@ The tool receives the allowed artifact root through a private child environment 
 
 **Steps:**
 
-- [ ] In expanded rendering, show payload kind, formatted size, validated path, and digest prefix for refs; do not synchronously load artifact contents.
-- [ ] Keep collapsed summary lines unchanged apart from the existing status/error behavior.
-- [ ] Add `artifacts/sha256/...` to the durable run directory diagram.
-- [ ] Document the 2 MiB ordinary RPC cap, 64 MiB projectable replayable-event cap, canonical-shape compatibility fallback, settle-time session rehydrate, 256 KiB inline threshold, and 64 MiB artifact cap.
-- [ ] Explain that `agent_end.messages` is wholly redundant, that oversized transcript/tool event payloads are recovered from native `sessionFile` before settle, and that `get_messages` is disabled in this integration.
-- [ ] Document artifact reference fields, exact-one-of rules, error codes, Chain descriptor behavior, and verified lazy structured resolution.
-- [ ] Add a how-to example for parent/user inspection with the displayed absolute path and ordinary `read`, plus a separate Chain example showing repeated `pi_agents_read_artifact` calls with `nextOffsetBytes`. The dedicated tool supports bounded byte chunks even when the authoritative artifact contains a long single line.
-- [ ] Update privacy/disk-growth guidance: artifacts may contain sensitive model/tool output, inherit the run directory's manual retention, and disappear when the complete inactive run directory is removed.
+- [ ] Document all fixed RPC, shell, inline, artifact, child-reader, presentation, diagnostic, and idle-retention budgets as separate boundaries.
+- [ ] Explain the historical 2,320,362-byte failure, the already-landed 8 MiB mitigation, and why projector regression fixtures start above 8 MiB.
+- [ ] Document exact-prefix Pi 0.80.9 compatibility, runtime/documentation `message_update` order disagreement, `agent_settled` authority, and fail-closed behavior on future key-order drift.
+- [ ] State dependency policy accurately: Pi peers are `"*"`; development and compatibility tests use exact Pi 0.80.9.
+- [ ] Explain transport omission versus registry `projectFinalizedMessage`, direct settle rehydrate, and why the ordinary lazy hydration path is not used at settle.
+- [ ] Document disabled `get_messages`, additive Version 1 refs, exact-one-of rules, error codes, artifact-first publication, claim cleanup, Chain/fanout/resume behavior, and child reader use.
+- [ ] Add parent inspection examples using the validated displayed path and child examples that repeat `pi_agents_read_artifact` with `nextOffsetBytes` for long single-line content.
+- [ ] Document privacy and retention: artifacts may contain sensitive model/tool output, use private run storage, can be exposed only to explicitly handed-off child runs, receive no automatic GC, and are removed with the entire inactive run directory.
+- [ ] Add focused tests, package test, typecheck, build, pack dry-run, and `hk check` commands to README validation guidance.
 
 **Validation:**
 
-- Run: `(cd packages/pi-agents && bun test tests/render.test.ts tests/interactive-relay.test.ts)`
-- Expected: artifact references render without loading payloads and large continuation relays remain bounded.
+- Run: `rg -n "8 MiB|64 MiB|16 KiB|256 KiB|48 KiB|512 KiB|get_messages|agent_settled|projectFinalizedMessage|artifact|sha256|pi_agents_read_artifact|0\.80\.9|peer" packages/pi-agents/README.md packages/pi-agents/docs/{reference,explanation,how-to}.md`
+- Expected: all limits, authority boundaries, dependency policy, reader usage, retention, and disabled command are documented consistently.
 
-- Run: `rg -n "agent_end|2 MiB|64 MiB|256 KiB|get_messages|artifact|sha256|sessionFile|pi_agents_read_artifact" packages/pi-agents/README.md packages/pi-agents/docs/{reference,explanation,how-to}.md`
-- Expected: every limit, authority boundary, inspection path, dedicated reader contract, and retention rule is documented consistently.
+- Run: `mise run typecheck --package packages/pi-agents`
+- Expected: no TypeScript errors, including async terminal/resume signatures and inline/reference unions.
+
+- Run: `mise run test --package packages/pi-agents`
+- Expected: the complete package suite passes with zero failures; the count is greater than the pre-change 1026-test baseline.
+
+- Run: `mise run build --package packages/pi-agents`
+- Expected: both package entries build without bundling a second Pi/typebox SDK instance.
+
+- Run: `(cd packages/pi-agents && bun pm pack --dry-run 2>&1 | rg "dist/(index|artifact-reader-extension)\.js")`
+- Expected: both built entries are present in the package file list.
+
+- Run: `hk check`
+- Expected: repository ESLint and Prettier checks pass.
+
+- Run: `git diff --check`
+- Expected: no whitespace errors.
 
 ## Final Validation
 
-- Run: `mise run typecheck --package packages/pi-agents`
-- Expected: TypeScript completes with no errors, including exact-one-of durable unions and async terminal plumbing.
+### Transport and Lifecycle
 
-- Run: `mise run test --package packages/pi-agents`
-- Expected: all package tests pass, including the synthetic 2.2-MiB aggregate event, 4-MiB final-message rehydrate, artifact durability, Chain/fanout, resume, rendering, and memory regressions.
+- Run: `(cd packages/pi-agents && bun test tests/pi-rpc-record-projector.test.ts tests/pi-rpc-transport.test.ts tests/interactive-agent.test.ts tests/pi-rpc-execution.test.ts tests/interactive-relay.test.ts tests/memory-regression.test.ts tests/update-coalescer.test.ts)`
+- Expected: historical and exact-8-MiB baselines pass; 8.2–8.3 MiB canonical records project; 12 MiB authority rehydrates before settle; ordinary/projectable cap failures remain independent; eviction and relay ordering pass.
 
-- Run: `mise run build --package packages/pi-agents`
-- Expected: `packages/pi-agents/dist/index.js` and `packages/pi-agents/dist/artifact-reader-extension.js` build successfully and the package includes every new runtime module.
+### Artifact and Workflow
 
-- Run: `hk check`
-- Expected: repository ESLint and Prettier checks pass with no modified-file violations.
+- Run: `(cd packages/pi-agents && bun test tests/artifact-store.test.ts tests/result-payload.test.ts tests/result-snapshot.test.ts tests/run-store.test.ts tests/run-coordinator.test.ts tests/tool.test.ts tests/output.test.ts tests/completion-check.test.ts tests/chain.test.ts tests/resume.test.ts tests/artifact-reader-extension.test.ts tests/security.test.ts tests/invocation.test.ts tests/execution.test.ts tests/render.test.ts)`
+- Expected: artifact durability, refs, provisional snapshots, strict barriers, Chain/fanout/resume, child reader, and rendering suites all pass.
 
-- Run: `rg -n "getMessages\(|request\(\{ type: ['\"]get_messages" packages/pi-agents/src`
-- Expected: no callable `get_messages` production path remains.
+### Memory and Serialized Size
 
-- Run: `rg -n "case ['\"]agent_end|\.messages" packages/pi-agents/src/interactive-agent.ts packages/pi-agents/src/pi-rpc-execution.ts packages/pi-agents/src/interactive-relay.ts`
-- Expected: lifecycle consumers still do not use `agent_end.messages`; transcript use remains tied to streamed message events/snapshots.
+Extend `tests/memory-regression.test.ts` with generated values and require:
 
-- Run two focused fake-child integrations: (1) the observed small context-window error followed by a 2.2-MiB canonical `agent_end`; (2) cumulative oversized `message_update`, `message_end`, `turn_end`, and `agent_end` around a persisted 4-MiB assistant message, followed by `agent_settled`.
-- Expected: the transport stays synchronized, preserves the observed model error, projects every eligible oversized event, rehydrates the 4-MiB finalized transcript before terminal publication, and never reports `stdout_overflow`.
+- A 12 MiB final text plus large structured output produces verified artifacts; terminal `SingleResult` JSON remains below 1 MiB and contains no 64-byte payload sentinel.
+- Pretty-printed `run.json`, including `details.results` and `units[*].result`, remains below 2 MiB for the 12 MiB fixture.
+- An eight-item fanout with 4 MiB final text and 4 MiB structured output per item stores authority only in artifacts/refs; combined parent details and `run.json` each remain below 2 MiB and contain no raw sentinel.
+- Every artifact is at or below 64 MiB and verifies exact byte count/digest.
+- Every provisional update contains no authoritative inline value or ref and remains inside existing presentation/diagnostic budgets.
+- Every child reader call returns at most 48 KiB of artifact data, keeps metadata bounded, and never starts or ends inside a UTF-8 code point.
 
-- Run the memory-regression fixture with 4 MiB final text, 4 MiB structured output, and eight fanout items.
-- Expected: authoritative artifact files verify; parent `details` and pretty-printed `run.json` remain below the thresholds established by the compact snapshot plan; no raw 4 MiB payload is duplicated into parent/durable records.
+- Run: `(cd packages/pi-agents && bun test tests/memory-regression.test.ts tests/result-snapshot.test.ts tests/result-payload.test.ts tests/artifact-reader-extension.test.ts)`
+- Expected: all explicit serialized-size, no-sentinel, digest, provisional-budget, and chunk-size thresholds pass.
+
+### Source Audits
+
+- Run: `rg -n "MAX_STDOUT_RECORD_BYTES|MAX_PROJECTABLE_RPC_RECORD_BYTES|RPC_PROJECTED_SHELL_FIELD_MAX_BYTES|RESULT_INLINE_PAYLOAD_MAX_BYTES|RUN_ARTIFACT_MAX_BYTES|RPC stdout record exceeded" packages/pi-agents/src packages/pi-agents/tests`
+- Expected: values are consistently 8 MiB ordinary, 64 MiB projectable, 16 KiB shell string, 256 KiB inline, and 64 MiB artifact; overflow text remains exact.
+
+- Run: `rg -n "snapshotSingleResult|snapshotProvisionalResult|externalizeTerminalResult" packages/pi-agents/src/{execution,pi-rpc-execution,tool,chain,abort,run-coordinator,result-snapshot,result-payload}.ts`
+- Expected: external running/low-level updates use provisional snapshots; terminal externalization occurs only at awaited publication boundaries.
+
+- Run: `rg -n "updateRunStrict|appendEventStrict|unit_terminal|run_terminal|abandonRun|unregisterRun|releaseRun" packages/pi-agents/src/{run-store,run-coordinator,run-persistence,tool}.ts`
+- Expected: artifacts precede strict run refs, strict terminal events precede publication, success unregisters before release, and failure unregisters before abandon.
+
+- Run: `rg -n "case ['\"]agent_end|\.messages" packages/pi-agents/src/{interactive-agent,pi-rpc-execution,interactive-relay}.ts`
+- Expected: raw child `agent_end` consumers do not inspect aggregate messages; authority comes from ordinary message events or verified session rehydrate.
+
+## Failure Behavior
+
+| Failure                                                         | Required behavior                                                                    |
+| --------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Ordinary/non-canonical record exceeds 8 MiB                     | `stdout_overflow`; no listener delivery                                              |
+| Canonical projectable record exceeds 64 MiB                     | `stdout_overflow`; no listener delivery                                              |
+| Projected record has malformed JSON or late canonical violation | `malformed_json` or ordinary-cap failure; never emit a synthetic event               |
+| Settle-time session is missing, stale, malformed, or incomplete | Activation fails with bounded `hydrate_error`; no successful terminal snapshot       |
+| `get_messages` requested                                        | `get_messages_disabled` before request ID, pending state, timer, or stdin write      |
+| Artifact exceeds 64 MiB                                         | `artifact_too_large`; no ref                                                         |
+| Oversized result has no run-local store                         | Bounded `artifact_store_unavailable`; no external write or oversized inline fallback |
+| Artifact write/sync fails                                       | Bounded `artifact_write_error`; unreferenced files may remain, dangling refs may not |
+| Trusted artifact ref is missing/corrupt/cross-run               | `artifact_missing` / `artifact_corrupt` before use or dispatch                       |
+| Child artifact is missing/corrupt/unauthorized                  | One bounded `artifact_unavailable` tool error without path-existence detail          |
+| Child offset is past EOF or inside a UTF-8 code point           | Bounded `invalid_artifact_offset`; no content                                        |
+| Continuation custom-message inline/ref union is malformed       | Bounded `artifact_corrupt`; do not resolve or render authority                       |
+| Strict `run.json` or terminal event write fails                 | `durable_write_error`; no parent/relay success; unregister then abandon claim        |
+| Grok ACP receives an artifact handoff                           | `artifact_handoff_unsupported` before unit registration or dispatch                  |
+| Async continuation becomes stale during artifact I/O            | Suppress send and release in-flight reservation without exposing output              |
+
+## Privacy and Security
+
+- Artifacts can contain sensitive model output, tool results, and structured data. Store them only under the owning run directory with private permissions where supported.
+- Artifact paths are derived from digest; no trusted or child API accepts a caller-supplied path.
+- Every trusted resolution verifies containment, file type, symlink status, byte count, digest, media type, payload kind, and run identity.
+- The child reader receives only one run ID/root through private environment values and returns bounded chunks. Child-visible errors do not distinguish missing from corrupt/unauthorized paths.
+- Reader injection does not remove capabilities already granted by the selected agent, but it must not add general `read`, `bash`, or filesystem tools.
+- Descriptors must not contain artifact content. Parent descriptors may contain a validated path; child descriptors contain only run ID, digest, byte count, payload kind, and reader instructions.
+- Do not log artifact content, private artifact roots, or full sensitive refs in error paths.
 
 ## Rollout Notes
 
-1. Merge Tasks 1-2 first as the independent transport hotfix. This immediately prevents the observed Reviewer failure.
-2. Land Task 3 as a separate transport-hardening change because disabling an unused command is not required for the overflow fix.
-3. Complete the compact snapshot prerequisite plan before Tasks 5-8. Do not externalize mutable parser results directly.
-4. Merge Tasks 4-8 together or behind an internal code path until all Chain/resume tests pass; a partial artifact schema without resolvers is unsafe.
-5. No durable schema version bump is required because all reference fields are additive to Version 1 and legacy inline records remain readable.
-6. Do not rewrite historical `run.json` or session files automatically. Existing failed runs remain inspection evidence; new code applies to new terminal snapshots and resumed records when they are next normalized.
-7. If a future Pi version changes an eligible oversized event's key order, the local projector intentionally returns to the ordinary 2 MiB failure. Treat that as a compatibility signal to update the projector/tests, not as permission to broaden the global cap.
+1. Task 1 intentionally updates compatibility metadata before runtime work: Pi peers become `"*"`, while development and projector compatibility tests pin exact 0.80.9.
+2. Tasks 2–5 form the transport/lifecycle layer and can land before artifact externalization. The projector is incomplete until the 8.2+ MiB and 12 MiB integrations pass.
+3. Tasks 6–11 add storage and all ref consumers while production terminal publication remains inline-compatible. Task 12 activates artifact-backed terminal publication only after those consumers are ready.
+4. Do not release a build containing durable refs unless Tasks 6–12 and all final gates pass together.
+5. Existing inline Version 1 records remain readable; no migration or rewrite is required.
+6. A future Pi key-order change intentionally returns affected oversized records to the ordinary 8 MiB failure until runtime source and compatibility tests are updated.
+7. Artifact retention is whole-run retention. Do not add partial cleanup or GC during this rollout.
 
 ## Risks and Mitigations
 
-- **The local projector depends on Pi's current eligible-event key order.** — Restrict every exception to an exact early prefix, fully validate the entire JSON token stream, keep a 64 MiB hard cap, and fail closed on shape changes.
-- **A custom bracket scanner could accept malformed JSON.** — Implement a complete incremental tokenizer/state machine and exhaustive malformed/chunk-boundary tests; never emit until EOF/LF validation completes.
-- **Projection could reorder events under stream backpressure.** — Process one record state at a time and do not advance into later bytes until the current projected record is complete; replayable-event projection performs no artifact I/O.
-- **Artifact refs could become durable before files.** — Publish and sync content first, then await the run-record update and terminal event before parent delivery.
-- **Artifact paths could escape the run or follow symlinks.** — Derive paths from digest only; validate containment, regular-file status, no symlink, exact bytes, and digest on every read.
-- **Externalization could break Chain semantics or strand an agent without file access.** — Keep authority fields separate from descriptors, validate before externalization, inject only the run-scoped dedicated reader for Pi handoff steps, reject unsupported runtimes before dispatch, resolve structured refs only inside trusted workflow code, and test current/resumed fanout paths.
-- **Settle-time transcript hydration could read before Pi persists the omitted message.** — Rely on Pi's event order only at `agent_settled`, verify the hydrated branch contains the expected post-baseline finalized message, and fail with `hydrate_error` rather than publishing incomplete output.
-- **Missing artifacts could cause duplicate side effects on resume.** — Fail the resume with explicit artifact errors; never downgrade completed work to queued or recompute frozen fanout mappings.
-- **Artifacts increase privacy and disk exposure.** — Reuse the private run directory, avoid duplicate transcript artifacts, document manual retention, and delete only the complete inactive run directory.
-- **The 64 MiB artifact/projectable limits may be insufficient for a future workload.** — Fail with explicit size errors and collect measurements before introducing configuration; do not silently raise safety bounds.
-- **`StringDecoder` replaces invalid UTF-8 before JSON validation.** — Define the projector guarantee over the decoded character stream, preserve current transport behavior, and add an invalid-byte regression proving deterministic handling; raw-byte UTF-8 rejection is outside this scoped change.
+- **Exact-prefix projection is coupled to Pi runtime construction.** — Pin exact 0.80.9 development versions and producer order; fully validate records; fall back to 8 MiB on drift.
+- **RPC documentation and runtime disagree on `message_update` key order.** — Treat installed runtime plus `JSON.stringify` forwarding as authority and document the discrepancy.
+- **A custom scanner could accept malformed JSON.** — Implement full grammar/depth/duplicate/order validation and exhaustive split/malformed tests.
+- **Projection could reorder stream and terminal events.** — Keep one record state, preserve same-chunk order, await endpoint transitions, and test blocked queues.
+- **Settle rehydrate could deadlock on the endpoint writer lease.** — Use only direct `SessionManager.open()` inside settle; never use ordinary lazy hydration there.
+- **Session persistence could lag `agent_settled`.** — Verify finalized/assistant counts and fail `hydrate_error` instead of publishing omission-only success.
+- **Artifact refs could become durable before files.** — Publish/verify artifact, strictly write `run.json`, strictly append terminal event, then publish parent/relay state.
+- **Strict event append could fail after `run.json` commits.** — Treat `run.json` as authority, mirror it, report failure, and abandon rather than reporting success.
+- **Artifact paths could escape or follow symlinks.** — Derive paths from digest and validate containment, `lstat`, `realpath`, regular-file status, size, and digest on every read.
+- **Ref hydration could restore memory growth or leak into persistence.** — Keep resolved values runtime-only, reverify lazily, and test that durable mirrors retain refs.
+- **Async resume inspection could race claim acquisition.** — Verify reachable refs both before and after claim; dispatch only from post-claim verified state.
+- **Child reader injection could be mistaken for a sandbox.** — Add only the dedicated tool and state clearly that pre-existing agent capabilities remain unchanged.
+- **Continuation I/O could deliver to a stale branch.** — Reserve activation identity, revalidate trust immediately before send, track promises, and suppress stale delivery.
+- **Fixed limits may reject future workloads.** — Return explicit errors and gather evidence before changing constants; do not add configuration or silently raise caps.
+
+## Open Questions
+
+**Open Questions:** None. The peer/dev dependency policy, fixed limits, Version 1 compatibility, Pi 0.80.9 canonical order, child-reader scope, and retention policy are decided for this plan.

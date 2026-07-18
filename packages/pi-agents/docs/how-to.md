@@ -437,3 +437,44 @@ The below-editor chrome (when any agent is `starting`/`running`) lists only thos
 - Post-completion interactive messages do not rewrite the completed durable unit result. After a normal completion they stay in the child session only. When the original tool-call activation was interrupted/cancelled, the next view continuation that settles is relayed back to the bound host model as a clearly-marked interactive continuation (once per activation); normal completed agents never relay.
 - Child slash commands are rejected; child extension UI dialogs are cancelled.
 - Private Grok session files under `~/.grok/sessions` are never parsed or displayed.
+
+## Inspect run artifacts
+
+After a unit spills oversized output, `run.json` carries `finalOutputRef` / `structuredOutputRef`
+with `sha256`, `bytes`, and `mediaType`. Resolve the artifact path from the run metadata
+(run ID + store root), not from a parent descriptor — parent descriptors are metadata-only,
+bounded to 2 KiB, and never contain absolute paths or artifact content.
+
+```sh
+# Resolve the store root and derive the canonical digest path:
+STORE="$HOME/.pi/agent/@balaenis/pi-agents/runs"
+RUN_ID="<run-id>"
+SHA="<sha256>"
+# Path: <store>/<run-id>/artifacts/sha256/<first-2-chars>/<sha>.<txt|json>
+PREFIX="${SHA:0:2}"
+FILE="${STORE}/${RUN_ID}/artifacts/sha256/${PREFIX}/${SHA}.json"
+jq . "$FILE"
+```
+
+## Read a handed-off artifact from a child agent
+
+When a Chain handoff includes a child descriptor, repeat `pi_agents_read_artifact` with `nextOffsetBytes` until `eof: true`:
+
+```
+pi_agents_read_artifact({
+  "runId": "run-...",
+  "sha256": "<digest>",
+  "mediaType": "text",
+  "offsetBytes": 0
+})
+# then call again with offsetBytes = details.nextOffsetBytes
+```
+
+## Diagnose missing or corrupt artifact refs
+
+| Symptom                                                 | Likely cause                                   | Action                                                                    |
+| ------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------- |
+| `artifact_missing` / `artifact_corrupt` before dispatch | Tampered, cross-run, or incomplete publication | Do not redispatch completed work; inspect `run.json` and artifact digests |
+| `hydrate_error` on settle                               | Session lag/missing after projected shells     | Check the unit `sessionFile`; re-run if the child crashed mid-write       |
+| `get_messages_disabled`                                 | Disabled unbounded history RPC                 | Hydrate from `sessionFile` instead                                        |
+| `artifact_store_unavailable`                            | Oversized result without durable run store     | Ensure production registration provides `RunStore`                        |

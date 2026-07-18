@@ -26,6 +26,7 @@ import { attachErrorStack, classifyEarlyFailureStopReason } from './early-failur
 import { emptyUsage } from './empty-usage.ts';
 import { startProfile, stopProfile } from './profiler.ts';
 import type { WorkflowFanoutState } from './run-types.ts';
+
 import {
   GROK_ACP_RUNTIME,
   MAX_CONCURRENCY,
@@ -50,10 +51,12 @@ import {
   applyTerminalStatus,
   getResultFinalOutput,
   getResultOutput,
+  getResultParentOutput,
   isFailedResult,
   resolveExecutionStatus,
   truncateParallelOutput,
 } from './output.ts';
+import { externalizeJsonPayload, externalizeTextPayload } from './result-payload.ts';
 import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
   createRunLifecycle,
@@ -63,7 +66,13 @@ import {
   originToRunStatus,
   type RunLifecycle,
 } from './run-lifecycle.ts';
-import { normalizeStoredRequest, startDurableRun, type StartedRun } from './run-persistence.ts';
+import {
+  finalizeDurableRun,
+  normalizeStoredRequest,
+  safeAbandon,
+  startDurableRun,
+  type StartedRun,
+} from './run-persistence.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import type { RunStore } from './run-store.ts';
 import { chainFanoutUnitId, chainStepUnitId, pad } from './run-coordinator.ts';
@@ -89,7 +98,8 @@ import {
   runWorktreeSetupHook,
 } from './worktree.ts';
 import {
-  inspectResume,
+  inspectResumeRecord,
+  resolveAndVerifyFanoutItems,
   incrementIncompleteAttempts,
   isNeverStartedUnit,
   reopenCompletedUnitsForResume,
@@ -134,6 +144,18 @@ export interface ExecuteAgentToolOptions {
   interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
   /** Test seam: inject child process spawn for orchestration-path tests. */
   spawnFn?: import('./execution.ts').SpawnFn;
+  /**
+   * Test-only seam: build restored chain state from the verified post-claim
+   * record. Override to force a failure after ref validation but before any
+   * durable mutation, event, registration, or dispatch. The production default
+   * calls the real builder inline.
+   */
+  buildRestoredChainState?: (input: {
+    mode: Mode;
+    record: import('./run-types.ts').AgentRunRecordV1;
+    units: Record<string, import('./run-types.ts').RunUnitRecord>;
+    resolvedFanouts: Record<string, import('./run-types.ts').WorkflowFanoutState>;
+  }) => import('./chain.ts').RestoredChainState | undefined;
 }
 
 /** Detect fresh-run configuration supplied alongside runId. */
@@ -283,7 +305,11 @@ interface DurableRunContext {
   /** Stamp the per-unit start; awaited before session stamp / interactive register. */
   beginUnit(ctx: UnitExecutionContext): void | Promise<void>;
   /** Stamp the per-unit terminal. */
-  endUnit(ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus): void;
+  endUnit(
+    ctx: UnitExecutionContext,
+    result: SingleResult,
+    status: ExecutionStatus
+  ): Promise<void | SingleResult>;
   /**
    * Strict awaited first-write of a unit sessionFile after Pi session creation.
    * Disk-first CAS via the coordinator; same path is idempotent.
@@ -388,6 +414,7 @@ async function maybeStartDurableRun(
         ? { sessionPromptEstablished: base.sessionPromptEstablished }
         : {}),
       ...(base?.worktreePath !== undefined ? { worktreePath: base.worktreePath } : {}),
+      ...(base?.requireArtifactReader ? { requireArtifactReader: true } : {}),
       ...(step !== undefined ? { step } : {}),
       ...(fanoutIndex !== undefined ? { fanoutIndex } : {}),
     };
@@ -395,12 +422,12 @@ async function maybeStartDurableRun(
   const beginUnit = async (unitCtx: UnitExecutionContext) => {
     await coordinator.startUnit(started.runId, unitCtx);
   };
-  const endUnit = (
+  const endUnit = async (
     unitCtx: UnitExecutionContext,
     result: SingleResult,
     status: ExecutionStatus
-  ) => {
-    coordinator.finishUnit(started.runId, unitCtx, result, status);
+  ): Promise<SingleResult> => {
+    return coordinator.finishUnit(started.runId, unitCtx, result, status);
   };
   const stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
     const unit = units[unitId];
@@ -470,6 +497,126 @@ async function maybeStartDurableRun(
  * Project/workspace cwd for a stored run: prefer request.cwd, else the first
  * unit's effectiveCwd (non-worktree original location).
  */
+/** UTF-8 budget for resume/store diagnostic strings (matches RESULT_DIAGNOSTIC_MAX_BYTES). */
+const STORE_ERROR_DIAGNOSTIC_MAX_BYTES = 64 * 1024;
+const STORE_ERROR_OMISSION_MARKER = '…[truncated]';
+
+function utf8BytesOf(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/** Truncate to at most maxBytes UTF-8, on a Unicode code-point boundary. */
+function truncateUtf8CodePoints(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  if (utf8BytesOf(value) <= maxBytes) return value;
+  let lo = 0;
+  let hi = value.length;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    // Do not end on a high surrogate (incomplete pair).
+    let end = mid;
+    if (end > 0) {
+      const prev = value.charCodeAt(end - 1);
+      if (prev >= 0xd800 && prev <= 0xdbff) end = end - 1;
+    }
+    if (utf8BytesOf(value.slice(0, end)) <= maxBytes) {
+      best = end;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return value.slice(0, best);
+}
+
+function boundDiagnosticText(value: string): string {
+  if (utf8BytesOf(value) <= STORE_ERROR_DIAGNOSTIC_MAX_BYTES) return value;
+  const marker = STORE_ERROR_OMISSION_MARKER;
+  const budget = STORE_ERROR_DIAGNOSTIC_MAX_BYTES - utf8BytesOf(marker);
+  if (budget <= 0) return truncateUtf8CodePoints(marker, STORE_ERROR_DIAGNOSTIC_MAX_BYTES);
+  return `${truncateUtf8CodePoints(value, budget)}${marker}`;
+}
+
+/**
+ * Deterministic useful fallback for non-Error throwables that lack own
+ * code/message. Never returns the useless `[object Object]` string.
+ */
+function fallbackDiagnosticPayload(err: unknown): string {
+  if (err === null) return 'null';
+  if (err === undefined) return 'undefined';
+  const t = typeof err;
+  if (t === 'string' || t === 'number' || t === 'boolean' || t === 'bigint') {
+    return String(err);
+  }
+  if (t === 'symbol') return err.toString();
+  try {
+    const json = JSON.stringify(err);
+    if (typeof json === 'string' && json.length > 0 && json !== '{}') return json;
+  } catch {
+    /* cyclic / non-serializable */
+  }
+  const tag =
+    err && typeof err === 'object' && err.constructor && err.constructor.name
+      ? err.constructor.name
+      : t;
+  return `unserializable_${tag}`;
+}
+
+/**
+ * Bounded diagnostic for store/resume failures. Prefer own string `code` and
+ * `message` from Error and plain-object failures; never surface `[object Object]`.
+ * When `prefix` is provided, the complete final string (prefix + body + omission
+ * marker) is UTF-8-bounded to STORE_ERROR_DIAGNOSTIC_MAX_BYTES.
+ */
+function formatBoundedStoreError(err: unknown, prefix = ''): string {
+  let raw: string;
+  if (err instanceof Error) {
+    const rec = err as unknown as Record<string, unknown>;
+    const ownCode =
+      Object.prototype.hasOwnProperty.call(err, 'code') && typeof rec.code === 'string'
+        ? rec.code
+        : undefined;
+    raw = ownCode ? `${ownCode}: ${err.message}` : err.message;
+  } else if (err && typeof err === 'object') {
+    const rec = err as Record<string, unknown>;
+    const ownCode =
+      Object.prototype.hasOwnProperty.call(err, 'code') && typeof rec.code === 'string'
+        ? rec.code
+        : undefined;
+    const ownMessage =
+      Object.prototype.hasOwnProperty.call(err, 'message') && typeof rec.message === 'string'
+        ? rec.message
+        : undefined;
+    if (ownCode && ownMessage) raw = `${ownCode}: ${ownMessage}`;
+    else if (ownMessage) raw = ownMessage;
+    else if (ownCode) raw = ownCode;
+    else raw = fallbackDiagnosticPayload(err);
+  } else {
+    raw = fallbackDiagnosticPayload(err);
+  }
+  if (!prefix) return boundDiagnosticText(raw);
+  // Cap the complete final diagnostic including prefix and omission marker.
+  const full = `${prefix}${raw}`;
+  if (utf8BytesOf(full) <= STORE_ERROR_DIAGNOSTIC_MAX_BYTES) return full;
+  const marker = STORE_ERROR_OMISSION_MARKER;
+  const prefixBytes = utf8BytesOf(prefix);
+  const markerBytes = utf8BytesOf(marker);
+  const bodyBudget = STORE_ERROR_DIAGNOSTIC_MAX_BYTES - prefixBytes - markerBytes;
+  if (bodyBudget <= 0) {
+    // Prefix alone exceeds budget: truncate the whole string.
+    return boundDiagnosticText(full);
+  }
+  const body = truncateUtf8CodePoints(raw, bodyBudget);
+  const budgetUsed = prefixBytes + utf8BytesOf(body) + markerBytes;
+  const padding = STORE_ERROR_DIAGNOSTIC_MAX_BYTES - budgetUsed;
+  if (padding > 0) {
+    // Pad with spaces to fill exact diagnostic budget so output is deterministic.
+    return `${prefix}${body}${' '.repeat(padding)}${marker}`;
+  }
+  return `${prefix}${body}${marker}`;
+}
+
 function projectCwdFromRecord(
   record: import('./run-types.ts').AgentRunRecordV1,
   fallback: string
@@ -497,9 +644,14 @@ async function maybeResumeDurableRun(
   | { durable: DurableRunContext; restoredChain?: import('./chain.ts').RestoredChainState }
   | { error: string }
 > {
+  /** Centralized bounded resume error with prefix. Every return <= 64 KiB UTF-8. */
+  const resumeError = (cause: unknown, prefix = 'resume_error: '): { error: string } => ({
+    error: formatBoundedStoreError(cause, prefix),
+  });
+
   const store = options.runStore;
   const coordinator = options.runCoordinator;
-  if (!store || !coordinator) return { error: 'persistence_not_configured' };
+  if (!store || !coordinator) return resumeError('persistence_not_configured');
 
   const resumeRunId = resume.runId;
   const hasContinuation = Boolean(resume.currentContinuationTask);
@@ -507,44 +659,79 @@ async function maybeResumeDurableRun(
     agents,
     hasContinuation,
   };
-  const inspection = inspectResume(resumeRunId, store, inspectOptions);
-  if (!inspection.ok) return { error: inspection.reason };
-  if (inspection.blockingReasons.length > 0) {
-    return { error: `preflight_failed: ${inspection.blockingReasons.join('; ')}` };
+  // Preflight: load once and verify that exact loaded record.
+  const preflightLoaded = store.getRun(resumeRunId);
+  if (!preflightLoaded.ok)
+    return resumeError(preflightLoaded.error, 'resume_error: run_not_found: ');
+  const preflightRecord = preflightLoaded.loaded.record;
+  const preflightInspection = await inspectResumeRecord(
+    resumeRunId,
+    preflightRecord,
+    store,
+    inspectOptions
+  );
+  if (!preflightInspection.ok) return resumeError(preflightInspection.reason);
+  if (preflightInspection.blockingReasons.length > 0) {
+    return resumeError(
+      preflightInspection.blockingReasons.join('; '),
+      'resume_error: preflight_failed: '
+    );
   }
-  if (coordinator.isActive(resumeRunId)) return { error: 'run_active' };
+  if (coordinator.isActive(resumeRunId)) return resumeError('run_active');
 
   const claim = await store.claimRun(resumeRunId);
-  if (!claim.ok) return { error: `claim_failed: ${claim.error.message}` };
+  if (!claim.ok) return resumeError(claim.error, 'resume_error: claim_failed: ');
 
-  // Re-validate eligibility on the post-claim record so a race that corrupts
-  // the run between preflight and claim fails safely without mutating it.
-  const loaded = store.getRun(resumeRunId);
-  if (!loaded.ok) {
-    await store.releaseRun(resumeRunId, claim.claimId);
-    return { error: 'run_not_found_after_claim' };
-  }
-  const postClaim = inspectResume(resumeRunId, store, inspectOptions);
-  if (!postClaim.ok) {
-    await store.releaseRun(resumeRunId, claim.claimId);
-    return { error: postClaim.reason };
-  }
-  if (postClaim.blockingReasons.length > 0) {
-    await store.releaseRun(resumeRunId, claim.claimId);
-    return { error: `preflight_failed: ${postClaim.blockingReasons.join('; ')}` };
-  }
-
-  const record = loaded.loaded.record;
-  const priorContinuations = record.continuationTasks ?? [];
-  const accumulatedContinuations = resume.currentContinuationTask
-    ? [...priorContinuations, resume.currentContinuationTask]
-    : [...priorContinuations];
-  const priorDelivery = { ...(record.continuationDelivery ?? {}) };
-
-  // All post-claim setup (normalize, stage, write, register) shares one cleanup
-  // boundary so any failure releases the claim without leaving an active holder.
-  let units!: typeof record.units;
+  // Every post-claim operation lives inside one unified abandon boundary.
+  // A single unregister+abandon on any error ensures the claim is never
+  // leaked; prepare + commit + validation all share the same cleanup path.
+  let record!: import('./run-types.ts').AgentRunRecordV1;
+  let resolvedFanouts!: Record<string, WorkflowFanoutState>;
+  let priorContinuations!: string[];
+  let accumulatedContinuations!: string[];
+  let priorDelivery!: Record<string, { deliveredCount: number }>;
+  let units!: Record<string, import('./run-types.ts').RunUnitRecord>;
+  let restoredChain: import('./chain.ts').RestoredChainState | undefined;
+  let lifecycle!: ReturnType<typeof createRunLifecycle>;
+  let projectCwd!: string;
+  let sessionsDir!: string;
+  let unitIds!: string[];
+  let unitFor!: DurableRunContext['unitFor'];
+  let beginUnit!: DurableRunContext['beginUnit'];
+  let endUnit!: DurableRunContext['endUnit'];
+  let stampUnitSessionFile!: DurableRunContext['stampUnitSessionFile'];
+  let markSessionPromptEstablished!: NonNullable<DurableRunContext['markSessionPromptEstablished']>;
+  let persistAcpSessionId!: NonNullable<DurableRunContext['persistAcpSessionId']>;
+  let expandFanout!: DurableRunContext['expandFanout'];
+  let resumePromptForUnit!: NonNullable<DurableRunContext['resumePromptForUnit']>;
+  let markContinuationDelivered!: NonNullable<DurableRunContext['markContinuationDelivered']>;
+  let started!: StartedRun;
+  let resumePrompt!: ResumePromptContext;
   try {
+    // === POST-CLAIM VALIDATION: re-verify eligibility after claim; every
+    // failure throws through the single abandon boundary below.
+    const loaded = store.getRun(resumeRunId);
+    if (!loaded.ok) throw new Error('run_not_found_after_claim');
+    record = loaded.loaded.record;
+    const postClaim = await inspectResumeRecord(resumeRunId, record, store, inspectOptions);
+    if (!postClaim.ok) throw new Error(postClaim.reason);
+    if (postClaim.blockingReasons.length > 0) {
+      throw new Error(`preflight_failed: ${postClaim.blockingReasons.join('; ')}`);
+    }
+    const fanoutResolution = await resolveAndVerifyFanoutItems(resumeRunId, store, record);
+    if (!fanoutResolution.ok) {
+      throw new Error(`preflight_failed: ${fanoutResolution.reasons.join('; ')}`);
+    }
+    resolvedFanouts = fanoutResolution.resolved;
+
+    priorContinuations = record.continuationTasks ?? [];
+    accumulatedContinuations = resume.currentContinuationTask
+      ? [...priorContinuations, resume.currentContinuationTask]
+      : [...priorContinuations];
+    priorDelivery = { ...(record.continuationDelivery ?? {}) };
+
+    // === PREPARE: construct every value that can throw; no durable mutations ===
+
     // Normalize legacy full-message results once after post-claim revalidation and
     // before any resume write can reserialize raw transcripts.
     if (Array.isArray(record.details.results)) {
@@ -577,6 +764,195 @@ async function maybeResumeDurableRun(
       }
     }
 
+    // Build restored chain state from the verified post-claim record before any
+    // durable mutation, event, registration, or dispatch. Every failure here
+    // leaves zero side effects (unregister + abandon, never release).
+    if (options.buildRestoredChainState) {
+      restoredChain = options.buildRestoredChainState({
+        mode,
+        record,
+        units,
+        resolvedFanouts,
+      });
+    } else if (
+      mode === 'chain' &&
+      Array.isArray(record.request.chain) &&
+      record.request.chain.length > 0
+    ) {
+      const chain = record.request.chain as import('./chain.ts').ChainItemInput[];
+      const fanoutRuntimeState: Record<string, WorkflowFanoutState> | undefined =
+        Object.keys(resolvedFanouts).length > 0
+          ? Object.fromEntries(
+              Object.entries(resolvedFanouts).map(([k, v]) => [
+                k,
+                { step: v.step, items: v.items, unitIds: v.unitIds },
+              ])
+            )
+          : undefined;
+      const logicalSteps = buildRestoredLogicalSteps(
+        chain,
+        record.details.chain?.steps,
+        units,
+        fanoutRuntimeState
+      );
+      restoredChain = {
+        results: record.details.results,
+        outputs: record.details.outputs ?? {},
+        logicalSteps,
+        units,
+        fanouts: fanoutRuntimeState,
+      };
+    }
+
+    // Build every runtime closure from the verified post-claim state.  All of
+    // these are side-effect-free to construct and must succeed before any
+    // durable mutation, event, registration, or dispatch.
+    lifecycle = createRunLifecycle(resumeRunId);
+    sessionsDir = path.join(store.getRunDir(resumeRunId), 'sessions');
+    unitIds = Object.keys(units);
+    projectCwd = projectCwdFromRecord(record, ctx.cwd);
+
+    unitFor = (
+      step: number | undefined,
+      fanoutIndex: number | undefined,
+      agentName: string
+    ): UnitExecutionContext => {
+      const unitId = resolveUnitId(mode, unitIds, step, fanoutIndex);
+      const base = units[unitId];
+      const neverStarted = base ? isNeverStartedUnit(base) : true;
+      return {
+        runId: resumeRunId,
+        unitId,
+        agent: agentName,
+        runtime: base?.runtime,
+        resumeCapability: base?.capability ?? 'session',
+        effectiveCwd: base?.effectiveCwd ?? projectCwd,
+        attempt: base?.attempt ?? 1,
+        sessionsDir,
+        neverStarted,
+        ...(base?.sessionFile !== undefined ? { sessionFile: base.sessionFile } : {}),
+        ...(base?.acpSessionId !== undefined ? { acpSessionId: base.acpSessionId } : {}),
+        ...(base?.sessionPromptEstablished !== undefined
+          ? { sessionPromptEstablished: base.sessionPromptEstablished }
+          : {}),
+        ...(base?.worktreePath !== undefined ? { worktreePath: base.worktreePath } : {}),
+        ...(base?.requireArtifactReader ? { requireArtifactReader: true } : {}),
+        ...(step !== undefined ? { step } : {}),
+        ...(fanoutIndex !== undefined ? { fanoutIndex } : {}),
+      };
+    };
+    beginUnit = async (unitCtx: UnitExecutionContext) => {
+      await coordinator.startUnit(resumeRunId, unitCtx);
+    };
+    endUnit = async (
+      unitCtx: UnitExecutionContext,
+      result: SingleResult,
+      status: ExecutionStatus
+    ): Promise<SingleResult> => {
+      return coordinator.finishUnit(resumeRunId, unitCtx, result, status);
+    };
+    stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
+      const unit = units[unitId];
+      const firstWrite = !unit?.sessionFile?.trim();
+      await coordinator.persistSessionFile({
+        runId: resumeRunId,
+        unitId,
+        sessionFile,
+      });
+      if (unit) {
+        unit.sessionFile = sessionFile.trim();
+        if (firstWrite && unit.sessionPromptEstablished !== true) {
+          unit.sessionPromptEstablished = false;
+        }
+      }
+    };
+    markSessionPromptEstablished = async (unitId: string): Promise<void> => {
+      await coordinator.persistSessionPromptEstablished({
+        runId: resumeRunId,
+        unitId,
+      });
+      const unit = units[unitId];
+      if (unit) {
+        unit.sessionPromptEstablished = true;
+      }
+    };
+    persistAcpSessionId = async (unitId: string, sessionId: string): Promise<void> => {
+      await coordinator.persistAcpSessionId({
+        runId: resumeRunId,
+        unitId,
+        sessionId,
+      });
+      const unit = units[unitId];
+      if (unit) {
+        unit.acpSessionId = sessionId.trim();
+      }
+    };
+    expandFanout = async (req: FanoutExpandRequest): Promise<WorkflowFanoutState> => {
+      const agent = agents.find((a) => a.name === req.agent) ?? syntheticAgent(req.agent);
+      const runtime = record.request.runtime ?? agent.runtime;
+      return coordinator.expandFanout(resumeRunId, {
+        step: req.step,
+        items: req.items,
+        agent,
+        runtime,
+        effectiveCwd: req.effectiveCwd ?? projectCwd,
+      });
+    };
+    resumePromptForUnit = (unitId: string): ResumePromptContext => {
+      const delivered = record.continuationDelivery?.[unitId]?.deliveredCount ?? 0;
+      const undelivered = accumulatedContinuations.slice(delivered);
+      return {
+        continuationTasks: accumulatedContinuations,
+        undeliveredContinuationTasks: undelivered,
+        ...(resume.currentContinuationTask
+          ? { currentContinuationTask: resume.currentContinuationTask }
+          : {}),
+      };
+    };
+    markContinuationDelivered = async (unitId: string): Promise<void> => {
+      const deliveredCount = accumulatedContinuations.length;
+      await coordinator.persistContinuationDelivery({
+        runId: resumeRunId,
+        unitId,
+        deliveredCount,
+        continuationTasks: accumulatedContinuations,
+      });
+      if (!record.continuationDelivery) record.continuationDelivery = {};
+      record.continuationDelivery[unitId] = { deliveredCount };
+    };
+
+    started = {
+      runId: resumeRunId,
+      record: { ...record, units },
+      claimId: claim.claimId,
+      ticket: claim.ticket,
+      units,
+      unitIds,
+      finalize: async (input) =>
+        finalizeDurableRun({
+          store,
+          coordinator,
+          runId: resumeRunId,
+          claimId: claim.claimId,
+          details: input.details,
+          units: input.units,
+          success: input.success,
+          cancelled: input.cancelled,
+          interrupted: input.interrupted,
+          lastError: input.lastError,
+        }),
+    };
+
+    resumePrompt = {
+      continuationTasks: accumulatedContinuations,
+      undeliveredContinuationTasks: accumulatedContinuations,
+      ...(resume.currentContinuationTask
+        ? { currentContinuationTask: resume.currentContinuationTask }
+        : {}),
+    };
+
+    // === COMMIT: durable mutations, events, registration (only after prepare) ===
+
     // Transition to running and append the current continuation task atomically.
     await store.appendEvent(resumeRunId, {
       version: 1,
@@ -586,7 +962,7 @@ async function maybeResumeDurableRun(
       claimId: claim.claimId,
       ticket: claim.ticket,
     });
-    await store.updateRun(resumeRunId, (r) => {
+    await store.updateRunStrict(resumeRunId, (r) => {
       r.status = 'running';
       delete r.finishedAt;
       r.units = units;
@@ -620,189 +996,12 @@ async function maybeResumeDurableRun(
     record.updatedAt = Date.now();
     coordinator.registerRun(resumeRunId, record);
   } catch (err) {
-    await store.releaseRun(resumeRunId, claim.claimId);
+    coordinator.unregisterRun(resumeRunId);
+    await safeAbandon(store, resumeRunId, claim.claimId);
     return {
-      error: `resume_setup_failed: ${err instanceof Error ? err.message : String(err)}`,
+      error: formatBoundedStoreError(err, 'resume_setup_failed: '),
     };
   }
-
-  const lifecycle = createRunLifecycle(resumeRunId);
-  const sessionsDir = path.join(store.getRunDir(resumeRunId), 'sessions');
-  const unitIds = Object.keys(units);
-  const projectCwd = projectCwdFromRecord(record, ctx.cwd);
-
-  const unitFor = (
-    step: number | undefined,
-    fanoutIndex: number | undefined,
-    agentName: string
-  ): UnitExecutionContext => {
-    const unitId = resolveUnitId(mode, unitIds, step, fanoutIndex);
-    const base = units[unitId];
-    const neverStarted = base ? isNeverStartedUnit(base) : true;
-    return {
-      runId: resumeRunId,
-      unitId,
-      agent: agentName,
-      runtime: base?.runtime,
-      resumeCapability: base?.capability ?? 'session',
-      effectiveCwd: base?.effectiveCwd ?? projectCwd,
-      attempt: base?.attempt ?? 1,
-      sessionsDir,
-      neverStarted,
-      ...(base?.sessionFile !== undefined ? { sessionFile: base.sessionFile } : {}),
-      ...(base?.acpSessionId !== undefined ? { acpSessionId: base.acpSessionId } : {}),
-      ...(base?.sessionPromptEstablished !== undefined
-        ? { sessionPromptEstablished: base.sessionPromptEstablished }
-        : {}),
-      ...(base?.worktreePath !== undefined ? { worktreePath: base.worktreePath } : {}),
-      ...(step !== undefined ? { step } : {}),
-      ...(fanoutIndex !== undefined ? { fanoutIndex } : {}),
-    };
-  };
-  const beginUnit = async (unitCtx: UnitExecutionContext) => {
-    await coordinator.startUnit(resumeRunId, unitCtx);
-  };
-  const endUnit = (
-    unitCtx: UnitExecutionContext,
-    result: SingleResult,
-    status: ExecutionStatus
-  ) => {
-    coordinator.finishUnit(resumeRunId, unitCtx, result, status);
-  };
-  const stampUnitSessionFile = async (unitId: string, sessionFile: string): Promise<void> => {
-    const unit = units[unitId];
-    const firstWrite = !unit?.sessionFile?.trim();
-    await coordinator.persistSessionFile({
-      runId: resumeRunId,
-      unitId,
-      sessionFile,
-    });
-    if (unit) {
-      unit.sessionFile = sessionFile.trim();
-      if (firstWrite && unit.sessionPromptEstablished !== true) {
-        unit.sessionPromptEstablished = false;
-      }
-    }
-  };
-  const markSessionPromptEstablished = async (unitId: string): Promise<void> => {
-    await coordinator.persistSessionPromptEstablished({
-      runId: resumeRunId,
-      unitId,
-    });
-    const unit = units[unitId];
-    if (unit) {
-      unit.sessionPromptEstablished = true;
-    }
-  };
-  const persistAcpSessionId = async (unitId: string, sessionId: string): Promise<void> => {
-    await coordinator.persistAcpSessionId({
-      runId: resumeRunId,
-      unitId,
-      sessionId,
-    });
-    const unit = units[unitId];
-    if (unit) {
-      unit.acpSessionId = sessionId.trim();
-    }
-  };
-  const expandFanout = async (req: FanoutExpandRequest): Promise<WorkflowFanoutState> => {
-    const agent = agents.find((a) => a.name === req.agent) ?? syntheticAgent(req.agent);
-    const runtime = record.request.runtime ?? agent.runtime;
-    return coordinator.expandFanout(resumeRunId, {
-      step: req.step,
-      items: req.items,
-      agent,
-      runtime,
-      effectiveCwd: req.effectiveCwd ?? projectCwd,
-    });
-  };
-  const resumePromptForUnit = (unitId: string): ResumePromptContext => {
-    const delivered = record.continuationDelivery?.[unitId]?.deliveredCount ?? 0;
-    const undelivered = accumulatedContinuations.slice(delivered);
-    return {
-      continuationTasks: accumulatedContinuations,
-      undeliveredContinuationTasks: undelivered,
-      ...(resume.currentContinuationTask
-        ? { currentContinuationTask: resume.currentContinuationTask }
-        : {}),
-    };
-  };
-  const markContinuationDelivered = async (unitId: string): Promise<void> => {
-    const deliveredCount = accumulatedContinuations.length;
-    // Disk-first strict write so a crash before confirm leaves instructions undelivered.
-    await coordinator.persistContinuationDelivery({
-      runId: resumeRunId,
-      unitId,
-      deliveredCount,
-      continuationTasks: accumulatedContinuations,
-    });
-    if (!record.continuationDelivery) record.continuationDelivery = {};
-    record.continuationDelivery[unitId] = { deliveredCount };
-  };
-
-  const started: StartedRun = {
-    runId: resumeRunId,
-    record: { ...record, units },
-    claimId: claim.claimId,
-    ticket: claim.ticket,
-    units,
-    unitIds,
-    finalize: async (input) => {
-      try {
-        await coordinator.finalizeRun(resumeRunId, input.details, input.units, {
-          success: input.success,
-          cancelled: input.cancelled,
-          interrupted: input.interrupted,
-          lastError: input.lastError,
-        });
-        const status = input.cancelled
-          ? 'cancelled'
-          : input.interrupted
-            ? 'interrupted'
-            : input.success === false
-              ? 'failed'
-              : 'completed';
-        await store.appendEvent(resumeRunId, {
-          version: 1,
-          event: 'run_terminal',
-          runId: resumeRunId,
-          timestamp: Date.now(),
-          status,
-        });
-      } finally {
-        await store.releaseRun(resumeRunId, claim.claimId);
-      }
-    },
-  };
-
-  // Build restored chain state from the stored request topology. Presentation
-  // metadata may be absent or shortened; frozen fanout mappings and units are
-  // always attached so resume never re-expands from mutable outputs.
-  let restoredChain: import('./chain.ts').RestoredChainState | undefined;
-  if (mode === 'chain' && Array.isArray(record.request.chain) && record.request.chain.length > 0) {
-    const chain = record.request.chain as import('./chain.ts').ChainItemInput[];
-    const logicalSteps = buildRestoredLogicalSteps(
-      chain,
-      record.details.chain?.steps,
-      units,
-      record.workflowState?.fanouts
-    );
-    restoredChain = {
-      results: record.details.results,
-      outputs: record.details.outputs ?? {},
-      logicalSteps,
-      units,
-      fanouts: record.workflowState?.fanouts,
-    };
-  }
-
-  const resumePrompt: ResumePromptContext = {
-    continuationTasks: accumulatedContinuations,
-    undeliveredContinuationTasks: accumulatedContinuations,
-    ...(resume.currentContinuationTask
-      ? { currentContinuationTask: resume.currentContinuationTask }
-      : {}),
-  };
 
   return {
     durable: {
@@ -1094,8 +1293,14 @@ export async function executeAgentTool(
     if (resumeDescriptor && options.runStore && options.runCoordinator) {
       const result = await maybeResumeDurableRun(resumeDescriptor, mode, options, ctx, agents);
       if ('error' in result) {
+        // Result.error is already bounded by formatBoundedStoreError to 64KiB.
         return {
-          content: [{ type: 'text', text: `resume_error: ${result.error}` }],
+          content: [
+            {
+              type: 'text',
+              text: result.error,
+            },
+          ],
           details: makeDetails(mode)([]),
           isError: true,
         };
@@ -1144,7 +1349,8 @@ export async function executeAgentTool(
         durable,
         restoredChain,
         interactiveRegistry,
-        spawnFn
+        spawnFn,
+        options.runStore
       );
     if (mode === 'parallel')
       return runParallel(
@@ -1398,7 +1604,8 @@ async function runChain(
   durable: DurableRunContext | undefined = undefined,
   restored?: import('./chain.ts').RestoredChainState,
   interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry,
-  spawnFn?: import('./execution.ts').SpawnFn
+  spawnFn?: import('./execution.ts').SpawnFn,
+  runStore?: RunStore
 ): Promise<AgentResult> {
   const chainDetails = (results: SingleResult[], outputs?: Record<string, ChainOutputEntry>) => ({
     ...makeDetails('chain')(results),
@@ -1411,6 +1618,29 @@ async function runChain(
     makeDetails: chainDetails,
     restored,
     ...(durable ? { onFanoutExpand: (req) => durable.expandFanout(req) } : {}),
+    ...(runStore
+      ? {
+          resolveArtifact: async (
+            ref: import('./run-types.ts').RunArtifactRefV1
+          ): Promise<unknown> => {
+            if (ref.mediaType === 'text/plain; charset=utf-8') {
+              return runStore.readTextArtifact(ref.runId, ref);
+            }
+            return runStore.readJsonArtifact(ref.runId, ref);
+          },
+          externalizeChainOutput: {
+            text: (text: string) =>
+              externalizeTextPayload(runStore, durable?.started.runId, 'chain-output-text', text),
+            json: (value: unknown) =>
+              externalizeJsonPayload(
+                runStore,
+                durable?.started.runId,
+                'chain-output-structured',
+                value
+              ),
+          },
+        }
+      : {}),
     runStep: (req) =>
       runStepWithContext(
         ctx,
@@ -1436,6 +1666,9 @@ async function runChain(
           ...(durable
             ? (() => {
                 const unitContext = durable.unitFor(req.step, req.fanoutIndex, req.agent);
+                if (req.requireArtifactReader) {
+                  unitContext.requireArtifactReader = true;
+                }
                 return {
                   unitContext,
                   getAbortOrigin: () => durable.lifecycle.origin,
@@ -1714,7 +1947,10 @@ async function runParallel(
   const successCount = results.filter((r) => !isFailedResult(r)).length;
   const cancelledCount = results.filter((r) => resolveExecutionStatus(r) === 'cancelled').length;
   const summaries = results.map((r) => {
-    const output = truncateParallelOutput(getResultOutput(r));
+    const output =
+      isFailedResult(r) || resolveExecutionStatus(r) === 'cancelled'
+        ? truncateParallelOutput(getResultOutput(r))
+        : truncateParallelOutput(getResultParentOutput(r));
     const status =
       resolveExecutionStatus(r) === 'cancelled'
         ? 'cancelled'
@@ -1848,7 +2084,7 @@ async function runSingle(
       };
     }
     return {
-      content: [{ type: 'text', text: getResultFinalOutput(result) || '(no output)' }],
+      content: [{ type: 'text', text: getResultParentOutput(result) || '(no output)' }],
       details: makeDetails('single')([snapshotSingleResult(result)]),
     };
   } catch (err) {
@@ -1907,7 +2143,11 @@ async function runStepWithContext(
     getAbortOrigin?: () => RunAbortOrigin;
     stampUnitSessionFile?: (sessionFile: string) => void | Promise<void>;
     beginUnit?: (ctx: UnitExecutionContext) => void | Promise<void>;
-    endUnit?: (ctx: UnitExecutionContext, result: SingleResult, status: ExecutionStatus) => void;
+    endUnit?: (
+      ctx: UnitExecutionContext,
+      result: SingleResult,
+      status: ExecutionStatus
+    ) => void | Promise<void | SingleResult>;
     /** Runs before worktree cleanup and durable endUnit (schema validation, metadata). */
     postprocessTerminal?: (result: SingleResult) => void;
     interactiveRegistry?: import('./interactive-agent.ts').InteractiveAgentRegistry;
@@ -1953,10 +2193,10 @@ async function runStepWithContext(
    * Abort/early-failure paths handle worktree retention themselves before calling this;
    * they leave pendingWorktreeFinalization false so finalizeWorktree is not re-applied.
    */
-  const finalizeTerminalResult = (
+  const finalizeTerminalResult = async (
     working: SingleResult,
     status?: ExecutionStatus
-  ): SingleResult => {
+  ): Promise<SingleResult> => {
     if (options.postprocessTerminal) options.postprocessTerminal(working);
     if (working.finalOutput === undefined && working.messages.length > 0) {
       working.finalOutput = getResultFinalOutput(working);
@@ -1976,11 +2216,21 @@ async function runStepWithContext(
         delete options.unitContext.worktreePath;
       }
     }
-    const snapshot = snapshotSingleResult(working);
+    // Pass the private unsnapshotted result to endUnit so finishUnit externalizes
+    // oversized authority before snapshotSingleResult. Snapshot directly only when
+    // endUnit is unavailable (non-durable paths).
     if (options.unitContext && options.endUnit) {
-      options.endUnit(options.unitContext, snapshot, status ?? resolveExecutionStatus(snapshot));
+      const committed = await options.endUnit(
+        options.unitContext,
+        working,
+        status ?? resolveExecutionStatus(working)
+      );
+      // Prefer the artifact-aware snapshot returned by finishUnit when present.
+      if (committed && typeof committed === 'object' && 'agent' in committed) {
+        return committed as SingleResult;
+      }
     }
-    return snapshot;
+    return snapshotSingleResult(working);
   };
   if (!agent) {
     const failed = await runSingleAgent(
@@ -2009,7 +2259,7 @@ async function runStepWithContext(
           : {}),
       }
     );
-    return finalizeTerminalResult(failed, 'failed');
+    return await finalizeTerminalResult(failed, 'failed');
   }
 
   const effectiveRuntime: Runtime | undefined = options.runtimeOverride ?? agent.runtime;
@@ -2044,7 +2294,7 @@ async function runStepWithContext(
         `Cannot resolve skill name(s): ${missing.join(', ')}. Available skills: ${availableText}.`,
         options.title
       );
-      return finalizeTerminalResult(failure, 'failed');
+      return await finalizeTerminalResult(failure, 'failed');
     }
     resolvedSkillPaths = resolved;
   }
@@ -2072,7 +2322,7 @@ async function runStepWithContext(
           'Worktree isolation requires a git repository.',
           options.title
         );
-        return finalizeTerminalResult(failure1, 'failed');
+        return await finalizeTerminalResult(failure1, 'failed');
       }
       const opened = openAgentWorktree(repoRoot, storedWorktreePath);
       if (!opened.ok) {
@@ -2085,7 +2335,7 @@ async function runStepWithContext(
           opened.error,
           options.title
         );
-        return finalizeTerminalResult(failure2, 'failed');
+        return await finalizeTerminalResult(failure2, 'failed');
       }
       worktree = opened.worktree;
       effectiveCwd = worktree.path;
@@ -2101,7 +2351,7 @@ async function runStepWithContext(
           'Worktree isolation requires a git repository.',
           options.title
         );
-        return finalizeTerminalResult(failure3, 'failed');
+        return await finalizeTerminalResult(failure3, 'failed');
       }
       try {
         worktree = createAgentWorktree(repoRoot, agentName, taskIndex);
@@ -2117,7 +2367,7 @@ async function runStepWithContext(
           message,
           options.title
         );
-        return finalizeTerminalResult(failure5, 'failed');
+        return await finalizeTerminalResult(failure5, 'failed');
       }
 
       if (agent.worktreeSetupHook) {
@@ -2136,7 +2386,7 @@ async function runStepWithContext(
           if (!failure.worktreePath) {
             worktree = undefined;
           }
-          return finalizeTerminalResult(failure, 'failed');
+          return await finalizeTerminalResult(failure, 'failed');
         }
       }
     }
@@ -2210,7 +2460,7 @@ async function runStepWithContext(
       const dirty = getWorktreeDirtyStatus(storedWorktreePath);
       failure4.worktreeDirty = dirty.ok ? dirty.output.trim().length > 0 : true;
     }
-    return finalizeTerminalResult(failure4, 'failed');
+    return await finalizeTerminalResult(failure4, 'failed');
   }
 
   // Interactive TUI registration: Pi (pre-spawn with session file) or Grok ACP
@@ -2232,6 +2482,26 @@ async function runStepWithContext(
     Boolean(acpSessionId);
   // Whether a worktree was created for this invocation (vs reopened stored path).
   const createdNewWorktree = Boolean(worktree && !storedWorktreePath);
+  // Artifact handoffs require the Pi-only reader extension; reject Grok ACP early.
+  if (options.unitContext?.requireArtifactReader && isGrokAcp) {
+    const failure = {
+      agent: agentName,
+      agentSource: agent.source ?? ('unknown' as const),
+      task,
+      title: options.title,
+      exitCode: 1,
+      status: 'failed' as const,
+      messages: [] as SingleResult['messages'],
+      stderr: 'artifact_handoff_unsupported',
+      usage: emptyUsage(),
+      stopReason: 'error',
+      errorCode: 'artifact_handoff_unsupported',
+      errorMessage:
+        'Artifact handoffs are not supported for runtime grok-acp; use pi runtime for oversized chain outputs.',
+    };
+    return await finalizeTerminalResult(failure, 'failed');
+  }
+
   // True once beginUnit has been called (spawn may have side effects).
   let beganUnit = false;
   // True once runSingleAgent is entered (child may have modified the worktree).
@@ -2388,6 +2658,7 @@ async function runStepWithContext(
             isolation: resolveIsolation(agent, taskIsolation),
             agentScope: 'both',
             registrationKind: 'initial',
+            ...(unitCtx.requireArtifactReader ? { requireArtifactReader: true } : {}),
           },
           getBranchEntries: () =>
             ctx.sessionManager.getBranch().map((e) => {
@@ -2428,7 +2699,7 @@ async function runStepWithContext(
         );
         if (formalCode) failure.errorCode = formalCode;
         maybeRemoveOwnedCleanWorktree(failure);
-        return finalizeTerminalResult(failure, 'failed');
+        return await finalizeTerminalResult(failure, 'failed');
       }
     }
 
@@ -2449,7 +2720,7 @@ async function runStepWithContext(
       );
       failure.errorCode = 'session_prompt_unestablished';
       maybeRemoveOwnedCleanWorktree(failure);
-      return finalizeTerminalResult(failure, 'failed');
+      return await finalizeTerminalResult(failure, 'failed');
     }
 
     executionStarted = true;
@@ -2610,7 +2881,7 @@ async function runStepWithContext(
     // Request worktree finalization after postprocess so retention uses the final
     // terminal status (schema/completion failure retains clean trees).
     if (worktree) pendingWorktreeFinalization = true;
-    return finalizeTerminalResult(result);
+    return await finalizeTerminalResult(result);
   } catch (err) {
     if (isAbortError(err)) {
       // Prefer the original abort origin; fall back to lifecycle/signal origin.
@@ -2621,7 +2892,7 @@ async function runStepWithContext(
         // Mutable working state from the provisional compact/low-level snapshot.
         const working = cloneSingleResult(provisional);
         if (worktree) stampWorktreeOnFailure(working);
-        const snapshot = finalizeTerminalResult(working, originToUnitStatus(origin));
+        const snapshot = await finalizeTerminalResult(working, originToUnitStatus(origin));
         // Replacement abort error carries the authoritative compact terminal snapshot.
         throw new AgentAbortError(snapshot, origin);
       }
@@ -2635,7 +2906,15 @@ async function runStepWithContext(
       delete options.unitContext.sessionFile;
       delete options.unitContext.sessionPromptEstablished;
     }
-    const message = err instanceof Error ? err.message : String(err);
+    const message =
+      err instanceof Error
+        ? err.message
+        : err &&
+            typeof err === 'object' &&
+            'message' in err &&
+            typeof (err as { message?: unknown }).message === 'string'
+          ? (err as { message: string }).message
+          : String(err);
     const failureCode = classifyEarlyFailureStopReason(err, message);
     const formalCode =
       err &&
@@ -2653,11 +2932,11 @@ async function runStepWithContext(
     // Always terminalize when we own a unit context (including post-begin stamp
     // failure) so durable state is not left running without a finishUnit.
     if (options.unitContext && options.endUnit) {
-      return finalizeTerminalResult(failure, 'failed');
+      return await finalizeTerminalResult(failure, 'failed');
     }
     if (beganUnit) throw err;
     // Compact even non-durable early failures so raw transcripts never escape.
-    return finalizeTerminalResult(failure, 'failed');
+    return await finalizeTerminalResult(failure, 'failed');
   } finally {
     const profilePath = await stopProfile();
     if (profilePath) {

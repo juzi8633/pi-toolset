@@ -9,6 +9,8 @@ import {
   PI_AGENT_DEPTH,
   PI_AGENT_MAX_DEPTH,
   PI_AGENT_TOOL_AVAILABLE,
+  PI_AGENTS_RUN_ARTIFACT_DIR,
+  PI_AGENTS_RUN_ID,
 } from './constants.ts';
 
 type EnvLike = NodeJS.ProcessEnv | Record<string, string | undefined>;
@@ -76,6 +78,9 @@ export function assertDepthAllowed(env: EnvLike): void {
 
 export interface ChildEnvOptions {
   agent?: AgentConfig;
+  /** When set with runArtifactDir, inject private artifact-reader env for the child. */
+  runId?: string;
+  runArtifactDir?: string;
 }
 
 export function buildChildAgentEnv(
@@ -95,23 +100,36 @@ export function buildChildAgentEnv(
     parentAllowsDelegation &&
     childDepth < cappedMax &&
     (agent ? agentToolAllowedByConfig(agent) : true);
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...parentEnv,
     [PI_AGENT_CHILD]: '1',
     [PI_AGENT_DEPTH]: String(childDepth),
     [PI_AGENT_MAX_DEPTH]: String(cappedMax),
     [PI_AGENT_TOOL_AVAILABLE]: childCanDelegate ? '1' : '0',
-  } as NodeJS.ProcessEnv;
+  };
+  if (options.runId && options.runArtifactDir) {
+    env[PI_AGENTS_RUN_ID] = options.runId;
+    env[PI_AGENTS_RUN_ARTIFACT_DIR] = options.runArtifactDir;
+  }
+  return env;
 }
 
 export interface ToolCliArgsOptions {
   disableAgentTool?: boolean;
+  /** Force-include the dedicated child artifact reader when a handoff requires it. */
+  requireArtifactReader?: boolean;
 }
+
+const ARTIFACT_READER_TOOL = 'pi_agents_read_artifact';
 
 export function buildToolCliArgs(agent: AgentConfig, options: ToolCliArgsOptions = {}): string[] {
   const args: string[] = [];
   if (agent.tools && agent.tools.length > 0) {
-    args.push('--tools', agent.tools.join(','));
+    const tools = [...agent.tools];
+    if (options.requireArtifactReader && !tools.includes(ARTIFACT_READER_TOOL)) {
+      tools.push(ARTIFACT_READER_TOOL);
+    }
+    args.push('--tools', tools.join(','));
   }
   const excludes = agent.excludeTools ? [...agent.excludeTools] : [];
   if (options.disableAgentTool) {
@@ -120,6 +138,12 @@ export function buildToolCliArgs(agent: AgentConfig, options: ToolCliArgsOptions
     // the tool name Pi exposes.
     const filtered = excludes.filter((name) => !isAgentToolName(name));
     filtered.push(AGENT_TOOL_NAME);
+    excludes.length = 0;
+    excludes.push(...filtered);
+  }
+  if (options.requireArtifactReader) {
+    // Only remove the dedicated reader from excludes; do not broaden other tools.
+    const filtered = excludes.filter((name) => name !== ARTIFACT_READER_TOOL);
     excludes.length = 0;
     excludes.push(...filtered);
   }

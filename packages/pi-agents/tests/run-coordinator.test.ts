@@ -430,7 +430,9 @@ function fakeStore(opts: FakeStoreOptions): RunStore & {
         : { ok: false, error: { code: 'run_not_found' as const, runId, message: 'nope' } };
     }) as RunStore['getRun'],
     updateRun,
+    updateRunStrict: updateRun,
     appendEvent: async () => {},
+    appendEventStrict: async () => {},
     listRuns: async () => [],
     claimRun: (() =>
       Promise.resolve({ ok: true, claimId: 'c', ticket: 1 } as const)) as RunStore['claimRun'],
@@ -515,7 +517,7 @@ describe('createRunCoordinator persistence and attempts', () => {
       stderr: '',
       usage: emptyUsage(),
     };
-    coord.startUnit('run-1', ctx(), result);
+    await coord.startUnit('run-1', ctx(), result);
     await store.flushes();
     expect(result.runId).toBe('run-1');
     expect(result.status).toBe('running');
@@ -567,7 +569,7 @@ describe('createRunCoordinator persistence and attempts', () => {
       usage: emptyUsage(),
       stopReason: 'end',
     };
-    coord.finishUnit('run-1', ctx(), result, 'completed');
+    await coord.finishUnit('run-1', ctx(), result, 'completed');
     await store.flushes();
     const stored = store.records.get('run-1')!;
     const unit = stored.units['single']!;
@@ -635,7 +637,7 @@ describe('createRunCoordinator persistence and attempts', () => {
       usage: emptyUsage(),
       finalOutput: 'final answer',
     };
-    coord.finishUnit('run-compact', ctx({ runId: 'run-compact' }), result, 'completed');
+    await coord.finishUnit('run-compact', ctx({ runId: 'run-compact' }), result, 'completed');
     await store.flushes();
 
     expect(result.messages).toHaveLength(2);
@@ -719,7 +721,7 @@ describe('createRunCoordinator persistence and attempts', () => {
     store.records.set('run-4mib', record);
     const coord = createRunCoordinator({ store: store as never });
     coord.registerRun('run-4mib', record);
-    coord.finishUnit(
+    await coord.finishUnit(
       'run-4mib',
       {
         runId: 'run-4mib',
@@ -813,7 +815,7 @@ describe('createRunCoordinator persistence and attempts', () => {
     expect(realWrites).toBe(1);
   });
 
-  it('finalizeRun flushes terminal state and unregisters the run', async () => {
+  it('finalizeRun strictly persists terminal status and returns it without unregistering', async () => {
     let t = 100;
     const store = fakeStore({ now: () => t });
     const record: AgentRunRecordV1 = {
@@ -857,7 +859,8 @@ describe('createRunCoordinator persistence and attempts', () => {
     const stored = store.records.get('run-1')!;
     expect(stored.status).toBe('completed');
     expect(stored.finishedAt).toBe(t);
-    expect(coord.isActive('run-1')).toBe(false);
+    // finalizeRun must NOT unregister; the shared terminal barrier owns that.
+    expect(coord.isActive('run-1')).toBe(true);
   });
 
   it('finalizeRun marks interrupted when interrupted=true', async () => {
@@ -896,6 +899,99 @@ describe('createRunCoordinator persistence and attempts', () => {
     await store.flushes();
     const stored = store.records.get('run-1')!;
     expect(stored.status).toBe('interrupted');
+  });
+
+  it('finalizeRun rejects on strict run.json failure without unregistering or falling back', async () => {
+    let t = 100;
+    const base = fakeStore({ now: () => t });
+    const record: AgentRunRecordV1 = {
+      version: 1,
+      runId: 'run-1',
+      mode: 'single',
+      status: 'running',
+      request: { mode: 'single', agentScope: 'both', agent: 'noop', task: '' },
+      background: false,
+      agentScope: 'both',
+      createdAt: 0,
+      updatedAt: 0,
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: '',
+          runtime: undefined,
+          capability: 'session',
+          status: 'completed',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/cwd',
+        },
+      },
+      eventsFile: 'events.jsonl',
+    };
+    base.records.set('run-1', record);
+    const store: typeof base = {
+      ...base,
+      updateRunStrict: async () => {
+        throw new Error('strict write failed');
+      },
+    };
+    const coord = createRunCoordinator({ store, now: () => t, coalesceMs: 1000 });
+    coord.registerRun('run-1', record);
+    await expect(
+      coord.finalizeRun('run-1', emptyDetails(), record.units, { success: true })
+    ).rejects.toThrow('strict write failed');
+    // No best-effort fallback mutated the record; run stays registered for the
+    // shared barrier to abandon.
+    expect(coord.isActive('run-1')).toBe(true);
+    const stored = store.records.get('run-1')!;
+    expect(stored.status).toBe('running');
+  });
+
+  it('finalizeRun inactive path rejects on strict failure without best-effort fallback', async () => {
+    let t = 100;
+    const base = fakeStore({ now: () => t });
+    const record: AgentRunRecordV1 = {
+      version: 1,
+      runId: 'run-1',
+      mode: 'single',
+      status: 'running',
+      request: { mode: 'single', agentScope: 'both', agent: 'noop', task: '' },
+      background: false,
+      agentScope: 'both',
+      createdAt: 0,
+      updatedAt: 0,
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: '',
+          runtime: undefined,
+          capability: 'session',
+          status: 'completed',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: '/cwd',
+        },
+      },
+      eventsFile: 'events.jsonl',
+    };
+    base.records.set('run-1', record);
+    const store: typeof base = {
+      ...base,
+      updateRunStrict: async () => {
+        throw new Error('strict write failed');
+      },
+    };
+    const coord = createRunCoordinator({ store, now: () => t, coalesceMs: 1000 });
+    // Not registered: inactive path.
+    await expect(
+      coord.finalizeRun('run-1', emptyDetails(), record.units, { success: true })
+    ).rejects.toThrow('strict write failed');
+    const stored = store.records.get('run-1')!;
+    expect(stored.status).toBe('running');
   });
 });
 
@@ -4545,7 +4641,7 @@ describe('persistSessionFile', () => {
       expect(live.units.single.sessionFile).toBe('/sessions/kept.jsonl');
 
       // ctx without sessionFile must not clear the durable path on live.
-      coord.startUnit(runId, {
+      await coord.startUnit(runId, {
         runId,
         unitId: 'single',
         agent: 'tester',
@@ -4614,7 +4710,7 @@ describe('persistSessionFile', () => {
         usage: emptyUsage(),
       };
       // ctx omits sessionFile — terminal result must still carry the unit path.
-      coord.finishUnit(
+      await coord.finishUnit(
         runId,
         {
           runId,
@@ -4674,7 +4770,7 @@ describe('persistSessionFile', () => {
       const live = structuredClone(seeded.loaded.record);
       coord.registerRun(runId, live);
 
-      coord.startUnit(runId, {
+      await coord.startUnit(runId, {
         runId,
         unitId: 'single',
         agent: 'tester',
@@ -4756,7 +4852,7 @@ describe('persistSessionFile', () => {
       acpSessionId: 'stale-acp',
       resumeCapability: 'session',
     };
-    coord.finishUnit('run-stale-clear', ctx, result, 'completed');
+    await coord.finishUnit('run-stale-clear', ctx, result, 'completed');
     // Caller object remains as supplied; private stored shell clears identity.
     expect(result.sessionFile).toBe('/sessions/stale.jsonl');
     expect(result.acpSessionId).toBe('stale-acp');
@@ -4827,7 +4923,7 @@ describe('persistSessionFile', () => {
       acpSessionId: 'stale-acp',
       resumeCapability: 'session',
     };
-    coord.finishUnit('run-stale-replace', ctx, result, 'completed');
+    await coord.finishUnit('run-stale-replace', ctx, result, 'completed');
     // Caller object remains as supplied; private stored shell gets canonical identity.
     expect(result.sessionFile).toBe('/sessions/stale.jsonl');
     expect(result.acpSessionId).toBe('stale-acp');
@@ -4901,7 +4997,7 @@ describe('persistSessionFile', () => {
       );
       for (let index = 0; index < expansion.unitIds.length; index++) {
         const unitId = expansion.unitIds[index]!;
-        coord.startUnit(runId, {
+        await coord.startUnit(runId, {
           runId,
           unitId,
           agent: 'worker',
@@ -4917,7 +5013,7 @@ describe('persistSessionFile', () => {
       for (const index of [1, 2, 0]) {
         const unitId = expansion.unitIds[index]!;
         const sessionFile = `/sessions/${unitId}.jsonl`;
-        coord.finishUnit(
+        await coord.finishUnit(
           runId,
           {
             runId,
@@ -5812,6 +5908,195 @@ describe('expandFanout identity-matched mirror preserves mutable payload', () =>
           expansionA
         );
       }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('startUnit disk-first strict failures', () => {
+  async function createQueuedRun(
+    root: string,
+    storeOptions?: Omit<import('../src/run-store.ts').CreateRunStoreOptions, 'rootDir'>
+  ): Promise<{
+    store: ReturnType<typeof createRunStore>;
+    coord: ReturnType<typeof createRunCoordinator>;
+    runId: string;
+    live: AgentRunRecordV1;
+  }> {
+    const store = createRunStore({ rootDir: root, ...storeOptions });
+    const coord = createRunCoordinator({ store });
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'noop', task: 't' },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: '',
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const live = structuredClone(record);
+    coord.registerRun(runId, live);
+    return { store, coord, runId, live };
+  }
+
+  function readEvents(store: ReturnType<typeof createRunStore>, runId: string): unknown[] {
+    const eventsFile = path.join(store.getRunDir(runId), 'events.jsonl');
+    if (!fs.existsSync(eventsFile)) return [];
+    return fs
+      .readFileSync(eventsFile, 'utf8')
+      .split('\n')
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as unknown);
+  }
+
+  it('strict write rejection leaves durable/live queued, no unit_started, propagates error', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-strict-start-write-'));
+    try {
+      const { store, coord, runId, live } = await createQueuedRun(root);
+      const realStrict = store.updateRunStrict.bind(store);
+      store.updateRunStrict = async () => {
+        throw new Error('strict write failed');
+      };
+
+      await expect(
+        coord.startUnit(runId, {
+          runId,
+          unitId: 'single',
+          agent: 'noop',
+          runtime: undefined,
+          resumeCapability: 'session',
+          effectiveCwd: root,
+          attempt: 1,
+          requireArtifactReader: true,
+        })
+      ).rejects.toThrow('strict write failed');
+
+      // Live must remain queued with no reader flag and no running attempt.
+      expect(live.units.single.status).toBe('queued');
+      expect(live.units.single.unitId).toBe('single');
+      expect(live.units.single.agent).toBe('noop');
+      expect(live.units.single.requireArtifactReader).toBeUndefined();
+      expect(live.units.single.attempts).toHaveLength(0);
+      expect(live.units.single.attempt).toBe(1);
+
+      // Durable record unchanged.
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+      if (!loaded.ok) return;
+      expect(loaded.loaded.record.units.single.status).toBe('queued');
+      expect(loaded.loaded.record.units.single.requireArtifactReader).toBeUndefined();
+      expect(loaded.loaded.record.units.single.attempts).toHaveLength(0);
+
+      // No unit_started event.
+      const events = readEvents(store, runId);
+      expect(events.some((e) => (e as { event?: string }).event === 'unit_started')).toBe(false);
+
+      // Restore for cleanup.
+      store.updateRunStrict = realStrict;
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('directory-sync rejection leaves durable/live queued, no unit_started, propagates error', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-strict-start-sync-'));
+    try {
+      let postRenameHits = 0;
+      const beforeCreate = await createQueuedRun(root);
+      const beforePath = path.join(beforeCreate.store.getRunDir(beforeCreate.runId), 'run.json');
+      const beforeBytes = fs.readFileSync(beforePath);
+      // Rebuild store with one-shot post-rename directory-sync fault so the real
+      // updateRunStrict rollback path runs (not a mock of updateRunStrict).
+      const store = createRunStore({
+        rootDir: root,
+        strictPostRenameDirectorySync: () => {
+          postRenameHits += 1;
+          throw {
+            code: 'run_store_error' as const,
+            message: 'directory fsync failed: injected',
+          };
+        },
+      });
+      const coord = createRunCoordinator({ store });
+      const loadedBefore = store.getRun(beforeCreate.runId);
+      expect(loadedBefore.ok).toBe(true);
+      if (!loadedBefore.ok) return;
+      const live = structuredClone(loadedBefore.loaded.record);
+      coord.registerRun(beforeCreate.runId, live);
+      const runId = beforeCreate.runId;
+
+      await expect(
+        coord.startUnit(runId, {
+          runId,
+          unitId: 'single',
+          agent: 'noop',
+          runtime: undefined,
+          resumeCapability: 'session',
+          effectiveCwd: root,
+          attempt: 1,
+          requireArtifactReader: true,
+        })
+      ).rejects.toMatchObject({
+        code: 'run_store_error',
+        message: expect.stringMatching(/directory fsync failed.*prior run\.json restored/),
+      });
+
+      expect(postRenameHits).toBe(1);
+      expect(fs.readFileSync(beforePath).equals(beforeBytes)).toBe(true);
+
+      expect(live.units.single.status).toBe('queued');
+      expect(live.units.single.requireArtifactReader).toBeUndefined();
+      expect(live.units.single.attempts).toHaveLength(0);
+
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+      if (!loaded.ok) return;
+      expect(loaded.loaded.record.units.single.status).toBe('queued');
+      expect(loaded.loaded.record.units.single.requireArtifactReader).toBeUndefined();
+      expect(loaded.loaded.record.units.single.attempts).toHaveLength(0);
+
+      const events = readEvents(store, runId);
+      expect(events.some((e) => (e as { event?: string }).event === 'unit_started')).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('successful startUnit with requireArtifactReader publishes disk then live+event', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-strict-start-ok-'));
+    try {
+      const { store, coord, runId, live } = await createQueuedRun(root);
+      await coord.startUnit(runId, {
+        runId,
+        unitId: 'single',
+        agent: 'noop',
+        runtime: undefined,
+        resumeCapability: 'session',
+        effectiveCwd: root,
+        attempt: 1,
+        requireArtifactReader: true,
+      });
+      expect(live.units.single.status).toBe('running');
+      expect(live.units.single.requireArtifactReader).toBe(true);
+      const loaded = store.getRun(runId);
+      expect(loaded.ok).toBe(true);
+      if (!loaded.ok) return;
+      expect(loaded.loaded.record.units.single.status).toBe('running');
+      expect(loaded.loaded.record.units.single.requireArtifactReader).toBe(true);
+      const events = readEvents(store, runId);
+      expect(events.some((e) => (e as { event?: string }).event === 'unit_started')).toBe(true);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

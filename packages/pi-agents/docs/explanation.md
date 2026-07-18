@@ -350,3 +350,9 @@ Messages sent before the original activation settles contribute to the unit's du
 ### Why worktrees are retained
 
 Interactive reattach needs a stable effective cwd. Automatic cleanup of a clean worktree after a successful unit would break later interactive prompts and lazy reopen. Version 1 prioritizes continuity and documents manual cleanup and disk growth instead of silent pruning.
+
+## Control-plane RPC projection and artifact authority
+
+Pi RPC stdout is a control plane, not a second transcript. Ordinary records stay fail-closed at 8 MiB. Only exact-prefix Pi 0.80.9 replayable events may use the 64 MiB projectable budget; their large payloads are omitted from listener delivery and rehydrated from the native session file at settle time. Compact `agent_end` alone never settles an activation — `agent_settled` remains the terminal signal.
+
+Oversized terminal workflow results are externalized into immutable content-addressed run artifacts before strict `run.json` / event publication. Parent and relay consumers observe refs only after artifacts exist. Child agents do not gain general filesystem tools; when a handoff requires it, they receive only `pi_agents_read_artifact` plus private run-scoped env.

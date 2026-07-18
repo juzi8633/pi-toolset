@@ -18,6 +18,7 @@ import {
   applyTerminalStatus,
   getResultFinalOutput,
   getResultOutput,
+  getResultParentOutput,
   isFailedResult,
   resolveExecutionStatus,
 } from './output.ts';
@@ -31,6 +32,7 @@ import {
 } from './structured-output.ts';
 import { emptyUsage } from './empty-usage.ts';
 import { renderTaskTemplate } from './template.ts';
+import { formatChildArtifactDescriptor } from './result-payload.ts';
 import { copySnapshotShell, snapshotSingleResult } from './result-snapshot.ts';
 import {
   cloneSingleResult,
@@ -76,6 +78,8 @@ export interface ChainStepRequest {
    * Callers that ignore it still get the same result via the chain-side call.
    */
   postprocessTerminal?: (result: SingleResult) => void;
+  /** When true, the Pi child needs the dedicated artifact reader for handoffs. */
+  requireArtifactReader?: boolean;
 }
 
 export type ChainRunStep = (req: ChainStepRequest) => Promise<SingleResult>;
@@ -109,6 +113,24 @@ export interface RunChainWorkflowOptions {
    * any worker is scheduled. Must not receive RunStore/RunCoordinator.
    */
   onFanoutExpand?: (req: FanoutExpandRequest) => Promise<WorkflowFanoutState | void>;
+  /** Trusted artifact resolver for structured refs (production workflow path only). */
+  resolveArtifact?: (ref: import('./run-types.ts').RunArtifactRefV1) => Promise<unknown>;
+  /**
+   * Optional awaited Chain-output externalizer. Spills oversized collected
+   * text/structured values to run artifacts before they enter details.outputs
+   * or later {previous}/named outputs. Returns inline values or verified refs.
+   */
+  externalizeChainOutput?: ChainOutputExternalizer;
+}
+
+/** Spills oversized Chain collect text/structured values into run artifacts. */
+export interface ChainOutputExternalizer {
+  text?: (
+    text: string
+  ) => Promise<{ text?: string; textRef?: import('./run-types.ts').RunArtifactRefV1 }>;
+  json?: (
+    value: unknown
+  ) => Promise<{ value?: unknown; valueRef?: import('./run-types.ts').RunArtifactRefV1 }>;
 }
 
 export type ChainResult = AgentToolResult<SubagentDetails> & { isError?: boolean };
@@ -230,11 +252,41 @@ function hasEmptyFanoutCompletionEvidence(
 /** Copy an output entry and isolate structured payload from shared mutable sources. */
 function isolateOutputEntry(entry: ChainOutputEntry): ChainOutputEntry {
   return {
-    text: entry.text,
-    structured: entry.structured !== undefined ? structuredClone(entry.structured) : undefined,
+    ...(entry.text !== undefined ? { text: entry.text } : {}),
+    ...(entry.textRef ? { textRef: { ...entry.textRef } } : {}),
+    ...(entry.structured !== undefined ? { structured: structuredClone(entry.structured) } : {}),
+    ...(entry.structuredRef ? { structuredRef: { ...entry.structuredRef } } : {}),
     agent: entry.agent,
     step: entry.step,
   };
+}
+
+/** Build chain previous/named output from a terminal unit result (inline or ref). */
+function chainOutputFromResult(
+  result: SingleResult,
+  agent: string,
+  step: number
+): ChainOutputEntry {
+  const entry: ChainOutputEntry = { agent, step };
+  if (result.finalOutputRef)
+    entry.textRef = { ...result.finalOutputRef, payload: 'chain-output-text' };
+  else entry.text = getResultFinalOutput(result);
+  if (result.structuredOutputRef) {
+    entry.structuredRef = { ...result.structuredOutputRef, payload: 'chain-output-structured' };
+  } else if (result.structuredOutput !== undefined) {
+    entry.structured = result.structuredOutput;
+  }
+  return entry;
+}
+
+function previousTextFromResult(result: SingleResult): string {
+  if (result.finalOutputRef) {
+    return formatChildArtifactDescriptor({
+      ...result.finalOutputRef,
+      payload: 'chain-output-text',
+    });
+  }
+  return getResultFinalOutput(result);
 }
 
 /**
@@ -394,22 +446,15 @@ function rehydrateCompletedSequentialFromDurable(
     if (existing !== undefined && existing.step > stepNumber) continue;
     outputs.set(
       sequential.name,
-      isolateOutputEntry({
-        text: resultText(durableResult),
-        structured:
-          durableResult.structuredOutput !== undefined
-            ? structuredClone(durableResult.structuredOutput)
-            : undefined,
-        agent: sequential.agent,
-        step: stepNumber,
-      })
+      isolateOutputEntry(chainOutputFromResult(durableResult, sequential.agent, stepNumber))
     );
   }
 }
 
 /**
- * Previous-output text for a completed logical step: presentation result first
- * when present, else durable sequential unit result, else fanout collect output.
+ * Previous-output text for a completed logical step.
+ * Fanout: collect output is authoritative; never select a single child result.
+ * Sequential: presentation result first, else durable unit result.
  */
 function completedStepPreviousOutput(
   logical: ChainLogicalStep,
@@ -418,7 +463,14 @@ function completedStepPreviousOutput(
   units: Record<string, RunUnitRecord> | undefined
 ): string | undefined {
   const stepNumber = logical.step;
-  const stepResults = results.filter((r) => r.step === stepNumber);
+
+  if (logical.kind === 'fanout') {
+    const entry = outputs.get(logical.collectName);
+    if (entry) return entry.text ?? '';
+    return undefined;
+  }
+
+  const stepResults = results.filter((r) => r.step === stepNumber && r.fanout === undefined);
   const last = stepResults[stepResults.length - 1];
   if (last) return resultText(last);
 
@@ -427,17 +479,58 @@ function completedStepPreviousOutput(
     if (durableResult) return resultText(durableResult);
   }
 
+  return undefined;
+}
+
+/**
+ * Previous-output textRef for a completed logical step, when its authority is a
+ * spilled text artifact.
+ * Fanout: collect textRef is authoritative; never select a single child ref.
+ * Sequential: presentation result first, else durable unit result.
+ */
+function completedStepPreviousRef(
+  logical: ChainLogicalStep,
+  results: SingleResult[],
+  outputs: Map<string, ChainOutputEntry>,
+  units: Record<string, RunUnitRecord> | undefined
+): ChainOutputEntry['textRef'] | undefined {
+  const stepNumber = logical.step;
+
   if (logical.kind === 'fanout') {
     const entry = outputs.get(logical.collectName);
-    if (entry) return entry.text;
+    if (entry?.textRef) return { ...entry.textRef };
+    return undefined;
+  }
+
+  const stepResults = results.filter((r) => r.step === stepNumber && r.fanout === undefined);
+  const last = stepResults[stepResults.length - 1];
+  if (last?.finalOutputRef) {
+    return { ...last.finalOutputRef, payload: 'chain-output-text' };
+  }
+  if (logical.kind === 'sequential' && units) {
+    const durableResult = durableCompletedSequentialResult(units, stepNumber);
+    if (durableResult?.finalOutputRef) {
+      return { ...durableResult.finalOutputRef, payload: 'chain-output-text' };
+    }
   }
   return undefined;
 }
 
 export async function runChainWorkflow(options: RunChainWorkflowOptions): Promise<ChainResult> {
-  const { chain, signal, onUpdate, makeDetails, runStep, restored, onFanoutExpand } = options;
+  const {
+    chain,
+    signal,
+    onUpdate,
+    makeDetails,
+    runStep,
+    restored,
+    onFanoutExpand,
+    resolveArtifact,
+    externalizeChainOutput,
+  } = options;
   let results: SingleResult[];
   let previousOutput = '';
+  let previousRef: ChainOutputEntry['textRef'] | undefined;
   const outputs = new Map<string, ChainOutputEntry>();
   let logicalSteps: ChainLogicalStep[];
 
@@ -459,12 +552,14 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
       restored.fanouts,
       Object.fromEntries(outputs)
     );
-    // Recompute previousOutput from the last completed sequential/fanout step.
+    // Recompute previousOutput/previousRef from the last completed sequential/fanout step.
     for (let i = logicalSteps.length - 1; i >= 0; i--) {
       const logical = logicalSteps[i];
       if (logical?.status === 'completed') {
         const text = completedStepPreviousOutput(logical, results, outputs, restored.units);
         if (text !== undefined) previousOutput = text;
+        const ref = completedStepPreviousRef(logical, results, outputs, restored.units);
+        previousRef = ref;
         break;
       }
     }
@@ -535,6 +630,7 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
       if (logical.status === 'completed') {
         const text = completedStepPreviousOutput(logical, results, outputs, restored?.units);
         if (text !== undefined) previousOutput = text;
+        previousRef = completedStepPreviousRef(logical, results, outputs, restored?.units);
         continue;
       }
       // Reset non-completed steps to queued for retry.
@@ -550,6 +646,7 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
           results,
           outputs,
           previousOutput,
+          previousRef,
           signal,
           onUpdate,
           makeDetails,
@@ -560,9 +657,12 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
           emit,
           restored,
           onFanoutExpand,
+          resolveArtifact,
+          externalizeChainOutput,
         });
         if (fanout.done) return fanout.result;
         previousOutput = fanout.previousOutput;
+        previousRef = fanout.previousRef;
         continue;
       }
 
@@ -595,6 +695,7 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
         results,
         outputs,
         previousOutput,
+        previousRef,
         signal,
         onUpdate,
         makeDetails,
@@ -604,9 +705,11 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
         buildDetails,
         emit,
         restored,
+        externalizeChainOutput,
       });
       if (sequential.done) return sequential.result;
       previousOutput = sequential.previousOutput;
+      previousRef = sequential.previousRef;
     }
 
     return {
@@ -616,9 +719,8 @@ export async function runChainWorkflow(options: RunChainWorkflowOptions): Promis
           text:
             previousOutput ||
             (results[results.length - 1]
-              ? getResultFinalOutput(results[results.length - 1]!)
-              : '') ||
-            '(no output)',
+              ? getResultParentOutput(results[results.length - 1]!)
+              : '(no output)'),
         },
       ],
       details: buildDetails(),
@@ -716,6 +818,7 @@ interface StepShared {
   results: SingleResult[];
   outputs: Map<string, ChainOutputEntry>;
   previousOutput: string;
+  previousRef?: ChainOutputEntry['textRef'];
   signal: AbortSignal | undefined;
   onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined;
   makeDetails: DetailsFactory;
@@ -726,6 +829,8 @@ interface StepShared {
   emit: (content: string) => void;
   restored?: RestoredChainState;
   onFanoutExpand?: (req: FanoutExpandRequest) => Promise<WorkflowFanoutState | void>;
+  resolveArtifact?: (ref: import('./run-types.ts').RunArtifactRefV1) => Promise<unknown>;
+  externalizeChainOutput?: ChainOutputExternalizer;
 }
 
 async function runSequentialStep(
@@ -735,7 +840,10 @@ async function runSequentialStep(
     stepIndex: number;
     taskIndex: number;
   }
-): Promise<{ done: false; previousOutput: string } | { done: true; result: ChainResult }> {
+): Promise<
+  | { done: false; previousOutput: string; previousRef?: ChainOutputEntry['textRef'] }
+  | { done: true; result: ChainResult }
+> {
   const {
     step,
     stepNumber,
@@ -752,7 +860,11 @@ async function runSequentialStep(
   logicalSteps[stepIndex].status = 'running';
   emit(`Chain step ${stepNumber}/${logicalSteps.length} running...`);
 
-  const rendered = renderTaskTemplate(step.task, { previous: previousOutput, outputs });
+  const rendered = renderTaskTemplate(step.task, {
+    previous: previousOutput,
+    outputs,
+    ...(opts.previousRef ? { previousRef: opts.previousRef } : {}),
+  });
   if (!rendered.ok) {
     const failure = synthesizeFailure(
       step.agent,
@@ -837,6 +949,7 @@ async function runSequentialStep(
       onUpdate: chainUpdate,
       skipCompletionCheck: outputSchema !== undefined,
       postprocessTerminal,
+      ...(rendered.requiresArtifactReader ? { requireArtifactReader: true } : {}),
     });
     if (!terminalPostprocessed) {
       // Injected runStep stubs that ignore postprocessTerminal get exactly one fallback.
@@ -923,24 +1036,28 @@ async function runSequentialStep(
   }
 
   logicalSteps[stepIndex].status = 'completed';
-  const nextPreviousOutput = getResultFinalOutput(result);
+  const nextPreviousOutput = previousTextFromResult(result);
   if (step.name) {
     outputs.set(
       step.name,
-      isolateOutputEntry({
-        text: nextPreviousOutput,
-        structured: result.structuredOutput,
-        agent: step.agent,
-        step: stepNumber,
-      })
+      isolateOutputEntry(chainOutputFromResult(result, step.agent, stepNumber))
     );
   }
-  return { done: false, previousOutput: nextPreviousOutput };
+  return {
+    done: false,
+    previousOutput: nextPreviousOutput,
+    ...(result.finalOutputRef
+      ? { previousRef: { ...result.finalOutputRef, payload: 'chain-output-text' as const } }
+      : {}),
+  };
 }
 
 async function runFanoutStep(
   opts: StepShared & { step: FanoutStep; stepNumber: number; stepIndex: number }
-): Promise<{ done: false; previousOutput: string } | { done: true; result: ChainResult }> {
+): Promise<
+  | { done: false; previousOutput: string; previousRef?: ChainOutputEntry['textRef'] }
+  | { done: true; result: ChainResult }
+> {
   const {
     step,
     stepNumber,
@@ -969,19 +1086,46 @@ async function runFanoutStep(
 
   if (isRestoredExpansion) {
     // Authoritative stored expansion: do not re-read source or reapply maxItems.
-    items = restoredFanout.items;
+    items = restoredFanout.items ?? [];
     // Preserve the logical step's original skipped count when present.
     skipped = fanoutMeta.skippedCount ?? 0;
   } else {
     const outputName = step.expand.from.output;
     const outputEntry = outputs.get(outputName);
-    if (!outputEntry || outputEntry.structured === undefined) {
+    if (!outputEntry) {
       return fanoutFailure(
         opts,
         `Fanout source output "${outputName}" is missing structured output.`
       );
     }
-    const pointer = readJsonPointer(outputEntry.structured as JsonValue, step.expand.from.path);
+    // Resolve structuredRef before JSON Pointer use. Missing resolver, wrong
+    // media type, cross-run, missing, or corrupt refs must fail before dispatch.
+    let structured: unknown;
+    if (outputEntry.structured !== undefined) {
+      structured = outputEntry.structured;
+    } else if (outputEntry.structuredRef) {
+      if (!opts.resolveArtifact) {
+        return fanoutFailure(
+          opts,
+          `Fanout source output "${outputName}" has a structuredRef but no trusted resolver.`
+        );
+      }
+      try {
+        structured = await opts.resolveArtifact(outputEntry.structuredRef);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'structured ref resolution failed';
+        return fanoutFailure(
+          opts,
+          `Fanout source output "${outputName}" ref unreadable: ${message}`
+        );
+      }
+    } else {
+      return fanoutFailure(
+        opts,
+        `Fanout source output "${outputName}" is missing structured output.`
+      );
+    }
+    const pointer = readJsonPointer(structured as JsonValue, step.expand.from.path);
     if (!pointer.ok) return fanoutFailure(opts, pointer.error);
     if (!Array.isArray(pointer.value)) {
       return fanoutFailure(
@@ -1032,6 +1176,7 @@ async function runFanoutStep(
 
   // Render tasks for every scheduled item before expansion persistence / dispatch.
   const renderedTasks: string[] = [];
+  let fanoutRequiresArtifactReader = false;
   for (const item of items) {
     const rendered = renderTaskTemplate(step.parallel.task, {
       previous: previousOutput,
@@ -1041,6 +1186,7 @@ async function runFanoutStep(
     if (!rendered.ok) {
       return fanoutFailure(opts, `Unknown fanout template value: ${rendered.unknown}`);
     }
+    if (rendered.requiresArtifactReader) fanoutRequiresArtifactReader = true;
     renderedTasks.push(
       outputSchema
         ? `${rendered.text}\n\n${buildStructuredOutputInstruction(outputSchema)}`
@@ -1298,6 +1444,7 @@ async function runFanoutStep(
             onUpdate: itemUpdate,
             skipCompletionCheck: outputSchema !== undefined,
             postprocessTerminal,
+            ...(fanoutRequiresArtifactReader ? { requireArtifactReader: true } : {}),
           });
           if (fanoutTerminal || signal?.aborted) {
             // Worker finished after cancel: keep cancelled if we already marked it.
@@ -1406,28 +1553,102 @@ async function runFanoutStep(
   }
 
   fanoutMeta.status = 'completed';
-  const collected = slots.map(
-    (result) => (result.structuredOutput ?? getResultFinalOutput(result)) as JsonValue
-  );
+  // Resolve refs through the trusted resolver to get real authority values.
+  // Descriptors must not substitute for JSON/text authority in collect output.
+  const collected: JsonValue[] = [];
+  for (const result of slots) {
+    if (result.structuredOutputRef) {
+      if (!opts.resolveArtifact) {
+        return fanoutFailure(
+          opts,
+          `Fanout collect: item has structuredOutputRef but no trusted resolver available.`
+        );
+      }
+      try {
+        const resolved = await opts.resolveArtifact(result.structuredOutputRef);
+        collected.push(resolved as JsonValue);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'ref resolution failed';
+        return fanoutFailure(
+          opts,
+          `Fanout collect: failed to resolve structuredOutputRef: ${message}`
+        );
+      }
+    } else if (result.structuredOutput !== undefined) {
+      collected.push(result.structuredOutput as JsonValue);
+    } else if (result.finalOutputRef) {
+      if (!opts.resolveArtifact) {
+        return fanoutFailure(
+          opts,
+          `Fanout collect: item has finalOutputRef but no trusted resolver available.`
+        );
+      }
+      try {
+        const resolved = await opts.resolveArtifact(result.finalOutputRef);
+        collected.push(
+          typeof resolved === 'string' ? resolved : (JSON.stringify(resolved) as JsonValue)
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'ref resolution failed';
+        return fanoutFailure(opts, `Fanout collect: failed to resolve finalOutputRef: ${message}`);
+      }
+    } else {
+      collected.push(getResultFinalOutput(result) as JsonValue);
+    }
+  }
   const maxItemsNote =
     typeof step.expand.maxItems === 'number' ? Math.floor(step.expand.maxItems) : undefined;
-  const text = `${JSON.stringify(collected, null, 2)}${
+  // Append skipped-item notes to the authoritative text BEFORE externalization so
+  // a referenced collect never becomes an inline descriptor plus a trailing note.
+  const note =
     skipped > 0
       ? `\n\n[Fanout skipped ${skipped} item${skipped === 1 ? '' : 's'}${
           maxItemsNote !== undefined ? ` due to maxItems=${maxItemsNote}` : ''
         }]`
-      : ''
-  }`;
-  outputs.set(
-    step.collect.name,
-    isolateOutputEntry({
-      text,
-      structured: collected,
-      agent: step.parallel.agent,
-      step: stepNumber,
-    })
-  );
-  return { done: false, previousOutput: text };
+      : '';
+  const fullCollectedText = `${JSON.stringify(collected, null, 2)}${note}`;
+  const collectedStructured: unknown = collected;
+  // Keep full text/JSON in runtime variables until externalization returns; store
+  // returned refs in textRef/structuredRef, never in text/structured.
+  let textValue: string | undefined = fullCollectedText;
+  let textRef: import('./run-types.ts').RunArtifactRefV1 | undefined;
+  let structuredValue: unknown = collectedStructured;
+  let structuredRef: import('./run-types.ts').RunArtifactRefV1 | undefined;
+  if (opts.externalizeChainOutput) {
+    if (opts.externalizeChainOutput.text) {
+      const spilled = await opts.externalizeChainOutput.text(fullCollectedText);
+      if (spilled.textRef) {
+        textRef = spilled.textRef;
+        textValue = undefined;
+      } else if (spilled.text !== undefined) {
+        textValue = spilled.text;
+      }
+    }
+    if (opts.externalizeChainOutput.json) {
+      const spilled = await opts.externalizeChainOutput.json(collectedStructured);
+      if (spilled.valueRef) {
+        structuredRef = spilled.valueRef;
+        structuredValue = undefined;
+      } else if (spilled.value !== undefined) {
+        structuredValue = spilled.value;
+      }
+    }
+  }
+  // One ChainOutputEntry with strict unions: exactly one of text/textRef;
+  // structured data absent or exactly one of structured/structuredRef.
+  const entry: ChainOutputEntry = { agent: step.parallel.agent, step: stepNumber };
+  if (textRef) entry.textRef = textRef;
+  else entry.text = textValue;
+  if (structuredRef) entry.structuredRef = structuredRef;
+  else if (structuredValue !== undefined) entry.structured = structuredValue;
+  outputs.set(step.collect.name, isolateOutputEntry(entry));
+  // Previous handoff: inline final text or a child descriptor derived from textRef.
+  const handoffOutput = textRef ? formatChildArtifactDescriptor(textRef) : (textValue ?? '');
+  return {
+    done: false,
+    previousOutput: handoffOutput,
+    ...(textRef ? { previousRef: { ...textRef } } : {}),
+  };
 }
 
 function fanoutFailure(

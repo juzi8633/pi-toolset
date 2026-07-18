@@ -1,6 +1,27 @@
 // ABOUTME: Shared limits and caps for subagent execution and output rendering.
 // ABOUTME: Imported by execution, output, and tool orchestration modules.
 
+/** Ordinary Pi RPC stdout record budget (responses, UI, unknown, non-canonical). */
+export const MAX_STDOUT_RECORD_BYTES = 8 * 1024 * 1024;
+/** Canonical projectable Pi 0.80.9 replayable RPC record budget. */
+export const MAX_PROJECTABLE_RPC_RECORD_BYTES = 64 * 1024 * 1024;
+/** Bytes scanned while classifying an RPC record's top-level key prefix. */
+export const RPC_PREFIX_PROBE_BYTES = 512;
+/** Maximum JSON nesting depth accepted by the RPC record projector. */
+export const RPC_JSON_MAX_DEPTH = 256;
+/** Max UTF-8 bytes for projected shell identity fields (role/toolCallId/toolName). */
+export const RPC_PROJECTED_SHELL_FIELD_MAX_BYTES = 16 * 1024;
+/** Inline authoritative result payload budget before artifact spill. */
+export const RESULT_INLINE_PAYLOAD_MAX_BYTES = 256 * 1024;
+/** Maximum size of one immutable run-local artifact. */
+export const RUN_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024;
+/** Maximum artifact bytes returned per child reader call. */
+export const ARTIFACT_READER_CHUNK_MAX_BYTES = 48 * 1024;
+/** Private env: absolute run directory root for child artifact reads. */
+export const PI_AGENTS_RUN_ARTIFACT_DIR = 'PI_AGENTS_RUN_ARTIFACT_DIR';
+/** Private env: owning run id for child artifact reads. */
+export const PI_AGENTS_RUN_ID = 'PI_AGENTS_RUN_ID';
+
 export const MAX_PARALLEL_TASKS = 8;
 export const MAX_FANOUT_ITEMS = MAX_PARALLEL_TASKS;
 export const MAX_CONCURRENCY = 4;

@@ -467,3 +467,48 @@ When the original `agent` tool-call activation terminates interrupted/cancelled,
 - A new `tool_call` activation clears the gate.
 - The relay is scoped to the same host session and active branch; if the host session or branch changes first, no content is injected (a content-free notification may be recorded). The detail-panel send never blocks waiting for the relay — the relay coordinator observes settle independently in the registry/index lifecycle layer.
 - The relay is additive metadata; it never rewrites the original tool call or the durable interrupted result.
+
+## RPC projection and run artifacts
+
+### Pi RPC stdout budgets
+
+| Boundary                     |  Budget | Code / behavior                                                     |
+| ---------------------------- | ------: | ------------------------------------------------------------------- |
+| Ordinary RPC record          |   8 MiB | `stdout_overflow` — responses, UI, unknown, non-canonical           |
+| Canonical projectable record |  64 MiB | Exact Pi 0.80.9 prefix only; oversized payloads omitted             |
+| Shell identity field         |  16 KiB | Oversized `role` / `toolCallId` / `toolName` revokes projectability |
+| Inline result payload        | 256 KiB | Spill to artifacts before terminal publication                      |
+| Run artifact                 |  64 MiB | `artifact_too_large`                                                |
+| Child reader chunk           |  48 KiB | `pi_agents_read_artifact` per call                                  |
+
+Canonical projectable top-level key orders (Pi 0.80.9 runtime):
+
+- `agent_end`: type → messages → willRetry
+- `message_start` / `message_end`: type → message
+- `message_update`: type → assistantMessageEvent → message
+- `turn_end`: type → message → toolResults
+- `tool_execution_start`: type → toolCallId → toolName → args
+- `tool_execution_update`: type → toolCallId → toolName → args → partialResult
+- `tool_execution_end`: type → toolCallId → toolName → result → isError
+
+`get_messages` is rejected with `get_messages_disabled` before any request side effects. Authority for projected message/tool/turn shells is restored from the native session at `agent_settled` (`hydrate_error` on failure).
+
+### Additive Version 1 refs
+
+`SingleResult` may carry `finalOutput` **or** `finalOutputRef`, and `structuredOutput` **or** `structuredOutputRef`. Chain outputs use `text`/`textRef` and optional `structured`/`structuredRef`. Fanout mappings use `items` **or** `itemsRef`. Malformed both/neither unions fail as `corrupt_run`.
+
+Artifact paths: `artifacts/sha256/<first-two-hex>/<64-hex>.{txt,json}`.
+
+### Child reader
+
+```
+pi_agents_read_artifact({
+  runId: 'run-...',
+  sha256: '<64 lowercase hex>',
+  mediaType: 'text' | 'json',
+  offsetBytes: 0,
+  maxBytes: 49152
+})
+```
+
+Private env: `PI_AGENTS_RUN_ID`, `PI_AGENTS_RUN_ARTIFACT_DIR`. Errors: `artifact_unavailable`, `invalid_artifact_offset`.

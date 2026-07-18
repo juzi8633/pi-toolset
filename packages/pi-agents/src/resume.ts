@@ -164,8 +164,17 @@ function validateFanoutMapping(record: AgentRunRecordV1, key: string, mapping: u
     reasons.push(`stored_fanout_state_unavailable: ${key} invalid step ${String(raw.step)}`);
     return reasons;
   }
-  if (!Array.isArray(raw.items) || !Array.isArray(raw.unitIds)) {
-    reasons.push(`stored_fanout_state_unavailable: ${key} items/unitIds must be arrays`);
+  if (!Array.isArray(raw.unitIds)) {
+    reasons.push(`stored_fanout_state_unavailable: ${key} unitIds must be an array`);
+    return reasons;
+  }
+  const hasItems = Array.isArray(raw.items);
+  const hasItemsRef =
+    raw.itemsRef !== null && typeof raw.itemsRef === 'object' && !Array.isArray(raw.itemsRef);
+  if (hasItems === hasItemsRef) {
+    reasons.push(
+      `stored_fanout_state_unavailable: ${key} must set exactly one of items or itemsRef`
+    );
     return reasons;
   }
   // Only string unit ids participate in bijection checks; reject non-strings.
@@ -175,7 +184,9 @@ function validateFanoutMapping(record: AgentRunRecordV1, key: string, mapping: u
   }
 
   const step = raw.step;
-  const items = raw.items as unknown[];
+  // For itemsRef, item count is taken from unitIds (bijection); full content is
+  // re-verified at resolve time after claim.
+  const items = hasItems ? (raw.items as unknown[]) : new Array(raw.unitIds.length).fill(null);
   const unitIds = raw.unitIds as string[];
 
   // mapping.step must name an actual fanout entry in the stored request chain.
@@ -287,17 +298,164 @@ function validateFanoutMapping(record: AgentRunRecordV1, key: string, mapping: u
   return reasons;
 }
 
+/** Collect all reachable artifact refs that must be verified before resume. */
+function collectReachableRefs(
+  record: AgentRunRecordV1
+): Array<{ label: string; ref: import('./run-types.ts').RunArtifactRefV1 }> {
+  const refs: Array<{ label: string; ref: import('./run-types.ts').RunArtifactRefV1 }> = [];
+  for (const [id, unit] of Object.entries(record.units)) {
+    const r = unit.result;
+    if (r?.finalOutputRef) refs.push({ label: `unit ${id} finalOutputRef`, ref: r.finalOutputRef });
+    if (r?.structuredOutputRef)
+      refs.push({ label: `unit ${id} structuredOutputRef`, ref: r.structuredOutputRef });
+  }
+  for (const result of record.details.results) {
+    if (result.finalOutputRef)
+      refs.push({ label: `details result finalOutputRef`, ref: result.finalOutputRef });
+    if (result.structuredOutputRef)
+      refs.push({ label: `details result structuredOutputRef`, ref: result.structuredOutputRef });
+  }
+  if (record.details.outputs) {
+    for (const [name, entry] of Object.entries(record.details.outputs)) {
+      if (entry.textRef) refs.push({ label: `output ${name} textRef`, ref: entry.textRef });
+      if (entry.structuredRef)
+        refs.push({ label: `output ${name} structuredRef`, ref: entry.structuredRef });
+    }
+  }
+  for (const [key, mapping] of Object.entries(record.workflowState?.fanouts ?? {})) {
+    if (mapping.itemsRef) refs.push({ label: `fanout ${key} itemsRef`, ref: mapping.itemsRef });
+  }
+  return refs;
+}
+
+/** Verify all reachable artifact refs in a stored run record are readable. */
+async function verifyReachableRefs(
+  runId: string,
+  store: RunStore,
+  record: AgentRunRecordV1
+): Promise<string[]> {
+  const reasons: string[] = [];
+  const refs = collectReachableRefs(record);
+  for (const { label, ref } of refs) {
+    if (ref.runId !== runId) {
+      reasons.push(`stored_output_invalid: ${label} references run ${ref.runId} (cross-run)`);
+      continue;
+    }
+    try {
+      if (ref.mediaType === 'text/plain; charset=utf-8') {
+        await store.readTextArtifact(runId, ref);
+      } else if (ref.mediaType === 'application/json') {
+        await store.readJsonArtifact(runId, ref);
+      } else {
+        reasons.push(`stored_output_invalid: ${label} has unknown mediaType ${ref.mediaType}`);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'artifact unavailable';
+      reasons.push(`stored_output_invalid: ${label} unreadable: ${message}`);
+    }
+  }
+  return reasons;
+}
+
+/**
+ * Resolve every persisted fanout itemsRef against the store and verify it is an
+ * array whose length matches the frozen mapping unitIds. Returns resolved
+ * runtime-only items keyed by fanout step id, or blocking reasons on failure.
+ * Durable records retain itemsRef; hydration is never written back.
+ */
+export async function resolveAndVerifyFanoutItems(
+  runId: string,
+  store: RunStore,
+  record: AgentRunRecordV1
+): Promise<
+  | { ok: true; resolved: Record<string, { step: number; items: unknown[]; unitIds: string[] }> }
+  | { ok: false; reasons: string[] }
+> {
+  const fanouts = record.workflowState?.fanouts ?? {};
+  const resolved: Record<string, { step: number; items: unknown[]; unitIds: string[] }> = {};
+  const reasons: string[] = [];
+  for (const [key, mapping] of Object.entries(fanouts)) {
+    if (!mapping.itemsRef) {
+      // Inline items: verify length matches unitIds without re-reading.
+      const items = mapping.items ?? [];
+      if (!Array.isArray(items)) {
+        reasons.push(`stored_fanout_state_unavailable: ${key} items is not an array`);
+        continue;
+      }
+      if (items.length !== mapping.unitIds.length) {
+        reasons.push(
+          `stored_fanout_state_unavailable: ${key} items.length (${items.length}) !== unitIds.length (${mapping.unitIds.length})`
+        );
+        continue;
+      }
+      resolved[key] = {
+        step: mapping.step,
+        items: items.slice(),
+        unitIds: mapping.unitIds.slice(),
+      };
+      continue;
+    }
+    const ref = mapping.itemsRef;
+    if (ref.runId !== runId) {
+      reasons.push(
+        `stored_output_invalid: fanout ${key} itemsRef references run ${ref.runId} (cross-run)`
+      );
+      continue;
+    }
+    if (ref.mediaType !== 'application/json') {
+      reasons.push(`stored_output_invalid: fanout ${key} itemsRef has mediaType ${ref.mediaType}`);
+      continue;
+    }
+    let value: unknown;
+    try {
+      value = await store.readJsonArtifact(runId, ref);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'artifact unavailable';
+      reasons.push(`stored_output_invalid: fanout ${key} itemsRef unreadable: ${message}`);
+      continue;
+    }
+    if (!Array.isArray(value)) {
+      reasons.push(`stored_output_invalid: fanout ${key} itemsRef resolved to non-array`);
+      continue;
+    }
+    if (value.length !== mapping.unitIds.length) {
+      reasons.push(
+        `stored_output_invalid: fanout ${key} itemsRef length (${value.length}) !== unitIds.length (${mapping.unitIds.length})`
+      );
+      continue;
+    }
+    resolved[key] = { step: mapping.step, items: value, unitIds: mapping.unitIds.slice() };
+  }
+  if (reasons.length > 0) return { ok: false, reasons };
+  return { ok: true, resolved };
+}
+
 /** Inspect a stored run for resume eligibility without mutating it. */
-export function inspectResume(
+export async function inspectResume(
   runId: string,
   store: RunStore,
   options: InspectResumeOptions
-): InspectResumeResult {
+): Promise<InspectResumeResult> {
   const loaded = store.getRun(runId);
   if (!loaded.ok) {
     return { ok: false, runId, reason: `run_not_found: ${loaded.error.message}` };
   }
   const record = loaded.loaded.record;
+  return inspectResumeRecord(runId, record, store, options);
+}
+
+/**
+ * Verify a single in-hand record for resume eligibility without rereading run.json.
+ * Used for both the preflight load and the fresh post-claim record so a race
+ * that corrupts the run between preflight and claim fails safely on the exact
+ * object later consumed. Reads only artifact refs through the store.
+ */
+export async function inspectResumeRecord(
+  runId: string,
+  record: AgentRunRecordV1,
+  store: RunStore,
+  options: InspectResumeOptions
+): Promise<InspectResumeResult> {
   if (record.version !== 1) {
     return { ok: false, runId, reason: `unsupported_schema_version: ${record.version}` };
   }
@@ -331,6 +489,9 @@ export function inspectResume(
       requireCompletedFanoutMappings: fullyCompleted && Boolean(options.hasContinuation),
     })
   );
+
+  // Verify all reachable artifact refs are readable before claim.
+  blockingReasons.push(...(await verifyReachableRefs(runId, store, record)));
 
   for (const unit of resumeTargets) {
     // Verify effective cwd exists (worktree or original workspace).
@@ -484,7 +645,7 @@ export async function preflightAndClaim(
   const { store, coordinator, agents, hasContinuation } = options;
 
   // Read-only preflight.
-  const inspection = inspectResume(runId, store, { agents, hasContinuation });
+  const inspection = await inspectResume(runId, store, { agents, hasContinuation });
   if (!inspection.ok) return inspection;
   if (inspection.blockingReasons.length > 0) {
     return {

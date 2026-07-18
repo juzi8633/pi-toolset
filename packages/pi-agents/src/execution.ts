@@ -4,6 +4,7 @@
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { Readable } from 'node:stream';
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
@@ -33,6 +34,7 @@ import {
   buildPiArgs,
   buildSessionContinuationPrompt,
   getPiInvocation,
+  resolveArtifactReaderExtensionPath,
   writePromptToTempFile,
 } from './invocation.ts';
 import { applyTerminalStatus, getResultFinalOutput } from './output.ts';
@@ -48,7 +50,7 @@ import { ABORT_MESSAGE, AgentAbortError, isAbortError } from './abort.ts';
 import { emptyUsage } from './empty-usage.ts';
 import { runSingleAgentInteractive } from './interactive-execution.ts';
 import { runSingleAgentPiRpc } from './pi-rpc-execution.ts';
-import { snapshotSingleResult } from './result-snapshot.ts';
+import { snapshotProvisionalResult } from './result-snapshot.ts';
 import type { SingleResult, SubagentDetails } from './types.ts';
 import { createLatestValueCoalescer } from './update-coalescer.ts';
 
@@ -238,8 +240,8 @@ function emitRunningSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
-  const snapshot = snapshotSingleResult(currentResult);
+  // Provisional UI update — no authoritative inline/ref values while running.
+  const snapshot = snapshotProvisionalResult(currentResult);
   snapshot.status = 'running';
   onUpdate({
     content: [
@@ -258,8 +260,8 @@ function emitTerminalSnapshot(
   makeDetails: (results: SingleResult[]) => SubagentDetails
 ): void {
   if (!onUpdate) return;
-  // Provisional UI update — authoritative terminal/durable snapshot is produced by runStepWithContext.
-  const snapshot = snapshotSingleResult(currentResult);
+  // Low-level terminal callback remains provisional; durable authority is finishUnit.
+  const snapshot = snapshotProvisionalResult(currentResult);
   onUpdate({
     content: [
       {
@@ -465,13 +467,29 @@ export async function runSingleAgent(
       tmpPromptPath = tmp.filePath;
     }
 
-    const childEnv = buildChildAgentEnv(process.env, { agent: effectiveAgent });
+    const requireArtifactReader = options.unitContext?.requireArtifactReader === true;
+    const childEnv = buildChildAgentEnv(process.env, {
+      agent: effectiveAgent,
+      ...(requireArtifactReader && options.unitContext?.runId && options.unitContext?.sessionsDir
+        ? {
+            runId: options.unitContext.runId,
+            // sessionsDir is <runDir>/sessions — artifact root is the run dir.
+            runArtifactDir: path.dirname(options.unitContext.sessionsDir),
+          }
+        : {}),
+    });
     const disableAgentTool = !isAgentDelegationAllowed(childEnv);
     const args = buildPiArgs(effectiveAgent, invocationTask, {
       tmpPromptPath: tmpPromptPath ?? undefined,
       sessionFile: options.sessionFile,
       disableAgentTool,
       resolvedSkillPaths: options.resolvedSkillPaths,
+      ...(requireArtifactReader
+        ? {
+            requireArtifactReader: true,
+            artifactReaderExtensionPath: resolveArtifactReaderExtensionPath(),
+          }
+        : {}),
       ...(useSessionContinuation
         ? {
             prompt: {
