@@ -345,12 +345,16 @@ export function getDetectedRecipeServers(
  * which matters when the agent reports a missing language server for a file
  * type — navigation needs a primary, so the hint should drive the user toward
  * installing one.
+ *
+ * Recipes with `enabled: false` are skipped: a default-off companion like
+ * Tailwind must not become the install recommendation for `.md` / `.mdx`.
  */
 export function getRecipeHintForExtension(ext: string): string | undefined {
   if (!ext) return undefined;
   const normalized = ext.toLowerCase();
   let companionHint: string | undefined;
   for (const recipe of BUILTIN_RECIPES) {
+    if (recipe.enabled === false) continue;
     if (!recipe.extensionToLanguage[normalized]) continue;
     if ((recipe.role ?? 'primary') === 'primary') return recipe.installHint;
     if (companionHint === undefined) companionHint = recipe.installHint;

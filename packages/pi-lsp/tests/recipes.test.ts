@@ -209,6 +209,25 @@ describe('recipe hint helpers', () => {
     expect(hint!.toLowerCase().includes('eslint')).toBe(false);
   });
 
+  it('skips default-disabled companions so .md does not recommend Tailwind', () => {
+    expect(getRecipeHintForExtension('.md')).toBeUndefined();
+    expect(getRecipeHintForExtension('.mdx')).toBeUndefined();
+    expect(recipeCoversExtension('.md')).toBe(false);
+    expect(recipeCoversExtension('.mdx')).toBe(false);
+  });
+
+  it('still prefers the primary html/css recipes over disabled Tailwind', () => {
+    const htmlHint = getRecipeHintForExtension('.html');
+    expect(htmlHint).toBeDefined();
+    expect(htmlHint!.toLowerCase().includes('vscode-html-language-server')).toBe(true);
+    expect(htmlHint!.toLowerCase().includes('tailwind')).toBe(false);
+
+    const cssHint = getRecipeHintForExtension('.css');
+    expect(cssHint).toBeDefined();
+    expect(cssHint!.toLowerCase().includes('vscode-css-language-server')).toBe(true);
+    expect(cssHint!.toLowerCase().includes('tailwind')).toBe(false);
+  });
+
   it('recipeCoversExtension reports coverage', () => {
     expect(recipeCoversExtension('.go')).toBe(true);
     expect(recipeCoversExtension('.lua')).toBe(true);
@@ -219,9 +238,10 @@ describe('recipe hint helpers', () => {
     expect(recipeCoversExtension('.css')).toBe(true);
     expect(recipeCoversExtension('.vue')).toBe(true);
     expect(recipeCoversExtension('.mjs')).toBe(true);
-    expect(recipeCoversExtension('.svelte')).toBe(true);
-    expect(recipeCoversExtension('.astro')).toBe(true);
-    expect(recipeCoversExtension('.mdx')).toBe(true);
+    // Only claimed by the default-disabled Tailwind companion today.
+    expect(recipeCoversExtension('.svelte')).toBe(false);
+    expect(recipeCoversExtension('.astro')).toBe(false);
+    expect(recipeCoversExtension('.mdx')).toBe(false);
     expect(recipeCoversExtension('.foo')).toBe(false);
   });
 });

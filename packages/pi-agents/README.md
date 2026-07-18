@@ -213,13 +213,13 @@ Run records contain prompts, compact assistant presentation, outputs, cwd paths,
 
 ## Bundled agents
 
-| Agent      | Purpose                 | Tools                                     | Nested agents                    |
-| ---------- | ----------------------- | ----------------------------------------- | -------------------------------- |
-| `debug`    | Bug diagnosis and fixes | `read, grep, find, ls, bash, edit, write` | disabled (`maxSubagentDepth: 0`) |
-| `explore`  | Fast codebase recon     | `read, grep, find, ls, bash`              | disabled (`maxSubagentDepth: 0`) |
-| `planner`  | Implementation plans    | `read, grep, find, ls`                    | disabled (`maxSubagentDepth: 0`) |
-| `reviewer` | Code review             | `read, grep, find, ls, bash`              | disabled (`maxSubagentDepth: 0`) |
-| `general`  | General-purpose         | (all default)                             | follows `PI_AGENT_MAX_DEPTH`     |
+| Agent      | Purpose                  | Tools                                  | Nested agents                              |
+| ---------- | ------------------------ | -------------------------------------- | ------------------------------------------ |
+| `debugger` | Bug investigation report | (all default; `edit`/`write` excluded) | `maxSubagentDepth: 1` (may call `explore`) |
+| `explore`  | Fast codebase recon      | `read, grep, find, ls, bash`           | disabled (`maxSubagentDepth: 0`)           |
+| `planner`  | Implementation plans     | `read, grep, find, ls`                 | disabled (`maxSubagentDepth: 0`)           |
+| `reviewer` | Code review              | `read, grep, find, ls, bash`           | disabled (`maxSubagentDepth: 0`)           |
+| `general`  | General-purpose          | (all default)                          | follows `PI_AGENT_MAX_DEPTH`               |
 
 The package also ships prompt templates: the `/implement`, `/explore-and-plan`, and `/implement-and-review` workflow prompts, plus `/work-with-grok` for delegating a task to the Grok ACP runtime. See [How-to guides](./docs/how-to.md#use-the-bundled-workflow-prompts).
 

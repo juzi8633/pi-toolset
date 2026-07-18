@@ -2,7 +2,7 @@
 
 ## Diagnosing Bugs methodology
 
-The debugging methodology in `agents/debug.md` is adapted from Matt Pocock's
+The debugging methodology in `agents/debugger.md` is adapted from Matt Pocock's
 [Diagnosing Bugs skill](https://github.com/mattpocock/skills/blob/9603c1cc8118d08bc1b3bf34cf714f62178dea3b/skills/engineering/diagnosing-bugs/SKILL.md).
 
 MIT License

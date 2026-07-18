@@ -91,9 +91,9 @@ the child's final message after an explicit warning that the output did not pass
 behavior from `tools`/`excludeTools`/`edit`/`write`/`bash`; agents opt in
 explicitly.
 
-All bundled agents declare `completionCheck`. `debug` requires `## Feedback
-Loop`, `## Root Cause`, `## Changes`, `## Validation`, `## Cleanup`, and
-`## Blockers`; `general` requires `## Completed`, `## Files Changed`, and
+All bundled agents declare `completionCheck`. `debugger` requires `## Symptom`,
+`## Feedback Loop`, `## Reproduction`, `## Root Cause`, `## Recommended Fix`,
+and `## Blockers`; `general` requires `## Completed`, `## Files Changed`, and
 `## Validation`. The bundled workflow prompts (`/implement`,
 `/implement-and-review`) restate the general-agent headings in task text so
 chain steps stay aligned with its contract.

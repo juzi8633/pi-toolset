@@ -319,13 +319,13 @@ invocation.
 
 ## Bundled agents
 
-| Agent      | Purpose                 | Tools                                     | Extras                                                                           |
-| ---------- | ----------------------- | ----------------------------------------- | -------------------------------------------------------------------------------- |
-| `debug`    | Bug diagnosis and fixes | `read, grep, find, ls, bash, edit, write` | `excludeTools: agent`, `maxSubagentDepth: 0`, `completionCheck` set              |
-| `explore`  | Fast codebase recon     | `read, grep, find, ls, bash`              | `noSkills`, `maxSubagentDepth: 0`, `completionCheck` set                         |
-| `planner`  | Implementation plans    | `read, grep, find, ls`                    | `excludeTools: write, edit, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
-| `reviewer` | Code review             | `read, grep, find, ls, bash`              | `excludeTools: edit, write, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
-| `general`  | General-purpose         | (all default tools)                       | follows `PI_AGENT_MAX_DEPTH`, `completionCheck` set                              |
+| Agent      | Purpose                  | Tools                        | Extras                                                                           |
+| ---------- | ------------------------ | ---------------------------- | -------------------------------------------------------------------------------- |
+| `debugger` | Bug investigation report | (all default)                | `excludeTools: edit, write`, `maxSubagentDepth: 1`, `completionCheck` set        |
+| `explore`  | Fast codebase recon      | `read, grep, find, ls, bash` | `noSkills`, `maxSubagentDepth: 0`, `completionCheck` set                         |
+| `planner`  | Implementation plans     | `read, grep, find, ls`       | `excludeTools: write, edit, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
+| `reviewer` | Code review              | `read, grep, find, ls, bash` | `excludeTools: edit, write, agent`, `maxSubagentDepth: 0`, `completionCheck` set |
+| `general`  | General-purpose          | (all default tools)          | follows `PI_AGENT_MAX_DEPTH`, `completionCheck` set                              |
 
 ## Workflow prompts
 

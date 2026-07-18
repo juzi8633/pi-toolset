@@ -210,27 +210,27 @@ Body.`
     env = withAgentsDir(() => {});
     const { agents } = discoverAgents(env.cwd, 'project');
     const get = (name: string) => agents.find((a) => a.name === name);
-    expect(get('debug')?.maxSubagentDepth).toBe(0);
+    expect(get('debugger')?.maxSubagentDepth).toBe(1);
     expect(get('explore')?.maxSubagentDepth).toBe(0);
     expect(get('planner')?.maxSubagentDepth).toBe(0);
     expect(get('reviewer')?.maxSubagentDepth).toBe(0);
     expect(get('general')?.maxSubagentDepth).toBeUndefined();
   });
 
-  it('bundled debug agent retains its operational contract', () => {
+  it('bundled debugger agent retains its operational contract', () => {
     env = withAgentsDir(() => {});
     const { agents } = discoverAgents(env.cwd, 'project');
-    const debug = agents.find((agent) => agent.name === 'debug');
+    const debuggerAgent = agents.find((agent) => agent.name === 'debugger');
 
-    expect(debug?.tools).toEqual(['read', 'grep', 'find', 'ls', 'bash', 'edit', 'write']);
-    expect(debug?.excludeTools).toEqual(['agent']);
-    expect(debug?.maxSubagentDepth).toBe(0);
-    expect(debug?.completionCheck).toEqual([
+    expect(debuggerAgent?.tools).toBeUndefined();
+    expect(debuggerAgent?.excludeTools).toEqual(['edit', 'write']);
+    expect(debuggerAgent?.maxSubagentDepth).toBe(1);
+    expect(debuggerAgent?.completionCheck).toEqual([
+      '## Symptom',
       '## Feedback Loop',
+      '## Reproduction',
       '## Root Cause',
-      '## Changes',
-      '## Validation',
-      '## Cleanup',
+      '## Recommended Fix',
       '## Blockers',
     ]);
   });
