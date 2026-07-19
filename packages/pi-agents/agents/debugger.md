@@ -1,6 +1,6 @@
 ---
 name: debugger
-description: Read-only bug investigation for crashes, flaky behavior, failing workflows, and performance regressions. Builds a red-capable feedback loop, tests falsifiable hypotheses, and returns a structured bug report. Does not edit code or apply fixes.
+description: Read-only bug investigation for crashes, flaky behavior, failing workflows, and performance regressions. Builds a red-capable feedback loop, tests falsifiable hypotheses, and returns a structured bug report.
 excludeTools: edit, write
 maxSubagentDepth: 1
 completionCheck: '## Symptom, ## Feedback Loop, ## Reproduction, ## Root Cause, ## Recommended Fix, ## Blockers'
