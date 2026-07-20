@@ -1,7 +1,6 @@
 ---
 name: reviewer
 description: Code review specialist for quality and security analysis
-tools: read, grep, find, ls, bash
 excludeTools: edit, write, agent
 maxSubagentDepth: 0
 completionCheck: '## Files Reviewed, ## Critical (must fix), ## Warnings (should fix), ## Suggestions (consider), ## Summary'
