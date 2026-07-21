@@ -3,19 +3,29 @@
 #MISE depends=["setup"]
 #USAGE flag "-p --package <path>" "Package dir, e.g. packages/pi-lsp" default=""
 
-set -e
+set -euo pipefail
 PKG="${usage_package}"
 [ -d "$PKG" ] || { echo "no such package: ${usage_package:-<missing>}" >&2; exit 1; }
 cd "$PKG"
 
-# Externalize peer packages (host provides them at runtime) plus this package's
-# declared extra externals. Bundling peer deps would load a second SDK instance
-# and break type/identity checks against the host's copy.
-EXTERNALS=$(jq -r '(.peerDependencies // {}) | keys[]' package.json)
-EXTRA=$(jq -r '(.pi.external // [])[]' package.json 2>/dev/null || true)
+# Externalize peer/runtime packages. Host peers must not be bundled (second SDK
+# instance breaks identity checks). Package dependencies stay installed for
+# Node resolution but are also external so large runtimes (e.g. effect) are not
+# inlined. Strip CR from jq output — Windows jq emits CRLF and breaks --external.
+EXTERNALS_FILE="$(mktemp)"
+trap 'rm -f "$EXTERNALS_FILE"' EXIT
+jq -r '([.peerDependencies // {}, .dependencies // {}] | map(keys) | add) + (.pi.external // []) | unique[]' package.json \
+  | tr -d '\r' >"$EXTERNALS_FILE"
 
 args=()
-for e in $EXTERNALS $EXTRA; do args+=(--external "$e"); done
+while IFS= read -r e || [ -n "${e:-}" ]; do
+  [ -n "${e:-}" ] || continue
+  args+=(--external "$e")
+done <"$EXTERNALS_FILE"
+
+if [ "${#args[@]}" -eq 0 ]; then
+  echo "warning: no externals resolved for $PKG; peer/host packages may be bundled" >&2
+fi
 
 bun build ./src/index.ts --outdir dist --target node "${args[@]}"
 

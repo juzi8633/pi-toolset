@@ -30,7 +30,8 @@
       "./agents"
     ],
     "external": [
-      "@agentclientprotocol/sdk"
+      "@agentclientprotocol/sdk",
+      "effect"
     ]
   },
   "repository": {
