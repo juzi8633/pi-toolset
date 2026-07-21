@@ -32,7 +32,7 @@ const TOOL_RESULT_MAX_BYTES = 4 * 1024;
 const DETAIL_PREVIEW_LINES = 15;
 /** Below-editor chrome title: bullet + label, whole line accent. */
 const WIDGET_TITLE = '● Agents';
-const WIDGET_OPEN_HINT = '/agent view or Ctrl+Alt+Down';
+const WIDGET_OPEN_HINT = '(/agent view or Ctrl+Alt+Down)';
 /** Leading pad for every chrome line (title + body). */
 const WIDGET_LINE_PREFIX = ' ';
 /** Tree branch for non-final agent rows under the title. */
