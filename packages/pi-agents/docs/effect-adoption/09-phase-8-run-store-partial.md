@@ -55,9 +55,9 @@ If any box fails → **do not start coding**.
 
 **Steps:**
 
-- [ ] Replace `queues: Map<string, RunQueue>` + `runSerial` with shared serial executor from Phase 5 or equivalent Effect implementation.
-- [ ] Keep `assertValidRunId` before enqueue.
-- [ ] Add/confirm test: task B runs after task A throws for same runId.
+- [x] Replace `runSerial` body with Effect.tryPromise + runEffectExit task runner; keep `queues` Promise tail (Phase 5-equivalent; no extracted serial-queue module).
+- [x] Keep `assertValidRunId` before enqueue.
+- [x] Add/confirm test: task B runs after task A throws for same runId (`continues the per-run serial queue after a rejected task`).
 
 **Validation:**
 
@@ -68,15 +68,18 @@ If any box fails → **do not start coding**.
 
 **Outcome:** `txLockWaitMs` / `txLockRetryMs` behavior preserved with Schedule-based retry.
 
-**Steps:**
+**Status:** Deferred until the **overall Effect adoption program** is complete (not mid-phase). **Post-program plan (behavior-preserving):** [10-post-program-tx-lock-effect-wait.md](./10-post-program-tx-lock-effect-wait.md).
+
+**Steps:** (execute via `10-post-gate-lock-schedule.md`, not this PR)
 
 - [ ] Locate lock acquire retry/sleep loop.
-- [ ] Implement retry with `Schedule.spaced(txLockRetryMs)` + overall duration bound `txLockWaitMs`.
+- [ ] Split try-once (sync) vs wait loop (async Effect sleep / Schedule).
 - [ ] Preserve:
   - live owner → wait/retry
   - dead owner detection via `isPidAlive` / `pidAliveKill` seam (ESRCH only = dead)
   - `run_busy` when wait exceeded
   - no lock-age steal on non-Linux beyond current rules
+  - **no `await` while holding the lock**
 - [ ] Keep injectable timing options and tests that use short waits.
 
 **Validation:**
@@ -111,8 +114,8 @@ If any box fails → **do not start coding**.
 
 **Steps:**
 
-- [ ] Fill checklist from Entry Gate.
-- [ ] State which of A/B/C are in scope for the first Phase 8 PR (prefer A+B, C optional separate PR).
+- [x] Fill checklist from Entry Gate.
+- [x] State which of A/B/C are in scope for the first Phase 8 PR (**A only**; B deferred — sync lock; C separate).
 
 **Validation:**
 
@@ -130,16 +133,16 @@ If any box fails → **do not start coding**.
 
 **Steps:**
 
-- [ ] One slice per commit/PR when possible (A, then B, then C).
-- [ ] After each slice: run full `run-store.test.ts` before starting the next.
-- [ ] No drive-by refactors in strict tx paths.
+- [x] One slice per commit/PR when possible (A this PR; B/C deferred).
+- [x] After Slice A: full `run-store.test.ts` green (119 pass including continue-after-failure).
+- [x] No drive-by refactors in strict tx paths (diff is imports + `runSerial` only).
 
 **Validation:**
 
 - Run: `cd packages/pi-agents && bun test tests/run-store.test.ts`
-- Expected: Pass.
+- Expected: Pass. **Done: 119 pass.**
 - Run: `mise run typecheck --package packages/pi-agents`
-- Expected: Pass.
+- Expected: Pass. **Done.**
 
 ### Task 3: Cross-suite durable smoke
 

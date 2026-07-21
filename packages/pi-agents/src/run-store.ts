@@ -4,6 +4,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { Cause, Effect, Exit, Option } from 'effect';
 import {
   getDefaultRunsRoot as resolveDefaultRunsRoot,
   initializeRunsRoot,
@@ -12,6 +13,7 @@ import {
   type RunStoreCapabilities,
 } from './run-store-paths.ts';
 import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
+import { runEffectExit } from './effect-runtime.ts';
 import { chainFanoutUnitId, chainStepUnitId, generateUnitIds, pad } from './run-coordinator.ts';
 import { createArtifactStore, isRunArtifactRef, type ArtifactStore } from './artifact-store.ts';
 import type {
@@ -3806,10 +3808,37 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     return q;
   }
 
+  /**
+   * Per-run serial executor (Phase 8 Slice A):
+   * - Continue-after-failure: prev.then(run, run) so one reject does not wedge the run
+   * - Task body via Effect.tryPromise + runEffectExit; rethrow failures as-is
+   *   (Error or plain {code,message}) for existing toMatchObject / instanceof paths
+   * - Map tail stores a swallowed promise (no unhandled rejection)
+   * - assertValidRunId before enqueue (unchanged)
+   */
   function runSerial<T>(runId: string, task: QueuedTask<T>): Promise<T> {
     assertValidRunId(runId);
     const q = getQueue(runId);
-    const result = q.tail.then(task, task);
+    const runTask = async (): Promise<T> => {
+      const exit = await runEffectExit(
+        Effect.tryPromise({
+          try: task,
+          catch: (cause) => cause,
+        })
+      );
+      if (Exit.isSuccess(exit)) {
+        return exit.value;
+      }
+      const failure = Option.getOrUndefined(Cause.failureOption(exit.cause));
+      if (failure !== undefined) {
+        throw failure;
+      }
+      for (const defect of Cause.defects(exit.cause)) {
+        throw defect;
+      }
+      throw new Error(Cause.pretty(exit.cause));
+    };
+    const result = q.tail.then(runTask, runTask);
     q.tail = result.then(
       () => undefined,
       () => undefined
