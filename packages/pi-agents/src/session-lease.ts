@@ -3,6 +3,8 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { Deferred, Effect } from 'effect';
+import { runEffectPromise } from './effect-runtime.ts';
 
 /**
  * Opaque owner token for a lease. Identity is object reference equality.
@@ -11,8 +13,15 @@ import * as path from 'node:path';
  */
 export type SessionLeaseToken = object;
 
+/**
+ * Effect mapping (approach A):
+ * - owner `done` Deferred → Deferred.succeed (clean release) / Deferred.fail (sticky)
+ * - `done` Promise view via runEffectPromise(Deferred.await) for Promise callers
+ * - acquireTails remains a per-key Promise chain serializing install only (not owner lifetime)
+ */
 type SessionLeaseRecord = {
   token: SessionLeaseToken;
+  deferred: Deferred.Deferred<void, Error>;
   /** Settles when owner releases (resolve) or sticky-fails (reject). */
   done: Promise<void>;
   settle: (err?: Error) => void;
@@ -52,6 +61,21 @@ function getSessionLeaseStore(): SessionLeaseStore {
   };
   g[SESSION_LEASE_GLOBAL_KEY] = store;
   return store;
+}
+
+function makeDonePromise(deferred: Deferred.Deferred<void, Error>): Promise<void> {
+  const done = runEffectPromise(Deferred.await(deferred));
+  // Sticky rejects must not become unhandled when no waiter is attached yet.
+  done.catch(() => undefined);
+  return done;
+}
+
+function completeDeferred(deferred: Deferred.Deferred<void, Error>, err?: Error): void {
+  if (err) {
+    Effect.runSync(Deferred.fail(deferred, err));
+    return;
+  }
+  Effect.runSync(Deferred.succeed(deferred, undefined));
 }
 
 /**
@@ -219,18 +243,13 @@ export async function acquireSessionLease(keyOrSessionFile: string): Promise<{
     }
 
     const token: SessionLeaseToken = Object.create(null);
+    const deferred = Effect.runSync(Deferred.make<void, Error>());
+    const done = makeDonePromise(deferred);
     let settled = false;
-    let resolveDone!: () => void;
-    let rejectDone!: (e: Error) => void;
-    const done = new Promise<void>((res, rej) => {
-      resolveDone = res;
-      rejectDone = rej;
-    });
-    // Sticky rejects must not become unhandled when no waiter is attached yet.
-    done.catch(() => undefined);
 
     const record: SessionLeaseRecord = {
       token,
+      deferred,
       done,
       settled: false,
       settle(err?: Error) {
@@ -238,10 +257,10 @@ export async function acquireSessionLease(keyOrSessionFile: string): Promise<{
         settled = true;
         record.settled = true;
         if (err) {
-          rejectDone(err);
+          completeDeferred(deferred, err);
           // Keep rejected entry sticky so later acquires fail closed.
         } else {
-          resolveDone();
+          completeDeferred(deferred);
           if (store.leases.get(key)?.token === token) {
             store.leases.delete(key);
           }
