@@ -56,7 +56,7 @@
   },
   "devDependencies": {
     "@balaenis/pi-log": "0.0.0",
-    "@earendil-works/pi-agent-core": "0.80.9"
+    "@earendil-works/pi-agent-core": "0.81.0"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.2.1",
