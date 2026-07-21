@@ -1296,7 +1296,7 @@ describe('interactive-view widget metadata refresh', () => {
       });
       view.installWidget();
       expect(capture.last).toBeDefined();
-      expect(capture.last!.some((l) => l.includes('◆ Agents'))).toBe(true);
+      expect(capture.last!.some((l) => l.includes('● Agents'))).toBe(true);
       expect(capture.last!.some((l) => l.includes(`agent-${status}`))).toBe(true);
       expect(capture.last!.some((l) => l.includes(status))).toBe(true);
       // Running glyph is ◐ (warning-colored when theme is real).
@@ -1339,22 +1339,68 @@ describe('interactive-view widget metadata refresh', () => {
     const accentAnsi = realTheme.getFgAnsi('accent');
     const dimAnsi = realTheme.getFgAnsi('dim');
     const warningAnsi = realTheme.getFgAnsi('warning');
-    // Title line: whole "◆ Agents" wrapped in accent; body rows indent under it.
-    const title = lines!.find((l) => l.includes('◆ Agents'));
+    // Title line: whole "● Agents" wrapped in accent; body rows use tree branches.
+    const title = lines!.find((l) => l.includes('● Agents'));
     expect(title).toBeDefined();
     expect(title!.includes(accentAnsi)).toBe(true);
-    expect(__test.stripSgr(title!)).toBe(' ◆ Agents');
-    // Agent row: indented under title; ◐ keeps warning; name/status are dim.
+    expect(__test.stripSgr(title!)).toBe(' ● Agents');
+    // Single agent row uses last-branch └─ (dim); ◐ keeps warning; name/status are dim.
     const row = lines!.find((l) => l.includes('◐') && l.includes('debugger'));
     expect(row).toBeDefined();
-    expect(__test.stripSgr(row!).startsWith('   ◐')).toBe(true);
+    expect(__test.stripSgr(row!).startsWith(' └─ ◐')).toBe(true);
+    expect(row!.includes(`${dimAnsi}└─ `)).toBe(true);
     expect(row!.includes(`${warningAnsi}◐`)).toBe(true);
     expect(row!.includes(dimAnsi)).toBe(true);
-    // Open hint is dim and shares body indent.
+    // Open hint is dim and aligns under tree content.
     const hint = lines!.find((l) => l.includes('/agent view'));
     expect(hint).toBeDefined();
-    expect(__test.stripSgr(hint!).startsWith('   /agent view')).toBe(true);
+    expect(__test.stripSgr(hint!).startsWith('    /agent view')).toBe(true);
     expect(hint!.includes(dimAnsi)).toBe(true);
+    view.clearWidget();
+  });
+
+  it('below-editor widget uses tree branches for multiple running endpoints', () => {
+    const capture = widgetCapture();
+    const view = createInteractiveViewController({
+      registry: {
+        listVisibleMeta: () => [
+          metaRow({
+            key: 'run:a',
+            unitId: 'a',
+            agent: 'debugger',
+            title: 'first',
+            status: 'running',
+            linkCreatedAt: 1,
+          }),
+          metaRow({
+            key: 'run:b',
+            unitId: 'b',
+            agent: 'debugger',
+            title: 'second',
+            status: 'running',
+            linkCreatedAt: 2,
+          }),
+        ],
+        subscribe: () => () => undefined,
+      } as never,
+      isTui: () => true,
+      getUi: () => ({
+        setWidget: capture.setWidget,
+      }),
+    });
+    view.installWidget();
+    expect(capture.last).toBeDefined();
+    const plain = capture.last!.map((l) => __test.stripSgr(l));
+    expect(plain[0]).toBe(' ● Agents');
+    expect(plain[1]).toMatch(/^ ├─ ◐ /);
+    expect(plain[1]).toContain('debugger - first');
+    expect(plain[2]).toMatch(/^ └─ ◐ /);
+    expect(plain[2]).toContain('debugger - second');
+    expect(plain.some((l) => l.includes('/agent view'))).toBe(true);
+    // Tree branches are dim (same as name/status); glyphs keep status color.
+    const dimAnsi = realTheme.getFgAnsi('dim');
+    expect(capture.last![1]!.includes(`${dimAnsi}├─ `)).toBe(true);
+    expect(capture.last![2]!.includes(`${dimAnsi}└─ `)).toBe(true);
     view.clearWidget();
   });
 
@@ -1447,7 +1493,7 @@ describe('interactive-view widget metadata refresh', () => {
     view.installWidget();
     expect(capture.last).toBeDefined();
     const joined = capture.last!.join('\n');
-    expect(joined).toContain('◆ Agents');
+    expect(joined).toContain('● Agents');
     expect(joined).toContain('worker-active');
     expect(joined).toContain('running');
     expect(joined).toContain('◐');

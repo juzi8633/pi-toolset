@@ -464,7 +464,7 @@ Detail status line: `queues N · session|no-session|acp:… · <runId>` and, whe
 
 List/widget interrupted glyph (`⊘`): interactive cancel always stores `usage.stopReason = 'aborted'` (registry cancel settle). `interrupted` is accepted when formal settle paths (assistant / `prompt_completed`) pass it through; both values map to the same glyph. Nav cancel does not write `interrupted`.
 
-The below-editor widget shows a `◆ Agents` title (theme `accent`) and only endpoints with status `starting` or `running`. Row text and the open hint use `dim`; the running glyph `◐` keeps its status color. Agent Nav (`/agent view`) lists every visible endpoint.
+The below-editor widget shows a `● Agents` title (theme `accent`) and only endpoints with status `starting` or `running`, rendered as a tree (`├─` mid-rows, `└─` last row). Tree branches, row text, and the open hint use `dim`; the running glyph `◐` keeps its status color. Agent Nav (`/agent view`) lists every visible endpoint.
 
 ### Link schema (Version 1)
 

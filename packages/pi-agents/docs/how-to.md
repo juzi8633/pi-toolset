@@ -437,7 +437,7 @@ or press `Ctrl+Alt+Down`. Outside TUI (print/JSON), the command is a no-op; RPC 
 4. Escape or Left returns from detail to the list, or closes the list. In detail, Left only returns when the prompt is empty; otherwise it moves the input cursor.
 5. Grok ACP history hydrates lazily on first detail open via `session/load` replay (no model prompt). Raw complete native history is available only for reloadable sessions; non-reloadable omitted history is unrecoverable.
 
-The below-editor chrome (when any agent is `starting`/`running`) shows a `◆ Agents` title and lists only those running endpoints; open `/agent view` for the full set.
+The below-editor chrome (when any agent is `starting`/`running`) shows a `● Agents` title and a tree of those running endpoints (`├─` / `└─`); open `/agent view` for the full set.
 
 ### Input by runtime
 
