@@ -44,7 +44,7 @@
     "dist",
     "agents",
     "prompts",
-    "src/version.ts",
+    "src/shared/version.ts",
     "THIRD_PARTY_NOTICES.md"
   ],
   "peerDependencies": {

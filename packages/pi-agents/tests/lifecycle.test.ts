@@ -12,7 +12,7 @@ import {
   type SpinnerScheduler,
   startSpinner,
   stopAllSpinners,
-} from '../src/render.ts';
+} from '../src/output/render.ts';
 
 type Handler = (event?: Record<string, unknown>) => void;
 

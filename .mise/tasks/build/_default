@@ -20,8 +20,12 @@ for e in $EXTERNALS $EXTRA; do args+=(--external "$e"); done
 bun build ./src/index.ts --outdir dist --target node "${args[@]}"
 
 # Optional child-only extension entry (pi-agents artifact reader).
-if [ -f ./src/artifact-reader-extension.ts ]; then
-  bun build ./src/artifact-reader-extension.ts --outdir dist --target node "${args[@]}"
+ARTIFACT_READER="./src/run/artifact-reader-extension.ts"
+if [ ! -f "$ARTIFACT_READER" ]; then
+  ARTIFACT_READER="./src/artifact-reader-extension.ts"
+fi
+if [ -f "$ARTIFACT_READER" ]; then
+  bun build "$ARTIFACT_READER" --outdir dist --target node "${args[@]}"
 fi
 
 if jq -e '.scripts.postbuild' package.json >/dev/null 2>&1; then

@@ -3,41 +3,41 @@
 
 import { type ExtensionAPI, type ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { Static } from '@earendil-works/pi-ai';
-import { discoverAgents } from './agents.ts';
+import { discoverAgents } from './config/agents.ts';
 import {
   BACKGROUND_MESSAGE_TYPE,
   createBackgroundManager,
   renderBackgroundMessage,
-} from './background.ts';
-import { renderAgentCatalogue, shouldInjectAgentCatalogue } from './catalogue.ts';
-import { registerAgentCommand } from './command.ts';
-import { createInteractiveAgentRegistry, INTERACTIVE_LINK_TYPE } from './interactive-agent.ts';
+} from './execution/background.ts';
+import { renderAgentCatalogue, shouldInjectAgentCatalogue } from './config/catalogue.ts';
+import { registerAgentCommand } from './execution/command.ts';
+import { createInteractiveAgentRegistry, INTERACTIVE_LINK_TYPE } from './interactive/interactive-agent.ts';
 import {
   createSessionAgentConfigStore,
   persistToSession,
   restoreFromBranch,
-} from './session-agent-config.ts';
+} from './config/session-agent-config.ts';
 import {
   CONTINUATION_MESSAGE_TYPE,
   createInteractiveRelayCoordinator,
   renderContinuationMessage,
-} from './interactive-relay.ts';
-import { buildHostResumePrompt, createInteractiveViewController } from './interactive-view.ts';
-import { withAgentToolFailureLogging } from './log.ts';
-import { createRunStore } from './run-store.ts';
-import { createRunCoordinator } from './run-coordinator.ts';
-import { reconcileDeadOwnerUnits } from './resume.ts';
+} from './interactive/interactive-relay.ts';
+import { buildHostResumePrompt, createInteractiveViewController } from './interactive/interactive-view.ts';
+import { withAgentToolFailureLogging } from './shared/log.ts';
+import { createRunStore } from './run/run-store.ts';
+import { createRunCoordinator } from './run/run-coordinator.ts';
+import { reconcileDeadOwnerUnits } from './run/resume.ts';
 import {
   type AgentRenderState,
   renderCall,
   renderResult,
   stopAllSpinners,
   stopSpinner,
-} from './render.ts';
-import { SubagentParams } from './schema.ts';
-import { setDiscoveredSkillsFromOptions } from './skills.ts';
-import { executeAgentTool } from './tool.ts';
-import type { SubagentDetails } from './types.ts';
+} from './output/render.ts';
+import { SubagentParams } from './shared/schema.ts';
+import { setDiscoveredSkillsFromOptions } from './config/skills.ts';
+import { executeAgentTool } from './execution/tool.ts';
+import type { SubagentDetails } from './shared/types.ts';
 
 type RawArgs = Record<string, unknown> & { run_in_background?: unknown };
 
