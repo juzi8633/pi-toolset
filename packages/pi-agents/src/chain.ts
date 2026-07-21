@@ -3,16 +3,12 @@
 
 import type { Static } from '@earendil-works/pi-ai';
 import type { AgentToolResult, AgentToolUpdateCallback } from '@earendil-works/pi-coding-agent';
+import { Cause, Effect, Exit, Option } from 'effect';
 import type { AgentConfig, AgentSource } from './agents.ts';
 import { MAX_CONCURRENCY, MAX_FANOUT_ITEMS, RESULT_UPDATE_INTERVAL_MS } from './constants.ts';
 import { createLatestValueCoalescer } from './update-coalescer.ts';
-import {
-  ABORT_MESSAGE,
-  getAbortResult,
-  isAbortError,
-  mapWithConcurrencyLimit,
-  type OnUpdateCallback,
-} from './execution.ts';
+import { runEffectExit } from './effect-runtime.ts';
+import { ABORT_MESSAGE, getAbortResult, isAbortError, type OnUpdateCallback } from './execution.ts';
 import { readJsonPointer } from './json-pointer.ts';
 import {
   applyTerminalStatus,
@@ -83,6 +79,92 @@ export interface ChainStepRequest {
 }
 
 export type ChainRunStep = (req: ChainStepRequest) => Promise<SingleResult>;
+
+/**
+ * Fanout worker pool (Phase 7):
+ * Same cancel-safe scheduling contract as `mapWithConcurrencyLimit`:
+ * - clamp concurrency to [1, items.length]
+ * - stop scheduling on error or AbortSignal; wait for in-flight workers
+ * - fill unstarted slots via onUnstarted; then rethrow first error
+ * Each worker body runs through Effect.tryPromise + runEffectExit so typed
+ * failures rethrow as-is (Error or plain objects).
+ * Index-based slot writes stay inside the worker; pool order of completion
+ * must not scramble fanout indices.
+ */
+async function runFanoutWorkers<TIn, TOut>(
+  items: TIn[],
+  concurrency: number,
+  signal: AbortSignal | undefined,
+  worker: (item: TIn, index: number) => Promise<TOut>,
+  onUnstarted?: (item: TIn, index: number) => TOut
+): Promise<TOut[]> {
+  if (items.length === 0) return [];
+  const limit = Math.max(1, Math.min(concurrency, items.length));
+  const results: TOut[] = new Array(items.length);
+  const started = new Array<boolean>(items.length).fill(false);
+  let nextIndex = 0;
+  let stopScheduling = false;
+  let firstError: unknown;
+
+  const claim = (): number | null => {
+    if (stopScheduling || signal?.aborted) {
+      stopScheduling = true;
+      return null;
+    }
+    const current = nextIndex++;
+    if (current >= items.length) return null;
+    started[current] = true;
+    return current;
+  };
+
+  const runOne = async (item: TIn, index: number): Promise<TOut> => {
+    const exit = await runEffectExit(
+      Effect.tryPromise({
+        try: () => worker(item, index),
+        catch: (cause) => cause,
+      })
+    );
+    if (Exit.isSuccess(exit)) {
+      return exit.value;
+    }
+    const failure = Option.getOrUndefined(Cause.failureOption(exit.cause));
+    if (failure !== undefined) {
+      throw failure;
+    }
+    for (const defect of Cause.defects(exit.cause)) {
+      throw defect;
+    }
+    throw new Error(Cause.pretty(exit.cause));
+  };
+
+  const pool = Array.from({ length: limit }, async () => {
+    while (true) {
+      const current = claim();
+      if (current === null) return;
+      try {
+        results[current] = await runOne(items[current], current);
+      } catch (err) {
+        if (firstError === undefined) firstError = err;
+        stopScheduling = true;
+      }
+    }
+  });
+
+  await Promise.all(pool);
+
+  if (onUnstarted) {
+    for (let i = 0; i < items.length; i++) {
+      if (!started[i] || results[i] === undefined) {
+        if (results[i] === undefined) {
+          results[i] = onUnstarted(items[i], i);
+        }
+      }
+    }
+  }
+
+  if (firstError !== undefined) throw firstError;
+  return results;
+}
 
 export interface RestoredChainState {
   results: SingleResult[];
@@ -1382,9 +1464,10 @@ async function runFanoutStep(
   };
 
   try {
-    await mapWithConcurrencyLimit(
+    await runFanoutWorkers(
       renderedTasks,
       concurrency,
+      signal,
       async (task, index) => {
         // Skip already-completed slots from restored state.
         if (resolveExecutionStatus(slots[index]) === 'completed') {
@@ -1473,21 +1556,18 @@ async function runFanoutStep(
           throw err;
         }
       },
-      {
-        signal,
-        onUnstarted: (_task, index) => {
-          // Presentation may mark skipped; durable state keeps the unit queued.
-          const skippedSlot = copySnapshotShell(slots[index]);
-          skippedSlot.status = 'skipped';
-          skippedSlot.exitCode = 1;
-          skippedSlot.stopReason = skippedSlot.stopReason ?? 'aborted';
-          slots[index] = skippedSlot;
-          return skippedSlot;
-        },
+      (_task, index) => {
+        // Presentation may mark skipped; durable state keeps the unit queued.
+        const skippedSlot = copySnapshotShell(slots[index]);
+        skippedSlot.status = 'skipped';
+        skippedSlot.exitCode = 1;
+        skippedSlot.stopReason = skippedSlot.stopReason ?? 'aborted';
+        slots[index] = skippedSlot;
+        return skippedSlot;
       }
     );
   } catch (err) {
-    // Non-abort worker failures still settle via mapWithConcurrencyLimit; rethrow if unexpected.
+    // Non-abort worker failures still settle via the pool; rethrow if unexpected.
     if (!isAbortError(err)) throw err;
   } finally {
     // Permanent terminal gate first so late worker callbacks cannot reschedule the
