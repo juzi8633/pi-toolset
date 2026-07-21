@@ -2,12 +2,14 @@
 // ABOUTME: Wraps existing workflow callbacks to persist durable snapshots without disrupting TUI streaming.
 
 import * as crypto from 'node:crypto';
+import { Cause, Effect, Exit, Option } from 'effect';
 import type { AgentConfig, Runtime } from './agents.ts';
 import {
   DEFAULT_RUNTIME,
   DEFAULT_COALESCE_MS,
   RESULT_INLINE_PAYLOAD_MAX_BYTES,
 } from './constants.ts';
+import { runEffectExit } from './effect-runtime.ts';
 import type { RunStore } from './run-store.ts';
 import type {
   AgentRunRecordV1,
@@ -463,15 +465,41 @@ export function createRunCoordinator(options: RunCoordinatorOptions): RunCoordin
    * Per-run serial queue for all durable writes (strict field updates, live
    * commit, coalesced/full flush). Prevents a full snapshot flush from running
    * between a strict disk write and its live mirror and wiping bindings/session.
+   *
+   * Effect mapping (Phase 5):
+   * - Task body: Effect.tryPromise + runEffectExit
+   * - Awaiter rejection: typed failure rethrown as-is (Error or plain {code,message})
+   *   so store/coordinator callers keep instanceof / toMatchObject semantics
+   * - Tail chain: Promise-based continue-after-failure
+   *   (`prev.then(run, run)` — one rejected write must not wedge the run)
+   * - Map entry stores a swallowed promise so unhandled rejections never wedge
    */
   const durableWriteTails = new Map<string, Promise<unknown>>();
 
   function enqueueDurableWrite<T>(runId: string, work: () => Promise<T>): Promise<T> {
     const prev = durableWriteTails.get(runId) ?? Promise.resolve();
-    const next = prev.then(
-      () => work(),
-      () => work()
-    );
+    const runTask = async (): Promise<T> => {
+      const exit = await runEffectExit(
+        Effect.tryPromise({
+          try: work,
+          catch: (cause) => cause,
+        })
+      );
+      if (Exit.isSuccess(exit)) {
+        return exit.value;
+      }
+      const failure = Option.getOrUndefined(Cause.failureOption(exit.cause));
+      if (failure !== undefined) {
+        // Preserve non-Error rejections (e.g. run_store plain { code, message }).
+        throw failure;
+      }
+      for (const defect of Cause.defects(exit.cause)) {
+        throw defect;
+      }
+      throw new Error(Cause.pretty(exit.cause));
+    };
+    // Continue after previous success or failure so one rejected write cannot wedge the run.
+    const next = prev.then(runTask, runTask);
     durableWriteTails.set(
       runId,
       next.then(

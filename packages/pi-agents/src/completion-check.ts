@@ -1,6 +1,7 @@
 // ABOUTME: Completion check validation for agent outputs that declare required headings.
 // ABOUTME: Enforces frontmatter-configured heading checks against final assistant messages.
 
+import { Either } from 'effect';
 import type { AgentConfig } from './agents.ts';
 import { getResultFinalOutput, isFailedResult } from './output.ts';
 import type { SingleResult } from './types.ts';
@@ -20,13 +21,27 @@ function hasHeading(output: string, heading: string): boolean {
   return re.test(output);
 }
 
-export function validateCompletionOutput(agent: AgentConfig, output: string): CompletionValidation {
+/** Pure core: Right = pass; Left = missing required headings. */
+function validateCompletionOutputEither(
+  agent: AgentConfig,
+  output: string
+): Either.Either<void, string[]> {
   const requiredHeadings = agent.completionCheck ?? [];
   if (requiredHeadings.length === 0) {
-    return { ok: true, missing: [] };
+    return Either.void;
   }
   const missing = requiredHeadings.filter((h) => !hasHeading(output, h));
-  return { ok: missing.length === 0, missing };
+  if (missing.length === 0) {
+    return Either.void;
+  }
+  return Either.left(missing);
+}
+
+export function validateCompletionOutput(agent: AgentConfig, output: string): CompletionValidation {
+  return Either.match(validateCompletionOutputEither(agent, output), {
+    onLeft: (missing) => ({ ok: false, missing }),
+    onRight: () => ({ ok: true, missing: [] }),
+  });
 }
 
 /**

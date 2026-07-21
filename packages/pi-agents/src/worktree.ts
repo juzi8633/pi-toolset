@@ -4,6 +4,7 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { Either } from 'effect';
 import { WORKTREE_NAME_MAX_CHARS } from './constants.ts';
 
 export function getGitRoot(cwd: string): string | undefined {
@@ -24,7 +25,12 @@ export interface AgentWorktree {
   repoRoot: string;
 }
 
-export function createAgentWorktree(repoRoot: string, agentName: string, index = 0): AgentWorktree {
+/** Internal Either core: Right = created worktree; Left = Error to throw at boundary. */
+function createAgentWorktreeEither(
+  repoRoot: string,
+  agentName: string,
+  index: number
+): Either.Either<AgentWorktree, Error> {
   const root = path.resolve(repoRoot);
   const baseDir = path.join(root, '.worktrees');
   fs.mkdirSync(baseDir, { recursive: true });
@@ -38,9 +44,18 @@ export function createAgentWorktree(repoRoot: string, agentName: string, index =
   });
   if (result.status !== 0) {
     const msg = (result.stderr || result.stdout || '').trim() || 'git worktree add failed';
-    throw new Error(`Failed to create worktree at ${dir}: ${msg}`);
+    return Either.left(new Error(`Failed to create worktree at ${dir}: ${msg}`));
   }
-  return { path: dir, repoRoot: root };
+  return Either.right({ path: dir, repoRoot: root });
+}
+
+export function createAgentWorktree(repoRoot: string, agentName: string, index = 0): AgentWorktree {
+  return Either.match(createAgentWorktreeEither(repoRoot, agentName, index), {
+    onLeft: (err) => {
+      throw err;
+    },
+    onRight: (worktree) => worktree,
+  });
 }
 
 export interface DirtyStatusResult {
@@ -49,18 +64,25 @@ export interface DirtyStatusResult {
   error?: string;
 }
 
-export function getWorktreeDirtyStatus(worktreePath: string): DirtyStatusResult {
+function getWorktreeDirtyStatusEither(
+  worktreePath: string
+): Either.Either<{ output: string }, { error: string }> {
   const result = spawnSync('git', ['-C', worktreePath, 'status', '--porcelain'], {
     encoding: 'utf-8',
   });
   if (result.status !== 0) {
-    return {
-      ok: false,
-      output: '',
+    return Either.left({
       error: (result.stderr || result.stdout || '').trim() || 'git status failed',
-    };
+    });
   }
-  return { ok: true, output: result.stdout };
+  return Either.right({ output: result.stdout });
+}
+
+export function getWorktreeDirtyStatus(worktreePath: string): DirtyStatusResult {
+  return Either.match(getWorktreeDirtyStatusEither(worktreePath), {
+    onLeft: ({ error }) => ({ ok: false, output: '', error }),
+    onRight: ({ output }) => ({ ok: true, output }),
+  });
 }
 
 export interface WorktreeDiffSummary {
@@ -70,15 +92,18 @@ export interface WorktreeDiffSummary {
   error?: string;
 }
 
-export function getWorktreeDiffSummary(worktreePath: string): WorktreeDiffSummary {
+type DiffSuccess = { stat: string; changedFiles: string[] };
+
+function getWorktreeDiffSummaryEither(
+  worktreePath: string
+): Either.Either<DiffSuccess, { error: string }> {
   const stat = spawnSync('git', ['-C', worktreePath, 'diff', '--stat', '--no-ext-diff', 'HEAD'], {
     encoding: 'utf-8',
   });
   if (stat.status !== 0) {
-    return {
-      ok: false,
+    return Either.left({
       error: (stat.stderr || stat.stdout || '').trim() || 'git diff --stat failed',
-    };
+    });
   }
   const names = spawnSync(
     'git',
@@ -86,10 +111,9 @@ export function getWorktreeDiffSummary(worktreePath: string): WorktreeDiffSummar
     { encoding: 'utf-8' }
   );
   if (names.status !== 0) {
-    return {
-      ok: false,
+    return Either.left({
       error: (names.stderr || names.stdout || '').trim() || 'git diff --name-only failed',
-    };
+    });
   }
   const untracked = spawnSync(
     'git',
@@ -112,7 +136,14 @@ export function getWorktreeDiffSummary(worktreePath: string): WorktreeDiffSummar
       ...untrackedFiles,
     ])
   );
-  return { ok: true, stat: stat.stdout, changedFiles };
+  return Either.right({ stat: stat.stdout, changedFiles });
+}
+
+export function getWorktreeDiffSummary(worktreePath: string): WorktreeDiffSummary {
+  return Either.match(getWorktreeDiffSummaryEither(worktreePath), {
+    onLeft: ({ error }) => ({ ok: false, error }),
+    onRight: ({ stat, changedFiles }) => ({ ok: true, stat, changedFiles }),
+  });
 }
 
 export interface WorktreeSetupHookResult {
@@ -123,39 +154,54 @@ export interface WorktreeSetupHookResult {
   error?: string;
 }
 
-export function runWorktreeSetupHook(
+type SetupSuccess = { exitCode: 0; stdout: string; stderr: string };
+type SetupFailure = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  error?: string;
+};
+
+function runWorktreeSetupHookEither(
   worktreePath: string,
   command: string
-): WorktreeSetupHookResult {
+): Either.Either<SetupSuccess, SetupFailure> {
   const result = spawnSync(command, {
     cwd: worktreePath,
     shell: true,
     encoding: 'utf-8',
   });
   if (result.error) {
-    return {
-      ok: false,
+    return Either.left({
       exitCode: result.status ?? -1,
       stdout: result.stdout ?? '',
       stderr: result.stderr ?? '',
       error: result.error.message,
-    };
+    });
   }
   const exitCode = result.status ?? -1;
   if (exitCode !== 0) {
-    return {
-      ok: false,
+    return Either.left({
       exitCode,
       stdout: result.stdout ?? '',
       stderr: result.stderr ?? '',
-    };
+    });
   }
-  return {
-    ok: true,
+  return Either.right({
     exitCode: 0,
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
-  };
+  });
+}
+
+export function runWorktreeSetupHook(
+  worktreePath: string,
+  command: string
+): WorktreeSetupHookResult {
+  return Either.match(runWorktreeSetupHookEither(worktreePath, command), {
+    onLeft: (failure) => ({ ok: false, ...failure }),
+    onRight: (success) => ({ ok: true, ...success }),
+  });
 }
 
 function isUnderWorktreesDir(repoRoot: string, candidate: string): boolean {
@@ -169,47 +215,55 @@ export type OpenWorktreeResult =
   | { ok: true; worktree: AgentWorktree }
   | { ok: false; error: string; code: 'worktree_unavailable' };
 
-/** Reopen a stored worktree for resume without creating a replacement. */
-export function openAgentWorktree(repoRoot: string, storedPath: string): OpenWorktreeResult {
+type OpenFailure = { error: string; code: 'worktree_unavailable' };
+
+function openAgentWorktreeEither(
+  repoRoot: string,
+  storedPath: string
+): Either.Either<AgentWorktree, OpenFailure> {
   const root = path.resolve(repoRoot);
   const candidate = path.resolve(storedPath);
   if (!isUnderWorktreesDir(root, candidate)) {
-    return {
-      ok: false,
+    return Either.left({
       error: `Stored worktree path is outside <repo>/.worktrees: ${storedPath}`,
       code: 'worktree_unavailable',
-    };
+    });
   }
   if (!fs.existsSync(candidate)) {
-    return {
-      ok: false,
+    return Either.left({
       error: `Stored worktree path no longer exists: ${storedPath}`,
       code: 'worktree_unavailable',
-    };
+    });
   }
   // Verify it is a registered worktree.
   const list = spawnSync('git', ['-C', root, 'worktree', 'list', '--porcelain'], {
     encoding: 'utf-8',
   });
   if (list.status !== 0) {
-    return {
-      ok: false,
+    return Either.left({
       error: `Cannot list worktrees: ${(list.stderr || '').trim()}`,
       code: 'worktree_unavailable',
-    };
+    });
   }
   const registered = list.stdout
     .split('\n')
     .filter((line) => line.startsWith('worktree '))
     .map((line) => path.resolve(line.slice('worktree '.length).trim()));
   if (!registered.includes(candidate)) {
-    return {
-      ok: false,
+    return Either.left({
       error: `Stored worktree is no longer registered: ${storedPath}`,
       code: 'worktree_unavailable',
-    };
+    });
   }
-  return { ok: true, worktree: { path: candidate, repoRoot: root } };
+  return Either.right({ path: candidate, repoRoot: root });
+}
+
+/** Reopen a stored worktree for resume without creating a replacement. */
+export function openAgentWorktree(repoRoot: string, storedPath: string): OpenWorktreeResult {
+  return Either.match(openAgentWorktreeEither(repoRoot, storedPath), {
+    onLeft: (failure) => ({ ok: false, ...failure }),
+    onRight: (worktree) => ({ ok: true, worktree }),
+  });
 }
 
 export interface RemoveWorktreeResult {
@@ -217,12 +271,17 @@ export interface RemoveWorktreeResult {
   error?: string;
 }
 
-export function removeAgentWorktree(worktree: AgentWorktree): RemoveWorktreeResult {
+type RemoveSuccess = { removed: true };
+type RemoveFailure = { removed: false; error?: string };
+
+function removeAgentWorktreeEither(
+  worktree: AgentWorktree
+): Either.Either<RemoveSuccess, RemoveFailure> {
   if (!isUnderWorktreesDir(worktree.repoRoot, worktree.path)) {
-    return {
+    return Either.left({
       removed: false,
       error: `Refusing to remove worktree outside <repo>/.worktrees: ${worktree.path}`,
-    };
+    });
   }
 
   const result = spawnSync(
@@ -232,7 +291,7 @@ export function removeAgentWorktree(worktree: AgentWorktree): RemoveWorktreeResu
   );
   if (result.status !== 0) {
     const msg = (result.stderr || result.stdout || '').trim() || 'git worktree remove failed';
-    return { removed: false, error: msg };
+    return Either.left({ removed: false, error: msg });
   }
   if (fs.existsSync(worktree.path)) {
     try {
@@ -241,5 +300,15 @@ export function removeAgentWorktree(worktree: AgentWorktree): RemoveWorktreeResu
       // best-effort
     }
   }
-  return { removed: !fs.existsSync(worktree.path) };
+  if (fs.existsSync(worktree.path)) {
+    return Either.left({ removed: false });
+  }
+  return Either.right({ removed: true });
+}
+
+export function removeAgentWorktree(worktree: AgentWorktree): RemoveWorktreeResult {
+  return Either.match(removeAgentWorktreeEither(worktree), {
+    onLeft: (failure) => failure,
+    onRight: (success) => success,
+  });
 }

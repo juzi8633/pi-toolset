@@ -4,6 +4,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { Cause, Effect, Exit, Option } from 'effect';
 import {
   getDefaultRunsRoot as resolveDefaultRunsRoot,
   initializeRunsRoot,
@@ -12,6 +13,7 @@ import {
   type RunStoreCapabilities,
 } from './run-store-paths.ts';
 import { DEFAULT_RUNTIME, GROK_ACP_RUNTIME } from './constants.ts';
+import { runEffectExit, runEffectPromise } from './effect-runtime.ts';
 import { chainFanoutUnitId, chainStepUnitId, generateUnitIds, pad } from './run-coordinator.ts';
 import { createArtifactStore, isRunArtifactRef, type ArtifactStore } from './artifact-store.ts';
 import type {
@@ -3140,116 +3142,193 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     }
   }
 
-  function acquireTxLock(runId: string): HeldTxLock {
-    const publicDir = runDirOf(runId);
-    const deadline = monotonicNowMs() + txLockWaitMs;
-    const token = randomUUID();
-    const owner: TxLockOwner = {
-      version: TX_LOCK_VERSION,
-      pid: process.pid,
-      processStart: selfStartIdentity,
-      token,
-      timestamp: now(),
-    };
+  type TxLockAttempt =
+    | { kind: 'acquired'; held: HeldTxLock }
+    | { kind: 'retry' }
+    /** Steal claimed success but token not yet visible — retry without sleeping. */
+    | { kind: 'retry_immediate' }
+    | { kind: 'fail'; error: RunStoreError };
 
-    const session = openRunDirHandle(publicDir, runId);
-    try {
-      collectSafeLockLeftovers(session, runId);
+  /**
+   * One lock-acquire attempt (sync). No sleep — caller decides wait policy.
+   * Post-program leftover: shared by sync getRun recovery and async write paths.
+   */
+  function tryAcquireTxLockOnce(
+    runId: string,
+    publicDir: string,
+    session: RunDirHandle,
+    owner: TxLockOwner
+  ): TxLockAttempt {
+    revalidatePublicRunDir(session.publicDir, undefined);
+    const lockPath = childInDir(session.publicDir, TX_LOCK_DIR_NAME);
+    const lockKind = pathEntryKind(lockPath);
+    if (lockKind === 'symlink' || lockKind === 'regular' || lockKind === 'other') {
+      return {
+        kind: 'fail',
+        error: {
+          code: 'corrupt_run',
+          runId,
+          message: `transaction lock path is unsafe (${lockKind})`,
+        },
+      };
+    }
 
-      for (;;) {
-        revalidatePublicRunDir(session.publicDir, undefined);
-        const lockPath = childInDir(session.publicDir, TX_LOCK_DIR_NAME);
-        const lockKind = pathEntryKind(lockPath);
-        if (lockKind === 'symlink' || lockKind === 'regular' || lockKind === 'other') {
-          throw {
-            code: 'corrupt_run',
-            runId,
-            message: `transaction lock path is unsafe (${lockKind})`,
-          } satisfies RunStoreError;
-        }
-
-        if (lockKind === 'absent') {
-          let candidatePath: string | undefined;
-          let candIdentity: FileIdentity | undefined;
-          try {
-            const built = buildCompleteLockCandidate(session, owner);
-            candidatePath = built.candidatePath;
-            candIdentity = built.lockIdentity;
-            try {
-              fs.renameSync(candidatePath, lockPath);
-              candidatePath = undefined;
-            } catch (renameErr) {
-              if (
-                isNoReplaceContentionError(renameErr, () => pathEntryKind(lockPath) === 'directory')
-              ) {
-                if (candidatePath && candIdentity) {
-                  removeOwnCandidate(candidatePath, candIdentity, token);
-                }
-                candidatePath = undefined;
-              } else {
-                throw renameErr;
-              }
-            }
-            if (candidatePath === undefined && pathEntryKind(lockPath) === 'directory') {
-              const published = readLockOwnerVia(lockPath);
-              if (published && published.owner.token === token) {
-                fsyncRunDir(session.publicDir);
-                revalidatePublicRunDir(session.publicDir, undefined);
-                return {
-                  runId,
-                  dir: publicDir,
-                  lockDir: path.join(publicDir, TX_LOCK_DIR_NAME),
-                  token,
-                  session,
-                  lockIdentity: published.lockIdentity,
-                };
-              }
-            }
-          } catch (err) {
+    if (lockKind === 'absent') {
+      let candidatePath: string | undefined;
+      let candIdentity: FileIdentity | undefined;
+      try {
+        const built = buildCompleteLockCandidate(session, owner);
+        candidatePath = built.candidatePath;
+        candIdentity = built.lockIdentity;
+        try {
+          fs.renameSync(candidatePath, lockPath);
+          candidatePath = undefined;
+        } catch (renameErr) {
+          if (
+            isNoReplaceContentionError(renameErr, () => pathEntryKind(lockPath) === 'directory')
+          ) {
             if (candidatePath && candIdentity) {
-              removeOwnCandidate(candidatePath, candIdentity, token);
+              removeOwnCandidate(candidatePath, candIdentity, owner.token);
             }
-            const code = (err as NodeJS.ErrnoException).code;
-            if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
-              if (isRunStoreError(err)) throw err;
-              throw {
-                code: 'run_store_error',
-                runId,
-                message: `transaction lock acquire failed: ${messageOf(err)}`,
-              } satisfies RunStoreError;
-            }
+            candidatePath = undefined;
+          } else {
+            throw renameErr;
           }
-        } else {
-          // Fixed lock present: try generation-safe stale transfer (never remove fixed name).
-          const steal = tryStealStaleLock(session, owner, runId);
-          if (steal === 'stolen') {
-            // Confirm we own the fixed lock after in-place transfer.
-            const published = readLockOwnerVia(lockPath);
-            if (published && published.owner.token === token) {
-              fsyncRunDir(session.publicDir);
-              revalidatePublicRunDir(session.publicDir, undefined);
-              return {
+        }
+        if (candidatePath === undefined && pathEntryKind(lockPath) === 'directory') {
+          const published = readLockOwnerVia(lockPath);
+          if (published && published.owner.token === owner.token) {
+            fsyncRunDir(session.publicDir);
+            revalidatePublicRunDir(session.publicDir, undefined);
+            return {
+              kind: 'acquired',
+              held: {
                 runId,
                 dir: publicDir,
                 lockDir: path.join(publicDir, TX_LOCK_DIR_NAME),
-                token,
+                token: owner.token,
                 session,
                 lockIdentity: published.lockIdentity,
-              };
-            }
-            continue;
+              },
+            };
           }
         }
-
-        if (monotonicNowMs() >= deadline) {
-          throw {
-            code: 'run_busy',
-            runId,
-            message: 'run transaction lock held by another live owner',
-          } satisfies RunStoreError;
+      } catch (err) {
+        if (candidatePath && candIdentity) {
+          removeOwnCandidate(candidatePath, candIdentity, owner.token);
         }
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+          if (isRunStoreError(err)) {
+            return { kind: 'fail', error: err as RunStoreError };
+          }
+          return {
+            kind: 'fail',
+            error: {
+              code: 'run_store_error',
+              runId,
+              message: `transaction lock acquire failed: ${messageOf(err)}`,
+            },
+          };
+        }
+      }
+      return { kind: 'retry' };
+    }
+
+    // Fixed lock present: try generation-safe stale transfer (never remove fixed name).
+    const steal = tryStealStaleLock(session, owner, runId);
+    if (steal === 'stolen') {
+      const published = readLockOwnerVia(lockPath);
+      if (published && published.owner.token === owner.token) {
+        fsyncRunDir(session.publicDir);
+        revalidatePublicRunDir(session.publicDir, undefined);
+        return {
+          kind: 'acquired',
+          held: {
+            runId,
+            dir: publicDir,
+            lockDir: path.join(publicDir, TX_LOCK_DIR_NAME),
+            token: owner.token,
+            session,
+            lockIdentity: published.lockIdentity,
+          },
+        };
+      }
+      // Pre-extract control flow used `continue` here — no deadline sleep before retry.
+      return { kind: 'retry_immediate' };
+    }
+    return { kind: 'retry' };
+  }
+
+  function createTxLockOwner(): TxLockOwner {
+    return {
+      version: TX_LOCK_VERSION,
+      pid: process.pid,
+      processStart: selfStartIdentity,
+      token: randomUUID(),
+      timestamp: now(),
+    };
+  }
+
+  function runBusyError(runId: string): RunStoreError {
+    return {
+      code: 'run_busy',
+      runId,
+      message: 'run transaction lock held by another live owner',
+    };
+  }
+
+  /** Sync acquire for getRun/list recovery (must stay sync). Uses Atomics.wait. */
+  function acquireTxLock(runId: string): HeldTxLock {
+    const publicDir = runDirOf(runId);
+    const deadline = monotonicNowMs() + txLockWaitMs;
+    const owner = createTxLockOwner();
+    const session = openRunDirHandle(publicDir, runId);
+    try {
+      collectSafeLockLeftovers(session, runId);
+      for (;;) {
+        const attempt = tryAcquireTxLockOnce(runId, publicDir, session, owner);
+        if (attempt.kind === 'acquired') return attempt.held;
+        if (attempt.kind === 'fail') throw attempt.error;
+        if (attempt.kind === 'retry_immediate') continue;
+        if (monotonicNowMs() >= deadline) throw runBusyError(runId);
         const remaining = deadline - monotonicNowMs();
         sleepMs(Math.min(txLockRetryMs, Math.max(1, remaining)));
+      }
+    } catch (err) {
+      closeRunDirHandle(session);
+      throw err;
+    }
+  }
+
+  /** Async delay for write-path lock wait (Effect sleep — not Atomics.wait). */
+  async function sleepLockRetry(delayMs: number): Promise<void> {
+    if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+    const bounded = Math.min(Math.floor(delayMs), TX_LOCK_WAIT_MS_MAX);
+    if (bounded <= 0) return;
+    await runEffectPromise(Effect.sleep(`${bounded} millis`));
+  }
+
+  /**
+   * Async acquire for mutating store paths (updateRun / writeRunJsonAtomic / …).
+   * Wait uses Effect sleep; hold section after return remains sync (no await under hold).
+   */
+  async function acquireTxLockAsync(runId: string): Promise<HeldTxLock> {
+    const publicDir = runDirOf(runId);
+    const deadline = monotonicNowMs() + txLockWaitMs;
+    const owner = createTxLockOwner();
+    const session = openRunDirHandle(publicDir, runId);
+    try {
+      collectSafeLockLeftovers(session, runId);
+      for (;;) {
+        const attempt = tryAcquireTxLockOnce(runId, publicDir, session, owner);
+        if (attempt.kind === 'acquired') return attempt.held;
+        if (attempt.kind === 'fail') throw attempt.error;
+        if (attempt.kind === 'retry_immediate') continue;
+        const nowMs = monotonicNowMs();
+        if (nowMs >= deadline) throw runBusyError(runId);
+        const delayMs = Math.min(txLockRetryMs, Math.max(1, deadline - nowMs));
+        await sleepLockRetry(delayMs);
       }
     } catch (err) {
       closeRunDirHandle(session);
@@ -3390,8 +3469,8 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     }
   }
 
-  function withTxLock<T>(runId: string, fn: (held: HeldTxLock) => T): T {
-    const held = acquireTxLock(runId);
+  function finishWithTxLock<T>(runId: string, held: HeldTxLock, fn: (held: HeldTxLock) => T): T {
+    // Hold section is always sync — no await between acquire and release.
     let result: T;
     let fnError: unknown;
     try {
@@ -3426,6 +3505,18 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     if (fnError) throw fnError;
     if (releaseError) throw releaseError;
     return result!;
+  }
+
+  /** Sync lock wrapper for getRun/list recovery (sync public API). */
+  function withTxLock<T>(runId: string, fn: (held: HeldTxLock) => T): T {
+    const held = acquireTxLock(runId);
+    return finishWithTxLock(runId, held, fn);
+  }
+
+  /** Async lock wrapper for mutating paths: Effect-sleep wait, sync hold. */
+  async function withTxLockAsync<T>(runId: string, fn: (held: HeldTxLock) => T): Promise<T> {
+    const held = await acquireTxLockAsync(runId);
+    return finishWithTxLock(runId, held, fn);
   }
 
   function hasTxArtifacts(dir: string): boolean {
@@ -3806,10 +3897,37 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     return q;
   }
 
+  /**
+   * Per-run serial executor (Phase 8 Slice A):
+   * - Continue-after-failure: prev.then(run, run) so one reject does not wedge the run
+   * - Task body via Effect.tryPromise + runEffectExit; rethrow failures as-is
+   *   (Error or plain {code,message}) for existing toMatchObject / instanceof paths
+   * - Map tail stores a swallowed promise (no unhandled rejection)
+   * - assertValidRunId before enqueue (unchanged)
+   */
   function runSerial<T>(runId: string, task: QueuedTask<T>): Promise<T> {
     assertValidRunId(runId);
     const q = getQueue(runId);
-    const result = q.tail.then(task, task);
+    const runTask = async (): Promise<T> => {
+      const exit = await runEffectExit(
+        Effect.tryPromise({
+          try: task,
+          catch: (cause) => cause,
+        })
+      );
+      if (Exit.isSuccess(exit)) {
+        return exit.value;
+      }
+      const failure = Option.getOrUndefined(Cause.failureOption(exit.cause));
+      if (failure !== undefined) {
+        throw failure;
+      }
+      for (const defect of Cause.defects(exit.cause)) {
+        throw defect;
+      }
+      throw new Error(Cause.pretty(exit.cause));
+    };
+    const result = q.tail.then(runTask, runTask);
     q.tail = result.then(
       () => undefined,
       () => undefined
@@ -5317,16 +5435,20 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
     }
   }
 
-  function writeRunContents(runId: string, record: AgentRunRecordV1, strict = false): void {
+  async function writeRunContents(
+    runId: string,
+    record: AgentRunRecordV1,
+    strict = false
+  ): Promise<void> {
     // Every run.json writer holds the cross-instance transaction lock.
-    withTxLock(runId, (held) => {
+    await withTxLockAsync(runId, (held) => {
       writeRunContentsLocked(runId, record, strict, held);
     });
   }
 
   function writeRunJsonAtomic(runId: string, record: AgentRunRecordV1): Promise<void> {
     return runSerial(runId, async () => {
-      writeRunContents(runId, record);
+      await writeRunContents(runId, record);
     });
   }
 
@@ -5828,7 +5950,7 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
   ): Promise<AgentRunRecordV1> {
     return runSerial(runId, async () => {
       // Full RMW under one transaction lock: recover → load → mutate → write.
-      return withTxLock(runId, (held) => {
+      return withTxLockAsync(runId, (held) => {
         const recovered = recoverStrictTransactionLocked(runId, held.session);
         if (!recovered.ok) throw recovered.error;
         revalidatePublicRunDir(held.session.publicDir, undefined, runId);
@@ -5881,7 +6003,7 @@ export function createRunStore(options: CreateRunStoreOptions = {}): RunStore {
   ): Promise<AgentRunRecordV1> {
     // Same serial queue as updateRun; full RMW under transaction lock.
     return runSerial(runId, async () => {
-      return withTxLock(runId, (held) => {
+      return withTxLockAsync(runId, (held) => {
         const recovered = recoverStrictTransactionLocked(runId, held.session);
         if (!recovered.ok) throw recovered.error;
         revalidatePublicRunDir(held.session.publicDir, undefined, runId);

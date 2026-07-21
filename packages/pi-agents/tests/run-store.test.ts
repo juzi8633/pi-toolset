@@ -264,6 +264,25 @@ describe('updateRun atomic snapshots', () => {
       expect(loaded.loaded.record.lastError).toBeDefined();
     }
   });
+
+  it('continues the per-run serial queue after a rejected task', async () => {
+    const store = createRunStore({ rootDir: root, ...makeDeps() });
+    const { runId } = await store.createRun(makeCreateInput());
+    const boom = new Error('inject serial fail');
+    await expect(
+      store.updateRun(runId, () => {
+        throw boom;
+      })
+    ).rejects.toBe(boom);
+
+    const after = await store.updateRun(runId, (r) => {
+      r.lastError = 'recovered';
+    });
+    expect(after.lastError).toBe('recovered');
+    const loaded = store.getRun(runId);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) expect(loaded.loaded.record.lastError).toBe('recovered');
+  });
 });
 
 describe('appendEvent', () => {

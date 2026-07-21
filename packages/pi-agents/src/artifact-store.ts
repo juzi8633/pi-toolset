@@ -5,7 +5,9 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { Effect } from 'effect';
 import { RUN_ARTIFACT_MAX_BYTES } from './constants.ts';
+import { runEffectPromise } from './effect-runtime.ts';
 import type { RunArtifactPayload, RunArtifactRefV1 } from './run-types.ts';
 
 const POSIX = process.platform !== 'win32';
@@ -230,206 +232,315 @@ export function createArtifactStore(options: CreateArtifactStoreOptions): Artifa
     directorySyncImpl(dirPath);
   }
 
-  async function writeBytes(
+  /**
+   * Effect core for trusted read/verify. Failures are ArtifactStoreError on the
+   * typed channel; Promise façades use runEffectPromise (preserves Error identity).
+   */
+  function verifyFile(
+    runId: string,
+    runDir: string,
+    ref: RunArtifactRefV1
+  ): Effect.Effect<{ absolute: string; buf: Buffer }, ArtifactStoreError> {
+    return Effect.try({
+      try: () => {
+        assertValidRefShape(runId, ref);
+        const absolute = resolveContainedArtifactPath(runDir, ref.relativePath);
+        let st: fs.Stats;
+        try {
+          st = fs.statSync(absolute);
+        } catch (err) {
+          throw new ArtifactStoreError(
+            'artifact_missing',
+            `artifact missing: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err }
+          );
+        }
+        if (!st.isFile()) {
+          throw new ArtifactStoreError('artifact_corrupt', 'artifact is not a regular file');
+        }
+        if (st.size !== ref.bytes) {
+          throw new ArtifactStoreError('artifact_corrupt', 'artifact size does not match ref');
+        }
+
+        let fd: number | undefined;
+        try {
+          fd = fs.openSync(absolute, fs.constants.O_RDONLY);
+          const buf = fs.readFileSync(fd);
+          if (buf.length !== ref.bytes) {
+            throw new ArtifactStoreError('artifact_corrupt', 'artifact size does not match ref');
+          }
+          const digest = sha256Hex(buf);
+          if (digest !== ref.sha256) {
+            throw new ArtifactStoreError('artifact_corrupt', 'artifact digest mismatch');
+          }
+          return { absolute, buf };
+        } catch (err) {
+          if (err instanceof ArtifactStoreError) throw err;
+          throw new ArtifactStoreError(
+            'artifact_corrupt',
+            `artifact read failed: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err }
+          );
+        } finally {
+          if (fd !== undefined) {
+            try {
+              fs.closeSync(fd);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      },
+      catch: (err) =>
+        err instanceof ArtifactStoreError
+          ? err
+          : new ArtifactStoreError(
+              'artifact_corrupt',
+              `artifact read failed: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err }
+            ),
+    });
+  }
+
+  function writeBytes(
     runId: string,
     runDir: string,
     payload: RunArtifactPayload,
     mediaType: ArtifactMediaType,
     bytes: Buffer
-  ): Promise<RunArtifactRefV1> {
-    if (bytes.length > RUN_ARTIFACT_MAX_BYTES) {
-      throw new ArtifactStoreError('artifact_too_large', 'artifact exceeds 64 MiB budget');
-    }
-    const sha256 = sha256Hex(bytes);
-    const relativePath = artifactRelativePath(sha256, mediaType);
-    const absolute = resolveContainedArtifactPath(runDir, relativePath);
-    const parent = path.dirname(absolute);
-    mkdirPrivate(path.join(runDir, 'artifacts'));
-    mkdirPrivate(path.join(runDir, 'artifacts', 'sha256'));
-    mkdirPrivate(parent);
+  ): Effect.Effect<RunArtifactRefV1, ArtifactStoreError> {
+    return Effect.gen(function* () {
+      if (bytes.length > RUN_ARTIFACT_MAX_BYTES) {
+        return yield* Effect.fail(
+          new ArtifactStoreError('artifact_too_large', 'artifact exceeds 64 MiB budget')
+        );
+      }
+      const sha256 = sha256Hex(bytes);
+      const relativePath = artifactRelativePath(sha256, mediaType);
+      const absolute = resolveContainedArtifactPath(runDir, relativePath);
+      const parent = path.dirname(absolute);
+      mkdirPrivate(path.join(runDir, 'artifacts'));
+      mkdirPrivate(path.join(runDir, 'artifacts', 'sha256'));
+      mkdirPrivate(parent);
 
-    const ref: RunArtifactRefV1 = {
-      kind: 'run-artifact',
-      version: 1,
-      runId,
-      payload,
-      relativePath,
-      sha256,
-      bytes: bytes.length,
-      mediaType,
-    };
+      const ref: RunArtifactRefV1 = {
+        kind: 'run-artifact',
+        version: 1,
+        runId,
+        payload,
+        relativePath,
+        sha256,
+        bytes: bytes.length,
+        mediaType,
+      };
 
-    // Dedup: existing digest path must verify exact bytes.
-    if (fs.existsSync(absolute)) {
-      await verifyFile(runId, runDir, ref);
-      return ref;
-    }
-
-    const stagingRoot = path.join(runDir, stagingName);
-    mkdirPrivate(stagingRoot);
-    const staging = path.join(
-      stagingRoot,
-      `${sha256}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
-    );
-
-    let fd: number | undefined;
-    let renamed = false;
-    try {
-      fd = fs.openSync(
-        staging,
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
-        FILE_MODE
-      );
-      fs.writeFileSync(fd, bytes);
-      fileFsync(fd);
-      fs.closeSync(fd);
-      fd = undefined;
-      applyMode(staging, FILE_MODE);
-      fs.renameSync(staging, absolute);
-      renamed = true;
-      syncDir(parent);
-      syncDir(path.join(runDir, 'artifacts', 'sha256'));
-      syncDir(path.join(runDir, 'artifacts'));
-      syncDir(runDir);
-    } catch (err) {
-      if (err instanceof ArtifactStoreError) throw err;
-      // Concurrent creator may have published the same digest before our rename.
-      if (!renamed && fs.existsSync(absolute)) {
-        await verifyFile(runId, runDir, ref);
+      // Dedup: existing digest path must verify exact bytes.
+      if (fs.existsSync(absolute)) {
+        yield* verifyFile(runId, runDir, ref);
         return ref;
       }
-      throw new ArtifactStoreError(
-        'artifact_write_error',
-        `artifact write failed: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err }
-      );
-    } finally {
-      if (fd !== undefined) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* ignore */
-        }
-      }
-      // Clean only this writer's exact staging pathname, then try non-recursive rmdir.
-      try {
-        if (fs.existsSync(staging)) fs.unlinkSync(staging);
-      } catch {
-        /* ignore */
-      }
-      try {
-        fs.rmdirSync(stagingRoot);
-      } catch {
-        /* not empty or missing — preserve competing/unknown entries */
-      }
-    }
 
-    return ref;
+      const stagingRoot = path.join(runDir, stagingName);
+      mkdirPrivate(stagingRoot);
+      const staging = path.join(
+        stagingRoot,
+        `${sha256}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
+      );
+
+      // Keep try/finally fully synchronous (no yield*) so staging cleanup always runs.
+      type PublishOutcome =
+        { kind: 'ok' } | { kind: 'dedup' } | { kind: 'fail'; error: ArtifactStoreError };
+      const outcome: PublishOutcome = (() => {
+        let fd: number | undefined;
+        let renamed = false;
+        try {
+          fd = fs.openSync(
+            staging,
+            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+            FILE_MODE
+          );
+          fs.writeFileSync(fd, bytes);
+          fileFsync(fd);
+          fs.closeSync(fd);
+          fd = undefined;
+          applyMode(staging, FILE_MODE);
+          fs.renameSync(staging, absolute);
+          renamed = true;
+          syncDir(parent);
+          syncDir(path.join(runDir, 'artifacts', 'sha256'));
+          syncDir(path.join(runDir, 'artifacts'));
+          syncDir(runDir);
+          return { kind: 'ok' };
+        } catch (err) {
+          if (err instanceof ArtifactStoreError) {
+            return { kind: 'fail', error: err };
+          }
+          // Concurrent creator may have published the same digest before our rename.
+          if (!renamed && fs.existsSync(absolute)) {
+            return { kind: 'dedup' };
+          }
+          return {
+            kind: 'fail',
+            error: new ArtifactStoreError(
+              'artifact_write_error',
+              `artifact write failed: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err }
+            ),
+          };
+        } finally {
+          if (fd !== undefined) {
+            try {
+              fs.closeSync(fd);
+            } catch {
+              /* ignore */
+            }
+          }
+          // Clean only this writer's exact staging pathname, then try non-recursive rmdir.
+          try {
+            if (fs.existsSync(staging)) fs.unlinkSync(staging);
+          } catch {
+            /* ignore */
+          }
+          try {
+            fs.rmdirSync(stagingRoot);
+          } catch {
+            /* not empty or missing — preserve competing/unknown entries */
+          }
+        }
+      })();
+
+      if (outcome.kind === 'ok') return ref;
+      if (outcome.kind === 'dedup') {
+        yield* verifyFile(runId, runDir, ref);
+        return ref;
+      }
+      return yield* Effect.fail(outcome.error);
+    });
   }
 
-  async function verifyFile(
+  function writeTextEffect(
+    runId: string,
+    runDir: string,
+    payload: RunArtifactPayload,
+    text: string
+  ): Effect.Effect<RunArtifactRefV1, ArtifactStoreError> {
+    const bytes = Buffer.from(text, 'utf8');
+    return writeBytes(runId, runDir, payload, 'text/plain; charset=utf-8', bytes);
+  }
+
+  function writeJsonEffect(
+    runId: string,
+    runDir: string,
+    payload: RunArtifactPayload,
+    value: unknown
+  ): Effect.Effect<RunArtifactRefV1, ArtifactStoreError> {
+    return Effect.gen(function* () {
+      if (value === undefined) {
+        return yield* Effect.fail(
+          new ArtifactStoreError('artifact_invalid', 'JSON artifact value cannot be undefined')
+        );
+      }
+      const text = yield* Effect.try({
+        try: () => serializeJsonArtifact(value),
+        catch: (err) =>
+          err instanceof ArtifactStoreError
+            ? err
+            : new ArtifactStoreError(
+                'artifact_invalid',
+                `JSON artifact value is not serializable: ${err instanceof Error ? err.message : String(err)}`,
+                { cause: err }
+              ),
+      });
+      yield* Effect.try({
+        try: () => {
+          JSON.parse(text);
+        },
+        catch: (err) =>
+          new ArtifactStoreError(
+            'artifact_invalid',
+            `JSON artifact is not re-parseable: ${err instanceof Error ? err.message : String(err)}`
+          ),
+      });
+      return yield* writeBytes(
+        runId,
+        runDir,
+        payload,
+        'application/json',
+        Buffer.from(text, 'utf8')
+      );
+    });
+  }
+
+  function readTextEffect(
     runId: string,
     runDir: string,
     ref: RunArtifactRefV1
-  ): Promise<{ absolute: string; buf: Buffer }> {
-    assertValidRefShape(runId, ref);
-    const absolute = resolveContainedArtifactPath(runDir, ref.relativePath);
-    let st: fs.Stats;
-    try {
-      st = fs.statSync(absolute);
-    } catch (err) {
-      throw new ArtifactStoreError(
-        'artifact_missing',
-        `artifact missing: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err }
-      );
-    }
-    if (!st.isFile()) {
-      throw new ArtifactStoreError('artifact_corrupt', 'artifact is not a regular file');
-    }
-    if (st.size !== ref.bytes) {
-      throw new ArtifactStoreError('artifact_corrupt', 'artifact size does not match ref');
-    }
+  ): Effect.Effect<string, ArtifactStoreError> {
+    return Effect.gen(function* () {
+      if (ref.mediaType !== 'text/plain; charset=utf-8') {
+        return yield* Effect.fail(
+          new ArtifactStoreError('artifact_corrupt', 'artifact mediaType is not text')
+        );
+      }
+      const { buf } = yield* verifyFile(runId, runDir, ref);
+      return buf.toString('utf8');
+    });
+  }
 
-    let fd: number | undefined;
-    try {
-      fd = fs.openSync(absolute, fs.constants.O_RDONLY);
-      const buf = fs.readFileSync(fd);
-      if (buf.length !== ref.bytes) {
-        throw new ArtifactStoreError('artifact_corrupt', 'artifact size does not match ref');
+  function readJsonEffect(
+    runId: string,
+    runDir: string,
+    ref: RunArtifactRefV1
+  ): Effect.Effect<unknown, ArtifactStoreError> {
+    return Effect.gen(function* () {
+      if (ref.mediaType !== 'application/json') {
+        return yield* Effect.fail(
+          new ArtifactStoreError('artifact_corrupt', 'artifact mediaType is not json')
+        );
       }
-      const digest = sha256Hex(buf);
-      if (digest !== ref.sha256) {
-        throw new ArtifactStoreError('artifact_corrupt', 'artifact digest mismatch');
-      }
-      return { absolute, buf };
-    } catch (err) {
-      if (err instanceof ArtifactStoreError) throw err;
-      throw new ArtifactStoreError(
-        'artifact_corrupt',
-        `artifact read failed: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err }
-      );
-    } finally {
-      if (fd !== undefined) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
+      const { buf } = yield* verifyFile(runId, runDir, ref);
+      return yield* Effect.try({
+        try: () => JSON.parse(buf.toString('utf8')) as unknown,
+        catch: (err) =>
+          new ArtifactStoreError(
+            'artifact_corrupt',
+            `artifact JSON parse failed: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err }
+          ),
+      });
+    });
+  }
+
+  function resolvePathEffect(
+    runId: string,
+    runDir: string,
+    ref: RunArtifactRefV1
+  ): Effect.Effect<string, ArtifactStoreError> {
+    return Effect.gen(function* () {
+      const { absolute } = yield* verifyFile(runId, runDir, ref);
+      return absolute;
+    });
   }
 
   return {
-    async writeTextArtifact(runId, runDir, payload, text) {
-      const bytes = Buffer.from(text, 'utf8');
-      return writeBytes(runId, runDir, payload, 'text/plain; charset=utf-8', bytes);
+    writeTextArtifact(runId, runDir, payload, text) {
+      return runEffectPromise(writeTextEffect(runId, runDir, payload, text));
     },
 
-    async writeJsonArtifact(runId, runDir, payload, value) {
-      if (value === undefined) {
-        throw new ArtifactStoreError('artifact_invalid', 'JSON artifact value cannot be undefined');
-      }
-      const text = serializeJsonArtifact(value);
-      try {
-        JSON.parse(text);
-      } catch (err) {
-        throw new ArtifactStoreError(
-          'artifact_invalid',
-          `JSON artifact is not re-parseable: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-      return writeBytes(runId, runDir, payload, 'application/json', Buffer.from(text, 'utf8'));
+    writeJsonArtifact(runId, runDir, payload, value) {
+      return runEffectPromise(writeJsonEffect(runId, runDir, payload, value));
     },
 
-    async readTextArtifact(runId, runDir, ref) {
-      if (ref.mediaType !== 'text/plain; charset=utf-8') {
-        throw new ArtifactStoreError('artifact_corrupt', 'artifact mediaType is not text');
-      }
-      const { buf } = await verifyFile(runId, runDir, ref);
-      return buf.toString('utf8');
+    readTextArtifact(runId, runDir, ref) {
+      return runEffectPromise(readTextEffect(runId, runDir, ref));
     },
 
-    async readJsonArtifact(runId, runDir, ref) {
-      if (ref.mediaType !== 'application/json') {
-        throw new ArtifactStoreError('artifact_corrupt', 'artifact mediaType is not json');
-      }
-      const { buf } = await verifyFile(runId, runDir, ref);
-      try {
-        return JSON.parse(buf.toString('utf8'));
-      } catch (err) {
-        throw new ArtifactStoreError(
-          'artifact_corrupt',
-          `artifact JSON parse failed: ${err instanceof Error ? err.message : String(err)}`,
-          { cause: err }
-        );
-      }
+    readJsonArtifact(runId, runDir, ref) {
+      return runEffectPromise(readJsonEffect(runId, runDir, ref));
     },
 
-    async resolveArtifactPath(runId, runDir, ref) {
-      const { absolute } = await verifyFile(runId, runDir, ref);
-      return absolute;
+    resolveArtifactPath(runId, runDir, ref) {
+      return runEffectPromise(resolvePathEffect(runId, runDir, ref));
     },
   };
 }

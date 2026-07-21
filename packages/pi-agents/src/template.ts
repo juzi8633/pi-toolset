@@ -1,6 +1,7 @@
 // ABOUTME: Chain task template expansion — substitutes {previous}, {outputs.<name>}, and {item} placeholders.
 // ABOUTME: Returns ok=false with the unknown name when the template references a missing output.
 
+import { Either } from 'effect';
 import { formatChildArtifactDescriptor } from './result-payload.ts';
 import type { ChainOutputEntry } from './types.ts';
 
@@ -24,7 +25,16 @@ function renderItem(value: unknown): string {
   return String(value);
 }
 
-export function renderTaskTemplate(template: string, context: TemplateContext): TemplateResult {
+type TemplateSuccess = {
+  text: string;
+  requiresArtifactReader?: boolean;
+};
+
+/** Pure core: Right = expanded text; Left = first unknown placeholder name. */
+function renderTaskTemplateEither(
+  template: string,
+  context: TemplateContext
+): Either.Either<TemplateSuccess, string> {
   let unknown: string | undefined;
   let requiresArtifactReader = false;
   const replaced = template.replace(TOKEN_RE, (_match, full: string, name?: string) => {
@@ -57,11 +67,21 @@ export function renderTaskTemplate(template: string, context: TemplateContext): 
     return _match;
   });
   if (unknown !== undefined) {
-    return { ok: false, unknown };
+    return Either.left(unknown);
   }
-  return {
-    ok: true,
+  return Either.right({
     text: replaced,
-    ...(requiresArtifactReader ? { requiresArtifactReader: true } : {}),
-  };
+    ...(requiresArtifactReader ? { requiresArtifactReader: true as const } : {}),
+  });
+}
+
+export function renderTaskTemplate(template: string, context: TemplateContext): TemplateResult {
+  return Either.match(renderTaskTemplateEither(template, context), {
+    onLeft: (unknown) => ({ ok: false, unknown }),
+    onRight: (value) => ({
+      ok: true,
+      text: value.text,
+      ...(value.requiresArtifactReader ? { requiresArtifactReader: true } : {}),
+    }),
+  });
 }

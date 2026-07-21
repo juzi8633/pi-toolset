@@ -145,6 +145,17 @@ Existing string codes (`RunStoreErrorCode`, `ArtifactStoreError['code']`, intera
 - Whether Phase 8 should adopt `effect/Schema` for `run.json` validation only, or leave hand-written validators indefinitely — decide at gate review.
 - Whether a future phase may introduce `@effect/platform-node` FileSystem — default **no** until sync test seams are redesigned.
 
+## After the program (deferred leftovers)
+
+Program exit record: [program-exit.md](./program-exit.md).
+
+When Phases 0–8A are done and the package suite is green, remaining Effect-adjacent work is **not** part of the main strangler timeline:
+
+| Leftover                                           | Doc                                                                                | Rule                                                                  |
+| -------------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Tx lock wait (`Atomics.wait` → Effect async sleep) | [10-post-program-tx-lock-effect-wait.md](./10-post-program-tx-lock-effect-wait.md) | Start only after program exit; existing tests are the behavior freeze |
+| Slice C Schema (optional)                          | [09-phase-8-run-store-partial.md](./09-phase-8-run-store-partial.md)               | Separate decision; not required for program complete                  |
+
 ## How to Execute a Phase
 
 1. Read this overview + the phase plan end-to-end.

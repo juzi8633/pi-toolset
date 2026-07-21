@@ -39,6 +39,8 @@ import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'eff
 1. **Public module APIs** that today return `Promise<T>` or sync `T` keep that shape.
 2. Internal helpers may return `Effect.Effect<A, E, R>` with `R = never` unless a phase explicitly introduces services.
 3. Crossing back to Promise uses `runEffectPromise` / `runEffectExit` from `effect-runtime.ts` (not raw `Effect.runPromise` scattered everywhere).
+   - `runEffectPromise`: typed `Error` failures reject as the same instance; non-Error failures wrap in `Error`.
+   - `runEffectExit`: returns `Exit`; never throws for typed failures.
 4. Sync pure functions may return `Either` without going through the runtime.
 
 ### Error tags
@@ -57,7 +59,10 @@ import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'eff
 
 - Host `AbortSignal` aborted → treat as cancellation, not generic failure.
 - Preserve `AgentAbortError` and `RunAbortOrigin` at execution boundaries.
-- Helper: if `signal?.aborted`, fail the Effect with a dedicated tag or interrupt; do not map to `stopReason: 'error'`.
+- Helper API (`effect-runtime.ts`):
+  - `AbortSignalAborted` — `Data.TaggedError('AbortSignalAborted')` with optional `reason`
+  - `checkAbortSignal(signal)` — if `signal?.aborted`, fail with `AbortSignalAborted` (no later-abort subscription)
+- Do not map abort to `stopReason: 'error'`. Callers map `AbortSignalAborted` to `AgentAbortError` at execution boundaries.
 
 ### Layers / services
 
@@ -82,10 +87,10 @@ import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'eff
 
 **Steps:**
 
-- [ ] Confirm `dependencies.effect` is `"^3.22.0"` (or update to that range if missing).
-- [ ] Do not add `@effect/*` packages.
-- [ ] Run `bun install` at monorepo root if the lockfile needs refresh.
-- [ ] Verify resolve: `node -e "import('effect').then(m => console.log(!!m.Effect))"` from package context, or import in a scratch test.
+- [x] Confirm `dependencies.effect` is `"^3.22.0"` (or update to that range if missing).
+- [x] Do not add `@effect/*` packages.
+- [x] Run `bun install` at monorepo root if the lockfile needs refresh.
+- [x] Verify resolve: `node -e "import('effect').then(m => console.log(!!m.Effect))"` from package context, or import in a scratch test.
 
 **Validation:**
 
@@ -105,15 +110,16 @@ import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'eff
 
 **Steps:**
 
-- [ ] Add 2-line ABOUTME header.
-- [ ] Export at least:
+- [x] Add 2-line ABOUTME header.
+- [x] Export at least:
   - `runEffectPromise<A, E>(effect: Effect.Effect<A, E>): Promise<A>` — runs with default runtime; rejects with the failure value if it is an `Error`, otherwise wraps non-Error failures in `Error` **only when necessary**. Prefer: if failure is `Error`, reject with it; if tagged error with `message`, reject with that instance when it extends `Error`.
   - `runEffectExit<A, E>(effect: Effect.Effect<A, E>): Promise<Exit.Exit<A, E>>` — never throws for typed failures.
-  - `effectFromAbortSignal(signal: AbortSignal | undefined): Effect.Effect<void, never>` **or** `checkAbortSignal(signal: AbortSignal | undefined): Effect.Effect<void, AbortSignalFailure>` — documents the chosen abort policy.
-- [ ] Document chosen abort policy in a short comment on the helper:
-  - Preferred: when `signal?.aborted`, fail with a small `Data.TaggedError('AbortSignalAborted')` carrying optional `reason`, so callers can map to `AgentAbortError` without treating it as defect.
-- [ ] Keep the module free of pi-agents domain imports (no `run-types`, no `SingleResult`) so it stays a true leaf.
-- [ ] Unit tests:
+  - `checkAbortSignal(signal: AbortSignal | undefined): Effect.Effect<void, AbortSignalAborted>` — chosen abort policy (point-in-time check).
+  - `AbortSignalAborted` — `Data.TaggedError('AbortSignalAborted')` with optional `reason`.
+- [x] Document chosen abort policy in a short comment on the helper:
+  - when `signal?.aborted`, fail with `AbortSignalAborted` carrying optional `reason`, so callers can map to `AgentAbortError` without treating it as defect.
+- [x] Keep the module free of pi-agents domain imports (no `run-types`, no `SingleResult`) so it stays a true leaf.
+- [x] Unit tests:
   - success path resolves value
   - failure path: `Effect.fail(new Error('x'))` rejects with that error via `runEffectPromise`
   - `runEffectExit` returns `Exit.isFailure` without throwing
@@ -136,8 +142,8 @@ import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'eff
 
 **Steps:**
 
-- [ ] Re-read Locked Conventions against the implemented helpers.
-- [ ] Align wording so Phase 1 authors copy the real API names.
+- [x] Re-read Locked Conventions against the implemented helpers.
+- [x] Align wording so Phase 1 authors copy the real API names (`runEffectPromise`, `runEffectExit`, `checkAbortSignal`, `AbortSignalAborted`).
 
 **Validation:**
 
@@ -173,4 +179,4 @@ import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'eff
 
 ## Open Questions
 
-None for Phase 0. Abort policy detail is decided in Task 2 and written back into this plan.
+None for Phase 0. Abort policy decided: point-in-time `checkAbortSignal` → `AbortSignalAborted` (no live signal subscription in Phase 0).

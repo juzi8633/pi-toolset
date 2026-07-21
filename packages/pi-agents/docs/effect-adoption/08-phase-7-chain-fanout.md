@@ -48,8 +48,8 @@
 
 **Steps:**
 
-- [ ] Locate `mapWithConcurrencyLimit(renderedTasks, concurrency, worker)` in `runFanoutStep`.
-- [ ] Extract local helper in `chain.ts` or shared:
+- [x] Locate `mapWithConcurrencyLimit(renderedTasks, concurrency, worker)` in `runFanoutStep`.
+- [x] Extract local helper in `chain.ts` or shared:
 
   ```ts
   async function runFanoutWorkers<T>(
@@ -79,28 +79,14 @@
 
 **Steps:**
 
-- [ ] Implement `runFanoutWorkers` with Effect, e.g.:
+- [x] Implement `runFanoutWorkers` with Effect worker bodies + cancel-safe Promise pool (same claim/onUnstarted contract as `mapWithConcurrencyLimit`).
+  - **Not** `Effect.forEach({ concurrency })` — that would fail-fast interrupt in-flight workers.
+  - Task body: `Effect.tryPromise` + `runEffectExit`; rethrow failures as-is.
 
-  ```ts
-  return runEffectPromise(
-    Effect.forEach(
-      items.map((item, index) => ({ item, index })),
-      ({ item, index }) =>
-        Effect.tryPromise({
-          try: () => worker(item, index),
-          catch: (e) => e as unknown,
-        }),
-      { concurrency }
-    )
-  );
-  ```
-
-  Adjust error channel so abort errors propagate the same way as today’s `mapWithConcurrencyLimit` (inspect current abort/rethrow behavior in `runFanoutStep` try/catch around workers).
-
-- [ ] Ensure mid-fanout `signal.aborted` still short-circuits or cancels per existing tests (match current skip/cancel behavior exactly).
-- [ ] Do not change sequential `runSequentialStep` in this phase.
-- [ ] Do not change template rendering beyond what Phase 1 already did.
-- [ ] If changing shared `mapWithConcurrencyLimit`, run parallel tool tests too.
+- [x] Ensure mid-fanout `signal.aborted` still short-circuits or cancels per existing tests (match current skip/cancel behavior exactly).
+- [x] Do not change sequential `runSequentialStep` in this phase.
+- [x] Do not change template rendering beyond what Phase 1 already did.
+- [x] Shared `mapWithConcurrencyLimit` left for tool parallel (not changed).
 
 **Validation:**
 
@@ -113,8 +99,8 @@
 
 **Steps:**
 
-- [ ] Default: **leave** `tool.ts` parallel path on `mapWithConcurrencyLimit`.
-- [ ] If migrating: treat as extra task with `tests/tool.test.ts` validation; do not hide it inside fanout-only PR without mention.
+- [x] Default: **leave** `tool.ts` parallel path on `mapWithConcurrencyLimit`.
+- [x] Fanout uses local `runFanoutWorkers` in `chain.ts` only; shared `mapWithConcurrencyLimit` unchanged for tool parallel.
 
 **Validation:**
 
