@@ -30,6 +30,13 @@ const TOOL_RESULT_MAX_LINES = 5;
 const TOOL_RESULT_MAX_BYTES = 4 * 1024;
 /** Default detail-panel content height: last N lines only (not terminal-row dependent). */
 const DETAIL_PREVIEW_LINES = 15;
+/** Below-editor chrome title: diamond + label, whole line accent. */
+const WIDGET_TITLE = '◆ Agents';
+const WIDGET_OPEN_HINT = '/agent view or Ctrl+Alt+Down';
+/** Leading pad for every chrome line (title + body). */
+const WIDGET_LINE_PREFIX = ' ';
+/** Extra indent for agent rows and open hint under the title. */
+const WIDGET_BODY_INDENT = '  ';
 
 /** Result returned from the navigator custom UI when the user requests a host resume. */
 export type InteractiveNavResult = null | { resumeRunId: string };
@@ -117,27 +124,27 @@ export function createInteractiveViewController(options: InteractiveViewControll
       // Labels use full visible set for collision suffixes so they match Agent Nav.
       const names = active.map((ep) => endpointLabel(ep, all));
       const nameCol = maxVisibleWidth(names);
-      // Component factory so status glyphs pick up theme colors (warning/text/error).
+      // Component factory so status glyphs pick up theme colors (warning for ◐).
       // Capture the snapshot at refresh time; host invokes the factory immediately.
       ui.setWidget(
         WIDGET_KEY,
         (_tui: TUI, theme: Theme) => {
           const themeFg: ThemeFg = (color, text) => theme.fg(color, text);
-          const lines: string[] = [];
+          // Title (incl. icon) accent; body indented; ◐ keeps status color, rest dim.
+          const lines: string[] = [`${WIDGET_LINE_PREFIX}${theme.fg('accent', WIDGET_TITLE)}`];
           for (let i = 0; i < active.length; i++) {
-            lines.push(
-              formatEndpointListLabel(
-                active[i]!,
-                names[i]!,
-                statusText(active[i]!),
-                nameCol,
-                themeFg
-              )
+            const glyph = formatEndpointStatusGlyph(active[i]!, themeFg);
+            const rest = theme.fg(
+              'dim',
+              `${padEndVisible(names[i]!, nameCol)} ${statusText(active[i]!)}`
             );
+            lines.push(`${WIDGET_LINE_PREFIX}${WIDGET_BODY_INDENT}${glyph} ${rest}`);
           }
-          lines.push('/agent view or Ctrl+Alt+Down');
+          lines.push(
+            `${WIDGET_LINE_PREFIX}${WIDGET_BODY_INDENT}${theme.fg('dim', WIDGET_OPEN_HINT)}`
+          );
           return {
-            render: () => lines.map((l) => ` ${l}`),
+            render: () => lines,
             invalidate: () => undefined,
           };
         },

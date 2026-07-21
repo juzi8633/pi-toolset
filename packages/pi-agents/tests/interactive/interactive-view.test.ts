@@ -1296,12 +1296,66 @@ describe('interactive-view widget metadata refresh', () => {
       });
       view.installWidget();
       expect(capture.last).toBeDefined();
+      expect(capture.last!.some((l) => l.includes('◆ Agents'))).toBe(true);
       expect(capture.last!.some((l) => l.includes(`agent-${status}`))).toBe(true);
       expect(capture.last!.some((l) => l.includes(status))).toBe(true);
       // Running glyph is ◐ (warning-colored when theme is real).
       expect(capture.last!.some((l) => l.includes('◐'))).toBe(true);
+      expect(capture.last!.some((l) => l.includes('/agent view'))).toBe(true);
       view.clearWidget();
     }
+  });
+
+  it('below-editor widget title is accent; body text is dim except ◐', () => {
+    // Materialize with realTheme so color SGR is present for assertions.
+    let lines: string[] | undefined;
+    const setWidget = (
+      _key: string,
+      content:
+        | string[]
+        | ((tui: unknown, theme: typeof realTheme) => { render: () => string[] })
+        | undefined
+    ) => {
+      if (content === undefined) {
+        lines = undefined;
+        return;
+      }
+      if (Array.isArray(content)) {
+        lines = content;
+        return;
+      }
+      lines = content({}, realTheme).render();
+    };
+    const view = createInteractiveViewController({
+      registry: {
+        listVisibleMeta: () => [metaRow({ status: 'running', title: 'worker', agent: 'debugger' })],
+        subscribe: () => () => undefined,
+      } as never,
+      isTui: () => true,
+      getUi: () => ({ setWidget }),
+    });
+    view.installWidget();
+    expect(lines).toBeDefined();
+    const accentAnsi = realTheme.getFgAnsi('accent');
+    const dimAnsi = realTheme.getFgAnsi('dim');
+    const warningAnsi = realTheme.getFgAnsi('warning');
+    // Title line: whole "◆ Agents" wrapped in accent; body rows indent under it.
+    const title = lines!.find((l) => l.includes('◆ Agents'));
+    expect(title).toBeDefined();
+    expect(title!.includes(accentAnsi)).toBe(true);
+    expect(__test.stripSgr(title!)).toBe(' ◆ Agents');
+    // Agent row: indented under title; ◐ keeps warning; name/status are dim.
+    const row = lines!.find((l) => l.includes('◐') && l.includes('debugger'));
+    expect(row).toBeDefined();
+    expect(__test.stripSgr(row!).startsWith('   ◐')).toBe(true);
+    expect(row!.includes(`${warningAnsi}◐`)).toBe(true);
+    expect(row!.includes(dimAnsi)).toBe(true);
+    // Open hint is dim and shares body indent.
+    const hint = lines!.find((l) => l.includes('/agent view'));
+    expect(hint).toBeDefined();
+    expect(__test.stripSgr(hint!).startsWith('   /agent view')).toBe(true);
+    expect(hint!.includes(dimAnsi)).toBe(true);
+    view.clearWidget();
   });
 
   it('clears below-editor widget after running becomes idle', () => {
@@ -1393,6 +1447,7 @@ describe('interactive-view widget metadata refresh', () => {
     view.installWidget();
     expect(capture.last).toBeDefined();
     const joined = capture.last!.join('\n');
+    expect(joined).toContain('◆ Agents');
     expect(joined).toContain('worker-active');
     expect(joined).toContain('running');
     expect(joined).toContain('◐');

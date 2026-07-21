@@ -166,7 +166,7 @@ Ctrl+Alt+Down            # same shortcut
 
 `/agent view` opens in the input/editor area (non-overlay `ui.custom`, same surface as `/settings`) with a candidate list styled like the prompt autocomplete list. Escape or Left restores the host editor; Enter or Right on an endpoint opens its detail transcript.
 
-The below-editor agent list appears only while at least one visible agent is `starting` or `running`, and **lists only those running endpoints** (plus the open hint). Idle, detached, error, and other non-running endpoints are omitted from the chrome and remain reachable from `/agent view`. While the navigator is open, that list (including the open hint) is hidden so it does not duplicate the navigator rows; it is restored after the navigator closes if any agent is still active.
+The below-editor agent list appears only while at least one visible agent is `starting` or `running`, and **lists only those running endpoints** under a `◆ Agents` title (plus the open hint). Idle, detached, error, and other non-running endpoints are omitted from the chrome and remain reachable from `/agent view`. The title (including the diamond) uses the theme `accent` color; body text uses `dim`, except the running glyph `◐` which keeps its status color. While the navigator is open, that list (including the open hint) is hidden so it does not duplicate the navigator rows; it is restored after the navigator closes if any agent is still active.
 
 List/widget status glyphs (Agent Nav uses the same mapping for every endpoint):
 
