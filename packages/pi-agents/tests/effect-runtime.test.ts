@@ -3,12 +3,17 @@
 
 import { describe, expect, it } from 'bun:test';
 import { Data, Effect, Exit } from 'effect';
+import { AgentAbortError } from '../src/abort.ts';
 import {
   AbortSignalAborted,
   checkAbortSignal,
+  failAgentAbortError,
+  failIfAborted,
   runEffectExit,
   runEffectPromise,
 } from '../src/effect-runtime.ts';
+import { emptyUsage } from '../src/empty-usage.ts';
+import type { SingleResult } from '../src/types.ts';
 
 class SampleTaggedFailure extends Data.TaggedError('SampleTaggedFailure')<{
   readonly message: string;
@@ -16,7 +21,7 @@ class SampleTaggedFailure extends Data.TaggedError('SampleTaggedFailure')<{
 
 describe('runEffectPromise', () => {
   it('resolves the success value', async () => {
-    await expect(runEffectPromise(Effect.succeed(42))).resolves.toBe(42);
+    expect(await runEffectPromise(Effect.succeed(42))).toBe(42);
   });
 
   it('rejects with the original Error on typed failure', async () => {
@@ -56,26 +61,56 @@ describe('runEffectExit', () => {
   });
 });
 
-describe('checkAbortSignal', () => {
+describe('failIfAborted', () => {
   it('succeeds when signal is undefined', async () => {
-    await expect(runEffectPromise(checkAbortSignal(undefined))).resolves.toBeUndefined();
+    expect(await runEffectPromise(failIfAborted(undefined))).toBeUndefined();
   });
 
   it('succeeds when signal is not aborted', async () => {
     const controller = new AbortController();
-    await expect(runEffectPromise(checkAbortSignal(controller.signal))).resolves.toBeUndefined();
+    expect(await runEffectPromise(failIfAborted(controller.signal))).toBeUndefined();
   });
 
   it('fails with AbortSignalAborted when signal is already aborted', async () => {
     const controller = new AbortController();
     controller.abort('user-cancel');
     try {
-      await runEffectPromise(checkAbortSignal(controller.signal));
+      await runEffectPromise(failIfAborted(controller.signal));
       expect.unreachable('expected AbortSignalAborted');
     } catch (err) {
       expect(err).toBeInstanceOf(AbortSignalAborted);
       expect((err as AbortSignalAborted)._tag).toBe('AbortSignalAborted');
       expect((err as AbortSignalAborted).reason).toBe('user-cancel');
+    }
+  });
+
+  it('checkAbortSignal is the Phase 0 alias of failIfAborted', () => {
+    expect(checkAbortSignal).toBe(failIfAborted);
+  });
+});
+
+describe('failAgentAbortError', () => {
+  it('rejects with the same AgentAbortError instance', async () => {
+    const result: SingleResult = {
+      agent: 'noop',
+      agentSource: 'builtin',
+      task: 't',
+      status: 'cancelled',
+      stopReason: 'aborted',
+      exitCode: 1,
+      messages: [],
+      stderr: '',
+      usage: emptyUsage(),
+    };
+    const abortErr = new AgentAbortError(result, 'user');
+    try {
+      await runEffectPromise(failAgentAbortError(abortErr));
+      expect.unreachable('expected AgentAbortError');
+    } catch (err) {
+      expect(err).toBe(abortErr);
+      expect(err).toBeInstanceOf(AgentAbortError);
+      expect((err as AgentAbortError).origin).toBe('user');
+      expect((err as AgentAbortError).result.agent).toBe('noop');
     }
   });
 });

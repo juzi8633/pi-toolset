@@ -9,8 +9,10 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { getMarkdownTheme } from '@earendil-works/pi-coding-agent';
 import { Container, Markdown, Spacer, Text, type Component } from '@earendil-works/pi-tui';
+import { Effect } from 'effect';
 import { getBuiltinAgentsDir, type AgentScope } from './agents.ts';
 import { PRESENTATION_ERROR_PREVIEW_CHARS } from './constants.ts';
+import { runEffectPromise } from './effect-runtime.ts';
 import { truncateParallelOutput } from './output.ts';
 import type { RunAbortOrigin } from './run-types.ts';
 import type {
@@ -345,12 +347,19 @@ export function createBackgroundManager(
     }
   };
 
-  const waitForIdle = async (): Promise<void> => {
-    while (jobs.size > 0) {
-      const pending = Array.from(jobs.values()).map((j) => j.promise);
-      await Promise.allSettled(pending);
-    }
-  };
+  /**
+   * Drain until the job map is empty. Uses Effect.promise + allSettled so a
+   * single job rejection cannot abort waiting for siblings (same as before).
+   */
+  const waitForIdle = (): Promise<void> =>
+    runEffectPromise(
+      Effect.gen(function* () {
+        while (jobs.size > 0) {
+          const pending = Array.from(jobs.values()).map((j) => j.promise);
+          yield* Effect.promise(() => Promise.allSettled(pending));
+        }
+      })
+    );
 
   return {
     launch,

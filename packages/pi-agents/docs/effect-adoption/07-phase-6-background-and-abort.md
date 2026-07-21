@@ -48,10 +48,10 @@
 
 **Steps:**
 
-- [ ] Export a helper, e.g.:
-  - `fromAbortSignal(signal: AbortSignal | undefined): Effect.Effect<void, AbortSignalAborted>`
-  - and/or `failIfAborted(signal)` for use at Effect boundaries
-- [ ] Define `AbortSignalAborted` as `Data.TaggedError` with optional `reason`.
+- [x] Export a helper:
+  - Canonical: `failIfAborted(signal: AbortSignal | undefined): Effect.Effect<void, AbortSignalAborted>`
+  - Compat alias: `checkAbortSignal` (Phase 0 name; same function)
+- [x] Define `AbortSignalAborted` as `Data.TaggedError` with optional `reason` (Phase 0).
 - [ ] Document mapping table in code comment:
 
   | Source                   | Effect                                     | Downstream (existing)                |

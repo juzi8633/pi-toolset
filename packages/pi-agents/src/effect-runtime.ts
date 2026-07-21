@@ -2,6 +2,24 @@
 // ABOUTME: Later phases import these instead of calling Effect.runPromise ad hoc.
 
 import { Cause, Data, Effect, Exit, Option } from 'effect';
+import type { AgentAbortError } from './abort.ts';
+
+/**
+ * Abort → Effect mapping (Phase 0 + 6):
+ *
+ * | Source                | Effect                                      | Downstream (existing)                |
+ * | --------------------- | ------------------------------------------- | ------------------------------------ |
+ * | `signal.aborted` user | fail `AbortSignalAborted` via `failIfAborted` | `AgentAbortError` / cancelled result |
+ * | `AgentAbortError`     | fail same instance (`failAgentAbortError`)  | preserve `result` + `origin`         |
+ * | defect                | die                                         | unexpected                           |
+ *
+ * Canonical Effect call-site helper for signals: `failIfAborted`.
+ * `checkAbortSignal` is the same function (Phase 0 name kept for compatibility).
+ *
+ * Do not map aborts to generic domain `stopReason: 'error'`. Keep dual
+ * representation: Effect tags at Effect boundaries; `AgentAbortError` at
+ * execution/tool Promise boundaries.
+ */
 
 /**
  * Typed abort failure for host AbortSignal cancellation.
@@ -14,14 +32,26 @@ export class AbortSignalAborted extends Data.TaggedError('AbortSignalAborted')<{
 /**
  * Fail immediately when `signal` is already aborted.
  * Does not subscribe for later aborts — compose with interruptible fibers if needed.
+ * Canonical name for Effect call sites (Phase 6+).
  */
-export function checkAbortSignal(
+export function failIfAborted(
   signal: AbortSignal | undefined
 ): Effect.Effect<void, AbortSignalAborted> {
   if (signal?.aborted) {
     return Effect.fail(new AbortSignalAborted({ reason: signal.reason }));
   }
   return Effect.void;
+}
+
+/** Phase 0 name; identical to `failIfAborted`. Prefer `failIfAborted` at new call sites. */
+export const checkAbortSignal = failIfAborted;
+
+/**
+ * Put an existing AgentAbortError on the failure channel without wrapping.
+ * Preserves `result` and `origin` for Promise-boundary rethrow.
+ */
+export function failAgentAbortError(err: AgentAbortError): Effect.Effect<never, AgentAbortError> {
+  return Effect.fail(err);
 }
 
 /**
