@@ -70,7 +70,7 @@ If any box fails → **do not start coding**.
 
 **Status:** Deferred until the **overall Effect adoption program** is complete (not mid-phase). **Post-program plan (behavior-preserving):** [10-post-program-tx-lock-effect-wait.md](./10-post-program-tx-lock-effect-wait.md).
 
-**Steps:** (execute via `10-post-gate-lock-schedule.md`, not this PR)
+**Steps:** (execute via [10-post-program-tx-lock-effect-wait.md](./10-post-program-tx-lock-effect-wait.md), not this PR)
 
 - [ ] Locate lock acquire retry/sleep loop.
 - [ ] Split try-once (sync) vs wait loop (async Effect sleep / Schedule).

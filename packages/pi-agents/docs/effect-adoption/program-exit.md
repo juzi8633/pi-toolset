@@ -2,7 +2,8 @@
 
 **Date:** 2026-07-21  
 **Package:** `@balaenis/pi-agents`  
-**Baseline SHA:** `bf22a7d` (Phase 8A + post-program lock plan docs)  
+**Baseline code SHA:** `bf22a7d` (Phase 8A + post-program lock plan docs)  
+**Exit record SHA:** `e14d2db` (this document)  
 **Exit branch:** `feat/effect-program-exit`
 
 ## Exit checklist
