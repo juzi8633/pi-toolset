@@ -34,8 +34,7 @@
   },
   "files": [
     "dist",
-    "schemas",
-    "src/version.ts"
+    "schemas"
   ],
   "dependencies": {
     "vscode-jsonrpc": "^9.0.0"
