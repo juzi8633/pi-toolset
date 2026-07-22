@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/balaenis/pi-toolset/compare/pi-format-v0.1.0...pi-format-v0.1.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* **build:** exclude source files from published packages ([18fa8c0](https://github.com/balaenis/pi-toolset/commit/18fa8c0daae92eaf2bfd64ddd54d2906e7c6ab4d))
+
 ## [0.1.0](https://github.com/balaenis/pi-toolset/compare/pi-format-v0.0.1...pi-format-v0.1.0) (2026-07-22)
 
 
