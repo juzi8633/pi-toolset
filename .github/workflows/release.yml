@@ -22,7 +22,7 @@ jobs:
       paths_released: ${{ steps.rp.outputs.paths_released }}
     steps:
       - id: rp
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Manifest mode: do NOT set release-type here. release-please reads
@@ -33,11 +33,11 @@ jobs:
     runs-on: ubuntu-latest
     if: needs.process.outputs.releases_created == 'true' || needs.process.outputs.prs_created == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Dispatch latest publishes (per released path)
         if: needs.process.outputs.releases_created == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           PATHS_RELEASED: ${{ needs.process.outputs.paths_released }}
         with:
@@ -56,7 +56,7 @@ jobs:
 
       - name: Dispatch next snapshots (all workspace packages)
         if: needs.process.outputs.prs_created == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
