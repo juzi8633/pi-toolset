@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/balaenis/pi-toolset/compare/pi-agents-v0.1.0...pi-agents-v0.2.0) (2026-07-22)
+
+
+### Features
+
+* **pi-agents:** optimize builds with runtime bundling and subpath Effect imports ([ecaadc8](https://github.com/balaenis/pi-toolset/commit/ecaadc851619f4c67f621925c8d5a4ed6e948aba))
+
+
+### Bug Fixes
+
+* **build:** exclude source files from published packages ([18fa8c0](https://github.com/balaenis/pi-toolset/commit/18fa8c0daae92eaf2bfd64ddd54d2906e7c6ab4d))
+
 ## [0.1.0](https://github.com/balaenis/pi-toolset/compare/pi-agents-v0.0.1...pi-agents-v0.1.0) (2026-07-22)
 
 
