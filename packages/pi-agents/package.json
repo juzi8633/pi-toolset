@@ -26,9 +26,6 @@
     "prompts": [
       "./prompts"
     ],
-    "agents": [
-      "./agents"
-    ],
     "external": [
       "@agentclientprotocol/sdk",
       "effect"

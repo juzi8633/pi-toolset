@@ -278,7 +278,7 @@ Put a `config.json` in the Pi user or project config directory:
 {
   "agents": {
     "explore": { "model": "gpt-5", "thinking": "high" },
-    "@balaenis/pi-agents.reviewer": { "model": "claude-sonnet-4.5" }
+    "reviewer": { "model": "claude-sonnet-4.5" }
   }
 }
 ```
@@ -325,7 +325,7 @@ Bypass the model and run a discovered agent directly:
 ```
 /agent config
 /agent:explore find all authentication code
-/agent:@balaenis/pi-agents.reviewer review the recent changes
+/agent:reviewer review the recent changes
 ```
 
 - `/agent config [name]` opens the TUI config editor (browse + session overrides + save).
