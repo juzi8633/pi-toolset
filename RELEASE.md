@@ -47,37 +47,96 @@ Why:
 - The first release creates the npm package on npmjs.com.
 - That then allows trusted publishing with GitHub Actions for future releases.
 
+### Package Map
+
+| Package path         | npm package           | Bootstrap tag      |
+| -------------------- | --------------------- | ------------------ |
+| `packages/pi-lsp`    | `@balaenis/pi-lsp`    | `pi-lsp-v0.0.1`    |
+| `packages/pi-format` | `@balaenis/pi-format` | `pi-format-v0.0.1` |
+| `packages/pi-agents` | `@balaenis/pi-agents` | `pi-agents-v0.0.1` |
+
+### Prerequisites
+
+- Use an npm account with permission to create and publish packages in the `@balaenis` npm organization.
+- Install the repository toolchain with `mise install` and `mise run setup`.
+- Ensure the scoped package name is available on npm.
+- Use local npm authentication for the first publish. GitHub OIDC is available only inside the trusted GitHub Actions workflow and cannot bootstrap a package that does not yet exist.
+
 ### Steps
 
 1. Confirm the package's `package.json` is correct:
    - `version` is `0.0.1`
-   - package name (with scope) is correct
-   - `repository.url` points to `https://github.com/balaenis/pi-toolset.git`
+   - `name` uses the `@balaenis/` scope
+   - `repository.url` is `https://github.com/balaenis/pi-toolset.git`
+   - `publishConfig.access` is `public`
    - `files`, `exports`, and `pi.extensions` are correct
 
-2. Run `npm login` to authenticate with npm.
-
-3. Build and publish the first version from the repository root:
+2. Authenticate locally with the npm account that has access to the organization:
 
    ```sh
-   mise run build --package packages/pi-lsp
-   mise run publish --package packages/pi-lsp --otp <your-2fa-code>
+   npm login --registry=https://registry.npmjs.org --auth-type=web
+   npm whoami
    ```
 
-4. Push a **bootstrap component tag** so the `next` self-skip logic has a baseline (the tag name must match `include-component-in-tag: true`):
+   `devDependencies`, npm organization membership, and local credentials are separate concerns. The package's scoped `name` determines that `npm publish` targets the `@balaenis` organization; the logged-in npm account must have permission to create that package.
+
+3. Run a dry run from the repository root. The publish task builds the package before packing it:
+
+   ```sh
+   mise run publish --package packages/pi-lsp --tag latest --dry-run
+   ```
+
+   Inspect the included files and confirm that no secrets, fixtures, or development-only artifacts are present.
+
+4. Publish the first public version:
+
+   ```sh
+   mise run publish --package packages/pi-lsp --tag latest
+   ```
+
+   If npm requires a one-time password for publishing, pass it explicitly:
+
+   ```sh
+   mise run publish --package packages/pi-lsp --tag latest --otp <your-2fa-code>
+   ```
+
+   The task runs `npm publish --access public`. With `name: "@balaenis/pi-lsp"`, this creates the package in the `@balaenis` npm organization. Local publishing uses the credentials stored by `npm login`; it does not use OIDC.
+
+5. Verify the published package:
+
+   ```sh
+   npm view @balaenis/pi-lsp version dist-tags repository.url
+   ```
+
+6. Push a **bootstrap component tag** so the `next` self-skip logic has a baseline. The tag must match `include-component-in-tag: true`:
 
    ```sh
    git tag pi-lsp-v0.0.1
    git push origin pi-lsp-v0.0.1
    ```
 
-5. On npmjs.com, add a trusted publisher for the package:
+7. On npmjs.com, open the package's **Settings → Trusted Publisher**, select **GitHub Actions**, and configure:
    - **Organization or user:** `balaenis`
    - **Repository:** `pi-toolset`
-   - **Workflow filename:** `publish.yml`
+   - **Workflow filename:** `publish.yml` — enter only the filename, not `.github/workflows/publish.yml`
+   - **Environment:** leave empty unless the workflow job is later bound to a matching GitHub environment
    - **Allowed actions:** select at least `npm publish`
 
-6. [Restrict token access](https://docs.npmjs.com/trusted-publishers#recommended-restrict-token-access-when-using-trusted-publishers) for maximum security.
+   Trusted publishing is configured separately for every npm package. A personal GitHub repository can publish to an npm organization package because npm validates the explicitly trusted repository and workflow; the GitHub owner and npm package owner do not need to be the same kind of account.
+
+8. Confirm that `.github/workflows/publish.yml` retains these permissions:
+
+   ```yaml
+   permissions:
+     id-token: write
+     contents: read
+   ```
+
+   During `npm publish`, npm CLI requests a short-lived GitHub OIDC token and exchanges it for package-scoped publish authorization. No `NPM_TOKEN` is required for this workflow. OIDC authentication exists only for the publish operation, so `npm whoami` does not report it.
+
+9. After a trusted publish succeeds, [restrict token access](https://docs.npmjs.com/trusted-publishers#recommended-restrict-token-access-when-using-trusted-publishers) and revoke obsolete automation tokens.
+
+Repeat the procedure for each package, substituting the package path, npm name, and component tag from the table above.
 
 ## Release Workflow
 
