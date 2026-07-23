@@ -229,6 +229,30 @@ as `name: reviewer` inside `@acme/pi-frontend` is invocable as
 Package agents are not pulled from a project's `dependencies`/`node_modules`;
 only packages explicitly listed in a pi settings file are considered.
 
+## Lazy Grok ACP load boundary
+
+Startup keeps a **static Pi graph**: validation, durable runs, interactive
+registry, Effect-backed background/leases, and PI-RPC execution stay eagerly
+reachable from `dist/index.js` so extension import does not need the ACP SDK.
+
+Grok ACP single-agent execution and interactive transport creation share one
+**memoized dynamic loader** (`loadGrokAcpRuntime`) that imports the sole façade
+`grok-acp-runtime` (and its hashed chunk graph). Concurrent first calls await
+the same in-flight import; a rejected load is shared by concurrent callers and
+then cleared so a later call can retry. Load failures surface only on the Grok
+path as `Grok ACP runtime failed to load: <cause>` — Pi runtime and extension
+startup remain usable.
+
+**No reverse value import:** Grok execution modules must not value-import
+`execution.ts`, `tool.ts`, or `index.ts`. Shared contracts live in
+`execution-types.ts` / `execution-result.ts` / `abort.ts` so the lazy boundary
+stays acyclic under Jiti (`moduleCache: false`).
+
+**Why PI-RPC stays static:** a prior dynamic import of `pi-rpc-execution` under
+parallel Jiti loads re-entered a circular graph and produced
+`undefined.emptyUsage`. PI-RPC therefore remains a static import with cycle
+protection comments; only the optional Grok ACP runtime is deferred.
+
 ## Grok ACP runtime
 
 **`runtime: "grok-acp"`** spawns `grok agent … stdio` and speaks ACP v1 over

@@ -7,45 +7,77 @@ Extension **module import** and **agent execution** are different phases.
 - `PI_AGENTS_CPU_PROFILE=1` starts sampling during agent execution only. It does **not** measure extension import time.
 - `PI_TIMING=1` is the Pi host startup timer. The `module import` line covers recursive dependency loading inside `jiti.import()`; `factory` is reported separately when the extension factory runs.
 
-### Deterministic warm benchmark (local)
+### Deterministic fresh-process warm benchmark (local)
 
 After `mise run build --package packages/pi-agents`:
 
 ```bash
 cd packages/pi-agents
-bun run scripts/benchmark-startup.ts --max-median-ms 250
+bun run scripts/benchmark-startup.ts --warmups 2 --samples 15 --max-median-ms 250
 ```
 
-This measures warm Jiti import of `dist/index.js` with Pi host peers supplied as virtual modules (`moduleCache: false`, `tryNative: false`). It is **not** a disk-cold measurement and does not include filesystem cold-cache or antivirus effects.
+Each sample runs in a **fresh Bun process** (`scripts/benchmark-startup-worker.ts`). Host peers are virtualized outside the timer (`moduleCache: false`, `tryNative: false`). The worker starts its timer immediately before `jiti.import()` and validates that the default export is a function without invoking the extension factory.
 
-Postbuild structural gate (also run by Mise build when present):
+This is a **fresh-process warm-disk** measurement: OS/Bun disk caches are warm, so filesystem/antivirus cold-cache effects are **not** represented. It is distinct from:
+
+- same-process hot module-cache re-imports
+- real disk-cold startup (`PI_TIMING=1` after reboot)
+- extension factory timing
+- first Grok ACP lazy-load latency (deferred until the first `runtime: "grok-acp"` call)
+
+Optional worker timeout (default `30_000` ms):
 
 ```bash
-cd packages/pi-agents
-bun run ./scripts/postbuild.ts
+bun run scripts/benchmark-startup.ts --samples 1 --worker-timeout-ms 30000
 ```
+
+Postbuild structural gate is invoked by Mise build with a transient Bun metafile (`PI_BUILD_METAFILE`). Prefer:
+
+```bash
+mise run build --package packages/pi-agents
+```
+
+Direct `bun run ./scripts/postbuild.ts` requires `PI_BUILD_METAFILE` from the corresponding split build when `pi.build.splitting` is enabled.
 
 **Deterministic gates**
 
-- Warm Jiti benchmark median `<= 250ms` (local/manual; not a flaky CI wall-clock gate)
-- Main bundle `dist/index.js` `<= 2.5 MiB` (`2_621_440` bytes); no external `effect` / `@agentclientprotocol/sdk`
+- Fresh-process warm Jiti median `<= 250ms` (loose local guard; not the relative ship target)
+- Startup static output closure `<= 1_325_000` bytes; total main-graph JS `<= 2_621_440` bytes
+- No startup-static output contains `@agentclientprotocol/sdk` or bundled `zod` inputs
+- At least one dynamic edge reaches an ACP SDK-containing output
+- `effect` and `@agentclientprotocol/sdk` remain bundled; Pi host peers remain external
 
-**Manual objectives** (same machine and extension path, before vs after)
+**Performance ship gates** (same machine and extension path, control vs candidate)
 
-- Cold import improves by at least 60% vs captured cold baseline; `3500ms` is a stretch target
-- Warm median improves by at least 50% vs captured warm baseline; `500ms` is a stretch target
-- Factory timing regresses by no more than 25% vs captured factory baseline
+- Fresh-process warm Jiti median improves by at least **15%**
+- Windows cold `module import` improves by at least **15%**
+- Windows factory median regresses by no more than **10%**
+- Both relative timing gates are mandatory; either failure blocks shipping splitting
 
 ### Windows cold/warm protocol
 
-1. Build the candidate (`mise run build --package packages/pi-agents`).
+1. Build control and candidate artifacts with the same path and enabled-extension set (`mise run build --package packages/pi-agents`).
 2. Ensure only one `pi-agents` extension instance is enabled.
 3. Set `$env:PI_TIMING = '1'`.
-4. Reboot before the cold sample.
-5. Start Pi, wait for the prompt, exit normally, and record the `pi-agents ... module import` line.
-6. Repeat five launches without reboot and record the median warm import (and factory timings as needed).
+4. Reboot before the cold sample for each artifact under test.
+5. Start Pi, wait for the prompt, exit normally, and record the `pi-agents ... module import` line (and factory timing).
+6. Repeat five launches without reboot and record the median warm import and factory median.
+7. Compare control vs candidate: cold import ≥15% better, factory median ≤10% worse.
 
-If the cold target is missed while structural and warm checks pass, stop release and collect a new startup profile; do not change Pi's global loader as part of package-local optimization.
+If either timing ship gate fails while structural checks pass, do not ship splitting; revert `pi.build.splitting` and keep only behavior-neutral source-boundary refactors.
+
+### Postbuild report fields
+
+Split builds print a JSON report including:
+
+- `startupStaticFiles` / `startupStaticBytes`
+- `dynamicReachableFiles` / `dynamicReachableBytes`
+- `totalMainGraphBytes`
+- `acpContainingOutputs`
+- `externalPackages`
+- `emittedChunkPaths`
+
+Limits: `MAX_STARTUP_STATIC_GRAPH_BYTES = 1_325_000`, `MAX_TOTAL_MAIN_GRAPH_BYTES = 2_621_440`.
 
 ---
 

@@ -105,15 +105,40 @@ jobs:
             }
           }
 
-          bun build ./src/index.ts --outdir dist --target node @externalArgs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $artifactReader = "./src/run/artifact-reader-extension.ts"
-          if (-not (Test-Path $artifactReader)) {
-            $artifactReader = "./src/artifact-reader-extension.ts"
+          $splitting = $false
+          if ($pkg.pi.build -and $pkg.pi.build.splitting -eq $true) {
+            $splitting = $true
           }
-          bun build $artifactReader --outdir dist --target node @externalArgs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          bun run ./scripts/postbuild.ts
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metafile = $null
+          try {
+            if ($splitting) {
+              $chunksDir = Join-Path (Get-Location) 'dist/chunks'
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $chunksDir
+              $metafile = [System.IO.Path]::GetTempFileName()
+              bun build ./src/index.ts --outdir dist --target node --splitting --chunk-naming 'chunks/[name]-[hash].[ext]' "--metafile=$metafile" @externalArgs
+            } else {
+              bun build ./src/index.ts --outdir dist --target node @externalArgs
+            }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            $artifactReader = "./src/run/artifact-reader-extension.ts"
+            if (-not (Test-Path $artifactReader)) {
+              $artifactReader = "./src/artifact-reader-extension.ts"
+            }
+            bun build $artifactReader --outdir dist --target node @externalArgs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+            if ($metafile) {
+              $env:PI_BUILD_METAFILE = $metafile
+            } else {
+              Remove-Item Env:PI_BUILD_METAFILE -ErrorAction SilentlyContinue
+            }
+            bun run ./scripts/postbuild.ts
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item Env:PI_BUILD_METAFILE -ErrorAction SilentlyContinue
+            if ($metafile) {
+              Remove-Item -Force -ErrorAction SilentlyContinue $metafile
+            }
+          }

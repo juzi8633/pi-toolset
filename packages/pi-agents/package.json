@@ -25,7 +25,10 @@
     ],
     "prompts": [
       "./prompts"
-    ]
+    ],
+    "build": {
+      "splitting": true
+    }
   },
   "repository": {
     "type": "git",

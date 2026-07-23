@@ -3,7 +3,7 @@
 
 import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { AgentConfig } from '../config/agents.ts';
-import type { OnUpdateCallback, RunSingleAgentOptions } from '../execution/execution.ts';
+import type { OnUpdateCallback, RunSingleAgentOptions } from '../execution/execution-types.ts';
 import type { InteractiveAgentRegistry } from './interactive-agent.ts';
 import { runSingleAgentPiRpc } from '../runtime/pi-rpc/pi-rpc-execution.ts';
 import type { SingleResult, SubagentDetails } from '../shared/types.ts';

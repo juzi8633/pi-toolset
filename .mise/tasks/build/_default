@@ -13,21 +13,36 @@ cd "$PKG"
 # stay external so identity checks and virtual-module resolution keep working.
 # Strip CR from jq output — Windows jq emits CRLF and breaks --external.
 EXTERNALS_FILE="$(mktemp)"
-trap 'rm -f "$EXTERNALS_FILE"' EXIT
+METAFILE=""
+cleanup() {
+  rm -f "$EXTERNALS_FILE"
+  if [ -n "${METAFILE:-}" ]; then
+    rm -f "$METAFILE"
+  fi
+}
+trap cleanup EXIT
 jq -r '([.peerDependencies // {}] | map(keys) | add) + (.pi.external // []) | unique[]' package.json \
   | tr -d '\r' >"$EXTERNALS_FILE"
 
-args=()
+external_args=()
 while IFS= read -r e || [ -n "${e:-}" ]; do
   [ -n "${e:-}" ] || continue
-  args+=(--external "$e")
+  external_args+=(--external "$e")
 done <"$EXTERNALS_FILE"
 
-if [ "${#args[@]}" -eq 0 ]; then
+if [ "${#external_args[@]}" -eq 0 ]; then
   echo "warning: no externals resolved for $PKG; peer/host packages may be bundled" >&2
 fi
 
-bun build ./src/index.ts --outdir dist --target node "${args[@]}"
+SPLITTING="$(jq -r '.pi.build.splitting // false' package.json | tr -d '\r')"
+main_args=(./src/index.ts --outdir dist --target node)
+if [ "$SPLITTING" = "true" ]; then
+  rm -rf dist/chunks
+  METAFILE="$(mktemp)"
+  main_args+=(--splitting --chunk-naming "chunks/[name]-[hash].[ext]" --metafile="$METAFILE")
+fi
+
+bun build "${main_args[@]}" "${external_args[@]}"
 
 # Optional child-only extension entry (pi-agents artifact reader).
 ARTIFACT_READER="./src/run/artifact-reader-extension.ts"
@@ -35,11 +50,20 @@ if [ ! -f "$ARTIFACT_READER" ]; then
   ARTIFACT_READER="./src/artifact-reader-extension.ts"
 fi
 if [ -f "$ARTIFACT_READER" ]; then
-  bun build "$ARTIFACT_READER" --outdir dist --target node "${args[@]}"
+  bun build "$ARTIFACT_READER" --outdir dist --target node "${external_args[@]}"
 fi
 
-if jq -e '.scripts.postbuild' package.json >/dev/null 2>&1; then
-  bun run postbuild
-elif [ -f ./scripts/postbuild.ts ]; then
-  bun run ./scripts/postbuild.ts
-fi
+run_postbuild() {
+  if [ -n "${METAFILE:-}" ]; then
+    export PI_BUILD_METAFILE="$METAFILE"
+  else
+    unset PI_BUILD_METAFILE || true
+  fi
+  if jq -e '.scripts.postbuild' package.json >/dev/null 2>&1; then
+    bun run postbuild
+  elif [ -f ./scripts/postbuild.ts ]; then
+    bun run ./scripts/postbuild.ts
+  fi
+}
+
+run_postbuild

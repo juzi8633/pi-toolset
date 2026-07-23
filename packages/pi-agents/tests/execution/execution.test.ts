@@ -7,7 +7,11 @@ import { Readable, Writable } from 'node:stream';
 import type { AgentConfig } from '../../src/config/agents.ts';
 import { RESULT_UPDATE_INTERVAL_MS } from '../../src/shared/constants.ts';
 import type { SpawnFn, SpawnedChild } from '../../src/execution/execution.ts';
-import { AgentAbortError, mapWithConcurrencyLimit, runSingleAgent } from '../../src/execution/execution.ts';
+import {
+  AgentAbortError,
+  mapWithConcurrencyLimit,
+  runSingleAgent,
+} from '../../src/execution/execution.ts';
 import { getResultFinalOutput } from '../../src/output/output.ts';
 import type { SingleResult, SubagentDetails } from '../../src/shared/types.ts';
 
@@ -981,6 +985,47 @@ describe('runSingleAgentGrokAcp', () => {
     await new Promise((r) => setTimeout(r, RESULT_UPDATE_INTERVAL_MS + 100));
     expect(updateCount).toBe(countAtSettle);
   }, 15_000);
+
+  it('completes concurrent first Grok ACP loads without partial exports', async () => {
+    const agent = makeAgent({ name: 'g', runtime: 'grok-acp', model: 'grok-4.5' });
+    const makeSpawn = () => captureAcpSpawn().spawnFn;
+
+    const [a, b] = await Promise.all([
+      runSingleAgent(
+        process.cwd(),
+        [agent],
+        agent.name,
+        'first concurrent',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        makeDetails,
+        { spawnFn: makeSpawn() }
+      ),
+      runSingleAgent(
+        process.cwd(),
+        [agent],
+        agent.name,
+        'second concurrent',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        makeDetails,
+        { spawnFn: makeSpawn() }
+      ),
+    ]);
+
+    expect(a.exitCode).toBe(0);
+    expect(b.exitCode).toBe(0);
+    expect(a.stopReason).toBe('end');
+    expect(b.stopReason).toBe('end');
+    expect(a.status).toBe('completed');
+    expect(b.status).toBe('completed');
+    expect(a.messages.length).toBeGreaterThan(0);
+    expect(b.messages.length).toBeGreaterThan(0);
+  }, 20_000);
 });
 
 describe('runSingleAgent execution status', () => {

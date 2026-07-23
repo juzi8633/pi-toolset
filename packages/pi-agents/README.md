@@ -36,15 +36,18 @@ mise run build --package packages/pi-agents
 pi -e ./packages/pi-agents/dist/index.js
 ```
 
-Build also runs `scripts/postbuild.ts`, which enforces runtime bundling of package-owned dependencies (`effect`, ACP SDK), keeps Pi host peers external, and caps `dist/index.js` at 2.5 MiB. Re-run the gate or the warm Jiti startup benchmark after local experiments:
+Build emits `dist/index.js` plus internal hashed chunks under `dist/chunks/`. Chunks are package-private (not public `exports`); consumers and Pi continue to load only `dist/index.js`, and published packages must retain the full `dist/` tree including chunks.
+
+`mise run build --package packages/pi-agents` is the supported structural-gate command: it opts into Bun splitting via `pi.build.splitting`, supplies a transient metafile (`PI_BUILD_METAFILE`), and runs postbuild graph checks (startup-static ≤ `1_325_000` bytes, total main graph ≤ `2_621_440` bytes, ACP SDK/Zod outside the startup static closure, `effect`/ACP bundled, Pi host peers external, Jiti lazy-runtime smoke). Direct `bun run ./scripts/postbuild.ts` requires `PI_BUILD_METAFILE` from the corresponding build and is not a standalone substitute.
+
+Fresh-process warm Jiti benchmark (disk cache warm; not disk-cold):
 
 ```sh
 cd packages/pi-agents
-bun run ./scripts/postbuild.ts
-bun run scripts/benchmark-startup.ts --max-median-ms 250
+bun run scripts/benchmark-startup.ts --warmups 2 --samples 15 --max-median-ms 250
 ```
 
-See [docs/profiling.md](./docs/profiling.md#startup-import-profiling) for startup import vs agent-execution profiling and the Windows cold/warm protocol.
+See [docs/profiling.md](./docs/profiling.md#startup-import-profiling) for graph metrics, deferred first Grok ACP load cost, and the Windows cold/warm protocol.
 
 ## Failure logging
 

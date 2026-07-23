@@ -4,10 +4,15 @@
 import type { Static } from '@earendil-works/pi-ai';
 import type { AgentToolResult, AgentToolUpdateCallback } from '@earendil-works/pi-coding-agent';
 import type { AgentConfig, AgentSource } from '../config/agents.ts';
-import { MAX_CONCURRENCY, MAX_FANOUT_ITEMS, RESULT_UPDATE_INTERVAL_MS } from '../shared/constants.ts';
+import {
+  MAX_CONCURRENCY,
+  MAX_FANOUT_ITEMS,
+  RESULT_UPDATE_INTERVAL_MS,
+} from '../shared/constants.ts';
 import { createLatestValueCoalescer } from '../shared/update-coalescer.ts';
 import { runEffectThrowingAsIs, tryPromiseUnknown } from '../shared/effect-runtime.ts';
-import { ABORT_MESSAGE, getAbortResult, isAbortError, type OnUpdateCallback } from './execution.ts';
+import { ABORT_MESSAGE, getAbortResult, isAbortError } from './abort.ts';
+import type { OnUpdateCallback } from './execution-types.ts';
 import { readJsonPointer } from '../output/json-pointer.ts';
 import {
   applyTerminalStatus,

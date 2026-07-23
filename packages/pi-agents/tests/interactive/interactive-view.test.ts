@@ -49,9 +49,9 @@ function snap(
   };
 }
 
-function fakeTheme() {
+function fakeTheme(): Pick<typeof realTheme, 'fg' | 'getFgAnsi'> {
   return {
-    fg: (_c: string, t: string) => t,
+    fg: (_c, text) => text,
     getFgAnsi: () => '',
   };
 }
@@ -61,15 +61,16 @@ function resolveWidgetLines(
   content:
     | string[]
     | ((tui: unknown, theme: ReturnType<typeof fakeTheme>) => { render: () => string[] })
-    | undefined
+    | undefined,
+  theme: ReturnType<typeof fakeTheme> = fakeTheme()
 ): string[] | undefined {
   if (content === undefined) return undefined;
   if (Array.isArray(content)) return content;
-  return content({}, fakeTheme()).render();
+  return content({}, theme).render();
 }
 
 /** setWidget mock that materializes factory content into lastWidget lines. */
-function widgetCapture() {
+function widgetCapture(theme: ReturnType<typeof fakeTheme> = fakeTheme()) {
   let lastWidget: string[] | undefined;
   return {
     get last() {
@@ -82,7 +83,7 @@ function widgetCapture() {
         | ((tui: unknown, theme: ReturnType<typeof fakeTheme>) => { render: () => string[] })
         | undefined
     ) => {
-      lastWidget = resolveWidgetLines(content);
+      lastWidget = resolveWidgetLines(content, theme);
     },
   };
 }
@@ -1354,13 +1355,13 @@ describe('interactive-view widget metadata refresh', () => {
     // Open hint is dim and aligns under tree content.
     const hint = lines!.find((l) => l.includes('/agent view'));
     expect(hint).toBeDefined();
-    expect(__test.stripSgr(hint!).startsWith('    /agent view')).toBe(true);
+    expect(__test.stripSgr(hint!).startsWith('    (/agent view')).toBe(true);
     expect(hint!.includes(dimAnsi)).toBe(true);
     view.clearWidget();
   });
 
   it('below-editor widget uses tree branches for multiple running endpoints', () => {
-    const capture = widgetCapture();
+    const capture = widgetCapture(realTheme);
     const view = createInteractiveViewController({
       registry: {
         listVisibleMeta: () => [

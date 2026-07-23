@@ -11,7 +11,7 @@ import type {
   RpcSessionState,
 } from '@earendil-works/pi-coding-agent';
 import type { ImageContent } from '@earendil-works/pi-ai';
-import type { SpawnFn, SpawnedChild } from '../../execution/execution.ts';
+import type { SpawnFn, SpawnedChild } from '../../execution/execution-types.ts';
 import {
   DEFAULT_KILL_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,

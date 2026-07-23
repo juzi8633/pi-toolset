@@ -38,7 +38,8 @@ import type {
 import { buildChildAgentEnv, isAgentDelegationAllowed } from '../execution/security.ts';
 import { resolveSkillNames } from '../config/skills.ts';
 import { getGitRoot, openAgentWorktree } from '../execution/worktree.ts';
-import type { SpawnFn } from '../execution/execution.ts';
+import type { SpawnFn } from '../execution/execution-types.ts';
+import { loadGrokAcpRuntime } from '../runtime/grok-acp/grok-acp-runtime-loader.ts';
 import {
   acquireSessionLease,
   awaitSessionLease,
@@ -1575,9 +1576,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
     if (options.grokAcpTransportFactory) {
       return options.grokAcpTransportFactory(factoryOpts);
     }
-    const { createGrokAcpInteractiveTransport } =
-      await import('../runtime/grok-acp/grok-acp-interactive-transport.ts');
-    return createGrokAcpInteractiveTransport(factoryOpts);
+    const runtime = await loadGrokAcpRuntime();
+    return runtime.createGrokAcpInteractiveTransport(factoryOpts);
   }
 
   /**

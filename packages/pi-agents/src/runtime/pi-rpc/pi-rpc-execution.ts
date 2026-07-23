@@ -5,7 +5,7 @@ import type { AgentToolResult } from '@earendil-works/pi-agent-core';
 import type { Message } from '@earendil-works/pi-ai';
 import { ABORT_MESSAGE, AgentAbortError } from '../../execution/abort.ts';
 import type { AgentConfig } from '../../config/agents.ts';
-import type { OnUpdateCallback, RunSingleAgentOptions } from '../../execution/execution.ts';
+import type { OnUpdateCallback, RunSingleAgentOptions } from '../../execution/execution-types.ts';
 import {
   InteractiveAgentError,
   type InteractiveAgentRegistry,
@@ -13,7 +13,10 @@ import {
   type InteractiveEndpointUpdateKind,
   type InteractiveRegistryEvent,
 } from '../../interactive/interactive-agent.ts';
-import { appendContinuationTasks, buildSessionContinuationPrompt } from '../../execution/invocation.ts';
+import {
+  appendContinuationTasks,
+  buildSessionContinuationPrompt,
+} from '../../execution/invocation.ts';
 import { applyTerminalStatus, getResultFinalOutput } from '../../output/output.ts';
 import { originToUnitStatus } from '../../run/run-lifecycle.ts';
 import type { RunAbortOrigin } from '../../run/run-types.ts';

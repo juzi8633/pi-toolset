@@ -38,15 +38,9 @@ import { createLatestValueCoalescer } from '../shared/update-coalescer.ts';
 import { enforceCompletionCheck } from './completion-check.ts';
 import { prepareAgentContext } from './context.ts';
 import { listAvailableSkillNames, resolveSkillNames } from '../config/skills.ts';
-import {
-  ABORT_MESSAGE,
-  AgentAbortError,
-  getAbortResult,
-  isAbortError,
-  mapWithConcurrencyLimit,
-  type OnUpdateCallback,
-  runSingleAgent,
-} from './execution.ts';
+import { ABORT_MESSAGE, AgentAbortError, getAbortResult, isAbortError } from './abort.ts';
+import type { OnUpdateCallback, ResumePromptContext, SpawnFn } from './execution-types.ts';
+import { mapWithConcurrencyLimit, runSingleAgent } from './execution.ts';
 import {
   applyTerminalStatus,
   getResultFinalOutput,
@@ -105,7 +99,6 @@ import {
   isNeverStartedUnit,
   reopenCompletedUnitsForResume,
 } from '../run/resume.ts';
-import type { ResumePromptContext } from './execution.ts';
 import type { StoredRunRequest } from '../run/run-types.ts';
 
 type Params = Static<typeof SubagentParams>;
@@ -144,10 +137,13 @@ export interface ExecuteAgentToolOptions {
   /** Interactive TUI registry; when present, eligible Pi units register before spawn. */
   interactiveRegistry?: import('../interactive/interactive-agent.ts').InteractiveAgentRegistry;
   /** Session-scoped agent config overrides (from /agent config). */
-  getSessionOverrides?: () => ReadonlyMap<string, import('../config/agent-config.ts').AgentOverride>;
+  getSessionOverrides?: () => ReadonlyMap<
+    string,
+    import('../config/agent-config.ts').AgentOverride
+  >;
   getSessionUnsets?: () => ReadonlyMap<string, ReadonlySet<string> | readonly string[]>;
   /** Test seam: inject child process spawn for orchestration-path tests. */
-  spawnFn?: import('./execution.ts').SpawnFn;
+  spawnFn?: SpawnFn;
   /**
    * Test-only seam: build restored chain state from the verified post-claim
    * record. Override to force a failure after ref validation but before any
@@ -1622,7 +1618,7 @@ async function runChain(
   durable: DurableRunContext | undefined = undefined,
   restored?: import('./chain.ts').RestoredChainState,
   interactiveRegistry?: import('../interactive/interactive-agent.ts').InteractiveAgentRegistry,
-  spawnFn?: import('./execution.ts').SpawnFn,
+  spawnFn?: SpawnFn,
   runStore?: RunStore
 ): Promise<AgentResult> {
   const chainDetails = (results: SingleResult[], outputs?: Record<string, ChainOutputEntry>) => ({
@@ -1737,7 +1733,7 @@ async function runParallel(
   runtimeOverride?: Runtime,
   durable: DurableRunContext | undefined = undefined,
   interactiveRegistry?: import('../interactive/interactive-agent.ts').InteractiveAgentRegistry,
-  spawnFn?: import('./execution.ts').SpawnFn
+  spawnFn?: SpawnFn
 ): Promise<AgentResult> {
   if (tasks.length > MAX_PARALLEL_TASKS)
     return {
@@ -2008,7 +2004,7 @@ async function runSingle(
   title?: string,
   durable: DurableRunContext | undefined = undefined,
   interactiveRegistry?: import('../interactive/interactive-agent.ts').InteractiveAgentRegistry,
-  spawnFn?: import('./execution.ts').SpawnFn
+  spawnFn?: SpawnFn
 ): Promise<AgentResult> {
   // Reject resume when the sole unit is already completed (unit.status is
   // authoritative; details.results alone must not skip incomplete units).
@@ -2179,7 +2175,7 @@ async function runStepWithContext(
     persistAcpSessionId?: (sessionId: string) => Promise<void>;
     /** Restored project/workspace cwd for resume (overrides ctx.cwd for git/cwd fallbacks). */
     projectCwd?: string;
-    spawnFn?: import('./execution.ts').SpawnFn;
+    spawnFn?: SpawnFn;
   } = {}
 ): Promise<SingleResult> {
   const agent = agents.find((a) => a.name === agentName);
