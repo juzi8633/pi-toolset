@@ -1,5 +1,54 @@
 # pi-agents CPU 性能分析指南
 
+## Startup import profiling
+
+Extension **module import** and **agent execution** are different phases.
+
+- `PI_AGENTS_CPU_PROFILE=1` starts sampling during agent execution only. It does **not** measure extension import time.
+- `PI_TIMING=1` is the Pi host startup timer. The `module import` line covers recursive dependency loading inside `jiti.import()`; `factory` is reported separately when the extension factory runs.
+
+### Deterministic warm benchmark (local)
+
+After `mise run build --package packages/pi-agents`:
+
+```bash
+cd packages/pi-agents
+bun run scripts/benchmark-startup.ts --max-median-ms 250
+```
+
+This measures warm Jiti import of `dist/index.js` with Pi host peers supplied as virtual modules (`moduleCache: false`, `tryNative: false`). It is **not** a disk-cold measurement and does not include filesystem cold-cache or antivirus effects.
+
+Postbuild structural gate (also run by Mise build when present):
+
+```bash
+cd packages/pi-agents
+bun run ./scripts/postbuild.ts
+```
+
+**Deterministic gates**
+
+- Warm Jiti benchmark median `<= 250ms` (local/manual; not a flaky CI wall-clock gate)
+- Main bundle `dist/index.js` `<= 2.5 MiB` (`2_621_440` bytes); no external `effect` / `@agentclientprotocol/sdk`
+
+**Manual objectives** (same machine and extension path, before vs after)
+
+- Cold import improves by at least 60% vs captured cold baseline; `3500ms` is a stretch target
+- Warm median improves by at least 50% vs captured warm baseline; `500ms` is a stretch target
+- Factory timing regresses by no more than 25% vs captured factory baseline
+
+### Windows cold/warm protocol
+
+1. Build the candidate (`mise run build --package packages/pi-agents`).
+2. Ensure only one `pi-agents` extension instance is enabled.
+3. Set `$env:PI_TIMING = '1'`.
+4. Reboot before the cold sample.
+5. Start Pi, wait for the prompt, exit normally, and record the `pi-agents ... module import` line.
+6. Repeat five launches without reboot and record the median warm import (and factory timings as needed).
+
+If the cold target is missed while structural and warm checks pass, stop release and collect a new startup profile; do not change Pi's global loader as part of package-local optimization.
+
+---
+
 ## 快速开始
 
 ```bash

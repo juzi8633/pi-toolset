@@ -1,7 +1,7 @@
 // ABOUTME: Chain task template expansion — substitutes {previous}, {outputs.<name>}, and {item} placeholders.
 // ABOUTME: Returns ok=false with the unknown name when the template references a missing output.
 
-import { Either } from 'effect';
+import * as Either from 'effect/Either';
 import { formatChildArtifactDescriptor } from './result-payload.ts';
 import type { ChainOutputEntry } from '../shared/types.ts';
 

@@ -1,7 +1,11 @@
 // ABOUTME: Leaf Effect runtime bridge — Promise boundary runners and abort helpers.
 // ABOUTME: Later phases import these instead of calling Effect.runPromise ad hoc.
 
-import { Cause, Data, Effect, Exit, Option } from 'effect';
+import * as Cause from 'effect/Cause';
+import * as Data from 'effect/Data';
+import * as Effect from 'effect/Effect';
+import * as Exit from 'effect/Exit';
+import * as Option from 'effect/Option';
 import type { AgentAbortError } from '../execution/abort.ts';
 
 /**

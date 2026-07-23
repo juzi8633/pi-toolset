@@ -5,7 +5,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { Effect } from 'effect';
+import * as Effect from 'effect/Effect';
 import { RUN_ARTIFACT_MAX_BYTES } from '../shared/constants.ts';
 import { runEffectPromise } from '../shared/effect-runtime.ts';
 import type { RunArtifactPayload, RunArtifactRefV1 } from './run-types.ts';

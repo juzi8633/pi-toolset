@@ -3,7 +3,8 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { Deferred, Effect } from 'effect';
+import * as Deferred from 'effect/Deferred';
+import * as Effect from 'effect/Effect';
 import { runEffectPromise } from '../shared/effect-runtime.ts';
 
 /**

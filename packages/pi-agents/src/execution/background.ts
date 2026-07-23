@@ -9,7 +9,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { getMarkdownTheme } from '@earendil-works/pi-coding-agent';
 import { Container, Markdown, Spacer, Text, type Component } from '@earendil-works/pi-tui';
-import { Effect } from 'effect';
+import * as Effect from 'effect/Effect';
 import { getBuiltinAgentsDir, type AgentScope } from '../config/agents.ts';
 import { PRESENTATION_ERROR_PREVIEW_CHARS } from '../shared/constants.ts';
 import { runEffectPromise } from '../shared/effect-runtime.ts';

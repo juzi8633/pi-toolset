@@ -28,11 +28,19 @@
 ### Imports
 
 ```ts
-import { Effect, Exit, Cause, Data, Schedule, Deferred, Scope, Fiber } from 'effect';
+import * as Cause from 'effect/Cause';
+import * as Data from 'effect/Data';
+import * as Deferred from 'effect/Deferred';
+import * as Effect from 'effect/Effect';
+import * as Exit from 'effect/Exit';
+import * as Fiber from 'effect/Fiber';
+import * as Schedule from 'effect/Schedule';
+import * as Scope from 'effect/Scope';
 ```
 
-- Prefer top-level named imports from `'effect'`.
-- Avoid `import * as Effect from 'effect/Effect'` unless a later phase needs it for tree-shaking measurements.
+- Prefer public subpath namespace imports (e.g. `effect/Effect`) over the root barrel `'effect'`.
+- Measured startup cost for the currently used API set: root barrel pulls ~600 translated ESM modules; the matching subpaths pull ~151.
+- Keep namespace-style call sites (`Effect.runPromiseExit`, `Either.left`, `Duration.millis`) so import rewrites stay mechanical.
 
 ### Boundary rules
 

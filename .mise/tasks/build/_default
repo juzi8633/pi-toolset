@@ -8,13 +8,13 @@ PKG="${usage_package}"
 [ -d "$PKG" ] || { echo "no such package: ${usage_package:-<missing>}" >&2; exit 1; }
 cd "$PKG"
 
-# Externalize peer/runtime packages. Host peers must not be bundled (second SDK
-# instance breaks identity checks). Package dependencies stay installed for
-# Node resolution but are also external so large runtimes (e.g. effect) are not
-# inlined. Strip CR from jq output — Windows jq emits CRLF and breaks --external.
+# Externalize host peers and explicit pi.external entries only. Package runtime
+# dependencies bundle into dist unless listed in pi.external. Host peers must
+# stay external so identity checks and virtual-module resolution keep working.
+# Strip CR from jq output — Windows jq emits CRLF and breaks --external.
 EXTERNALS_FILE="$(mktemp)"
 trap 'rm -f "$EXTERNALS_FILE"' EXIT
-jq -r '([.peerDependencies // {}, .dependencies // {}] | map(keys) | add) + (.pi.external // []) | unique[]' package.json \
+jq -r '([.peerDependencies // {}] | map(keys) | add) + (.pi.external // []) | unique[]' package.json \
   | tr -d '\r' >"$EXTERNALS_FILE"
 
 args=()
@@ -40,4 +40,6 @@ fi
 
 if jq -e '.scripts.postbuild' package.json >/dev/null 2>&1; then
   bun run postbuild
+elif [ -f ./scripts/postbuild.ts ]; then
+  bun run ./scripts/postbuild.ts
 fi

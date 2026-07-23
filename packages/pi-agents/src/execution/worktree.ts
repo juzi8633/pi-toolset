@@ -4,7 +4,7 @@
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { Either } from 'effect';
+import * as Either from 'effect/Either';
 import { WORKTREE_NAME_MAX_CHARS } from '../shared/constants.ts';
 
 export function getGitRoot(cwd: string): string | undefined {

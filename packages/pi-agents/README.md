@@ -36,6 +36,16 @@ mise run build --package packages/pi-agents
 pi -e ./packages/pi-agents/dist/index.js
 ```
 
+Build also runs `scripts/postbuild.ts`, which enforces runtime bundling of package-owned dependencies (`effect`, ACP SDK), keeps Pi host peers external, and caps `dist/index.js` at 2.5 MiB. Re-run the gate or the warm Jiti startup benchmark after local experiments:
+
+```sh
+cd packages/pi-agents
+bun run ./scripts/postbuild.ts
+bun run scripts/benchmark-startup.ts --max-median-ms 250
+```
+
+See [docs/profiling.md](./docs/profiling.md#startup-import-profiling) for startup import vs agent-execution profiling and the Windows cold/warm protocol.
+
 ## Failure logging
 
 Failed `agent` tool invocations record the complete tool call parameters, failure details, and any captured `Error.stack` / result `errorStack` in `~/.pi/@balaenis/pi-agents/default.log`. Set `PI_AGENTS_LOG_FILE` to override the path. Because task prompts and continuation instructions may contain sensitive information, protect or remove this log as appropriate.

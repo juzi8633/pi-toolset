@@ -99,12 +99,21 @@ jobs:
           $pkg.peerDependencies.PSObject.Properties.Name | ForEach-Object {
             $externalArgs += @("--external", $_)
           }
-          $pkg.pi.external | ForEach-Object {
-            $externalArgs += @("--external", $_)
+          if ($pkg.pi.external) {
+            $pkg.pi.external | ForEach-Object {
+              $externalArgs += @("--external", $_)
+            }
           }
 
           bun build ./src/index.ts --outdir dist --target node @externalArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          bun build ./src/artifact-reader-extension.ts --outdir dist --target node @externalArgs
+          $artifactReader = "./src/run/artifact-reader-extension.ts"
+          if (-not (Test-Path $artifactReader)) {
+            $artifactReader = "./src/artifact-reader-extension.ts"
+          }
+          bun build $artifactReader --outdir dist --target node @externalArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          bun run ./scripts/postbuild.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

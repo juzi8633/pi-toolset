@@ -1,7 +1,7 @@
 // ABOUTME: Completion check validation for agent outputs that declare required headings.
 // ABOUTME: Enforces frontmatter-configured heading checks against final assistant messages.
 
-import { Either } from 'effect';
+import * as Either from 'effect/Either';
 import type { AgentConfig } from '../config/agents.ts';
 import { getResultFinalOutput, isFailedResult } from '../output/output.ts';
 import type { SingleResult } from '../shared/types.ts';
