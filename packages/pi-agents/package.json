@@ -1,6 +1,6 @@
 {
   "name": "@balaenis/pi-agents",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Delegate tasks to specialized subagents with isolated context windows.",
   "license": "Apache-2.0",
   "author": {
