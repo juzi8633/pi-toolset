@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/balaenis/pi-toolset/compare/pi-format-v0.2.0...pi-format-v0.2.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* **version:** align embedded versions with release-please ([a6196e3](https://github.com/balaenis/pi-toolset/commit/a6196e31ef71d83490dfd9d38dd4dda8c5ed70c0))
+
 ## [0.2.0](https://github.com/balaenis/pi-toolset/compare/pi-format-v0.1.1...pi-format-v0.2.0) (2026-08-02)
 
 

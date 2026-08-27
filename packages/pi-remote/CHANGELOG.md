@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/balaenis/pi-toolset/compare/pi-remote-v0.2.0...pi-remote-v0.3.0) (2026-08-27)
+
+
+### Features
+
+* **pi-remote:** add /ssh:cwd to switch the remote working directory ([d11c4f7](https://github.com/balaenis/pi-toolset/commit/d11c4f7431315d8281f43e06f4a5d7cfb9ed9a66))
+
+
+### Bug Fixes
+
+* **pi-remote:** harden SSH prompts and surface failure reasons ([0b70fa7](https://github.com/balaenis/pi-toolset/commit/0b70fa76dd6ad037310417091448b6f231db9c07))
+* **version:** align embedded versions with release-please ([a6196e3](https://github.com/balaenis/pi-toolset/commit/a6196e31ef71d83490dfd9d38dd4dda8c5ed70c0))
+
 ## [0.2.0](https://github.com/balaenis/pi-toolset/compare/pi-remote-v0.1.0...pi-remote-v0.2.0) (2026-08-08)
 
 
