@@ -6799,6 +6799,277 @@ describe('InteractiveAgentRegistry planned missing, hydrate, dispose barrier', (
     fs.rmSync(cleanupRoot, { recursive: true, force: true });
   });
 
+  it('restoreActiveBranch keeps a live planned-missing session so activate can spawn', async () => {
+    const { root, cleanupRoot, store, coordinator } = makePlannedMissingTempStore();
+    const agent = makeAgent({ systemPrompt: '' });
+    let attempts = 0;
+    let eventListener: ((e: unknown) => void) | undefined;
+    const hostSessionId = 'host-planned-restore';
+
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'look',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionFile = path.join(store.getRunDir(runId), 'sessions', 'planned-restore.jsonl');
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    expect(fs.existsSync(sessionFile)).toBe(false);
+
+    const links: InteractiveAgentLinkV1[] = [];
+    const branchEntries = () =>
+      links.map((data) => ({
+        type: 'custom' as const,
+        customType: INTERACTIVE_LINK_TYPE,
+        data,
+      }));
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      transportFactory: async () => {
+        attempts += 1;
+        return {
+          async getState() {
+            return {
+              sessionId: 's',
+              thinkingLevel: 'off',
+              isStreaming: false,
+              isCompacting: false,
+              steeringMode: 'all',
+              followUpMode: 'one-at-a-time',
+              autoCompactionEnabled: true,
+              messageCount: 0,
+              pendingMessageCount: 0,
+            };
+          },
+          async prompt() {},
+          async steer() {},
+          async followUp() {},
+          async abort() {},
+          subscribe(fn: (e: unknown) => void) {
+            eventListener = fn;
+            return () => {
+              eventListener = undefined;
+            };
+          },
+          async dispose() {},
+          getStderr() {
+            return '';
+          },
+        } as unknown as PiRpcTransport;
+      },
+    });
+    registry.setHostLinkAppender((link) => links.push(link));
+
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId,
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: branchEntries,
+    });
+    expect(snap.status).toBe('registered');
+    expect(links).toHaveLength(1);
+    expect(fs.existsSync(sessionFile)).toBe(false);
+
+    const restored = await registry.restoreActiveBranch({
+      cwd: root,
+      sessionManager: {
+        getSessionId: () => hostSessionId,
+        getBranch: branchEntries,
+      } as never,
+    });
+    expect(restored.some((e) => e.status === 'unavailable')).toBe(false);
+    expect(registry.get(snap.key)?.status).not.toBe('unavailable');
+
+    const act = await registry.activate(snap.key, 'Task: after restore', 'prompt');
+    expect(act.activationId).toBeTruthy();
+    expect(attempts).toBe(1);
+    eventListener?.({ type: 'agent_start' });
+    eventListener?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+
+    await registry.shutdown();
+    fs.rmSync(cleanupRoot, { recursive: true, force: true });
+  });
+
+  it('appendLink-triggered restore does not cold-restore over a planned-missing register', async () => {
+    const { root, cleanupRoot, store, coordinator } = makePlannedMissingTempStore();
+    const agent = makeAgent({ systemPrompt: '' });
+    let attempts = 0;
+    let eventListener: ((e: unknown) => void) | undefined;
+    const hostSessionId = 'host-append-restore';
+
+    const { runId, record } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: {
+        mode: 'single',
+        agentScope: 'both',
+        agent: 'explore',
+        task: 'look',
+      },
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: agentFingerprint(agent),
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+    const sessionFile = path.join(
+      store.getRunDir(runId),
+      'sessions',
+      'planned-append-restore.jsonl'
+    );
+    await store.updateRun(runId, (r) => {
+      r.units.single.sessionFile = sessionFile;
+      r.status = 'running';
+    });
+    const live = store.getRun(runId);
+    if (live.ok) coordinator.registerRun(runId, live.loaded.record);
+    fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+    expect(fs.existsSync(sessionFile)).toBe(false);
+
+    const links: InteractiveAgentLinkV1[] = [];
+    const branchEntries = () =>
+      links.map((data) => ({
+        type: 'custom' as const,
+        customType: INTERACTIVE_LINK_TYPE,
+        data,
+      }));
+
+    const registry = createInteractiveAgentRegistry({
+      runStore: store,
+      runCoordinator: coordinator,
+      discoverAgentsFn: () => ({
+        agents: [agent],
+        projectAgentsDir: null,
+        builtinAgentsDir: '/tmp',
+      }),
+      transportFactory: async () => {
+        attempts += 1;
+        return {
+          async getState() {
+            return {
+              sessionId: 's',
+              thinkingLevel: 'off',
+              isStreaming: false,
+              isCompacting: false,
+              steeringMode: 'all',
+              followUpMode: 'one-at-a-time',
+              autoCompactionEnabled: true,
+              messageCount: 0,
+              pendingMessageCount: 0,
+            };
+          },
+          async prompt() {},
+          async steer() {},
+          async followUp() {},
+          async abort() {},
+          subscribe(fn: (e: unknown) => void) {
+            eventListener = fn;
+            return () => {
+              eventListener = undefined;
+            };
+          },
+          async dispose() {},
+          getStderr() {
+            return '';
+          },
+        } as unknown as PiRpcTransport;
+      },
+    });
+
+    let restoreDuringAppend: Promise<unknown> | undefined;
+    registry.setHostLinkAppender((link) => {
+      links.push(link);
+      restoreDuringAppend = registry.restoreActiveBranch({
+        cwd: root,
+        sessionManager: {
+          getSessionId: () => hostSessionId,
+          getBranch: branchEntries,
+        } as never,
+      });
+    });
+
+    const snap = await registry.registerInitial({
+      runId,
+      unitId: 'single',
+      hostSessionId,
+      launchSpec: {
+        agent,
+        request: record.request,
+        sessionFile,
+        effectiveCwd: root,
+        agentScope: 'both',
+        registrationKind: 'initial',
+      },
+      getBranchEntries: branchEntries,
+    });
+    expect(snap.status).toBe('registered');
+    expect(restoreDuringAppend).toBeDefined();
+    const restored = (await restoreDuringAppend) as Array<{ status: string }>;
+    expect(restored.some((e) => e.status === 'unavailable')).toBe(false);
+    expect(registry.get(snap.key)?.status).not.toBe('unavailable');
+
+    const act = await registry.activate(snap.key, 'Task: after concurrent restore', 'prompt');
+    expect(act.activationId).toBeTruthy();
+    expect(attempts).toBe(1);
+    eventListener?.({ type: 'agent_start' });
+    eventListener?.({ type: 'agent_settled' });
+    await new Promise((r) => setImmediate(r));
+
+    await registry.shutdown();
+    fs.rmSync(cleanupRoot, { recursive: true, force: true });
+  });
+
   it('restored missing session still fails closed (no planned-missing grace)', async () => {
     const { root, store, coordinator } = makeTempStore();
     const agent = makeAgent();

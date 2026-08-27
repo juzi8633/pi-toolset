@@ -22,7 +22,12 @@ import {
 } from '../../src/run/run-coordinator.ts';
 import { createRunStore, type RunStore } from '../../src/run/run-store.ts';
 import type { AgentRunRecordV1, RunUnitRecord } from '../../src/run/run-types.ts';
-import { emptyUsage, type SingleResult, type SubagentDetails } from '../../src/shared/types.ts';
+import {
+  cloneSingleResult,
+  emptyUsage,
+  type SingleResult,
+  type SubagentDetails,
+} from '../../src/shared/types.ts';
 
 function baseAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -579,6 +584,60 @@ describe('createRunCoordinator persistence and attempts', () => {
     expect(unit.attempts[0]!.finishedAt).toBe(t);
     // Never overwrite previous attempt's data: a second finish would append a new attempt only on resume.
     expect(unit.attempts[0]!.finishedAt).toBe(t);
+  });
+
+  it('finishUnit keeps abort diagnostics when structuredOutput is own undefined', async () => {
+    const store = fakeStore({ now: () => 1 });
+    const record: AgentRunRecordV1 = {
+      version: 1,
+      runId: 'run-1',
+      mode: 'single',
+      status: 'running',
+      request: { mode: 'single', agentScope: 'both', agent: 'noop', task: '' },
+      background: false,
+      agentScope: 'both',
+      createdAt: 0,
+      updatedAt: 0,
+      details: emptyDetails(),
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'noop',
+          agentFingerprint: '',
+          runtime: undefined,
+          capability: 'session',
+          status: 'running',
+          attempt: 1,
+          attempts: [{ attempt: 1, status: 'running', startedAt: 0 }],
+          effectiveCwd: '/cwd',
+        },
+      },
+      eventsFile: 'events.jsonl',
+    };
+    store.records.set('run-1', record);
+    const coord = createRunCoordinator({ store, now: () => 1, coalesceMs: 1000 });
+    coord.registerRun('run-1', record);
+
+    const abortMessage = 'Activation cancelled before send';
+    const cloned = cloneSingleResult({
+      agent: 'noop',
+      agentSource: 'unknown',
+      task: '',
+      exitCode: 1,
+      status: 'interrupted',
+      messages: [],
+      stderr: '',
+      usage: emptyUsage(),
+      stopReason: 'interrupted',
+      errorMessage: abortMessage,
+    });
+    cloned.structuredOutput = undefined;
+
+    const committed = await coord.finishUnit('run-1', ctx(), cloned, 'interrupted');
+    expect(committed.status).toBe('interrupted');
+    expect(committed.errorMessage).toBe(abortMessage);
+    expect(committed.errorCode).not.toBe('artifact_invalid');
+    expect(committed.structuredOutput).toBeUndefined();
   });
 
   it('finishUnit stores a private compact shell and does not mutate the caller result', async () => {

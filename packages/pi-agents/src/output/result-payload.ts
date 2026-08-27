@@ -125,7 +125,10 @@ export async function externalizeTerminalResult(
     }
   }
 
-  if (hasOwn(next as unknown as Record<string, unknown>, 'structuredOutput')) {
+  if (
+    hasOwn(next as unknown as Record<string, unknown>, 'structuredOutput') &&
+    next.structuredOutput !== undefined
+  ) {
     const out = await externalizeJsonPayload(
       store,
       runId,
@@ -136,6 +139,8 @@ export async function externalizeTerminalResult(
       delete next.structuredOutput;
       next.structuredOutputRef = out.valueRef;
     }
+  } else {
+    delete next.structuredOutput;
   }
 
   return next;

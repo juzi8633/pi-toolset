@@ -385,6 +385,22 @@ describe('getPiInvocation', () => {
     expect(inv.args).toEqual([cli, '--help']);
   });
 
+  it('reuses the packaged npm bundled CLI entry used by current pi bin shims', () => {
+    setGenericRuntime();
+    const cli = makeScript(
+      'node_modules',
+      '@earendil-works',
+      'pi-coding-agent',
+      'dist',
+      'bundle',
+      'cli.js'
+    );
+    process.argv[1] = cli;
+    const inv = getPiInvocation(['--help']);
+    expect(inv.command).toBe('/usr/bin/node');
+    expect(inv.args).toEqual([cli, '--help']);
+  });
+
   it('reuses the monorepo pi coding-agent dist/cli.js entry', () => {
     setGenericRuntime();
     const cli = makeScript('packages', 'coding-agent', 'dist', 'cli.js');

@@ -2607,26 +2607,8 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         await persistBinding(input.runId, input.unitId, binding);
         // After await: refuse endpoint insert if superseded or shutdown mid-binding.
         assertRegistration(reg);
-
-        const link: InteractiveAgentLinkV1 = {
-          version: 1,
-          runId: input.runId,
-          unitId: input.unitId,
-          bindingId,
-          hostSessionId: input.hostSessionId,
-          createdAt,
-        };
-        // Exact match only — forged/stale run:unit links must not block the precise append.
-        if (!branchHasExactLink(input.getBranchEntries(), link)) {
-          if (input.appendLink) {
-            input.appendLink(link);
-          } else {
-            appendHostLink(link);
-          }
-        }
-        assertRegistration(reg);
       } catch (err) {
-        // Binding or link persistence failed: roll back the in-process session claim
+        // Binding persistence failed: roll back the in-process session claim
         // so a retry can re-register without session_busy.
         if (!isGrokAcp && sessionFile) {
           releaseSessionFile(key, sessionFile);
@@ -2697,32 +2679,59 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           contextTokens: 0,
         },
       };
-      // Grok ACP: no local session file; hydrate lazily via session/load.
+      // Insert before appendLink so session_tree restore sees the in-process
+      // planned-missing endpoint instead of cold-restoring over it.
       if (sessionArtifact.runtime === 'grok-acp') {
-        assertRegistration(reg);
         ep.transcriptHydrated = false;
         ep.allowPlannedMissingSession = false;
-        endpoints.set(key, ep);
-        grantTrustedBranch(key, bindingId);
-        treeClaimKeys.add(key);
+      } else if (!sessionFile || !fs.existsSync(sessionFile)) {
+        ep.transcriptHydrated = true;
+        ep.allowPlannedMissingSession = true;
+      }
+      endpoints.set(key, ep);
+      grantTrustedBranch(key, bindingId);
+      treeClaimKeys.add(key);
+
+      const link: InteractiveAgentLinkV1 = {
+        version: 1,
+        runId: input.runId,
+        unitId: input.unitId,
+        bindingId,
+        hostSessionId: input.hostSessionId,
+        createdAt,
+      };
+      try {
+        // Exact match only — forged/stale run:unit links must not block the precise append.
+        if (!branchHasExactLink(input.getBranchEntries(), link)) {
+          if (input.appendLink) {
+            input.appendLink(link);
+          } else {
+            appendHostLink(link);
+          }
+        }
+        assertRegistration(reg);
+      } catch (err) {
+        endpoints.delete(key);
+        revokeTrustedBranch(key);
+        treeClaimKeys.delete(key);
+        if (!isGrokAcp && sessionFile) {
+          releaseSessionFile(key, sessionFile);
+        }
+        throw err;
+      }
+
+      if (sessionArtifact.runtime === 'grok-acp') {
         publish(ep, 'full');
         emitEndpointsChanged();
         return snapshotOf(ep);
       }
-      // Fresh planned path (file not created yet): empty view is authoritative for
-      // live turns, but reopen may still need the planned-missing grace flag.
       // Existing session (fork/resume): wait for any prior writer lease, then hydrate
       // so baseline reflects the final JSONL (never a partial dispose write).
-      if (!sessionFile || !fs.existsSync(sessionFile)) {
-        ep.transcriptHydrated = true;
-        ep.allowPlannedMissingSession = true;
-      } else {
-        // Non-read validation (claim/bind/path) already completed above; only now read.
+      if (sessionFile && fs.existsSync(sessionFile)) {
         await awaitSessionLease(sessionFile);
         assertRegistration(reg);
         const existing = hydrateMessages(sessionFile);
         if (!existing.ok) {
-          // File present but unreadable: leave unhydrated so get/activate can retry.
           ep.transcriptHydrated = false;
         } else if (existing.messages.length === 0) {
           ep.transcriptHydrated = true;
@@ -2732,8 +2741,6 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         }
       }
       assertRegistration(reg);
-      endpoints.set(key, ep);
-      grantTrustedBranch(key, bindingId);
       emitEndpointsChanged();
       return publish(ep);
     } finally {
@@ -3310,8 +3317,10 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
         resolvedSession = fs.realpathSync(unit.sessionFile);
       } catch {
         // Live-only planned path: same-process initial registration may reopen
-        // before Pi persists the JSONL. Restored links never pass this flag.
-        if (!opts.allowPlannedMissing) {
+        // before Pi persists the JSONL. Restored links never pass this flag
+        // unless the durable unit is still running (session_tree during register).
+        const livePlannedMissing = record.status === 'running';
+        if (!opts.allowPlannedMissing && !livePlannedMissing) {
           return { ok: false, reason: 'session_unreadable' };
         }
         resolvedSession = canonicalizeSessionLeaseKey(unit.sessionFile);
@@ -3570,11 +3579,28 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
       // UI tree claim only until resolveTrusted succeeds.
       treeClaimKeys.add(key);
 
+      // Re-read after await: registerInitial may insert the endpoint while
+      // resolveTrusted yields, and a stale undefined must not cold-restore over it.
+      const trust = await resolveTrusted(link, hostSessionId, {
+        allowPlannedMissing: !!endpoints.get(key)?.allowPlannedMissingSession,
+      });
       const existing = endpoints.get(key);
-      // Always re-validate the current branch link, even when the key already exists
-      // (forged/copied link data on the same run:unit must fail closed).
-      const trust = await resolveTrusted(link, hostSessionId);
       if (!trust.ok) {
+        const inProcessLive =
+          !!existing &&
+          (existing.status === 'starting' ||
+            existing.status === 'running' ||
+            existing.status === 'registered' ||
+            !!existing.activation ||
+            !!existing.client ||
+            !!existing.transportReady);
+        if (
+          inProcessLive &&
+          (trust.reason === 'session_unreadable' || trust.reason === 'session_missing')
+        ) {
+          restored.push(publish(existing));
+          continue;
+        }
         // Revoke trust then settle (applyUnavailable) so relay never sees old binding+active.
         restored.push(
           applyUnavailable(key, link, trust.reason, {
@@ -3595,7 +3621,9 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
           existing.status === 'starting' ||
           existing.status === 'running' ||
           existing.activation ||
-          existing.client
+          existing.client ||
+          existing.transportReady ||
+          (existing.status === 'registered' && existing.allowPlannedMissingSession)
         ) {
           existing.bindingId = link.bindingId;
           existing.hostSessionId = link.hostSessionId;
@@ -4986,8 +5014,17 @@ export function createInteractiveAgentRegistry(options: InteractiveRegistryOptio
             };
             const unsub = subscribe((ev) => {
               if (ev.type === 'activation_settled' && ev.activationId === prepared.activationId) {
+                const settled = endpoints.get(key);
+                const detail = settled?.lastError?.trim();
                 finish(() =>
-                  reject(new InteractiveAgentError('rejected', 'Activation cancelled before send'))
+                  reject(
+                    new InteractiveAgentError(
+                      'rejected',
+                      detail
+                        ? `Activation cancelled before send: ${detail}`
+                        : 'Activation cancelled before send'
+                    )
+                  )
                 );
               }
             });

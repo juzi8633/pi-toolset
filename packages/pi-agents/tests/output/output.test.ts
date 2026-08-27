@@ -400,6 +400,26 @@ describe('cloneSingleResult deep snapshot', () => {
       'clone'
     );
   });
+
+  it('omits structuredOutput when the source result has none', async () => {
+    const { cloneSingleResult } = await import('../../src/shared/types.ts');
+    const result: SingleResult = {
+      agent: 'explore',
+      agentSource: 'user',
+      task: 't',
+      exitCode: 1,
+      status: 'interrupted',
+      messages: [],
+      stderr: '',
+      usage: emptyUsage(),
+      stopReason: 'interrupted',
+      errorMessage: 'Activation cancelled before send',
+    };
+    const snap = cloneSingleResult(result);
+    expect(Object.prototype.hasOwnProperty.call(snap, 'structuredOutput')).toBe(false);
+    expect(snap.structuredOutput).toBeUndefined();
+    expect(snap.errorMessage).toBe('Activation cancelled before send');
+  });
 });
 
 function baseResult(overrides: Partial<SingleResult> = {}): SingleResult {

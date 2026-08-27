@@ -11,6 +11,7 @@ import {
   shouldSpillPayload,
   textPayloadBytes,
 } from '../../src/output/result-payload.ts';
+import { cloneSingleResult } from '../../src/shared/types.ts';
 import { RESULT_INLINE_PAYLOAD_MAX_BYTES } from '../../src/shared/constants.ts';
 import { createRunStore } from '../../src/run/run-store.ts';
 import type { SingleResult } from '../../src/shared/types.ts';
@@ -122,5 +123,65 @@ describe('result-payload', () => {
     expect(provisional.structuredOutput).toBeUndefined();
     expect(provisional.structuredOutputRef).toBeUndefined();
     expect(provisional.messages).toEqual([]);
+  });
+
+  it('skips own-property structuredOutput undefined without throwing', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-agents-result-payload-undef-'));
+    const store = createRunStore({ rootDir: root });
+    const { runId } = await store.createRun({
+      mode: 'single',
+      agentScope: 'both',
+      background: false,
+      request: { mode: 'single', agentScope: 'both', agent: 'explore', task: 't' },
+      details: {
+        mode: 'single',
+        agentScope: 'both',
+        projectAgentsDir: null,
+        builtinAgentsDir: '/b',
+        results: [],
+      },
+      units: {
+        single: {
+          unitId: 'single',
+          agent: 'explore',
+          agentFingerprint: 'fp',
+          runtime: undefined,
+          capability: 'session',
+          status: 'queued',
+          attempt: 1,
+          attempts: [],
+          effectiveCwd: root,
+        },
+      },
+    });
+
+    const aborted = baseResult({
+      exitCode: 1,
+      status: 'interrupted',
+      stopReason: 'interrupted',
+      errorMessage: 'Activation cancelled before send',
+    });
+    aborted.structuredOutput = undefined;
+    expect(Object.prototype.hasOwnProperty.call(aborted, 'structuredOutput')).toBe(true);
+
+    const fromClone = cloneSingleResult(
+      baseResult({
+        exitCode: 1,
+        status: 'interrupted',
+        stopReason: 'interrupted',
+        errorMessage: 'Activation cancelled before send',
+      })
+    );
+
+    const ownUndef = await externalizeTerminalResult(aborted, store, runId);
+    expect(ownUndef.errorMessage).toBe('Activation cancelled before send');
+    expect(ownUndef.structuredOutput).toBeUndefined();
+    expect(ownUndef.structuredOutputRef).toBeUndefined();
+
+    const cloned = await externalizeTerminalResult(fromClone, store, runId);
+    expect(cloned.errorMessage).toBe('Activation cancelled before send');
+    expect(cloned.structuredOutput).toBeUndefined();
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });

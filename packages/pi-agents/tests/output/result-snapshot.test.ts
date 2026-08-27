@@ -228,6 +228,14 @@ describe('snapshotSingleResult isolation and idempotence', () => {
     expect(snap.worktreeChangedFiles).toEqual(['x.ts']);
   });
 
+  it('copySnapshotShell omits structuredOutput when the source snapshot has none', () => {
+    const snap = snapshotSingleResult(baseResult({ messages: [assistantText('done')] }));
+    expect(Object.prototype.hasOwnProperty.call(snap, 'structuredOutput')).toBe(false);
+    const shell = copySnapshotShell(snap);
+    expect(Object.prototype.hasOwnProperty.call(shell, 'structuredOutput')).toBe(false);
+    expect(shell.structuredOutput).toBeUndefined();
+  });
+
   it('copySnapshotShell reprojects externally frozen presentation and unowned structured payloads', () => {
     const hugeText = 'H'.repeat(RESULT_PRESENTATION_ITEM_MAX_BYTES + 2048);
     const externalPresentation = Object.freeze({

@@ -368,20 +368,31 @@ function rebindDiagnostics(result: SingleResult): {
  */
 function copyOwnedSnapshotShell(result: SingleResult): SingleResult {
   const diagnostics = rebindDiagnostics(result);
-  return {
+  const snap: SingleResult = {
     ...result,
     messages: [],
     usage: { ...result.usage },
-    fanout: result.fanout ? { ...result.fanout } : undefined,
-    worktreeChangedFiles: result.worktreeChangedFiles
-      ? [...result.worktreeChangedFiles]
-      : undefined,
     presentation: result.presentation,
-    structuredOutput: result.structuredOutput,
     stderr: diagnostics.stderr,
     errorMessage: diagnostics.errorMessage,
     errorStack: diagnostics.errorStack,
   };
+  if (result.fanout) {
+    snap.fanout = { ...result.fanout };
+  } else {
+    delete snap.fanout;
+  }
+  if (result.worktreeChangedFiles) {
+    snap.worktreeChangedFiles = [...result.worktreeChangedFiles];
+  } else {
+    delete snap.worktreeChangedFiles;
+  }
+  if (result.structuredOutput !== undefined) {
+    snap.structuredOutput = result.structuredOutput;
+  } else {
+    delete snap.structuredOutput;
+  }
+  return snap;
 }
 
 /**

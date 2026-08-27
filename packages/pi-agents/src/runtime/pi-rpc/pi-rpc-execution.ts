@@ -642,6 +642,9 @@ export async function runSingleAgentPiRpc(
         (err instanceof Error && /cancel/i.test(err.message))
       ) {
         const origin = resolveAbortOrigin(signal, options);
+        if (!currentResult.errorMessage && err instanceof Error && err.message) {
+          currentResult.errorMessage = err.message;
+        }
         finalizeAborted(currentResult, origin);
         emitTerminalSnapshot(onUpdate, currentResult, makeDetails);
         throw new AgentAbortError(currentResult, origin);

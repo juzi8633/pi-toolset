@@ -244,18 +244,32 @@ export { emptyUsage } from './empty-usage.ts';
  * Parsers mutate messages/content/tool arguments/usage in place; consumers must not share those refs.
  */
 export function cloneSingleResult(result: SingleResult): SingleResult {
-  return {
+  const snap: SingleResult = {
     ...result,
     messages: result.messages.map((message) => structuredClone(message)),
-    presentation: result.presentation ? structuredClone(result.presentation) : undefined,
     usage: { ...result.usage },
-    fanout: result.fanout ? { ...result.fanout } : undefined,
-    worktreeChangedFiles: result.worktreeChangedFiles
-      ? [...result.worktreeChangedFiles]
-      : undefined,
-    structuredOutput:
-      result.structuredOutput !== undefined ? structuredClone(result.structuredOutput) : undefined,
   };
+  if (result.presentation) {
+    snap.presentation = structuredClone(result.presentation);
+  } else {
+    delete snap.presentation;
+  }
+  if (result.fanout) {
+    snap.fanout = { ...result.fanout };
+  } else {
+    delete snap.fanout;
+  }
+  if (result.worktreeChangedFiles) {
+    snap.worktreeChangedFiles = [...result.worktreeChangedFiles];
+  } else {
+    delete snap.worktreeChangedFiles;
+  }
+  if (result.structuredOutput !== undefined) {
+    snap.structuredOutput = structuredClone(result.structuredOutput);
+  } else {
+    delete snap.structuredOutput;
+  }
+  return snap;
 }
 
 export function cloneResults(results: SingleResult[]): SingleResult[] {

@@ -22,6 +22,8 @@ export async function writePromptToTempFile(
 }
 
 const PI_CODING_AGENT_NPM_CLI_ENTRY = '/node_modules/@earendil-works/pi-coding-agent/dist/cli.js';
+const PI_CODING_AGENT_NPM_BUNDLE_CLI_ENTRY =
+  '/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js';
 const PI_CODING_AGENT_MONOREPO_CLI_ENTRY = '/packages/coding-agent/dist/cli.js';
 
 function isPiCodingAgentScript(scriptPath: string): boolean {
@@ -34,6 +36,7 @@ function isPiCodingAgentScript(scriptPath: string): boolean {
   const normalized = resolved.replace(/\\/g, '/').toLowerCase();
   return (
     normalized.endsWith(PI_CODING_AGENT_NPM_CLI_ENTRY) ||
+    normalized.endsWith(PI_CODING_AGENT_NPM_BUNDLE_CLI_ENTRY) ||
     normalized.endsWith(PI_CODING_AGENT_MONOREPO_CLI_ENTRY)
   );
 }
