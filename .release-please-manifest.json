@@ -1,6 +1,6 @@
 {
-  "packages/pi-lsp": "0.2.0",
-  "packages/pi-format": "0.2.0",
-  "packages/pi-agents": "0.4.6",
-  "packages/pi-remote": "0.2.0"
+  "packages/pi-lsp": "0.2.1",
+  "packages/pi-format": "0.2.1",
+  "packages/pi-agents": "0.4.7",
+  "packages/pi-remote": "0.3.0"
 }

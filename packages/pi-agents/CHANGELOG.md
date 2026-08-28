@@ -10,6 +10,16 @@
 
 - **pi-agents:** lazy-load the optional Grok ACP runtime (and bundled ACP SDK/Zod graph) behind one memoized dynamic import with opt-in Bun code splitting under `dist/chunks/`. Extension import and Pi runtime paths no longer pay the ACP graph cost up front; the first `runtime: "grok-acp"` call loads the hashed façade chunk. Public tool schema, `package.json` exports, and the Pi extension entry (`dist/index.js`) are unchanged — published installs must retain `dist/chunks/`.
 
+## [0.4.7](https://github.com/balaenis/pi-toolset/compare/pi-agents-v0.4.6...pi-agents-v0.4.7) (2026-08-27)
+
+
+### Bug Fixes
+
+* clarify chain round semantics in review-loop prompt ([19b62f5](https://github.com/balaenis/pi-toolset/commit/19b62f5ba06e3061b83a681e5485c571dc39371d))
+* **pi-agents:** clarify chain round step enumeration in prompts ([08bba26](https://github.com/balaenis/pi-toolset/commit/08bba26bc025b62dfee542d253aa3d800e6b8a04))
+* **pi-agents:** prevent TUI subagent abort on planned-missing sessions ([8eea1d7](https://github.com/balaenis/pi-toolset/commit/8eea1d723d7469f432e64f1dcd9189a8742f970d))
+* **version:** align embedded versions with release-please ([a6196e3](https://github.com/balaenis/pi-toolset/commit/a6196e31ef71d83490dfd9d38dd4dda8c5ed70c0))
+
 ## [0.4.6](https://github.com/balaenis/pi-toolset/compare/pi-agents-v0.4.5...pi-agents-v0.4.6) (2026-08-08)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "@balaenis/pi-remote",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extension that runs read/write/edit/bash/grep/find/ls tools on a remote machine via SSH (--ssh flag).",
   "license": "Apache-2.0",
   "author": {
